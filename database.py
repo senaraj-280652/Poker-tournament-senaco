@@ -938,36 +938,108 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
     return {"tournaments": tournaments, "players": players_list}
 
 
-def export_period_summary_csv(summary, path):
+# Colonnes disponibles pour l'export de la synthèse par période, sous la
+# forme (clé, en-tête, fonction d'extraction de la valeur à partir d'une
+# ligne de tournoi/joueur). Définies une seule fois ici et réutilisées à
+# la fois par l'export CSV, l'export Excel et la boîte de dialogue de
+# sélection des colonnes (main.py) — ainsi les trois restent toujours en
+# phase.
+PERIOD_TOURNAMENT_COLUMNS = [
+    ("date", "Date", lambda t: t["date"]),
+    ("name", "Tournoi", lambda t: t["name"]),
+    ("status", "Statut", lambda t: t["status"]),
+    ("entries", "Entrées", lambda t: t["entries"]),
+    ("prize_pool", "Prize pool (€)", lambda t: round(t["prize_pool"], 2)),
+    ("winner", "Vainqueur", lambda t: t["winner"]),
+    ("bounty_distributed", "Primes distribuées (€)", lambda t: t["bounty_distributed"]),
+]
+
+PERIOD_PLAYER_COLUMNS = [
+    ("name", "Joueur", lambda a: a["name"]),
+    ("tournaments_played", "Tournois joués", lambda a: a["tournaments_played"]),
+    ("wins", "Victoires", lambda a: a["wins"]),
+    ("best_place", "Meilleure place", lambda a: a["best_place"] or "-"),
+    ("total_cost", "Total investi (€)", lambda a: round(a["total_cost"], 2)),
+    ("total_gain", "Gains classement (€)", lambda a: round(a["total_gain"], 2)),
+    ("total_bounty_won", "Primes gagnées (€)", lambda a: a["total_bounty_won"]),
+    ("net", "Net (€)", lambda a: round(a["net"], 2)),
+]
+
+
+def _selected_period_columns(columns, keys):
+    """Sous-ensemble de `columns` (une des listes ci-dessus) correspondant
+    à `keys`, dans l'ordre d'origine ; toutes les colonnes si `keys` est
+    None."""
+    if keys is None:
+        return columns
+    keys = set(keys)
+    return [c for c in columns if c[0] in keys]
+
+
+def export_period_summary_csv(summary, path, tournament_keys=None, player_keys=None):
     """Exporte une synthèse (issue de build_period_summary) en CSV : une
     section 'Tournois de la période', puis une section 'Classement des
-    joueurs' incluant les primes (bounty) empochées."""
+    joueurs' incluant les primes (bounty) empochées. `tournament_keys` /
+    `player_keys` permettent de ne garder qu'un sous-ensemble de colonnes
+    (voir PERIOD_TOURNAMENT_COLUMNS / PERIOD_PLAYER_COLUMNS) ; None = toutes."""
     import csv
+
+    t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
+    p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
 
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f, delimiter=";")
-        writer.writerow(["Tournois de la période"])
-        writer.writerow([
-            "Date", "Tournoi", "Statut", "Entrées", "Prize pool (€)",
-            "Vainqueur", "Primes distribuées (€)",
-        ])
-        for t in summary["tournaments"]:
-            writer.writerow([
-                t["date"], t["name"], t["status"], t["entries"],
-                f"{t['prize_pool']:.2f}", t["winner"], t["bounty_distributed"],
-            ])
-        writer.writerow([])
-        writer.writerow(["Classement des joueurs sur la période"])
-        writer.writerow([
-            "Joueur", "Tournois joués", "Victoires", "Meilleure place",
-            "Total investi (€)", "Total gains classement (€)",
-            "Total primes gagnées (€)", "Net (€)",
-        ])
-        for a in summary["players"]:
-            writer.writerow([
-                a["name"], a["tournaments_played"], a["wins"],
-                a["best_place"] or "-", f"{a['total_cost']:.2f}",
-                f"{a['total_gain']:.2f}", a["total_bounty_won"],
-                f"{a['net']:.2f}",
-            ])
+        if t_cols:
+            writer.writerow(["Tournois de la période"])
+            writer.writerow([h for _, h, _ in t_cols])
+            for t in summary["tournaments"]:
+                writer.writerow([fn(t) for _, _, fn in t_cols])
+            writer.writerow([])
+        if p_cols:
+            writer.writerow(["Classement des joueurs sur la période"])
+            writer.writerow([h for _, h, _ in p_cols])
+            for a in summary["players"]:
+                writer.writerow([fn(a) for _, _, fn in p_cols])
+    return path
+
+
+def export_period_summary_xlsx(summary, path, tournament_keys=None, player_keys=None):
+    """Exporte une synthèse en Excel (.xlsx) : une feuille 'Tournois', une
+    feuille 'Joueurs', avec les mêmes options de sélection de colonnes que
+    export_period_summary_csv. Nécessite le paquet 'openpyxl'."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
+    p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
+    header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+
+    def _write_sheet(ws, cols, rows):
+        ws.append([h for _, h, _ in cols])
+        for col in range(1, len(cols) + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+        for row in rows:
+            ws.append([fn(row) for _, _, fn in cols])
+        for i, _ in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = 20
+
+    wb = Workbook()
+    first = True
+    if t_cols:
+        ws_t = wb.active
+        ws_t.title = "Tournois"
+        first = False
+        _write_sheet(ws_t, t_cols, summary["tournaments"])
+    if p_cols:
+        ws_p = wb.active if first else wb.create_sheet("Joueurs")
+        ws_p.title = "Joueurs"
+        _write_sheet(ws_p, p_cols, summary["players"])
+    if not t_cols and not p_cols:
+        wb.active.title = "Synthèse"
+
+    wb.save(path)
     return path

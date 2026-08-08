@@ -111,8 +111,10 @@ existant"** pour reprendre un tournoi déjà commencé.
 
   La date d'un tournoi est celle fixée à sa création ; pour les fichiers
   créés avant l'existence de ce réglage, elle est déduite de la date de
-  création du fichier lui-même. Exportable en CSV depuis la fenêtre de
-  synthèse.
+  création du fichier lui-même. Exportable en **CSV ou Excel (.xlsx)**
+  depuis la fenêtre de synthèse (bouton "Exporter..."), avec le choix des
+  colonnes à inclure (séparément pour la liste des tournois et pour le
+  classement des joueurs).
 
 ## Sauvegarde
 

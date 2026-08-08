@@ -12,7 +12,10 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog
 
-from database import Database, build_period_summary, export_period_summary_csv
+from database import (
+    Database, build_period_summary, export_period_summary_csv,
+    export_period_summary_xlsx, PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
+)
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
 import roster
@@ -592,7 +595,7 @@ class PeriodSummaryDialog(tk.Toplevel):
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=14, pady=(0, 14))
-        ttk.Button(btns, text="Exporter en CSV...", command=self._export_csv).pack(side="left")
+        ttk.Button(btns, text="Exporter...", command=self._open_export_dialog).pack(side="left")
         ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right")
 
     def _browse_folder(self):
@@ -684,20 +687,105 @@ class PeriodSummaryDialog(tk.Toplevel):
             text=f"{len(tournaments)} tournoi(s) trouvé(s) sur la période — {len(players)} joueur(s) distinct(s)."
         )
 
-    def _export_csv(self):
-        if not self.summary or not self.summary["tournaments"]:
+    def _open_export_dialog(self):
+        if not self.summary or not (self.summary["tournaments"] or self.summary["players"]):
             messagebox.showinfo("Info", "Générez d'abord une synthèse non vide.")
             return
+        PeriodExportDialog(self, self.summary)
+
+
+class PeriodExportDialog(tk.Toplevel):
+    """Choix du format (CSV / Excel) et des colonnes à exporter pour une
+    synthèse par période déjà générée (voir PeriodSummaryDialog)."""
+
+    def __init__(self, master, summary):
+        super().__init__(master)
+        self.summary = summary
+        self.title("Exporter la synthèse")
+        self.configure(bg=FELT_DARK)
+        self.geometry("480x560")
+        self.transient(master)
+        self.grab_set()
+
+        self.format_var = tk.StringVar(value="csv")
+        self.tournament_vars = {key: tk.BooleanVar(value=True) for key, _, _ in PERIOD_TOURNAMENT_COLUMNS}
+        self.player_vars = {key: tk.BooleanVar(value=True) for key, _, _ in PERIOD_PLAYER_COLUMNS}
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(14, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+
+        t_frame = ttk.LabelFrame(self, text="Colonnes — Tournois de la période")
+        t_frame.pack(fill="x", padx=14, pady=8)
+        self._build_column_checks(t_frame, PERIOD_TOURNAMENT_COLUMNS, self.tournament_vars)
+
+        p_frame = ttk.LabelFrame(self, text="Colonnes — Classement des joueurs")
+        p_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        self._build_column_checks(p_frame, PERIOD_PLAYER_COLUMNS, self.player_vars)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=14, pady=(4, 14))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+    def _build_column_checks(self, parent, columns, var_map):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in var_map.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in var_map.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(parent)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header, _fn) in enumerate(columns):
+            ttk.Checkbutton(grid, text=header, variable=var_map[key]).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        t_keys = [k for k, v in self.tournament_vars.items() if v.get()]
+        p_keys = [k for k, v in self.player_vars.items() if v.get()]
+        if not t_keys and not p_keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        is_xlsx = self.format_var.get() == "xlsx"
+        ext = ".xlsx" if is_xlsx else ".csv"
         path = filedialog.asksaveasfilename(
             title="Exporter la synthèse",
-            defaultextension=".csv",
-            filetypes=[("Fichier CSV", "*.csv")],
-            initialfile="synthese_periode.csv",
+            defaultextension=ext,
+            filetypes=[("Fichier Excel", "*.xlsx")] if is_xlsx else [("Fichier CSV", "*.csv")],
+            initialfile=f"synthese_periode{ext}",
         )
         if not path:
             return
-        export_period_summary_csv(self.summary, path)
+
+        try:
+            if is_xlsx:
+                export_period_summary_xlsx(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
+            else:
+                export_period_summary_csv(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
+        except ImportError:
+            messagebox.showerror(
+                "Module manquant",
+                "L'export Excel (.xlsx) nécessite le paquet 'openpyxl', qui n'est "
+                "pas installé.\n\nOuvrez un terminal et tapez :\n\n"
+                "    pip3 install openpyxl\n\n"
+                "puis relancez l'export. (Vous pouvez aussi choisir le format CSV, "
+                "qui ne nécessite rien de plus.)",
+            )
+            return
         messagebox.showinfo("Export", f"Synthèse exportée vers :\n{path}")
+        self.destroy()
 
 
 class App(tk.Tk):
