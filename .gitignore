@@ -1,0 +1,14 @@
+# Données de tournoi (personnelles, propres à chaque partie) — pas du code
+*.tournoi
+
+# Fichiers système macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Dossiers/archives de dépose ponctuelle (téléchargements, pas du code source)
+files/
+files [0-9]*/
+files.zip
