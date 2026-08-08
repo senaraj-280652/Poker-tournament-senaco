@@ -79,7 +79,12 @@ existant"** pour reprendre un tournoi déjà commencé.
 - **Tables** : placement automatique des joueurs, rééquilibrage automatique
   après chaque élimination/inscription (fermeture des tables devenues
   inutiles, déplacement des joueurs pour garder les tables équilibrées).
-  Un bouton permet aussi de forcer un rééquilibrage.
+  Un bouton permet aussi de forcer un rééquilibrage. Si le nombre de
+  tables dépasse la capacité d'affichage de l'écran, l'onglet défile
+  automatiquement, lentement et en boucle (utile pour laisser cet onglet
+  affiché en continu sur un écran dédié) ; sinon rien ne défile. La
+  molette de la souris permet aussi de défiler manuellement à tout
+  moment.
 - **Chronomètre** : structure de blindes standard préchargée (modifiable),
   démarrage/pause/niveau suivant-précédent, passage automatique au niveau
   suivant à la fin du temps. Un écran séparé ("Affichage > Ouvrir l'écran

@@ -1528,14 +1528,65 @@ class App(tk.Tk):
     # ---------------------------------------------------------------
     # Onglet Tables
     # ---------------------------------------------------------------
+    # Vitesse du défilement automatique de l'onglet Tables (utilisé
+    # seulement quand le contenu dépasse la hauteur visible) : 2 pixels
+    # toutes les 45 ms, soit environ 44 px/s — assez lent pour rester
+    # lisible sur un écran de vidéoprojecteur.
+    TABLES_AUTOSCROLL_STEP_PX = 2
+    TABLES_AUTOSCROLL_INTERVAL_MS = 45
+    TABLES_AUTOSCROLL_PAUSE_MS = 2500  # pause en haut et en bas avant de reboucler
+
     def _build_tables_tab(self):
         top = ttk.Frame(self.tables_tab)
         top.pack(fill="x", padx=10, pady=10)
         ttk.Button(top, text="Rééquilibrer les tables", command=self._rebalance).pack(side="left", padx=3)
         ttk.Button(top, text="Ajouter une table", command=self._add_table).pack(side="left", padx=3)
 
-        self.tables_canvas = tk.Frame(self.tables_tab)
-        self.tables_canvas.pack(fill="both", expand=True, padx=10, pady=10)
+        scroll_container = ttk.Frame(self.tables_tab)
+        scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Zone défilante : un Canvas (seul widget dont on peut piloter le
+        # défilement par programme) contenant un Frame avec les tables en
+        # grille. Sans cette zone, les tables au-delà de la capacité
+        # d'affichage de l'écran seraient simplement invisibles.
+        self.tables_canvas = tk.Canvas(scroll_container, bg=FELT, highlightthickness=0)
+        tables_scrollbar = ttk.Scrollbar(
+            scroll_container, orient="vertical", command=self.tables_canvas.yview
+        )
+        # yscrollincrement=1 : chaque "unit" de yview_scroll vaut 1 pixel,
+        # ce qui permet un défilement automatique fluide (voir
+        # _tables_autoscroll_tick) plutôt que par grands blocs.
+        self.tables_canvas.configure(yscrollcommand=tables_scrollbar.set, yscrollincrement=1)
+        self.tables_canvas.pack(side="left", fill="both", expand=True)
+        tables_scrollbar.pack(side="right", fill="y")
+
+        self.tables_inner = ttk.Frame(self.tables_canvas)
+        self._tables_inner_window = self.tables_canvas.create_window(
+            (0, 0), window=self.tables_inner, anchor="nw"
+        )
+        self.tables_inner.bind(
+            "<Configure>",
+            lambda e: self.tables_canvas.configure(scrollregion=self.tables_canvas.bbox("all")),
+        )
+        self.tables_canvas.bind(
+            "<Configure>",
+            lambda e: self.tables_canvas.itemconfigure(self._tables_inner_window, width=e.width),
+        )
+        # Molette de souris, pour un défilement manuel en complément du
+        # défilement automatique (macOS/Windows puis Linux).
+        self.tables_canvas.bind("<MouseWheel>", self._on_tables_mousewheel)
+        self.tables_canvas.bind("<Button-4>", lambda e: self.tables_canvas.yview_scroll(-40, "units"))
+        self.tables_canvas.bind("<Button-5>", lambda e: self.tables_canvas.yview_scroll(40, "units"))
+
+        self._tables_scroll_after_id = None
+        self._tables_scroll_paused = False
+        self._tables_autoscroll_tick()
+
+    def _on_tables_mousewheel(self, event):
+        # event.delta : multiples de 120 sous Windows, valeur brute (~1-3)
+        # sous macOS — dans les deux cas, on veut quelques dizaines de
+        # pixels par cran de molette.
+        self.tables_canvas.yview_scroll(int(-event.delta / 120 * 40) or (-40 if event.delta > 0 else 40), "units")
 
     def _rebalance(self):
         self.db.rebalance_tables()
@@ -1546,7 +1597,7 @@ class App(tk.Tk):
         self._refresh_all()
 
     def _refresh_tables_tab(self):
-        for w in self.tables_canvas.winfo_children():
+        for w in self.tables_inner.winfo_children():
             w.destroy()
         tables = self.db.list_tables()
         players_by_table = {}
@@ -1555,7 +1606,7 @@ class App(tk.Tk):
 
         cols = 3
         for idx, t in enumerate(tables):
-            frame = ttk.LabelFrame(self.tables_canvas, text=t["name"])
+            frame = ttk.LabelFrame(self.tables_inner, text=t["name"])
             frame.grid(row=idx // cols, column=idx % cols, padx=8, pady=8, sticky="n")
             plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["seat"] or 0)
             if not plist:
@@ -1565,6 +1616,49 @@ class App(tk.Tk):
                     frame,
                     text=f"Siège {p['seat']} — {p['name']}  ({p['chips']:,}".replace(",", " ") + ")",
                 ).pack(anchor="w", padx=10, pady=2)
+
+        # Repart du haut à chaque rafraîchissement (rééquilibrage,
+        # élimination...) plutôt que de rester sur une position de
+        # défilement qui ne correspond plus forcément au même contenu.
+        self.tables_canvas.update_idletasks()
+        self.tables_canvas.configure(scrollregion=self.tables_canvas.bbox("all"))
+        self.tables_canvas.yview_moveto(0.0)
+        self._tables_scroll_paused = False
+
+    def _tables_autoscroll_tick(self):
+        """Boucle de défilement automatique et lent de l'onglet Tables,
+        active seulement quand le nombre de tables dépasse la capacité
+        d'affichage à l'écran (sinon rien ne défile)."""
+        if not self.winfo_exists() or not self.tables_canvas.winfo_exists():
+            return
+
+        # N'anime que si l'onglet Tables est actuellement affiché, pour ne
+        # pas défiler inutilement en arrière-plan pendant que l'utilisateur
+        # est sur un autre onglet.
+        if self.notebook.tab(self.notebook.select(), "text") != "Tables":
+            self._tables_scroll_after_id = self.after(500, self._tables_autoscroll_tick)
+            return
+
+        bbox = self.tables_canvas.bbox("all")
+        visible_height = self.tables_canvas.winfo_height()
+        content_height = (bbox[3] - bbox[1]) if bbox else 0
+
+        if not self._tables_scroll_paused and content_height > visible_height:
+            top_frac, bottom_frac = self.tables_canvas.yview()
+            if bottom_frac >= 1.0:
+                # Arrivé en bas : pause de lecture puis retour en boucle en haut.
+                self._tables_scroll_paused = True
+                self.tables_canvas.yview_moveto(0.0)
+                self.after(self.TABLES_AUTOSCROLL_PAUSE_MS, self._tables_resume_autoscroll)
+            else:
+                self.tables_canvas.yview_scroll(self.TABLES_AUTOSCROLL_STEP_PX, "units")
+
+        self._tables_scroll_after_id = self.after(
+            self.TABLES_AUTOSCROLL_INTERVAL_MS, self._tables_autoscroll_tick
+        )
+
+    def _tables_resume_autoscroll(self):
+        self._tables_scroll_paused = False
 
     # ---------------------------------------------------------------
     # Onglet Mouvements (historique des changements de table/siège)

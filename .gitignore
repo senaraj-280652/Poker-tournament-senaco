@@ -12,3 +12,6 @@ __pycache__/
 files/
 files [0-9]*/
 files.zip
+
+# Réglages locaux de l'outil Claude Code (spécifiques à cette machine)
+.claude/
