@@ -1520,6 +1520,14 @@ class App(tk.Tk):
             popup = tk.Toplevel(self)
             popup.withdraw()
             popup.overrideredirect(True)
+            # 'transient' associe explicitement la fenêtre à la fenêtre
+            # principale : sans ça, sous macOS, l'appli entière peut perdre
+            # le focus après un clic sur cette petite fenêtre sans style
+            # (overrideredirect) et devenir insensible aux clics jusqu'à ce
+            # qu'on la réactive manuellement (bascule vers une autre appli
+            # puis retour, par ex.) — c'est ce "gel" apparent des champs
+            # Nom/Club/Ajouter qui a été signalé.
+            popup.transient(self)
             try:
                 popup.attributes("-topmost", True)
             except tk.TclError:
@@ -1529,6 +1537,7 @@ class App(tk.Tk):
                 selectforeground=TEXT_DARK, font=("Helvetica", 11),
                 exportselection=False, activestyle="none",
                 highlightthickness=1, highlightbackground=GOLD_DARK, borderwidth=0,
+                takefocus=0,
             )
             listbox.pack(fill="both", expand=True)
             # ButtonRelease (et non Button-1) : la sélection du Listbox est
@@ -1556,6 +1565,19 @@ class App(tk.Tk):
     def _hide_autocomplete(self):
         if self._autocomplete_popup is not None and self._autocomplete_popup.winfo_exists():
             self._autocomplete_popup.withdraw()
+            # Redonne explicitement la main (au niveau fenêtre) à la
+            # fenêtre principale : sous macOS, une fenêtre overrideredirect
+            # qui a reçu un clic peut sinon laisser l'appli entière
+            # insensible aux clics une fois masquée (voir commentaire dans
+            # _show_autocomplete). On ne force pas le focus clavier sur un
+            # champ précis ici, pour ne pas perturber une saisie déjà
+            # entamée ailleurs (ex : champ Club) au moment où ce masquage
+            # différé se déclenche.
+            self.lift()
+            try:
+                self.focus_force()
+            except tk.TclError:
+                pass
 
     def _on_player_name_focus_out(self, event=None):
         self._prefill_club_from_roster()
@@ -1599,6 +1621,8 @@ class App(tk.Tk):
         self.new_player_club_var.set("")
         self._hide_autocomplete()
         self._refresh_all()
+        # Prêt à saisir le joueur suivant.
+        self.new_player_entry.focus_set()
 
     def _add_from_roster(self):
         existing_names = {p["name"] for p in self.db.list_players()}
