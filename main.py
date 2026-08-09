@@ -309,6 +309,44 @@ class CameraCaptureDialog(tk.Toplevel):
         self.destroy()
 
 
+def ask_club_dialog(master, title="Club", current_club=""):
+    """Petite fenêtre pour choisir un club dans une liste déroulante des
+    clubs déjà connus du répertoire, ou en saisir un nouveau. Renvoie le
+    club choisi/saisi (chaîne, éventuellement vide), ou None si annulé."""
+    win = tk.Toplevel(master)
+    win.title(title)
+    win.configure(bg=FELT_DARK)
+    win.resizable(False, False)
+    win.transient(master)
+    win.grab_set()
+    result = {"club": None}
+
+    tk.Label(
+        win, bg=FELT_DARK, fg=CREAM, text="Club (choisir dans la liste, ou saisir un nouveau) :",
+    ).pack(padx=16, pady=(16, 6))
+
+    var = tk.StringVar(value=current_club)
+    combo = ttk.Combobox(win, textvariable=var, values=roster.list_clubs(), width=30)
+    combo.pack(padx=16, pady=(0, 16))
+    combo.focus_set()
+
+    def confirm():
+        result["club"] = var.get().strip()
+        win.destroy()
+
+    def cancel():
+        win.destroy()
+
+    combo.bind("<Return>", lambda e: confirm())
+    btns = ttk.Frame(win)
+    btns.pack(pady=(0, 16))
+    ttk.Button(btns, text="Annuler", command=cancel).pack(side="left", padx=5)
+    ttk.Button(btns, text="Valider", command=confirm).pack(side="left", padx=5)
+
+    win.wait_window(win)
+    return result["club"]
+
+
 class RosterManagerDialog(tk.Toplevel):
     """Fenêtre de gestion du répertoire de joueurs habituels, indépendante
     de tout tournoi en cours."""
@@ -316,9 +354,10 @@ class RosterManagerDialog(tk.Toplevel):
     def __init__(self, master):
         super().__init__(master)
         self.title("Répertoire de joueurs")
-        self.geometry("560x520")
+        self.geometry("640x540")
         self.grab_set()
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
+        self.roster_sort = {"column": "name", "ascending": True}
 
         ttk.Label(
             self, text="Joueurs habituels (proposés à la création d'un tournoi)",
@@ -330,12 +369,18 @@ class RosterManagerDialog(tk.Toplevel):
 
         list_frame = ttk.Frame(body)
         list_frame.pack(side="left", fill="both", expand=True)
-        self.listbox = tk.Listbox(list_frame, selectmode="browse")
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
-        self.listbox.configure(yscrollcommand=scrollbar.set)
-        self.listbox.pack(side="left", fill="both", expand=True)
+        self.roster_tree = ttk.Treeview(
+            list_frame, columns=("name", "club"), show="headings", selectmode="browse",
+        )
+        self.roster_tree.heading("name", text="Nom", command=lambda: self._sort_roster_by("name"))
+        self.roster_tree.heading("club", text="Club", command=lambda: self._sort_roster_by("club"))
+        self.roster_tree.column("name", width=180, anchor="w")
+        self.roster_tree.column("club", width=140, anchor="w")
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.roster_tree.yview)
+        self.roster_tree.configure(yscrollcommand=scrollbar.set)
+        self.roster_tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-        self.listbox.bind("<<ListboxSelect>>", lambda e: self._refresh_preview())
+        self.roster_tree.bind("<<TreeviewSelect>>", lambda e: self._refresh_preview())
 
         photo_frame = ttk.Frame(body)
         photo_frame.pack(side="left", fill="y", padx=(12, 0))
@@ -343,7 +388,9 @@ class RosterManagerDialog(tk.Toplevel):
             photo_frame, width=ROSTER_PREVIEW_SIZE, height=ROSTER_PREVIEW_SIZE, bg=CREAM
         )
         preview_container.pack_propagate(False)  # taille fixe en pixels, quel que soit le contenu
-        preview_container.pack()
+        # pady(top) : laisse un peu d'air au-dessus de la vignette, qui
+        # touchait presque le haut de la fenêtre auparavant.
+        preview_container.pack(pady=(24, 0))
         self.preview_lbl = tk.Label(
             preview_container, bg=CREAM, text="Aucune photo", fg="#888888",
         )
@@ -365,6 +412,7 @@ class RosterManagerDialog(tk.Toplevel):
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0, 4))
         ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
+        ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
         ttk.Button(btns, text="Supprimer", command=self._delete).pack(side="left", padx=3)
         ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right", padx=3)
 
@@ -377,10 +425,39 @@ class RosterManagerDialog(tk.Toplevel):
 
         self._refresh()
 
+    def _sort_roster_by(self, column):
+        """Tri par clic sur un en-tête (Nom / Club) : ré-appuyer sur le
+        même en-tête inverse l'ordre (croissant <-> décroissant)."""
+        if self.roster_sort["column"] == column:
+            self.roster_sort["ascending"] = not self.roster_sort["ascending"]
+        else:
+            self.roster_sort["column"] = column
+            self.roster_sort["ascending"] = True
+        self._refresh()
+
+    def _update_roster_sort_headings(self):
+        labels = {"name": "Nom", "club": "Club"}
+        for col, label in labels.items():
+            if self.roster_sort["column"] == col:
+                arrow = " ▲" if self.roster_sort["ascending"] else " ▼"
+                self.roster_tree.heading(col, text=label + arrow)
+            else:
+                self.roster_tree.heading(col, text=label)
+
     def _refresh(self):
-        self.listbox.delete(0, "end")
-        for name in roster.load_roster():
-            self.listbox.insert("end", name)
+        selected = self._selected_name()
+        for row in self.roster_tree.get_children():
+            self.roster_tree.delete(row)
+        entries = roster.load_roster_entries()
+        col = self.roster_sort["column"]
+        entries.sort(key=lambda e: (e[col] or "").lower())
+        if not self.roster_sort["ascending"]:
+            entries.reverse()
+        self._update_roster_sort_headings()
+        for e in entries:
+            self.roster_tree.insert("", "end", iid=e["name"], values=(e["name"], e["club"]))
+        if selected and self.roster_tree.exists(selected):
+            self.roster_tree.selection_set(selected)
         self._refresh_preview()
 
     def _refresh_preview(self):
@@ -401,10 +478,10 @@ class RosterManagerDialog(tk.Toplevel):
             self._preview_photo = None
 
     def _selected_name(self):
-        sel = self.listbox.curselection()
+        sel = self.roster_tree.selection()
         if not sel:
             return None
-        return self.listbox.get(sel[0])
+        return sel[0]
 
     def _add(self):
         name = self.new_name_var.get().strip()
@@ -421,6 +498,16 @@ class RosterManagerDialog(tk.Toplevel):
         if new_name and new_name.strip():
             roster.rename_in_roster(name, new_name.strip())
             player_photos.rename_photo(name, new_name.strip())
+            self._refresh()
+
+    def _edit_club(self):
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
+            return
+        club = ask_club_dialog(self, title=f"Club de {name}", current_club=roster.get_club(name))
+        if club is not None:
+            roster.set_club(name, club)
             self._refresh()
 
     def _delete(self):
@@ -1174,9 +1261,23 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Nom du joueur :").pack(side="left")
         self.new_player_var = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=self.new_player_var, width=30)
+        entry = ttk.Entry(top, textvariable=self.new_player_var, width=24)
         entry.pack(side="left", padx=5)
         entry.bind("<Return>", lambda e: self._add_player())
+        # Si le nom saisi correspond à un joueur déjà connu du répertoire,
+        # propose automatiquement son club (sans écraser une saisie déjà
+        # en cours dans le champ Club).
+        entry.bind("<FocusOut>", lambda e: self._prefill_club_from_roster())
+
+        ttk.Label(top, text="Club :").pack(side="left", padx=(8, 0))
+        self.new_player_club_var = tk.StringVar()
+        self.new_player_club_combo = ttk.Combobox(
+            top, textvariable=self.new_player_club_var, width=16,
+            values=roster.list_clubs(),
+        )
+        self.new_player_club_combo.pack(side="left", padx=5)
+        self.new_player_club_combo.bind("<Return>", lambda e: self._add_player())
+
         ttk.Button(top, text="Ajouter", command=self._add_player).pack(side="left", padx=5)
         ttk.Button(top, text="Ajouter depuis le répertoire...", command=self._add_from_roster).pack(side="left", padx=5)
 
@@ -1296,14 +1397,27 @@ class App(tk.Tk):
     def _clear_checked(self):
         self.checked_player_ids.clear()
 
+    def _prefill_club_from_roster(self):
+        name = self.new_player_var.get().strip()
+        if not name or self.new_player_club_var.get().strip():
+            return  # ne pas écraser une saisie de club déjà en cours
+        club = roster.get_club(name)
+        if club:
+            self.new_player_club_var.set(club)
+
     def _add_player(self):
         name = self.new_player_var.get().strip()
         if not name:
             return
+        club = self.new_player_club_var.get().strip()
         self.db.add_player(name)
         if not self.temp_player_var.get():
-            roster.add_to_roster(name)
+            roster.add_to_roster(name, club=club or None)
+            # Rafraîchit la liste de clubs proposée dans le menu déroulant
+            # si un club inédit vient d'être saisi.
+            self.new_player_club_combo.configure(values=roster.list_clubs())
         self.new_player_var.set("")
+        self.new_player_club_var.set("")
         self._refresh_all()
 
     def _add_from_roster(self):
@@ -1554,6 +1668,9 @@ class App(tk.Tk):
             self.bell()  # repli si la lecture audio n'a pas pu être lancée
 
     def _refresh_players_tab(self):
+        # Garde la liste déroulante des clubs à jour (un club a pu être
+        # ajouté/modifié entre-temps depuis le répertoire de joueurs).
+        self.new_player_club_combo.configure(values=roster.list_clubs())
         for row in self.players_tree.get_children():
             self.players_tree.delete(row)
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}

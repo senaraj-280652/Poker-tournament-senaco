@@ -73,12 +73,19 @@ existant"** pour reprendre un tournoi déjà commencé.
   création d'un nouveau tournoi. Gérable à tout moment via le menu
   "Répertoire > Gérer le répertoire de joueurs...". On peut aussi piocher
   dans le répertoire en cours de tournoi avec "Ajouter depuis le
-  répertoire..." (utile pour les inscriptions tardives).
+  répertoire..." (utile pour les inscriptions tardives). Le répertoire
+  affiche un tableau **Nom / Club**, triable en cliquant sur l'un ou
+  l'autre en-tête (re-cliquer inverse l'ordre) ; un bouton "Modifier le
+  club..." permet de renseigner ou corriger le club d'un joueur à tout
+  moment.
 - **Joueurs** : inscription, rebuy, add-on, modification manuelle des chips,
   élimination (place calculée automatiquement), réinscription, suppression.
   Case « Temp » à cocher avant d'ajouter un joueur pour l'inscrire au
   tournoi sans l'ajouter au répertoire de joueurs habituels (utile pour
-  un invité ponctuel).
+  un invité ponctuel). Un champ **Club** (menu déroulant des clubs déjà
+  connus, ou saisie libre d'un nouveau club) accompagne l'ajout d'un
+  joueur et se pré-remplit automatiquement pour un nom déjà présent dans
+  le répertoire.
 - **Tables** : placement automatique des joueurs, rééquilibrage automatique
   après chaque élimination/inscription (fermeture des tables devenues
   inutiles, déplacement des joueurs pour garder les tables équilibrées).
