@@ -79,7 +79,10 @@ existant"** pour reprendre un tournoi déjà commencé.
   club..." permet de renseigner ou corriger le club d'un joueur à tout
   moment. La liste à cocher (nouveau tournoi / "Ajouter depuis le
   répertoire...") affiche elle aussi le club dans une colonne séparée,
-  avec des en-têtes "Joueur"/"Club" tout aussi triables.
+  avec des en-têtes "Joueur"/"Club" tout aussi triables ; un champ Club
+  accompagne l'ajout d'un nouveau nom, et cliquer sur la cellule Club
+  d'un joueur déjà listé ("+ ajouter un club" si vide) permet de le
+  définir ou le corriger directement depuis cette fenêtre.
 - **Joueurs** : inscription, rebuy, add-on, modification manuelle des chips,
   élimination (place calculée automatiquement), réinscription, suppression.
   Case « Temp » à cocher avant d'ajouter un joueur pour l'inscrire au
