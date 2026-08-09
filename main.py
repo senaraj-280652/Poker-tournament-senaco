@@ -93,6 +93,8 @@ class PlayerSelectionDialog(tk.Toplevel):
         self.check_vars = {}
         exclude_names = exclude_names or set()
         self.roster_names = [n for n in roster.load_roster() if n not in exclude_names]
+        self.sort_state = {"column": "name", "ascending": True}
+        self.header_labels = {}
 
         ttk.Label(
             self, text="Cochez les joueurs concernés :",
@@ -150,14 +152,18 @@ class PlayerSelectionDialog(tk.Toplevel):
     def _build_list(self, names):
         for w in self.list_frame.winfo_children():
             w.destroy()
+        self.header_labels = {}
         if names:
-            ttk.Label(self.list_frame, text="Joueur", font=("Helvetica", 9, "bold")).grid(
-                row=0, column=0, sticky="w", padx=(0, 20)
-            )
-            ttk.Label(self.list_frame, text="Club", font=("Helvetica", 9, "bold")).grid(
-                row=0, column=1, sticky="w"
-            )
-        for idx, name in enumerate(names, start=1):
+            for col, key, label in ((0, "name", "Joueur"), (1, "club", "Club")):
+                hdr = ttk.Label(
+                    self.list_frame, font=("Helvetica", 9, "bold"),
+                    foreground=GOLD_DARK, cursor="hand2",
+                )
+                hdr.grid(row=0, column=col, sticky="w", padx=(0, 20) if col == 0 else 0)
+                hdr.bind("<Button-1>", lambda e, k=key: self._sort_by(k))
+                self.header_labels[key] = hdr
+            self._update_sort_headers(label_texts={"name": "Joueur", "club": "Club"})
+        for idx, name in enumerate(self._sorted(names), start=1):
             var = self.check_vars.get(name)
             if var is None:
                 var = tk.BooleanVar(value=False)
@@ -168,6 +174,34 @@ class PlayerSelectionDialog(tk.Toplevel):
             ttk.Label(self.list_frame, text=roster.get_club(name), foreground=MUTED).grid(
                 row=idx, column=1, sticky="w", pady=1
             )
+
+    def _sorted(self, names):
+        col = self.sort_state["column"]
+        if col == "club":
+            key = lambda n: (roster.get_club(n) or "").lower()
+        else:
+            key = lambda n: n.lower()
+        result = sorted(names, key=key)
+        if not self.sort_state["ascending"]:
+            result.reverse()
+        return result
+
+    def _update_sort_headers(self, label_texts):
+        for key, hdr in self.header_labels.items():
+            text = label_texts[key]
+            if self.sort_state["column"] == key:
+                text += " ▲" if self.sort_state["ascending"] else " ▼"
+            hdr.configure(text=text)
+
+    def _sort_by(self, column):
+        """Clic sur l'en-tête Joueur/Club : trie la liste, ré-appuyer
+        inverse l'ordre (croissant <-> décroissant)."""
+        if self.sort_state["column"] == column:
+            self.sort_state["ascending"] = not self.sort_state["ascending"]
+        else:
+            self.sort_state["column"] = column
+            self.sort_state["ascending"] = True
+        self._filter()
 
     def _filter(self):
         term = self.search_var.get().strip().lower()
