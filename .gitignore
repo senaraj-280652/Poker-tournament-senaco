@@ -15,3 +15,8 @@ files.zip
 
 # Réglages locaux de l'outil Claude Code (spécifiques à cette machine)
 .claude/
+
+# Fichiers verrous temporaires de Microsoft Word (créés pendant l'édition,
+# supprimés automatiquement à la fermeture du document)
+~$*.doc
+~$*.docx
