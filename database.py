@@ -958,7 +958,7 @@ PERIOD_PLAYER_COLUMNS = [
     ("name", "Joueur", lambda a: a["name"]),
     ("tournaments_played", "Tournois joués", lambda a: a["tournaments_played"]),
     ("wins", "Victoires", lambda a: a["wins"]),
-    ("best_place", "Meilleure place", lambda a: a["best_place"] or "-"),
+    ("best_place", "Meilleur Rang", lambda a: a["best_place"] or "-"),
     ("total_cost", "Total investi (€)", lambda a: round(a["total_cost"], 2)),
     ("total_gain", "Gains classement (€)", lambda a: round(a["total_gain"], 2)),
     ("total_bounty_won", "Primes gagnées (€)", lambda a: a["total_bounty_won"]),

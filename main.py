@@ -745,7 +745,7 @@ class PeriodSummaryDialog(tk.Toplevel):
         bottom_pane.pack(fill="both", expand=True)
         cols_p = ("name", "played", "wins", "best", "cost", "gain", "bounty", "net")
         headers_p = [
-            "Joueur", "Tournois joués", "Victoires", "Meilleure place",
+            "Joueur", "Tournois joués", "Victoires", "Meilleur Rang",
             "Total investi (€)", "Gains classement (€)", "Primes gagnées (€)", "Net (€)",
         ]
         self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=10)
@@ -1402,8 +1402,8 @@ class App(tk.Tk):
         ttk.Button(actions, text="Réinscrire", command=self._reinstate_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Supprimer", command=self._delete_selected).pack(side="left", padx=3)
 
-        columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "place")
-        headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Place"]
+        columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang")
+        headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang"]
         self.players_tree = ttk.Treeview(
             self.players_tab, columns=columns, show="tree headings", height=20,
             style="Players.Treeview",
@@ -1416,6 +1416,9 @@ class App(tk.Tk):
         self.players_tree.heading("name", command=lambda: self._sort_players_by("name"))
         self.players_tree.heading("status", command=lambda: self._sort_players_by("status"))
         self.players_tree.heading("table", command=lambda: self._sort_players_by("table"))
+        # "Rang" : classement final du joueur (100 pour le 1er éliminé d'un
+        # champ de 100, 99 pour le 2e, etc. — voir _sort_players_by), triable.
+        self.players_tree.heading("rang", command=lambda: self._sort_players_by("rang"))
         self.players_tree.column("sel", width=56, anchor="center", stretch=False)
         self.players_tree.column("name", width=180, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -1460,7 +1463,7 @@ class App(tk.Tk):
         self._refresh_players_tab()
 
     def _update_sort_headings(self):
-        base_headers = {"name": "Nom", "status": "Statut", "table": "Table"}
+        base_headers = {"name": "Nom", "status": "Statut", "table": "Table", "rang": "Rang"}
         for col, label in base_headers.items():
             if self.players_sort["column"] == col:
                 arrow = " ▲" if self.players_sort["ascending"] else " ▼"
@@ -1882,9 +1885,18 @@ class App(tk.Tk):
 
         status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
         players = [dict(p) for p in self.db.list_players()]
+        n_active = sum(1 for p in players if p["status"] == "active")
         for p in players:
             p["status_label"] = status_labels.get(p["status"], p["status"])
             p["table_name"] = tables.get(p["table_id"], "-") if p["table_id"] else "-"
+            # Rang final : celui d'un joueur éliminé (voir eliminate_player),
+            # 1 pour le vainqueur (seul joueur encore actif, tournoi
+            # terminé), et non déterminé (« - ») pour les autres joueurs
+            # encore actifs tant que le tournoi est en cours.
+            if p["status"] == "active":
+                p["rang"] = 1 if n_active == 1 else None
+            else:
+                p["rang"] = p["place"]
 
         sort_col = self.players_sort["column"]
         if sort_col == "name":
@@ -1893,6 +1905,11 @@ class App(tk.Tk):
             players.sort(key=lambda p: p["status_label"].lower())
         elif sort_col == "table":
             players.sort(key=lambda p: (p["table_name"].lower(), p["seat"] or 0))
+        elif sort_col == "rang":
+            # Le vainqueur (rang 1) et les joueurs encore actifs en cours de
+            # tournoi (rang indéterminé) sont classés en tête, cohérent avec
+            # un classement "du meilleur au moins bon".
+            players.sort(key=lambda p: p["rang"] or 1)
         if sort_col and not self.players_sort["ascending"]:
             players.reverse()
         self._update_sort_headings()
@@ -1922,7 +1939,7 @@ class App(tk.Tk):
                     mark, p["id"], p["name"], table_name, p["seat"] or "-",
                     f"{p['chips']:,}".replace(",", " "),
                     p["buyin_count"], p["rebuy_count"], p["addon_count"],
-                    bounty_txt, status, p["place"] or "-",
+                    bounty_txt, status, p["rang"] or "-",
                 ),
                 tags=tags,
             )
