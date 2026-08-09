@@ -150,14 +150,24 @@ class PlayerSelectionDialog(tk.Toplevel):
     def _build_list(self, names):
         for w in self.list_frame.winfo_children():
             w.destroy()
-        for name in names:
+        if names:
+            ttk.Label(self.list_frame, text="Joueur", font=("Helvetica", 9, "bold")).grid(
+                row=0, column=0, sticky="w", padx=(0, 20)
+            )
+            ttk.Label(self.list_frame, text="Club", font=("Helvetica", 9, "bold")).grid(
+                row=0, column=1, sticky="w"
+            )
+        for idx, name in enumerate(names, start=1):
             var = self.check_vars.get(name)
             if var is None:
                 var = tk.BooleanVar(value=False)
                 self.check_vars[name] = var
-            club = roster.get_club(name)
-            label = f"{name}  —  {club}" if club else name
-            ttk.Checkbutton(self.list_frame, text=label, variable=var).pack(anchor="w", pady=1)
+            ttk.Checkbutton(self.list_frame, text=name, variable=var).grid(
+                row=idx, column=0, sticky="w", pady=1, padx=(0, 20)
+            )
+            ttk.Label(self.list_frame, text=roster.get_club(name), foreground=MUTED).grid(
+                row=idx, column=1, sticky="w", pady=1
+            )
 
     def _filter(self):
         term = self.search_var.get().strip().lower()
