@@ -155,7 +155,9 @@ class PlayerSelectionDialog(tk.Toplevel):
             if var is None:
                 var = tk.BooleanVar(value=False)
                 self.check_vars[name] = var
-            ttk.Checkbutton(self.list_frame, text=name, variable=var).pack(anchor="w", pady=1)
+            club = roster.get_club(name)
+            label = f"{name}  —  {club}" if club else name
+            ttk.Checkbutton(self.list_frame, text=label, variable=var).pack(anchor="w", pady=1)
 
     def _filter(self):
         term = self.search_var.get().strip().lower()
