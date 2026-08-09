@@ -87,7 +87,7 @@ class PlayerSelectionDialog(tk.Toplevel):
                  exclude_names=None):
         super().__init__(master)
         self.title(title)
-        self.geometry("440x560")
+        self.geometry("500x560")
         self.grab_set()
         self.selected_names = []
         self.check_vars = {}
@@ -139,9 +139,17 @@ class PlayerSelectionDialog(tk.Toplevel):
         add_frame = ttk.LabelFrame(self, text="Ajouter un joueur au répertoire")
         add_frame.pack(fill="x", padx=12, pady=8)
         self.new_name_var = tk.StringVar()
-        entry = ttk.Entry(add_frame, textvariable=self.new_name_var)
-        entry.pack(side="left", fill="x", expand=True, padx=8, pady=8)
+        entry = ttk.Entry(add_frame, textvariable=self.new_name_var, width=16)
+        entry.pack(side="left", fill="x", expand=True, padx=(8, 4), pady=8)
         entry.bind("<Return>", lambda e: self._add_new_name())
+        ttk.Label(add_frame, text="Club :").pack(side="left", padx=(4, 0))
+        self.new_name_club_var = tk.StringVar()
+        self.new_name_club_combo = ttk.Combobox(
+            add_frame, textvariable=self.new_name_club_var, width=14,
+            values=roster.list_clubs(),
+        )
+        self.new_name_club_combo.pack(side="left", padx=4, pady=8)
+        self.new_name_club_combo.bind("<Return>", lambda e: self._add_new_name())
         ttk.Button(add_frame, text="Ajouter", command=self._add_new_name).pack(side="left", padx=8)
 
         bottom = ttk.Frame(self)
@@ -171,9 +179,18 @@ class PlayerSelectionDialog(tk.Toplevel):
             ttk.Checkbutton(self.list_frame, text=name, variable=var).grid(
                 row=idx, column=0, sticky="w", pady=1, padx=(0, 20)
             )
-            ttk.Label(self.list_frame, text=roster.get_club(name), foreground=MUTED).grid(
-                row=idx, column=1, sticky="w", pady=1
+            club = roster.get_club(name)
+            club_lbl = ttk.Label(
+                self.list_frame, text=club or "+ ajouter un club",
+                foreground=MUTED if club else GOLD_DARK,
+                font=("Helvetica", 9, "italic") if not club else ("Helvetica", 9),
+                cursor="hand2",
             )
+            club_lbl.grid(row=idx, column=1, sticky="w", pady=1)
+            # Cliquer sur le club (ou sur l'invite s'il n'y en a pas encore)
+            # ouvre la même boîte de dialogue que "Modifier le club..." dans
+            # la fenêtre Répertoire, pour le gérer directement depuis ici.
+            club_lbl.bind("<Button-1>", lambda e, n=name: self._edit_club_for(n))
 
     def _sorted(self, names):
         col = self.sort_state["column"]
@@ -222,12 +239,24 @@ class PlayerSelectionDialog(tk.Toplevel):
         name = self.new_name_var.get().strip()
         if not name:
             return
+        club = self.new_name_club_var.get().strip()
         if name not in self.roster_names:
-            roster.add_to_roster(name)
+            roster.add_to_roster(name, club=club or None)
             self.roster_names = roster.load_roster()
+            self.new_name_club_combo.configure(values=roster.list_clubs())
+        elif club:
+            roster.set_club(name, club)
         self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
         self.new_name_var.set("")
+        self.new_name_club_var.set("")
         self._filter()
+
+    def _edit_club_for(self, name):
+        club = ask_club_dialog(self, title=f"Club de {name}", current_club=roster.get_club(name))
+        if club is not None:
+            roster.set_club(name, club)
+            self.new_name_club_combo.configure(values=roster.list_clubs())
+            self._filter()
 
     def _skip(self):
         self.selected_names = []
