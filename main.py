@@ -1180,6 +1180,11 @@ class App(tk.Tk):
         ttk.Button(top, text="Ajouter", command=self._add_player).pack(side="left", padx=5)
         ttk.Button(top, text="Ajouter depuis le répertoire...", command=self._add_from_roster).pack(side="left", padx=5)
 
+        self.temp_player_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            top, text="Temp (ne pas ajouter au répertoire)", variable=self.temp_player_var,
+        ).pack(side="left", padx=(10, 5))
+
         self.stats_lbl = ttk.Label(top, text="", font=("Helvetica", 10, "bold"))
         self.stats_lbl.pack(side="right")
 
@@ -1296,7 +1301,8 @@ class App(tk.Tk):
         if not name:
             return
         self.db.add_player(name)
-        roster.add_to_roster(name)
+        if not self.temp_player_var.get():
+            roster.add_to_roster(name)
         self.new_player_var.set("")
         self._refresh_all()
 

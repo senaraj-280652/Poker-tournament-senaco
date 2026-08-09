@@ -76,6 +76,9 @@ existant"** pour reprendre un tournoi déjà commencé.
   répertoire..." (utile pour les inscriptions tardives).
 - **Joueurs** : inscription, rebuy, add-on, modification manuelle des chips,
   élimination (place calculée automatiquement), réinscription, suppression.
+  Case « Temp » à cocher avant d'ajouter un joueur pour l'inscrire au
+  tournoi sans l'ajouter au répertoire de joueurs habituels (utile pour
+  un invité ponctuel).
 - **Tables** : placement automatique des joueurs, rééquilibrage automatique
   après chaque élimination/inscription (fermeture des tables devenues
   inutiles, déplacement des joueurs pour garder les tables équilibrées).
