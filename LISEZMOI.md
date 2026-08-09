@@ -85,7 +85,11 @@ existant"** pour reprendre un tournoi déjà commencé.
   un invité ponctuel). Un champ **Club** (menu déroulant des clubs déjà
   connus, ou saisie libre d'un nouveau club) accompagne l'ajout d'un
   joueur et se pré-remplit automatiquement pour un nom déjà présent dans
-  le répertoire.
+  le répertoire. Le champ **Nom du joueur** propose aussi, dès la
+  première lettre tapée, une liste déroulante des joueurs du répertoire
+  correspondants (déjà inscrits au tournoi exclus) ; cliquer une
+  suggestion inscrit le joueur immédiatement, sans passer par le bouton
+  « Ajouter ».
 - **Tables** : placement automatique des joueurs, rééquilibrage automatique
   après chaque élimination/inscription (fermeture des tables devenues
   inutiles, déplacement des joueurs pour garder les tables équilibrées).
