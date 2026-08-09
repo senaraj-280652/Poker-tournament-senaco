@@ -1249,6 +1249,15 @@ class App(tk.Tk):
     CHECKBOX_UNCHECKED = "\u2610"  # ☐
     CHECKBOX_CHECKED = "\u2611"    # ☑
 
+    # Touches à ignorer dans l'auto-complétion du champ "Nom du joueur" :
+    # navigation dans le menu déroulant et touches de modification, qui ne
+    # doivent pas déclencher un recalcul des suggestions.
+    _AUTOCOMPLETE_IGNORED_KEYS = {
+        "Up", "Down", "Return", "Escape", "Tab", "ISO_Left_Tab",
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+        "Caps_Lock", "Meta_L", "Meta_R", "Super_L", "Super_R",
+    }
+
     def _build_players_tab(self):
         # ids des joueurs actuellement cochés (cases à cocher, pour les
         # actions groupées) — indépendant de la sélection classique du
@@ -1261,13 +1270,23 @@ class App(tk.Tk):
 
         ttk.Label(top, text="Nom du joueur :").pack(side="left")
         self.new_player_var = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=self.new_player_var, width=24)
-        entry.pack(side="left", padx=5)
-        entry.bind("<Return>", lambda e: self._add_player())
-        # Si le nom saisi correspond à un joueur déjà connu du répertoire,
-        # propose automatiquement son club (sans écraser une saisie déjà
-        # en cours dans le champ Club).
-        entry.bind("<FocusOut>", lambda e: self._prefill_club_from_roster())
+        self.new_player_entry = ttk.Entry(top, textvariable=self.new_player_var, width=24)
+        self.new_player_entry.pack(side="left", padx=5)
+        self.new_player_entry.bind("<Return>", lambda e: self._add_player())
+        self.new_player_entry.bind("<Escape>", lambda e: self._hide_autocomplete())
+        # Un seul gestionnaire pour FocusOut : pré-remplit le club, puis
+        # referme (avec un léger délai) le menu déroulant d'auto-complétion
+        # — le délai laisse le temps à un clic sur une suggestion de bien
+        # être traité avant que la liste ne disparaisse.
+        self.new_player_entry.bind("<FocusOut>", self._on_player_name_focus_out)
+        # Auto-complétion : à chaque lettre tapée, propose dans un menu
+        # déroulant (maison, sous forme de petite fenêtre) les joueurs du
+        # répertoire dont le nom commence par ce qui a été saisi ; cliquer
+        # un nom l'inscrit directement au tournoi, sans passer par le
+        # bouton "Ajouter".
+        self.new_player_entry.bind("<KeyRelease>", self._on_player_name_keyrelease)
+        self._autocomplete_popup = None
+        self._autocomplete_listbox = None
 
         ttk.Label(top, text="Club :").pack(side="left", padx=(8, 0))
         self.new_player_club_var = tk.StringVar()
@@ -1397,6 +1416,91 @@ class App(tk.Tk):
     def _clear_checked(self):
         self.checked_player_ids.clear()
 
+    def _on_player_name_keyrelease(self, event):
+        """Recalcule, à chaque lettre tapée, les suggestions (joueurs du
+        répertoire dont le nom commence par le texte saisi, déjà inscrits
+        au tournoi exclus) et affiche/masque le menu déroulant en
+        conséquence."""
+        if event.keysym in self._AUTOCOMPLETE_IGNORED_KEYS:
+            return
+        text = self.new_player_var.get().strip()
+        if not text:
+            self._hide_autocomplete()
+            return
+        already_in_tournament = {p["name"] for p in self.db.list_players()}
+        matches = sorted(
+            (n for n in roster.load_roster()
+             if n.lower().startswith(text.lower()) and n not in already_in_tournament),
+            key=str.lower,
+        )
+        if matches:
+            self._show_autocomplete(matches)
+        else:
+            self._hide_autocomplete()
+
+    def _show_autocomplete(self, matches):
+        """Affiche (en la créant si besoin) une petite liste cliquable
+        juste sous le champ Nom du joueur, avec les suggestions."""
+        if self._autocomplete_popup is None or not self._autocomplete_popup.winfo_exists():
+            popup = tk.Toplevel(self)
+            popup.withdraw()
+            popup.overrideredirect(True)
+            try:
+                popup.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            listbox = tk.Listbox(
+                popup, bg=CREAM, fg=TEXT_DARK, selectbackground=GOLD,
+                selectforeground=TEXT_DARK, font=("Helvetica", 11),
+                exportselection=False, activestyle="none",
+                highlightthickness=1, highlightbackground=GOLD_DARK, borderwidth=0,
+            )
+            listbox.pack(fill="both", expand=True)
+            # ButtonRelease (et non Button-1) : la sélection du Listbox est
+            # déjà à jour au relâchement du clic, ce qui évite de lire
+            # l'ancienne sélection.
+            listbox.bind("<ButtonRelease-1>", self._on_autocomplete_click)
+            self._autocomplete_popup = popup
+            self._autocomplete_listbox = listbox
+
+        listbox = self._autocomplete_listbox
+        listbox.delete(0, "end")
+        for name in matches:
+            listbox.insert("end", name)
+        height = min(6, len(matches))
+        listbox.configure(height=height)
+
+        entry = self.new_player_entry
+        x = entry.winfo_rootx()
+        y = entry.winfo_rooty() + entry.winfo_height()
+        width = max(entry.winfo_width(), 160)
+        self._autocomplete_popup.geometry(f"{width}x{height * 20}+{x}+{y}")
+        self._autocomplete_popup.deiconify()
+        self._autocomplete_popup.lift()
+
+    def _hide_autocomplete(self):
+        if self._autocomplete_popup is not None and self._autocomplete_popup.winfo_exists():
+            self._autocomplete_popup.withdraw()
+
+    def _on_player_name_focus_out(self, event=None):
+        self._prefill_club_from_roster()
+        # Léger délai : laisse le temps au clic sur une suggestion
+        # (<ButtonRelease-1> sur la liste) d'être traité avant de la
+        # masquer — sinon FocusOut la ferme avant que le clic ne compte.
+        self.after(150, self._hide_autocomplete)
+
+    def _on_autocomplete_click(self, event):
+        if self._autocomplete_listbox is None:
+            return
+        sel = self._autocomplete_listbox.curselection()
+        if not sel:
+            return
+        name = self._autocomplete_listbox.get(sel[0])
+        self._hide_autocomplete()
+        self.new_player_var.set(name)
+        self._prefill_club_from_roster()
+        self._add_player()
+
     def _prefill_club_from_roster(self):
         name = self.new_player_var.get().strip()
         if not name or self.new_player_club_var.get().strip():
@@ -1418,6 +1522,7 @@ class App(tk.Tk):
             self.new_player_club_combo.configure(values=roster.list_clubs())
         self.new_player_var.set("")
         self.new_player_club_var.set("")
+        self._hide_autocomplete()
         self._refresh_all()
 
     def _add_from_roster(self):
