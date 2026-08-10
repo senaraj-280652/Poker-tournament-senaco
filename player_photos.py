@@ -50,16 +50,9 @@ def get_photo_path(name):
     return path if os.path.exists(path) else None
 
 
-def save_photo_from_file(name, source_path):
-    """Copie le fichier image `source_path` dans le stockage des photos,
-    associé au joueur `name` (remplace une éventuelle photo existante)."""
-    ext = os.path.splitext(source_path)[1].lower()
-    if ext not in (".jpg", ".jpeg", ".png"):
-        ext = ".jpg"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    dest = os.path.join(_photos_dir(), filename)
-    shutil.copyfile(source_path, dest)
-
+def _register_photo(name, filename):
+    """Associe `filename` (déjà présent dans le dossier photos) au joueur
+    `name` dans l'index, et supprime l'ancien fichier s'il est remplacé."""
     index = _load_index()
     old_filename = index.get(name)
     index[name] = filename
@@ -72,6 +65,29 @@ def save_photo_from_file(name, source_path):
                 os.remove(old_path)
             except OSError:
                 pass
+
+
+def save_photo_from_file(name, source_path):
+    """Copie le fichier image `source_path` dans le stockage des photos,
+    associé au joueur `name` (remplace une éventuelle photo existante)."""
+    ext = os.path.splitext(source_path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png"):
+        ext = ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest = os.path.join(_photos_dir(), filename)
+    shutil.copyfile(source_path, dest)
+    _register_photo(name, filename)
+    return dest
+
+
+def save_photo_from_image(name, pil_image):
+    """Enregistre une image PIL déjà en mémoire (typiquement après
+    recadrage) comme photo du joueur `name`. Nécessite Pillow — à
+    l'appelant de vérifier sa disponibilité au préalable."""
+    filename = f"{uuid.uuid4().hex}.jpg"
+    dest = os.path.join(_photos_dir(), filename)
+    pil_image.convert("RGB").save(dest, "JPEG", quality=90)
+    _register_photo(name, filename)
     return dest
 
 

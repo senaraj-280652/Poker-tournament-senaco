@@ -10,6 +10,8 @@ import os
 import sys
 import subprocess
 import time
+import json
+import shutil
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog
@@ -381,21 +383,17 @@ class CameraCaptureDialog(tk.Toplevel):
     def _save(self):
         if self._frozen_frame is None:
             return
-        tmp_dir = os.path.join(os.path.expanduser("~"), ".poker_tournament")
-        os.makedirs(tmp_dir, exist_ok=True)
-        tmp_path = os.path.join(tmp_dir, "_capture_tmp.jpg")
+        crop_dlg = CropDialog(self, self._frozen_frame)
+        self.wait_window(crop_dlg)
+        if crop_dlg.result is None:
+            # L'utilisateur a annulé le cadrage : on reste sur la photo
+            # figée, prête à être recadrée à nouveau ou reprise.
+            return
         try:
-            self._frozen_frame.save(tmp_path, "JPEG", quality=90)
-            player_photos.save_photo_from_file(self.player_name, tmp_path)
+            player_photos.save_photo_from_image(self.player_name, crop_dlg.result)
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible d'enregistrer la photo :\n{e}")
             return
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
         if self.on_saved:
             self.on_saved()
         self._on_close()
@@ -404,6 +402,133 @@ class CameraCaptureDialog(tk.Toplevel):
         self._live = False
         if self._cap is not None:
             self._cap.release()
+        self.destroy()
+
+
+class CropDialog(tk.Toplevel):
+    """Fenêtre pour cadrer (recadrer) une photo avant de l'enregistrer :
+    zone de sélection carrée sur l'image, qu'on déplace (glisser à
+    l'intérieur) ou redimensionne (glisser un coin) à la souris. Nécessite
+    Pillow — à l'appelant de vérifier PIL_AVAILABLE avant d'ouvrir cette
+    fenêtre. `self.result` contient l'image PIL recadrée après fermeture,
+    ou None si l'utilisateur a annulé."""
+
+    MAX_DISPLAY = 440
+    HANDLE_HIT = 14  # rayon (px, à l'écran) de détection d'un coin
+    MIN_BOX = 30  # taille minimale (px, à l'écran) du cadre
+
+    def __init__(self, master, pil_image, title="Cadrer la photo"):
+        super().__init__(master)
+        self.title(title)
+        self.configure(bg=FELT_DARK)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+
+        self.original = pil_image.convert("RGB")
+        self.result = None
+
+        ow, oh = self.original.size
+        self.scale = min(self.MAX_DISPLAY / ow, self.MAX_DISPLAY / oh, 1.0)
+        self.disp_w = max(1, round(ow * self.scale))
+        self.disp_h = max(1, round(oh * self.scale))
+
+        tk.Label(
+            self, bg=FELT_DARK, fg=CREAM,
+            text="Glissez à l'intérieur du cadre pour le déplacer, ou un coin pour le redimensionner :",
+            wraplength=self.disp_w,
+        ).pack(padx=12, pady=(12, 6))
+
+        self.canvas = tk.Canvas(
+            self, width=self.disp_w, height=self.disp_h,
+            highlightthickness=0, cursor="crosshair",
+        )
+        self.canvas.pack(padx=12, pady=(0, 6))
+        self._tk_img = ImageTk.PhotoImage(self.original.resize((self.disp_w, self.disp_h)))
+        self.canvas.create_image(0, 0, anchor="nw", image=self._tk_img)
+
+        side = min(self.disp_w, self.disp_h)
+        x0 = (self.disp_w - side) / 2
+        y0 = (self.disp_h - side) / 2
+        self.box = [x0, y0, x0 + side, y0 + side]
+        self.rect_id = self.canvas.create_rectangle(*self.box, outline=GOLD, width=2)
+        self._handle_ids = {
+            corner: self.canvas.create_rectangle(0, 0, 0, 0, fill=GOLD, outline="")
+            for corner in ("nw", "ne", "sw", "se")
+        }
+        self._redraw_handles()
+
+        self._drag_mode = None  # None | "move" | "nw"/"ne"/"sw"/"se" | "new"
+        self._drag_anchor = None  # coin fixe lors d'un resize, ou point de clic lors d'un move/new
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+
+        btns = ttk.Frame(self)
+        btns.pack(pady=(4, 12))
+        ttk.Button(btns, text="Valider", command=self._confirm).pack(side="left", padx=5)
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="left", padx=5)
+
+    def _redraw_handles(self):
+        x0, y0, x1, y1 = self.box
+        h = self.HANDLE_HIT / 2
+        corners = {"nw": (x0, y0), "ne": (x1, y0), "sw": (x0, y1), "se": (x1, y1)}
+        for name, (cx, cy) in corners.items():
+            self.canvas.coords(self._handle_ids[name], cx - h, cy - h, cx + h, cy + h)
+
+    def _redraw(self):
+        self.canvas.coords(self.rect_id, *self.box)
+        self._redraw_handles()
+
+    def _corner_at(self, x, y):
+        x0, y0, x1, y1 = self.box
+        for name, (cx, cy) in {"nw": (x0, y0), "ne": (x1, y0), "sw": (x0, y1), "se": (x1, y1)}.items():
+            if abs(x - cx) <= self.HANDLE_HIT and abs(y - cy) <= self.HANDLE_HIT:
+                return name
+        return None
+
+    def _on_press(self, event):
+        x, y = event.x, event.y
+        corner = self._corner_at(x, y)
+        x0, y0, x1, y1 = self.box
+        if corner:
+            self._drag_mode = corner
+            opposite = {"nw": (x1, y1), "ne": (x0, y1), "sw": (x1, y0), "se": (x0, y0)}
+            self._drag_anchor = opposite[corner]
+        elif x0 <= x <= x1 and y0 <= y <= y1:
+            self._drag_mode = "move"
+            self._drag_anchor = (x - x0, y - y0)  # décalage clic <-> coin nw
+        else:
+            self._drag_mode = "new"
+            self._drag_anchor = (x, y)
+
+    def _on_drag(self, event):
+        x = max(0, min(self.disp_w, event.x))
+        y = max(0, min(self.disp_h, event.y))
+        if self._drag_mode == "move":
+            offx, offy = self._drag_anchor
+            side = self.box[2] - self.box[0]
+            nx0 = max(0, min(self.disp_w - side, x - offx))
+            ny0 = max(0, min(self.disp_h - side, y - offy))
+            self.box = [nx0, ny0, nx0 + side, ny0 + side]
+        elif self._drag_mode in ("nw", "ne", "sw", "se", "new"):
+            ax, ay = self._drag_anchor
+            # Taille carrée souhaitée d'après le mouvement de la souris,
+            # puis bornée pour que le cadre reste dans le canevas quelle
+            # que soit la direction du glissement depuis le coin fixe `ax,ay`.
+            size = max(self.MIN_BOX, max(abs(x - ax), abs(y - ay)))
+            max_size_x = (self.disp_w - ax) if x >= ax else ax
+            max_size_y = (self.disp_h - ay) if y >= ay else ay
+            size = min(size, max_size_x, max_size_y)
+            sx = ax + size if x >= ax else ax - size
+            sy = ay + size if y >= ay else ay - size
+            self.box = [min(ax, sx), min(ay, sy), max(ax, sx), max(ay, sy)]
+        self._redraw()
+
+    def _confirm(self):
+        x0, y0, x1, y1 = self.box
+        ox0, oy0 = x0 / self.scale, y0 / self.scale
+        ox1, oy1 = x1 / self.scale, y1 / self.scale
+        self.result = self.original.crop((round(ox0), round(oy0), round(ox1), round(oy1)))
         self.destroy()
 
 
@@ -479,6 +604,9 @@ class RosterManagerDialog(tk.Toplevel):
         ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
         ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
         ttk.Button(btns, text="Supprimer", command=self._delete).pack(side="left", padx=3)
+        ttk.Button(
+            btns, text="Tout supprimer", command=self._delete_all, style="Danger.TButton",
+        ).pack(side="left", padx=3)
         ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right", padx=3)
 
         btns2 = ttk.Frame(self)
@@ -622,6 +750,64 @@ class RosterManagerDialog(tk.Toplevel):
             player_photos.delete_photo(name)
             self._refresh()
 
+    def _delete_all(self):
+        names = roster.load_roster()
+        if not names:
+            messagebox.showinfo("Info", "Le répertoire est déjà vide.")
+            return
+        if messagebox.askyesno(
+            "Confirmer",
+            f"Vider entièrement le répertoire ({len(names)} joueur(s)) ?\n\n"
+            "Une sauvegarde du répertoire et des photos sera d'abord enregistrée "
+            "dans ~/.poker_tournament/backups/, pour pouvoir être restaurée "
+            "manuellement en cas d'erreur.\n(Cela ne touche à aucun tournoi déjà créé.)",
+        ):
+            backup_dir = self._backup_roster_before_wipe()
+            for name in names:
+                roster.remove_from_roster(name)
+                player_photos.delete_photo(name)
+            self._refresh()
+            messagebox.showinfo(
+                "Répertoire vidé",
+                f"Le répertoire a été vidé.\n\nUne sauvegarde a été enregistrée ici :\n{backup_dir}",
+            )
+
+    def _backup_roster_before_wipe(self):
+        """Enregistre un instantané horodaté du répertoire (roster.json) et
+        des photos associées avant une suppression totale, sous
+        ~/.poker_tournament/backups/repertoire_<horodatage>/. Ne modifie ni
+        ne supprime rien : purement une copie, à restaurer manuellement en
+        cas de besoin (recopier roster.json et les photos à la main)."""
+        entries = roster.load_roster_entries()
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        backup_dir = os.path.join(
+            os.path.expanduser("~"), ".poker_tournament", "backups", f"repertoire_{timestamp}"
+        )
+        os.makedirs(backup_dir, exist_ok=True)
+
+        with open(os.path.join(backup_dir, "roster.json"), "w", encoding="utf-8") as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+
+        photo_index = {}
+        for entry in entries:
+            name = entry["name"]
+            path = player_photos.get_photo_path(name)
+            if not path or not os.path.exists(path):
+                continue
+            photos_dir = os.path.join(backup_dir, "photos")
+            os.makedirs(photos_dir, exist_ok=True)
+            filename = os.path.basename(path)
+            try:
+                shutil.copyfile(path, os.path.join(photos_dir, filename))
+                photo_index[name] = filename
+            except OSError:
+                pass
+        if photo_index:
+            with open(os.path.join(backup_dir, "photos", "index.json"), "w", encoding="utf-8") as f:
+                json.dump(photo_index, f, ensure_ascii=False, indent=2)
+
+        return backup_dir
+
     def _take_photo(self):
         name = self._selected_name()
         if not name:
@@ -651,11 +837,28 @@ class RosterManagerDialog(tk.Toplevel):
         )
         if not path:
             return
-        try:
-            player_photos.save_photo_from_file(name, path)
-        except OSError as e:
-            messagebox.showerror("Erreur", f"Impossible d'importer cette photo :\n{e}")
-            return
+        if PIL_AVAILABLE:
+            try:
+                source_image = Image.open(path)
+                source_image.load()
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible d'ouvrir cette image :\n{e}")
+                return
+            crop_dlg = CropDialog(self, source_image)
+            self.wait_window(crop_dlg)
+            if crop_dlg.result is None:
+                return
+            try:
+                player_photos.save_photo_from_image(name, crop_dlg.result)
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Impossible d'importer cette photo :\n{e}")
+                return
+        else:
+            try:
+                player_photos.save_photo_from_file(name, path)
+            except OSError as e:
+                messagebox.showerror("Erreur", f"Impossible d'importer cette photo :\n{e}")
+                return
         self._refresh_preview()
         if not PIL_AVAILABLE:
             messagebox.showinfo(
