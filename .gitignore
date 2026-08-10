@@ -1,6 +1,11 @@
 # Données de tournoi (personnelles, propres à chaque partie) — pas du code
 *.tournoi
 
+# Exports générés par l'application (résultats, synthèses, grilles de
+# gains...) — jamais du code source, propres à chaque utilisation.
+*.xlsx
+*.csv
+
 # Fichiers système macOS
 .DS_Store
 

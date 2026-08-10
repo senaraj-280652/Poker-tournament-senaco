@@ -7,6 +7,8 @@ standard de Python sous Windows/macOS ; sous Linux, installez le paquet
 python3-tk si besoin).
 """
 import os
+import sys
+import subprocess
 import time
 from datetime import datetime, timedelta
 import tkinter as tk
@@ -15,11 +17,13 @@ from tkinter import ttk, simpledialog, messagebox, filedialog
 from database import (
     Database, build_period_summary, export_period_summary_csv,
     export_period_summary_xlsx, PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
+    RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
 import roster
 import tournament_prefs
+import export_prefs
 import player_photos
 import sound_signal
 
@@ -43,6 +47,23 @@ except ImportError:
 
 PLAYER_THUMB_SIZE = 28  # taille des vignettes dans le tableau des joueurs
 ROSTER_PREVIEW_SIZE = 160  # taille de l'aperçu dans le répertoire
+
+
+def open_file_with_default_app(path):
+    """Ouvre un fichier exporté avec l'application par défaut du système
+    (Excel/LibreOffice pour .xlsx, l'application associée aux .csv...),
+    pour éviter d'avoir à aller le rechercher manuellement après un
+    export. Best-effort : une erreur ici n'annule pas l'export lui-même,
+    déjà réussi à ce stade."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except OSError:
+        pass
 
 
 def load_thumbnail(path, size):
@@ -75,6 +96,8 @@ CREAM = "#f7f1e3"
 CREAM_ALT = "#ece2c8"
 TEXT_DARK = "#17281f"
 MUTED = "#b9c9bd"  # texte discret, lisible sur fond foncé
+DANGER_RED = "#8a1f1f"
+DANGER_RED_ACTIVE = "#a92c2c"
 
 
 class PlayerSelectionDialog(tk.Toplevel):
@@ -439,8 +462,34 @@ class RosterManagerDialog(tk.Toplevel):
             font=("Helvetica", 10, "bold"),
         ).pack(anchor="w", padx=12, pady=(12, 6))
 
+        # Tous les boutons d'action tout en haut de la fenêtre (avant la
+        # zone de liste, extensible) : ils restent ainsi toujours visibles
+        # en premier, quelle que soit la hauteur prise par la liste sur un
+        # écran donné.
+        add_frame = ttk.Frame(self)
+        add_frame.pack(fill="x", padx=12, pady=(0, 8))
+        self.new_name_var = tk.StringVar()
+        entry = ttk.Entry(add_frame, textvariable=self.new_name_var)
+        entry.pack(side="left", fill="x", expand=True)
+        entry.bind("<Return>", lambda e: self._add())
+        ttk.Button(add_frame, text="Ajouter", command=self._add).pack(side="left", padx=5)
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=(0, 4))
+        ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
+        ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
+        ttk.Button(btns, text="Supprimer", command=self._delete).pack(side="left", padx=3)
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right", padx=3)
+
+        btns2 = ttk.Frame(self)
+        btns2.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(
+            btns2, text="Importer les joueurs d'un tournoi existant...",
+            command=self._import_from_tournament,
+        ).pack(fill="x")
+
         body = ttk.Frame(self)
-        body.pack(fill="both", expand=True, padx=12)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
         list_frame = ttk.Frame(body)
         list_frame.pack(side="left", fill="both", expand=True)
@@ -475,28 +524,6 @@ class RosterManagerDialog(tk.Toplevel):
         ttk.Button(photo_btns, text="📷  Prendre une photo...", command=self._take_photo).pack(fill="x", pady=2)
         ttk.Button(photo_btns, text="🖼  Importer une photo...", command=self._import_photo).pack(fill="x", pady=2)
         ttk.Button(photo_btns, text="🗑  Supprimer la photo", command=self._delete_photo).pack(fill="x", pady=2)
-
-        add_frame = ttk.Frame(self)
-        add_frame.pack(fill="x", padx=12, pady=8)
-        self.new_name_var = tk.StringVar()
-        entry = ttk.Entry(add_frame, textvariable=self.new_name_var)
-        entry.pack(side="left", fill="x", expand=True)
-        entry.bind("<Return>", lambda e: self._add())
-        ttk.Button(add_frame, text="Ajouter", command=self._add).pack(side="left", padx=5)
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=12, pady=(0, 4))
-        ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
-        ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
-        ttk.Button(btns, text="Supprimer", command=self._delete).pack(side="left", padx=3)
-        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right", padx=3)
-
-        btns2 = ttk.Frame(self)
-        btns2.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(
-            btns2, text="Importer les joueurs d'un tournoi existant...",
-            command=self._import_from_tournament,
-        ).pack(fill="x")
 
         self._refresh()
 
@@ -696,6 +723,14 @@ class PeriodSummaryDialog(tk.Toplevel):
         self.date_from_var = tk.StringVar(value=f"{today.year}-01-01")
         self.date_to_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
 
+        # Barre de boutons tout en haut de la fenêtre (et non en bas) :
+        # ainsi elle reste toujours visible en premier, quelle que soit la
+        # hauteur prise par le reste du contenu sur un écran donné.
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 6))
+        ttk.Button(btns, text="Exporter...", command=self._open_export_dialog).pack(side="left")
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right")
+
         params = ttk.Frame(self)
         params.pack(fill="x", padx=14, pady=(14, 6))
 
@@ -754,11 +789,6 @@ class PeriodSummaryDialog(tk.Toplevel):
             self.players_tree.column(c, width=115, anchor="center")
         self.players_tree.column("name", width=170, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=6, pady=6)
-
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=14, pady=(0, 14))
-        ttk.Button(btns, text="Exporter...", command=self._open_export_dialog).pack(side="left")
-        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right")
 
     def _browse_folder(self):
         path = filedialog.askdirectory(
@@ -869,12 +899,34 @@ class PeriodExportDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
 
-        self.format_var = tk.StringVar(value="csv")
-        self.tournament_vars = {key: tk.BooleanVar(value=True) for key, _, _ in PERIOD_TOURNAMENT_COLUMNS}
-        self.player_vars = {key: tk.BooleanVar(value=True) for key, _, _ in PERIOD_PLAYER_COLUMNS}
+        # Reprend le format et les colonnes cochées/décochées lors du
+        # dernier export de ce type, plutôt que de repartir de zéro à
+        # chaque fois (tout coché, CSV).
+        self.format_var = tk.StringVar(value=export_prefs.load_format("period"))
+        saved_t = export_prefs.load_columns(
+            "period_tournament", [k for k, _, _ in PERIOD_TOURNAMENT_COLUMNS]
+        )
+        saved_p = export_prefs.load_columns(
+            "period_player", [k for k, _, _ in PERIOD_PLAYER_COLUMNS]
+        )
+        self.tournament_vars = {
+            key: tk.BooleanVar(value=key in saved_t) for key, _, _ in PERIOD_TOURNAMENT_COLUMNS
+        }
+        self.player_vars = {
+            key: tk.BooleanVar(value=key in saved_p) for key, _, _ in PERIOD_PLAYER_COLUMNS
+        }
+
+        # Barre du haut : juste le format et un bouton pour fermer sans
+        # exporter. Il n'y a volontairement plus de bouton "Exporter..."
+        # unique ici : chaque tableau ci-dessous a le sien (voir
+        # _build_column_checks), pour qu'il soit toujours sans ambiguïté
+        # de savoir lequel des deux tableaux on est en train d'exporter.
+        top_bar = ttk.Frame(self)
+        top_bar.pack(side="top", fill="x", padx=14, pady=(14, 0))
+        ttk.Button(top_bar, text="Fermer", command=self.destroy).pack(side="right")
 
         fmt_frame = ttk.LabelFrame(self, text="Format")
-        fmt_frame.pack(fill="x", padx=14, pady=(14, 8))
+        fmt_frame.pack(fill="x", padx=14, pady=(8, 8))
         ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
             side="left", padx=10, pady=6
         )
@@ -884,18 +936,21 @@ class PeriodExportDialog(tk.Toplevel):
 
         t_frame = ttk.LabelFrame(self, text="Colonnes — Tournois de la période")
         t_frame.pack(fill="x", padx=14, pady=8)
-        self._build_column_checks(t_frame, PERIOD_TOURNAMENT_COLUMNS, self.tournament_vars)
+        self._build_column_checks(
+            t_frame, PERIOD_TOURNAMENT_COLUMNS, self.tournament_vars,
+            kind="tournament", prefs_key="period_tournament",
+            title="Exporter les tournois de la période", filename_prefix="synthese_tournois",
+        )
 
         p_frame = ttk.LabelFrame(self, text="Colonnes — Classement des joueurs")
         p_frame.pack(fill="both", expand=True, padx=14, pady=8)
-        self._build_column_checks(p_frame, PERIOD_PLAYER_COLUMNS, self.player_vars)
+        self._build_column_checks(
+            p_frame, PERIOD_PLAYER_COLUMNS, self.player_vars,
+            kind="player", prefs_key="period_player",
+            title="Exporter le classement des joueurs", filename_prefix="synthese_joueurs",
+        )
 
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", padx=14, pady=(4, 14))
-        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
-        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
-
-    def _build_column_checks(self, parent, columns, var_map):
+    def _build_column_checks(self, parent, columns, var_map, kind, prefs_key, title, filename_prefix):
         bar = ttk.Frame(parent)
         bar.pack(fill="x", padx=8, pady=(4, 2))
         ttk.Button(
@@ -906,6 +961,13 @@ class PeriodExportDialog(tk.Toplevel):
             bar, text="Tout décocher",
             command=lambda: [v.set(False) for v in var_map.values()],
         ).pack(side="left")
+        # Bouton d'export propre à CE tableau, dans la barre du haut de sa
+        # propre section (donc toujours visible, quelle que soit la
+        # hauteur prise par ses cases à cocher en dessous).
+        ttk.Button(
+            bar, text="Exporter ce tableau...",
+            command=lambda: self._do_export_section(kind, var_map, prefs_key, title, filename_prefix),
+        ).pack(side="right")
         grid = ttk.Frame(parent)
         grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
         for idx, (key, header, _fn) in enumerate(columns):
@@ -913,24 +975,33 @@ class PeriodExportDialog(tk.Toplevel):
                 row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
             )
 
-    def _do_export(self):
-        t_keys = [k for k, v in self.tournament_vars.items() if v.get()]
-        p_keys = [k for k, v in self.player_vars.items() if v.get()]
-        if not t_keys and not p_keys:
+    def _do_export_section(self, kind, var_map, prefs_key, title, filename_prefix):
+        keys = [k for k, v in var_map.items() if v.get()]
+        if not keys:
             messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
             return
+
+        # Mémorise ce choix (colonnes de CE tableau + format), pour le
+        # proposer par défaut au prochain export.
+        export_prefs.save_columns(prefs_key, keys)
+        export_prefs.save_format("period", self.format_var.get())
 
         is_xlsx = self.format_var.get() == "xlsx"
         ext = ".xlsx" if is_xlsx else ".csv"
         path = filedialog.asksaveasfilename(
-            title="Exporter la synthèse",
+            title=title,
             defaultextension=ext,
             filetypes=[("Fichier Excel", "*.xlsx")] if is_xlsx else [("Fichier CSV", "*.csv")],
-            initialfile=f"synthese_periode{ext}",
+            initialfile=f"{filename_prefix}{ext}",
         )
         if not path:
             return
 
+        # N'exporte QUE ce tableau : l'autre reçoit une liste de colonnes
+        # vide, ce qui lui fait sauter entièrement sa section (voir
+        # build_period_summary / export_period_summary_csv|xlsx).
+        t_keys = keys if kind == "tournament" else []
+        p_keys = keys if kind == "player" else []
         try:
             if is_xlsx:
                 export_period_summary_xlsx(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
@@ -946,8 +1017,318 @@ class PeriodExportDialog(tk.Toplevel):
                 "qui ne nécessite rien de plus.)",
             )
             return
-        messagebox.showinfo("Export", f"Synthèse exportée vers :\n{path}")
         self.destroy()
+        # Ouvre directement le fichier généré (Excel/LibreOffice ou
+        # l'application associée aux .csv), sans avoir à aller le chercher.
+        open_file_with_default_app(path)
+
+
+class ResultsExportDialog(tk.Toplevel):
+    """Choix du format (CSV / Excel) et des colonnes à exporter pour le
+    classement final du tournoi en cours (Fichier > Exporter les
+    résultats..., ou depuis l'onglet Gains)."""
+
+    def __init__(self, master, db):
+        super().__init__(master)
+        self.db = db
+        self.title("Exporter les résultats")
+        self.configure(bg=FELT_DARK)
+        self.geometry("420x420")
+        self.transient(master)
+        self.grab_set()
+
+        # Reprend le format et les colonnes cochées/décochées lors du
+        # dernier export de ce type, plutôt que de repartir de zéro.
+        self.format_var = tk.StringVar(value=export_prefs.load_format("results"))
+        saved_cols = export_prefs.load_columns("results", [k for k, _, _ in RESULT_COLUMNS])
+        self.col_vars = {
+            key: tk.BooleanVar(value=key in saved_cols) for key, _, _ in RESULT_COLUMNS
+        }
+
+        # Barre de boutons tout en haut de la fenêtre, toujours visible en
+        # premier quelle que soit la hauteur du reste du contenu.
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+
+        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
+        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = ttk.Frame(cols_frame)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(cols_frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header, _fn) in enumerate(RESULT_COLUMNS):
+            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        export_prefs.save_columns("results", keys)
+        export_prefs.save_format("results", self.format_var.get())
+
+        name = self.db.get_setting("tournament_name", "tournoi")
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip() or "tournoi"
+        is_xlsx = self.format_var.get() == "xlsx"
+        ext = ".xlsx" if is_xlsx else ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Exporter les résultats",
+            defaultextension=ext,
+            filetypes=[("Fichier Excel", "*.xlsx")] if is_xlsx else [("Fichier CSV", "*.csv")],
+            initialfile=f"resultats_{safe_name}{ext}",
+        )
+        if not path:
+            return
+
+        try:
+            if is_xlsx:
+                self.db.export_results_xlsx(path, columns=keys)
+            else:
+                self.db.export_results_csv(path, columns=keys)
+        except ImportError:
+            messagebox.showerror(
+                "Module manquant",
+                "L'export Excel (.xlsx) nécessite le paquet 'openpyxl', qui n'est "
+                "pas installé.\n\nOuvrez un terminal et tapez :\n\n"
+                "    pip3 install openpyxl\n\n"
+                "puis relancez l'export. (Vous pouvez aussi choisir le format CSV, "
+                "qui ne nécessite rien de plus.)",
+            )
+            return
+        self.destroy()
+        open_file_with_default_app(path)
+
+
+class PayoutExportDialog(tk.Toplevel):
+    """Choix du format (CSV / Excel) et des colonnes à exporter pour la
+    grille de gains telle qu'affichée dans l'onglet Gains (place,
+    pourcentage, montant — sans nom de joueur). Distinct de "Exporter les
+    résultats..." (menu Fichier), qui exporte le classement nominatif."""
+
+    def __init__(self, master, db):
+        super().__init__(master)
+        self.db = db
+        self.title("Exporter la grille de gains")
+        self.configure(bg=FELT_DARK)
+        self.geometry("380x360")
+        self.transient(master)
+        self.grab_set()
+
+        self.format_var = tk.StringVar(value=export_prefs.load_format("payouts"))
+        saved_cols = export_prefs.load_columns("payouts", [k for k, _, _ in PAYOUT_COLUMNS])
+        self.col_vars = {
+            key: tk.BooleanVar(value=key in saved_cols) for key, _, _ in PAYOUT_COLUMNS
+        }
+
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+
+        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
+        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = ttk.Frame(cols_frame)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(cols_frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header, _fn) in enumerate(PAYOUT_COLUMNS):
+            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
+                row=idx, column=0, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        export_prefs.save_columns("payouts", keys)
+        export_prefs.save_format("payouts", self.format_var.get())
+
+        name = self.db.get_setting("tournament_name", "tournoi")
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip() or "tournoi"
+        is_xlsx = self.format_var.get() == "xlsx"
+        ext = ".xlsx" if is_xlsx else ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Exporter la grille de gains",
+            defaultextension=ext,
+            filetypes=[("Fichier Excel", "*.xlsx")] if is_xlsx else [("Fichier CSV", "*.csv")],
+            initialfile=f"grille_gains_{safe_name}{ext}",
+        )
+        if not path:
+            return
+
+        try:
+            if is_xlsx:
+                self.db.export_payouts_xlsx(path, columns=keys)
+            else:
+                self.db.export_payouts_csv(path, columns=keys)
+        except ImportError:
+            messagebox.showerror(
+                "Module manquant",
+                "L'export Excel (.xlsx) nécessite le paquet 'openpyxl', qui n'est "
+                "pas installé.\n\nOuvrez un terminal et tapez :\n\n"
+                "    pip3 install openpyxl\n\n"
+                "puis relancez l'export. (Vous pouvez aussi choisir le format CSV, "
+                "qui ne nécessite rien de plus.)",
+            )
+            return
+        self.destroy()
+        open_file_with_default_app(path)
+
+
+class PlayersExportDialog(tk.Toplevel):
+    """Choix du format (CSV / Excel) et des colonnes à exporter pour le
+    tableau de l'onglet Joueurs tel qu'affiché (nom, table, siège, chips,
+    achats, prime en jeu, statut, rang). Distinct de "Exporter les
+    résultats..." (menu Fichier, classement nominatif avec gains)."""
+
+    def __init__(self, master, db, sort_state=None):
+        super().__init__(master)
+        self.db = db
+        # Tri actuellement appliqué dans l'onglet Joueurs (colonne cliquée
+        # + sens) : repris tel quel à l'export, pour que l'ordre du
+        # fichier corresponde à ce qui est affiché à l'écran.
+        self.sort_state = sort_state or {"column": None, "ascending": True}
+        self.title("Exporter les joueurs")
+        self.configure(bg=FELT_DARK)
+        self.geometry("420x420")
+        self.transient(master)
+        self.grab_set()
+
+        self.format_var = tk.StringVar(value=export_prefs.load_format("players"))
+        saved_cols = export_prefs.load_columns("players", [k for k, _, _ in PLAYERS_TAB_COLUMNS])
+        self.col_vars = {
+            key: tk.BooleanVar(value=key in saved_cols) for key, _, _ in PLAYERS_TAB_COLUMNS
+        }
+
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        sort_col = self.sort_state.get("column")
+        if sort_col:
+            headers_by_key = {k: h for k, h, _ in PLAYERS_TAB_COLUMNS}
+            sort_label = headers_by_key.get(sort_col, sort_col)
+            direction = "croissant" if self.sort_state.get("ascending", True) else "décroissant"
+            ttk.Label(
+                self, foreground=MUTED,
+                text=f"Tri actuel repris à l'export : {sort_label} ({direction}).",
+            ).pack(fill="x", padx=14, pady=(0, 4))
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+
+        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
+        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = ttk.Frame(cols_frame)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(cols_frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header, _fn) in enumerate(PLAYERS_TAB_COLUMNS):
+            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        export_prefs.save_columns("players", keys)
+        export_prefs.save_format("players", self.format_var.get())
+
+        name = self.db.get_setting("tournament_name", "tournoi")
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip() or "tournoi"
+        is_xlsx = self.format_var.get() == "xlsx"
+        ext = ".xlsx" if is_xlsx else ".csv"
+        path = filedialog.asksaveasfilename(
+            title="Exporter les joueurs",
+            defaultextension=ext,
+            filetypes=[("Fichier Excel", "*.xlsx")] if is_xlsx else [("Fichier CSV", "*.csv")],
+            initialfile=f"joueurs_{safe_name}{ext}",
+        )
+        if not path:
+            return
+
+        sort_column = self.sort_state.get("column")
+        ascending = self.sort_state.get("ascending", True)
+        try:
+            if is_xlsx:
+                self.db.export_players_xlsx(
+                    path, columns=keys, sort_column=sort_column, ascending=ascending
+                )
+            else:
+                self.db.export_players_csv(
+                    path, columns=keys, sort_column=sort_column, ascending=ascending
+                )
+        except ImportError:
+            messagebox.showerror(
+                "Module manquant",
+                "L'export Excel (.xlsx) nécessite le paquet 'openpyxl', qui n'est "
+                "pas installé.\n\nOuvrez un terminal et tapez :\n\n"
+                "    pip3 install openpyxl\n\n"
+                "puis relancez l'export. (Vous pouvez aussi choisir le format CSV, "
+                "qui ne nécessite rien de plus.)",
+            )
+            return
+        self.destroy()
+        open_file_with_default_app(path)
 
 
 class App(tk.Tk):
@@ -1003,6 +1384,17 @@ class App(tk.Tk):
             "TButton",
             background=[("active", GOLD), ("pressed", GOLD_DARK), ("disabled", FELT)],
             foreground=[("active", TEXT_DARK), ("pressed", TEXT_DARK), ("disabled", MUTED)],
+        )
+        # Variante rouge pour les actions destructrices/à risque (ex :
+        # "Éliminer"), pour bien les distinguer visuellement du reste.
+        style.configure(
+            "Danger.TButton", background=DANGER_RED, foreground=CREAM, padding=(10, 6),
+            borderwidth=0, focuscolor=DANGER_RED, font=bold_font,
+        )
+        style.map(
+            "Danger.TButton",
+            background=[("active", DANGER_RED_ACTIVE), ("pressed", DANGER_RED), ("disabled", FELT)],
+            foreground=[("active", CREAM), ("pressed", CREAM), ("disabled", MUTED)],
         )
         style.configure("TCheckbutton", background=FELT, foreground=CREAM)
         style.map("TCheckbutton", background=[("active", FELT)])
@@ -1256,34 +1648,17 @@ class App(tk.Tk):
     def _export_results(self):
         if not self.db:
             return
-        name = self.db.get_setting("tournament_name", "tournoi")
-        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip() or "tournoi"
-        path = filedialog.asksaveasfilename(
-            title="Exporter les résultats",
-            defaultextension=".xlsx",
-            filetypes=[("Fichier Excel", "*.xlsx"), ("Fichier CSV", "*.csv")],
-            initialfile=f"resultats_{safe_name}.xlsx",
-        )
-        if not path:
+        ResultsExportDialog(self, self.db)
+
+    def _export_payouts(self):
+        if not self.db:
             return
-        try:
-            if path.lower().endswith(".csv"):
-                self.db.export_results_csv(path)
-            else:
-                if not path.lower().endswith(".xlsx"):
-                    path += ".xlsx"
-                self.db.export_results_xlsx(path)
-        except ImportError:
-            messagebox.showerror(
-                "Module manquant",
-                "L'export Excel (.xlsx) nécessite le paquet 'openpyxl', qui n'est "
-                "pas installé.\n\nOuvrez un terminal et tapez :\n\n"
-                "    pip3 install openpyxl\n\n"
-                "puis relancez l'export. (Vous pouvez aussi choisir le format CSV, "
-                "qui ne nécessite rien de plus.)",
-            )
+        PayoutExportDialog(self, self.db)
+
+    def _export_players(self):
+        if not self.db:
             return
-        messagebox.showinfo("Export", f"Résultats exportés vers :\n{path}")
+        PlayersExportDialog(self, self.db, sort_state=self.players_sort)
 
     # ---------------------------------------------------------------
     # Construction des onglets
@@ -1387,6 +1762,15 @@ class App(tk.Tk):
         check_bar.pack(fill="x", padx=10)
         ttk.Button(check_bar, text="Tout cocher", command=self._check_all_players).pack(side="left", padx=3)
         ttk.Button(check_bar, text="Tout décocher", command=self._uncheck_all_players).pack(side="left", padx=3)
+        ttk.Button(
+            check_bar, text="Éliminer", command=self._eliminate_selected, style="Danger.TButton",
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            check_bar, text="Exporter les joueurs (Excel/CSV)...", command=self._export_players,
+        ).pack(side="left", padx=3)
+        ttk.Button(check_bar, text="Colonnes...", command=self._manage_player_columns).pack(
+            side="left", padx=3
+        )
         self.checked_count_lbl = ttk.Label(check_bar, text="", foreground=GOLD)
         self.checked_count_lbl.pack(side="left", padx=10)
 
@@ -1397,13 +1781,23 @@ class App(tk.Tk):
         ttk.Button(actions, text="Add-on (+)", command=self._addon_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Modifier chips...", command=self._edit_chips_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Modifier achats...", command=self._edit_purchases_selected).pack(side="left", padx=3)
-        ttk.Button(actions, text="Éliminer", command=self._eliminate_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Désactiver (forfait)", command=self._withdraw_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Réinscrire", command=self._reinstate_selected).pack(side="left", padx=3)
         ttk.Button(actions, text="Supprimer", command=self._delete_selected).pack(side="left", padx=3)
 
         columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang")
         headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang"]
+        self.players_columns = columns
+        self.players_headers = headers
+        # Colonnes qu'on a réduites à presque rien (voir
+        # _collapse_tiny_player_columns) et qui sont donc masquées ; "sel"
+        # et "name" restent toujours affichées. Mémorisé entre deux
+        # lancements de l'appli (indépendamment de chaque tournoi, comme
+        # les préférences d'export).
+        visible_saved = export_prefs.load_columns("players_tab_visible", list(columns))
+        self.hidden_player_columns = {
+            c for c in columns if c not in visible_saved and c not in ("sel", "name")
+        }
         self.players_tree = ttk.Treeview(
             self.players_tab, columns=columns, show="tree headings", height=20,
             style="Players.Treeview",
@@ -1412,7 +1806,13 @@ class App(tk.Tk):
         self.players_tree.column("#0", width=PLAYER_THUMB_SIZE + 16, stretch=False, anchor="center")
         for c, h in zip(columns, headers):
             self.players_tree.heading(c, text=h)
-            self.players_tree.column(c, width=90, anchor="center")
+            # stretch=False : sans ça, ttk réétire automatiquement les
+            # colonnes pour combler l'espace disponible dès que la
+            # fenêtre se redessine, ce qui annulait silencieusement tout
+            # rétrécissement manuel à la souris avant même que le
+            # masquage automatique (_collapse_tiny_player_columns) ait pu
+            # s'en apercevoir.
+            self.players_tree.column(c, width=90, anchor="center", stretch=False)
         self.players_tree.heading("name", command=lambda: self._sort_players_by("name"))
         self.players_tree.heading("status", command=lambda: self._sort_players_by("status"))
         self.players_tree.heading("table", command=lambda: self._sort_players_by("table"))
@@ -1423,6 +1823,14 @@ class App(tk.Tk):
         self.players_tree.column("name", width=180, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.players_tree.bind("<Button-1>", self._on_players_tree_click)
+        # Après tout relâchement de clic dans l'en-tête (typiquement la fin
+        # d'un redimensionnement de colonne à la souris), masque
+        # automatiquement les colonnes réduites à presque rien plutôt que
+        # de laisser un filet de quelques pixels affiché pour rien.
+        self.players_tree.bind("<ButtonRelease-1>", self._on_players_header_release, add="+")
+        # Applique dès l'ouverture les colonnes masquées mémorisées d'une
+        # session précédente (voir visible_saved ci-dessus).
+        self._apply_players_displaycolumns()
         self.player_photo_images = {}  # {player_id: PhotoImage} — évite le garbage collect
 
     # -- Gestion des cases à cocher --------------------------------
@@ -1470,6 +1878,82 @@ class App(tk.Tk):
                 self.players_tree.heading(col, text=label + arrow)
             else:
                 self.players_tree.heading(col, text=label)
+
+    # -- Colonnes affichées (masquage auto au redimensionnement minimal) --
+    # ttk impose une largeur minimale de colonne de 20px par défaut :
+    # impossible de descendre en dessous en glissant la bordure à la
+    # souris. Le seuil est donc fixé à 20 (et non plus bas), sans quoi le
+    # masquage automatique ne se déclencherait jamais.
+    _PLAYER_COLUMN_MIN_WIDTH = 20  # px : à/en dessous, on masque la colonne
+    _PLAYER_COLUMN_RESTORE_WIDTH = 90  # largeur redonnée quand on la réaffiche
+
+    def _on_players_header_release(self, event):
+        # Laisse ttk terminer d'appliquer le redimensionnement avant de
+        # relire les largeurs, sinon on peut lire une valeur pas encore à
+        # jour au tout premier relâchement du clic.
+        self.after(1, self._collapse_tiny_player_columns)
+
+    def _collapse_tiny_player_columns(self):
+        if not self.players_tree.winfo_exists():
+            return
+        changed = False
+        for c in self.players_columns:
+            if c in ("sel", "name") or c in self.hidden_player_columns:
+                continue
+            try:
+                width = self.players_tree.column(c, "width")
+            except tk.TclError:
+                continue
+            if width <= self._PLAYER_COLUMN_MIN_WIDTH:
+                self.hidden_player_columns.add(c)
+                changed = True
+        if changed:
+            self._apply_players_displaycolumns()
+
+    def _apply_players_displaycolumns(self):
+        visible = [c for c in self.players_columns if c not in self.hidden_player_columns]
+        self.players_tree["displaycolumns"] = tuple(visible)
+        # Mémorise ce choix pour le reprendre au prochain lancement de
+        # l'appli (indépendamment du tournoi ouvert).
+        export_prefs.save_columns("players_tab_visible", visible)
+
+    def _manage_player_columns(self):
+        """Fenêtre pour réafficher (ou masquer manuellement) les colonnes
+        du tableau Joueurs — seul moyen de récupérer une colonne réduite
+        à rien, puisqu'elle n'a alors plus de bordure à ressaisir."""
+        win = tk.Toplevel(self)
+        win.title("Colonnes affichées")
+        win.configure(bg=FELT_DARK)
+        win.transient(self)
+        win.grab_set()
+
+        tk.Label(
+            win, text="Colonnes affichées dans l'onglet Joueurs :",
+            bg=FELT_DARK, fg=CREAM, font=("Helvetica", 10, "bold"),
+        ).pack(padx=16, pady=(16, 8), anchor="w")
+
+        headers_by_key = dict(zip(self.players_columns, self.players_headers))
+        hideable = [c for c in self.players_columns if c not in ("sel", "name")]
+        col_vars = {c: tk.BooleanVar(value=c not in self.hidden_player_columns) for c in hideable}
+        for c in hideable:
+            ttk.Checkbutton(win, text=headers_by_key.get(c, c), variable=col_vars[c]).pack(
+                anchor="w", padx=16, pady=2
+            )
+
+        def apply_and_close():
+            for c, var in col_vars.items():
+                if var.get():
+                    self.hidden_player_columns.discard(c)
+                    if self.players_tree.column(c, "width") <= self._PLAYER_COLUMN_MIN_WIDTH:
+                        self.players_tree.column(c, width=self._PLAYER_COLUMN_RESTORE_WIDTH)
+                else:
+                    self.hidden_player_columns.add(c)
+            self._apply_players_displaycolumns()
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=(8, 16))
+        ttk.Button(btns, text="Fermer", command=apply_and_close).pack()
 
     def _check_all_players(self):
         for row_iid in self.players_tree.get_children():
@@ -2483,7 +2967,9 @@ class App(tk.Tk):
         ttk.Button(top, text="Générer grille standard (selon le nombre d'entrées)",
                    command=self._generate_standard_payouts).pack(side="left", padx=3)
         ttk.Button(top, text="Modifier % d'une place", command=self._edit_payout_pct).pack(side="left", padx=3)
-        ttk.Button(top, text="Exporter les résultats (Excel/CSV)...", command=self._export_results).pack(side="left", padx=3)
+        ttk.Button(
+            top, text="Exporter la grille de gains (Excel/CSV)...", command=self._export_payouts,
+        ).pack(side="left", padx=3)
 
         self.payout_summary_lbl = ttk.Label(self.payouts_tab, text="", font=("Helvetica", 11, "bold"))
         self.payout_summary_lbl.pack(padx=10, anchor="w")

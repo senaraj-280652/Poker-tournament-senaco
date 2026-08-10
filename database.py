@@ -713,31 +713,92 @@ class Database:
         return result
 
     def _results_rows(self):
-        """Construit les lignes de résultats (place, nom, statut, gain,
-        buy-ins, rebuys, add-ons, prime gagnée), triées meilleure place en
-        premier. Utilisé par les exports CSV et XLSX."""
+        """Construit les lignes de résultats (rang, nom, statut, gain,
+        buy-ins, rebuys, add-ons, prime gagnée) sous forme de dicts, triées
+        meilleur rang en premier. Utilisé par les exports CSV et XLSX.
+
+        Le rang suit exactement la même convention que l'onglet Joueurs :
+        1 pour le vainqueur (seul joueur encore actif, tournoi terminé),
+        None (affiché "-") pour les autres joueurs encore actifs tant que
+        le tournoi est en cours, et le rang habituel pour les éliminés."""
         payouts_by_place = {p["place"]: p["amount"] for p in self.get_payouts_amounts()}
         eliminated = [p for p in self.list_players() if p["status"] == "eliminated"]
         eliminated.sort(key=lambda p: p["place"])
         withdrawn = [p for p in self.list_players() if p["status"] == "withdrawn"]
         active = [p for p in self.list_players() if p["status"] == "active"]
+        finished = len(active) == 1
 
         rows = []
-        if active:
-            place_label = f"1-{len(active)}" if len(active) > 1 else "1"
-            for p in active:
-                rows.append((place_label, p["name"], "En cours", None,
-                             p["buyin_count"], p["rebuy_count"], p["addon_count"],
-                             p["bounty_won"]))
+        for p in active:
+            rows.append({
+                "rang": 1 if finished else None,
+                "name": p["name"], "status": "En cours" if not finished else "Terminé",
+                "gain": payouts_by_place.get(1) if finished else None,
+                "buyin": p["buyin_count"], "rebuy": p["rebuy_count"], "addon": p["addon_count"],
+                "bounty_won": p["bounty_won"],
+            })
         for p in eliminated:
-            gain = payouts_by_place.get(p["place"])
-            rows.append((p["place"], p["name"], "Éliminé", gain,
-                         p["buyin_count"], p["rebuy_count"], p["addon_count"],
-                         p["bounty_won"]))
+            rows.append({
+                "rang": p["place"],
+                "name": p["name"], "status": "Éliminé",
+                "gain": payouts_by_place.get(p["place"]),
+                "buyin": p["buyin_count"], "rebuy": p["rebuy_count"], "addon": p["addon_count"],
+                "bounty_won": p["bounty_won"],
+            })
         for p in withdrawn:
-            rows.append(("-", p["name"], "Forfait", None,
-                         p["buyin_count"], p["rebuy_count"], p["addon_count"],
-                         p["bounty_won"]))
+            rows.append({
+                "rang": None,
+                "name": p["name"], "status": "Forfait", "gain": None,
+                "buyin": p["buyin_count"], "rebuy": p["rebuy_count"], "addon": p["addon_count"],
+                "bounty_won": p["bounty_won"],
+            })
+        return rows
+
+    def players_rows(self, sort_column=None, ascending=True):
+        """Construit les lignes du tableau de l'onglet Joueurs (nom, table,
+        siège, chips, achats, prime en jeu, statut, rang), avec le même
+        calcul de rang que cet onglet. Utilisé pour son export dédié.
+
+        `sort_column`/`ascending` reproduisent exactement le tri appliqué
+        dans l'onglet (voir App._sort_players_by côté interface) : sans
+        eux, l'ordre d'affichage à l'écran (par ex. trié par Rang) et
+        l'ordre du fichier exporté pouvaient diverger."""
+        status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
+        tables = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+        players = [dict(p) for p in self.list_players()]
+        n_active = sum(1 for p in players if p["status"] == "active")
+
+        rows = []
+        for p in players:
+            if p["status"] == "active":
+                rang = 1 if n_active == 1 else None
+            elif p["status"] == "eliminated":
+                rang = p["place"]
+            else:
+                rang = None
+            rows.append({
+                "name": p["name"],
+                "table": tables.get(p["table_id"], "-") if p["table_id"] else "-",
+                "seat": p["seat"],
+                "chips": p["chips"],
+                "buyin": p["buyin_count"],
+                "rebuy": p["rebuy_count"],
+                "addon": p["addon_count"],
+                "bounty": p["bounty"],
+                "status": status_labels.get(p["status"], p["status"]),
+                "rang": rang,
+            })
+
+        if sort_column == "name":
+            rows.sort(key=lambda r: r["name"].lower())
+        elif sort_column == "status":
+            rows.sort(key=lambda r: r["status"].lower())
+        elif sort_column == "table":
+            rows.sort(key=lambda r: ((r["table"] or "").lower(), r["seat"] or 0))
+        elif sort_column == "rang":
+            rows.sort(key=lambda r: r["rang"] or 1)
+        if sort_column and not ascending:
+            rows.reverse()
         return rows
 
     def _bounty_in_use(self):
@@ -747,34 +808,38 @@ class Database:
             "SELECT COUNT(*) c FROM players WHERE bounty_won > 0"
         ).fetchone()["c"] > 0
 
-    def export_results_csv(self, path):
-        """Exporte le classement final (éliminés triés par place, puis
-        joueurs encore actifs) avec le gain correspondant, en CSV. La
-        colonne "Prime gagnée" n'apparaît que si le bounty est utilisé."""
+    def export_results_csv(self, path, columns=None):
+        """Exporte le classement final (éliminés triés par rang, puis
+        joueurs encore actifs) avec le gain correspondant, en CSV.
+        `columns` : sous-ensemble de clés de RESULT_COLUMNS à inclure
+        (None = toutes celles pertinentes, primes comprises seulement si
+        le bounty est utilisé)."""
         import csv
 
-        with_bounty = self._bounty_in_use()
+        cols = _selected_period_columns(RESULT_COLUMNS, columns)
+        if columns is None and not self._bounty_in_use():
+            cols = [c for c in cols if c[0] != "bounty_won"]
+        rows = self._results_rows()
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            headers = ["Place", "Nom", "Statut", "Gain (€)", "Buy-ins", "Rebuys", "Add-ons"]
-            if with_bounty:
-                headers.append("Prime gagnée (€)")
-            writer.writerow(headers)
-            for place, name, status, gain, bi, rb, ad, bounty_won in self._results_rows():
-                gain_txt = f"{gain:.2f}" if gain else ""
-                row = [place, name, status, gain_txt, bi, rb, ad]
-                if with_bounty:
-                    row.append(bounty_won or "")
-                writer.writerow(row)
+            writer.writerow([h for _, h, _ in cols])
+            for r in rows:
+                writer.writerow([fn(r) for _, _, fn in cols])
         return path
 
-    def export_results_xlsx(self, path):
+    def export_results_xlsx(self, path, columns=None):
         """Exporte le classement final au format Excel (.xlsx), avec
         mise en forme (en-têtes en gras, colonnes ajustées, ligne de
-        synthèse du tournoi). Nécessite le paquet 'openpyxl'."""
+        synthèse du tournoi). `columns` : voir export_results_csv.
+        Nécessite le paquet 'openpyxl'."""
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
         from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(RESULT_COLUMNS, columns)
+        if columns is None and not self._bounty_in_use():
+            cols = [c for c in cols if c[0] != "bounty_won"]
+        rows = self._results_rows()
 
         wb = Workbook()
         ws = wb.active
@@ -782,7 +847,6 @@ class Database:
 
         stats = self.get_stats()
         name = self.get_setting("tournament_name", "Tournoi")
-        with_bounty = self._bounty_in_use()
 
         ws.append([name])
         ws["A1"].font = Font(bold=True, size=14)
@@ -790,9 +854,7 @@ class Database:
         ws["A2"].font = Font(italic=True)
         ws.append([])
 
-        headers = ["Place", "Nom", "Statut", "Gain (€)", "Buy-ins", "Rebuys", "Add-ons"]
-        if with_bounty:
-            headers.append("Prime gagnée (€)")
+        headers = [h for _, h, _ in cols]
         header_row = ws.max_row + 1
         ws.append(headers)
         header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
@@ -802,15 +864,132 @@ class Database:
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
 
-        for place, pname, status, gain, bi, rb, ad, bounty_won in self._results_rows():
-            row = [place, pname, status, round(gain, 2) if gain else None, bi, rb, ad]
-            if with_bounty:
-                row.append(bounty_won or None)
-            ws.append(row)
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
 
-        widths = [10, 26, 12, 14, 10, 10, 10, 16]
-        for i, w in enumerate(widths[: len(headers)], start=1):
-            ws.column_dimensions[get_column_letter(i)].width = w
+        widths = {"rang": 10, "name": 26, "status": 12, "gain": 14,
+                  "buyin": 10, "rebuy": 10, "addon": 10, "bounty_won": 16}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
+
+        wb.save(path)
+        return path
+
+    def export_payouts_csv(self, path, columns=None):
+        """Exporte la grille de gains telle qu'affichée dans l'onglet
+        Gains (place, pourcentage, montant — sans nom de joueur), en CSV.
+        `columns` : sous-ensemble de clés de PAYOUT_COLUMNS (None = toutes)."""
+        import csv
+
+        cols = _selected_period_columns(PAYOUT_COLUMNS, columns)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for _, h, _ in cols])
+            for r in self.get_payouts_amounts():
+                writer.writerow([fn(r) for _, _, fn in cols])
+        return path
+
+    def export_payouts_xlsx(self, path, columns=None):
+        """Exporte la grille de gains au format Excel (.xlsx). `columns` :
+        voir export_payouts_csv. Nécessite le paquet 'openpyxl'."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(PAYOUT_COLUMNS, columns)
+        rows = self.get_payouts_amounts()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Grille de gains"
+
+        stats = self.get_stats()
+        name = self.get_setting("tournament_name", "Tournoi")
+
+        ws.append([name])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append([f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} €"])
+        ws["A2"].font = Font(italic=True)
+        ws.append([])
+
+        headers = [h for _, h, _ in cols]
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
+
+        widths = {"place": 10, "percentage": 16, "amount": 14}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
+
+        wb.save(path)
+        return path
+
+    def export_players_csv(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Joueurs tel qu'affiché (nom,
+        table, siège, chips, achats, prime en jeu, statut, rang), en CSV.
+        `columns` : sous-ensemble de clés de PLAYERS_TAB_COLUMNS (None =
+        toutes). `sort_column`/`ascending` : voir players_rows — reprend
+        le tri actuellement appliqué dans l'onglet."""
+        import csv
+
+        cols = _selected_period_columns(PLAYERS_TAB_COLUMNS, columns)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for _, h, _ in cols])
+            for r in self.players_rows(sort_column=sort_column, ascending=ascending):
+                writer.writerow([fn(r) for _, _, fn in cols])
+        return path
+
+    def export_players_xlsx(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Joueurs au format Excel (.xlsx).
+        `columns`, `sort_column`, `ascending` : voir export_players_csv.
+        Nécessite 'openpyxl'."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(PLAYERS_TAB_COLUMNS, columns)
+        rows = self.players_rows(sort_column=sort_column, ascending=ascending)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Joueurs"
+
+        stats = self.get_stats()
+        name = self.get_setting("tournament_name", "Tournoi")
+
+        ws.append([name])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append([f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} €"])
+        ws["A2"].font = Font(italic=True)
+        ws.append([])
+
+        headers = [h for _, h, _ in cols]
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
+
+        widths = {"name": 22, "table": 14, "seat": 10, "chips": 12,
+                  "buyin": 10, "rebuy": 10, "addon": 10, "bounty": 12,
+                  "status": 12, "rang": 10}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
 
         wb.save(path)
         return path
@@ -958,11 +1137,52 @@ PERIOD_PLAYER_COLUMNS = [
     ("name", "Joueur", lambda a: a["name"]),
     ("tournaments_played", "Tournois joués", lambda a: a["tournaments_played"]),
     ("wins", "Victoires", lambda a: a["wins"]),
-    ("best_place", "Meilleur Rang", lambda a: a["best_place"] or "-"),
+    ("best_place", "Meilleur Rang", lambda a: a["best_place"]),
     ("total_cost", "Total investi (€)", lambda a: round(a["total_cost"], 2)),
     ("total_gain", "Gains classement (€)", lambda a: round(a["total_gain"], 2)),
     ("total_bounty_won", "Primes gagnées (€)", lambda a: a["total_bounty_won"]),
     ("net", "Net (€)", lambda a: round(a["net"], 2)),
+]
+
+# Colonnes disponibles pour l'export du classement final nominatif d'UN
+# tournoi (menu Fichier > Exporter les résultats...). Le rang du vainqueur
+# est un entier (1), pas une chaîne, pour éviter le souci d'alignement
+# Excel entre texte et nombres dans la même colonne.
+RESULT_COLUMNS = [
+    ("rang", "Rang", lambda r: r["rang"]),
+    ("name", "Nom", lambda r: r["name"]),
+    ("status", "Statut", lambda r: r["status"]),
+    ("gain", "Gain (€)", lambda r: round(r["gain"], 2) if r["gain"] else None),
+    ("buyin", "Buy-ins", lambda r: r["buyin"]),
+    ("rebuy", "Rebuys", lambda r: r["rebuy"]),
+    ("addon", "Add-ons", lambda r: r["addon"]),
+    ("bounty_won", "Prime gagnée (€)", lambda r: r["bounty_won"]),
+]
+
+# Colonnes disponibles pour l'export de la grille de gains telle
+# qu'affichée dans l'onglet Gains (place -> pourcentage -> montant, sans
+# nom de joueur) — distinct du classement nominatif ci-dessus.
+PAYOUT_COLUMNS = [
+    ("place", "Place", lambda r: r["place"]),
+    ("percentage", "Pourcentage (%)", lambda r: round(r["percentage"], 1)),
+    ("amount", "Montant (€)", lambda r: round(r["amount"], 2)),
+]
+
+# Colonnes disponibles pour l'export de l'onglet Joueurs, dans le même
+# ordre que son tableau (nom, table, siège, chips, achats, prime en jeu,
+# statut, rang) — distinct du classement final nominatif (RESULT_COLUMNS,
+# qui a le gain et la prime déjà empochée plutôt que la prime en jeu).
+PLAYERS_TAB_COLUMNS = [
+    ("name", "Nom", lambda p: p["name"]),
+    ("table", "Table", lambda p: p["table"]),
+    ("seat", "Siège", lambda p: p["seat"]),
+    ("chips", "Chips", lambda p: p["chips"]),
+    ("buyin", "Buy-in", lambda p: p["buyin"]),
+    ("rebuy", "Rebuys", lambda p: p["rebuy"]),
+    ("addon", "Add-ons", lambda p: p["addon"]),
+    ("bounty", "Prime", lambda p: p["bounty"]),
+    ("status", "Statut", lambda p: p["status"]),
+    ("rang", "Rang", lambda p: p["rang"]),
 ]
 
 
