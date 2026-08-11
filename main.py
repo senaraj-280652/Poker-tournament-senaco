@@ -18,7 +18,8 @@ from tkinter import ttk, simpledialog, messagebox, filedialog
 
 from database import (
     Database, build_period_summary, export_period_summary_csv,
-    export_period_summary_xlsx, PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
+    export_period_summary_xlsx, read_player_names_from_file,
+    PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
@@ -116,8 +117,8 @@ class PlayerSelectionDialog(tk.Toplevel):
         self.grab_set()
         self.selected_names = []
         self.check_vars = {}
-        exclude_names = exclude_names or set()
-        self.roster_names = [n for n in roster.load_roster() if n not in exclude_names]
+        self.exclude_names = exclude_names or set()
+        self.roster_names = [n for n in roster.load_roster() if n not in self.exclude_names]
         self.sort_state = {"column": "name", "ascending": True}
         self.header_labels = {}
 
@@ -138,6 +139,10 @@ class PlayerSelectionDialog(tk.Toplevel):
         btns_top.pack(fill="x", padx=12, pady=6)
         ttk.Button(btns_top, text="Tout cocher", command=self._check_all).pack(side="left", padx=3)
         ttk.Button(btns_top, text="Tout décocher", command=self._uncheck_all).pack(side="left", padx=3)
+        ttk.Button(
+            btns_top, text="Importer d'un tournoi précédent...",
+            command=self._import_from_previous_tournament,
+        ).pack(side="left", padx=3)
 
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True, padx=12, pady=5)
@@ -275,6 +280,50 @@ class PlayerSelectionDialog(tk.Toplevel):
         self.new_name_var.set("")
         self.new_name_club_var.set("")
         self._filter()
+
+    def _import_from_previous_tournament(self):
+        """Reprend uniquement la liste des noms de joueurs d'un fichier
+        .tournoi précédent (pas leurs chips, place, buy-ins...) : les
+        coche ici, et les ajoute au répertoire s'ils n'y figurent pas
+        déjà, pour que le nouveau tournoi reparte de zéro pour chacun."""
+        path = filedialog.askopenfilename(
+            title="Importer les joueurs d'un tournoi précédent",
+            filetypes=[("Fichier de tournoi", "*.tournoi"), ("Tous les fichiers", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            names = read_player_names_from_file(path)
+        except Exception as e:
+            messagebox.showerror(
+                "Erreur", f"Impossible de lire les joueurs de ce fichier :\n{e}",
+                parent=self,
+            )
+            return
+        if not names:
+            messagebox.showinfo(
+                "Aucun joueur", "Ce tournoi ne contient aucun joueur.", parent=self,
+            )
+            return
+        already_present = [n for n in names if n in self.exclude_names]
+        names = [n for n in names if n not in self.exclude_names]
+        added_to_roster = 0
+        for name in names:
+            if name not in self.roster_names:
+                roster.add_to_roster(name)
+                added_to_roster += 1
+            self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
+        if added_to_roster:
+            self.roster_names = roster.load_roster()
+        self._filter()
+        msg = (
+            f"{len(names)} joueur(s) importé(s) et coché(s) "
+            f"(sans leurs performances du tournoi précédent)."
+        )
+        if already_present:
+            msg += f"\n{len(already_present)} joueur(s) déjà présent(s) ignoré(s)."
+        messagebox.showinfo("Import terminé", msg, parent=self)
 
     def _edit_club_for(self, name):
         club = ask_club_dialog(self, title=f"Club de {name}", current_club=roster.get_club(name))

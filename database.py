@@ -998,6 +998,25 @@ class Database:
         self.conn.close()
 
 
+def read_player_names_from_file(path):
+    """Lit uniquement les noms des joueurs d'un fichier .tournoi existant,
+    triés par ordre alphabétique, sans toucher au fichier ni reprendre
+    leurs performances (chips, place, buy-ins...). Utilisé pour reprendre
+    la liste des joueurs d'un tournoi précédent dans un nouveau tournoi.
+    Ouvre la base en lecture seule (URI mode=ro) pour ne jamais créer ni
+    modifier ce fichier, même par erreur. Lève une exception si le
+    fichier n'est pas une base de tournoi valide."""
+    uri = f"file:{os.path.abspath(path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT name FROM players ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return [row[0] for row in rows if row[0] and row[0].strip()]
+    finally:
+        conn.close()
+
+
 # =====================================================================
 # Synthèse multi-tournois par période (parcourt plusieurs fichiers
 # .tournoi d'un dossier). Contrairement au reste de ce module, ces
