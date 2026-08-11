@@ -51,7 +51,7 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
     $dotnetTools = Join-Path $env:USERPROFILE ".dotnet\tools"
     if ($env:PATH -notlike "*$dotnetTools*") { $env:PATH = "$env:PATH;$dotnetTools" }
 }
-wix extension add WixToolset.UI.wixext --global 2>$null
+wix extension add WixToolset.UI.wixext/5.0.2 --global 2>$null
 
 Write-Host "== 5/5 : génération de PokerTournament.msi (WiX) ==" -ForegroundColor Cyan
 wix build windows\app.wxs `

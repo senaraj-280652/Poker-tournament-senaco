@@ -37,7 +37,7 @@ jobs:
       - name: Installation de l'outil WiX
         run: |
           dotnet tool install --global wix --version 5.0.2
-          wix extension add WixToolset.UI.wixext --global
+          wix extension add WixToolset.UI.wixext/5.0.2 --global
 
       - name: Génération de PokerTournament.msi (WiX)
         run: |
