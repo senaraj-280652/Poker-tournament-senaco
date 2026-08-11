@@ -1,0 +1,9 @@
+# Dépendances pour générer PokerTournament.app (macOS) via PyInstaller.
+# L'application elle-même ne requiert que la bibliothèque standard ; ces
+# paquets ajoutent les fonctionnalités optionnelles (export Excel, photos
+# de joueurs) directement dans l'app, pour que rien à installer ne soit
+# nécessaire une fois l'application copiée dans /Applications.
+pyinstaller>=6.0
+openpyxl>=3.1
+opencv-python>=4.8
+pillow>=10.0

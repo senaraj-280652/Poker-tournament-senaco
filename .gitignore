@@ -20,6 +20,12 @@ windows/venv/
 windows/build/
 windows/dist/
 
+# Artefacts de build de l'installateur macOS (.dmg) — régénérés par
+# macos/build_dmg.sh, jamais versionnés (voir macos/README.md).
+macos/venv/
+macos/build/
+macos/dist/
+
 # Dossiers/archives de dépose ponctuelle (téléchargements, pas du code source)
 files/
 files [0-9]*/
