@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Projet WiX Toolset (v5) décrivant l'installateur .msi du Gestionnaire de
+  Tournoi de Poker. Suppose que PokerTournament.exe a déjà été généré par
+  PyInstaller (voir windows/poker_tournament.spec) dans le dossier passé
+  via la variable de préprocesseur "Dist" (par défaut windows/dist,
+  positionnée par windows/build.ps1).
+
+  Construction manuelle (depuis la racine du dépôt) :
+    wix build windows\app.wxs -arch x64 -ext WixToolset.UI.wixext ^
+        -d Dist=windows\dist -out windows\dist\PokerTournament.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?ifndef Dist?>
+  <?define Dist = "windows/dist" ?>
+  <?endif?>
+
+  <Package name="Gestionnaire de Tournoi de Poker"
+           Manufacturer="Raj Juganaikloo"
+           Version="1.0.0"
+           UpgradeCode="1702C0EB-14D2-4A17-B3B2-E1042B9298D3"
+           Language="1036"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <SummaryInformation Description="Installateur - Gestionnaire de Tournoi de Poker" />
+
+    <MajorUpgrade
+        DowngradeErrorMessage="Une version plus récente du Gestionnaire de Tournoi de Poker est déjà installée." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Gestionnaire de Tournoi de Poker">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="PokerTournamentEXE"
+                Source="$(var.Dist)\PokerTournament.exe"
+                KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Gestionnaire de Tournoi de Poker">
+        <Component Id="ApplicationShortcut" Guid="*">
+          <Shortcut Id="ApplicationStartMenuShortcut"
+                    Name="Gestionnaire de Tournoi de Poker"
+                    Description="Gestionnaire de tournoi de poker multi-tables"
+                    Target="[#PokerTournamentEXE]"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="CleanUpProgramMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKCU"
+                          Key="Software\PokerTournament"
+                          Name="StartMenuShortcutInstalled"
+                          Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="ApplicationDesktopShortcut"
+                  Name="Gestionnaire de Tournoi de Poker"
+                  Description="Gestionnaire de tournoi de poker multi-tables"
+                  Target="[#PokerTournamentEXE]"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKCU"
+                        Key="Software\PokerTournament"
+                        Name="DesktopShortcutInstalled"
+                        Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Gestionnaire de Tournoi de Poker" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="windows\License.rtf" />
+
+  </Package>
+</Wix>

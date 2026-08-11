@@ -1,0 +1,57 @@
+name: Build Windows .msi
+
+# Compile le Gestionnaire de Tournoi de Poker en un installateur Windows
+# (.msi) sur un runner Windows fourni par GitHub — voir windows/README.md.
+#
+# Déclenchement :
+#   - manuel (onglet Actions → "Build Windows .msi" → "Run workflow")
+#   - automatique sur un tag "v*" (ex. v1.0.0), avec publication du .msi
+#     dans une Release GitHub
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installation des dépendances Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r windows/requirements.txt
+
+      - name: Génération de PokerTournament.exe (PyInstaller)
+        run: |
+          pyinstaller windows/poker_tournament.spec --distpath windows/dist --workpath windows/build --noconfirm
+
+      - name: Installation de l'outil WiX
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add WixToolset.UI.wixext --global
+
+      - name: Génération de PokerTournament.msi (WiX)
+        run: |
+          wix build windows/app.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament.msi
+
+      - name: Publication de l'artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokerTournament-msi
+          path: windows/dist/PokerTournament.msi
+          if-no-files-found: error
+
+      - name: Publication dans la Release (si déclenché par un tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: windows/dist/PokerTournament.msi

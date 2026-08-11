@@ -13,6 +13,13 @@
 __pycache__/
 *.pyc
 
+# Artefacts de build de l'installateur Windows (.msi) — régénérés par
+# windows/build.ps1 ou la GitHub Action, jamais versionnés (voir
+# windows/README.md).
+windows/venv/
+windows/build/
+windows/dist/
+
 # Dossiers/archives de dépose ponctuelle (téléchargements, pas du code source)
 files/
 files [0-9]*/
