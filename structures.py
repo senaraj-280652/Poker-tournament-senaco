@@ -36,11 +36,12 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
     - Le niveau 1 utilise exactement les valeurs fournies.
     - Les niveaux suivants reprennent la même progression relative que la
       structure standard, mise à l'échelle du big blind de départ.
-    - `ante_start_level` désigne le niveau tel qu'affiché dans le tableau
-      (les pauses comptent comme un niveau, puisqu'elles y occupent une
-      ligne) : avant ce niveau, l'ante est nulle ; à partir de ce niveau
-      (inclus), elle démarre à `start_ante` puis grandit proportionnellement
-      au big blind.
+    - `ante_start_level` désigne le niveau de blindes (les pauses ne
+      comptent pas, seuls les niveaux avec petite/grosse blinde sont
+      numérotés) : avant ce niveau, l'ante est nulle ; à partir de ce
+      niveau (inclus), elle démarre à `start_ante` puis grandit
+      proportionnellement au big blind. Les pauses gardent toujours une
+      ante à 0.
     - `break_duration_minutes` fixe la durée des pauses, indépendamment de
       `duration_minutes` (durée des niveaux de blindes). Par défaut, égale
       à `duration_minutes` si non précisée.
@@ -78,9 +79,16 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
 
     # 2) Ante : nulle avant ante_start_level ; à partir de ce niveau, elle
     #    démarre à start_ante puis suit la progression du big blind.
+    #    `ante_start_level` compte uniquement les niveaux de blindes (les
+    #    pauses n'en sont pas un et ne reçoivent donc jamais d'ante), pour
+    #    correspondre au numéro de "Round" affiché dans l'onglet Blindes.
     anchor_bb = None
-    for idx, row in enumerate(rows, start=1):
-        if idx < ante_start_level:
+    blind_idx = 0
+    for row in rows:
+        if row["is_break"]:
+            continue
+        blind_idx += 1
+        if blind_idx < ante_start_level:
             continue
         if anchor_bb is None:
             anchor_bb = row["big_blind"] or 1

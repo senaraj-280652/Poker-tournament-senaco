@@ -1924,6 +1924,7 @@ class App(tk.Tk):
         self.moves_tab = ttk.Frame(self.notebook)
         self.bounty_tab = ttk.Frame(self.notebook)
         self.clock_tab = ttk.Frame(self.notebook)
+        self.blinds_tab = ttk.Frame(self.notebook)
         self.payouts_tab = ttk.Frame(self.notebook)
         self.settings_tab = ttk.Frame(self.notebook)
 
@@ -1932,6 +1933,7 @@ class App(tk.Tk):
         self.notebook.add(self.moves_tab, text="Mouvements")
         self.notebook.add(self.bounty_tab, text="Primes")
         self.notebook.add(self.clock_tab, text="Chronomètre")
+        self.notebook.add(self.blinds_tab, text="Blindes")
         self.notebook.add(self.payouts_tab, text="Gains")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
@@ -1940,6 +1942,7 @@ class App(tk.Tk):
         self._build_moves_tab()
         self._build_bounty_tab()
         self._build_clock_tab()
+        self._build_blinds_tab()
         self._build_payouts_tab()
         self._build_settings_tab()
 
@@ -3211,6 +3214,206 @@ class App(tk.Tk):
         self.clock_window = ClockWindow(self, self)
 
     # ---------------------------------------------------------------
+    # Onglet Blindes
+    # ---------------------------------------------------------------
+    # Saisie manuelle de la structure, ligne par ligne : Round / Durée /
+    # Petite Blind / Grosse Blind / Ante / Durée Pause. En base, une pause
+    # reste une ligne à part (is_break=1) juste après le niveau concerné
+    # (voir database.set_blind_structure) ; cet onglet la présente à
+    # l'utilisateur comme une simple colonne "Durée Pause" du round
+    # précédent, plus parlant pour un responsable de tournoi.
+    def _build_blinds_tab(self):
+        ttk.Label(
+            self.blinds_tab, foreground=MUTED,
+            text="Saisissez manuellement chaque round (durée, blindes, ante) et, "
+                 "si besoin, la durée d'une pause juste après. Laissez \"Durée "
+                 "Pause\" à 0 pour un round sans pause. N'oubliez pas d'enregistrer.",
+            wraplength=760, justify="left",
+        ).pack(anchor="w", padx=15, pady=(12, 6))
+
+        top_btns = ttk.Frame(self.blinds_tab)
+        top_btns.pack(fill="x", padx=15)
+        ttk.Button(top_btns, text="➕ Ajouter un round", command=lambda: self._add_blind_round()).pack(side="left", padx=3)
+        ttk.Button(top_btns, text="Structure standard", command=self._reset_blind_structure_from_tab).pack(side="left", padx=3)
+        ttk.Button(top_btns, text="💾 Enregistrer les modifications", command=self._save_blinds_structure).pack(side="right", padx=3)
+
+        # Conteneur défilable : le nombre de rounds peut largement dépasser
+        # la hauteur de l'écran.
+        canvas = tk.Canvas(self.blinds_tab, bg=FELT, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self.blinds_tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(15, 0), pady=10)
+        vscroll.pack(side="right", fill="y", pady=10)
+
+        self.blinds_rows_frame = ttk.Frame(canvas)
+        outer_id = canvas.create_window((0, 0), window=self.blinds_rows_frame, anchor="nw")
+        self.blinds_rows_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(outer_id, width=e.width))
+
+        is_mac = self.tk.call("tk", "windowingsystem") == "aqua"
+
+        def _on_mousewheel(event):
+            if is_mac:
+                canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        self._blind_row_vars = []
+        self._refresh_blinds_tab()
+
+    def _blind_rounds_from_db(self):
+        """Regroupe la liste plate de la base (niveaux + pauses) en rounds
+        {duration, sb, bb, ante, pause}, un round par niveau de blindes."""
+        rounds = []
+        for lvl in self.db.get_blind_structure():
+            if lvl["is_break"]:
+                if rounds:
+                    rounds[-1]["pause"] += lvl["duration_minutes"]
+                # une pause sans round précédent (structure mal formée) est
+                # ignorée : cas qui ne devrait pas se produire en pratique.
+                continue
+            rounds.append({
+                "duration": lvl["duration_minutes"],
+                "sb": lvl["small_blind"],
+                "bb": lvl["big_blind"],
+                "ante": lvl["ante"],
+                "pause": 0,
+            })
+        return rounds
+
+    def _refresh_blinds_tab(self):
+        for w in self.blinds_rows_frame.winfo_children():
+            w.destroy()
+        self._blind_row_vars = []
+
+        headers = ["Round", "Durée (min)", "Petite Blind", "Grosse Blind", "Ante", "Durée Pause (min)", ""]
+        for col, h in enumerate(headers):
+            ttk.Label(self.blinds_rows_frame, text=h, font=("Helvetica", 9, "bold"),
+                      foreground=GOLD_DARK).grid(row=0, column=col, padx=6, pady=(0, 6), sticky="w")
+
+        rounds = self._blind_rounds_from_db()
+        if not rounds:
+            rounds = [{"duration": 15, "sb": 25, "bb": 50, "ante": 0, "pause": 0}]
+
+        for i, rnd in enumerate(rounds, start=1):
+            row_vars = {
+                "duration": tk.StringVar(value=str(rnd["duration"])),
+                "sb": tk.StringVar(value=str(rnd["sb"])),
+                "bb": tk.StringVar(value=str(rnd["bb"])),
+                "ante": tk.StringVar(value=str(rnd["ante"])),
+                "pause": tk.StringVar(value=str(rnd["pause"])),
+            }
+            self._blind_row_vars.append(row_vars)
+
+            ttk.Label(self.blinds_rows_frame, text=str(i)).grid(row=i, column=0, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["duration"], width=10).grid(row=i, column=1, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["sb"], width=10).grid(row=i, column=2, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["bb"], width=10).grid(row=i, column=3, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["ante"], width=10).grid(row=i, column=4, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["pause"], width=10).grid(row=i, column=5, padx=6, pady=2)
+
+            actions = ttk.Frame(self.blinds_rows_frame)
+            actions.grid(row=i, column=6, padx=6, pady=2)
+            ttk.Button(actions, text="➕", width=3,
+                       command=lambda idx=i: self._add_blind_round(idx)).pack(side="left", padx=1)
+            ttk.Button(actions, text="🗑", width=3,
+                       command=lambda idx=i: self._delete_blind_round(idx)).pack(side="left", padx=1)
+
+    def _collect_blinds_from_widgets(self):
+        """Lit les champs actuellement affichés (y compris non enregistrés)
+        et renvoie la liste de rounds {duration, sb, bb, ante, pause}, ou
+        None (avec un message d'erreur) si une valeur saisie est invalide."""
+        rounds = []
+        for i, row_vars in enumerate(self._blind_row_vars, start=1):
+            try:
+                duration = int(row_vars["duration"].get())
+                sb = int(row_vars["sb"].get())
+                bb = int(row_vars["bb"].get())
+                ante = int(row_vars["ante"].get())
+                pause = int(row_vars["pause"].get())
+            except (ValueError, tk.TclError):
+                messagebox.showerror(
+                    "Erreur", f"Round {i} : toutes les valeurs doivent être des nombres entiers."
+                )
+                return None
+            if duration < 1:
+                messagebox.showerror("Erreur", f"Round {i} : la durée doit être d'au moins 1 minute.")
+                return None
+            if sb < 0 or bb < 0 or ante < 0 or pause < 0:
+                messagebox.showerror("Erreur", f"Round {i} : les valeurs ne peuvent pas être négatives.")
+                return None
+            rounds.append({"duration": duration, "sb": sb, "bb": bb, "ante": ante, "pause": pause})
+        return rounds
+
+    def _rounds_to_flat_structure(self, rounds):
+        """Convertit les rounds édités (une ligne = un niveau + sa pause
+        éventuelle) vers la liste plate attendue par
+        database.set_blind_structure (niveaux et pauses en lignes
+        distinctes, comme le reste de l'application le suppose)."""
+        flat = []
+        for rnd in rounds:
+            flat.append({
+                "small_blind": rnd["sb"], "big_blind": rnd["bb"], "ante": rnd["ante"],
+                "duration_minutes": rnd["duration"], "is_break": False,
+            })
+            if rnd["pause"] > 0:
+                flat.append({
+                    "small_blind": 0, "big_blind": 0, "ante": 0,
+                    "duration_minutes": rnd["pause"], "is_break": True, "break_label": "Pause",
+                })
+        return flat
+
+    def _save_blinds_structure(self):
+        rounds = self._collect_blinds_from_widgets()
+        if rounds is None:
+            return
+        self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        self._refresh_blinds_tab()
+        if hasattr(self, "blinds_tree"):
+            self._refresh_clock_tab()
+        messagebox.showinfo("Structure enregistrée", "La structure de blindes a été mise à jour.")
+
+    def _add_blind_round(self, after_index=None):
+        rounds = self._collect_blinds_from_widgets()
+        if rounds is None:
+            return
+        if after_index is None or not rounds:
+            new_round = dict(rounds[-1]) if rounds else {"duration": 15, "sb": 25, "bb": 50, "ante": 0, "pause": 0}
+            new_round["pause"] = 0
+            rounds.append(new_round)
+        else:
+            new_round = dict(rounds[after_index - 1])
+            new_round["pause"] = 0
+            rounds.insert(after_index, new_round)
+        self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        self._refresh_blinds_tab()
+
+    def _delete_blind_round(self, index):
+        rounds = self._collect_blinds_from_widgets()
+        if rounds is None:
+            return
+        if len(rounds) <= 1:
+            messagebox.showerror("Erreur", "La structure doit contenir au moins un round.")
+            return
+        if not messagebox.askyesno("Confirmer", f"Supprimer le round {index} ?"):
+            return
+        del rounds[index - 1]
+        self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        self._refresh_blinds_tab()
+
+    def _reset_blind_structure_from_tab(self):
+        if messagebox.askyesno("Confirmer", "Remplacer la structure actuelle par la structure standard ?"):
+            self.db.set_blind_structure(default_blind_structure())
+            self._refresh_blinds_tab()
+            if hasattr(self, "blinds_tree"):
+                self._go_to_level(1)
+
+    # ---------------------------------------------------------------
     # Onglet Gains
     # ---------------------------------------------------------------
     def _build_payouts_tab(self):
@@ -3563,6 +3766,8 @@ class App(tk.Tk):
             self._refresh_bounty_tab()
         elif current == "Chronomètre":
             self._refresh_clock_tab()
+        elif current == "Blindes":
+            self._refresh_blinds_tab()
         elif current == "Gains":
             self._refresh_payouts_tab()
 
