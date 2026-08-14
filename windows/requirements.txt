@@ -1,9 +1,10 @@
 # Dépendances pour générer PokerTournament.exe (Windows) via PyInstaller.
 # L'application elle-même ne requiert que la bibliothèque standard ; ces
-# paquets ajoutent les fonctionnalités optionnelles (export Excel, photos
-# de joueurs) directement dans l'exécutable, pour que rien à installer ne
-# soit nécessaire une fois le programme installé.
+# paquets ajoutent les fonctionnalités optionnelles (export Excel, export
+# PDF, photos de joueurs) directement dans l'exécutable, pour que rien à
+# installer ne soit nécessaire une fois le programme installé.
 pyinstaller>=6.0
 openpyxl>=3.1
+fpdf2>=2.7
 opencv-python>=4.8
 pillow>=10.0

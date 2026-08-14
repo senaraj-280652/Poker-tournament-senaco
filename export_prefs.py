@@ -58,10 +58,22 @@ def save_columns(key, keys):
 
 def load_format(key, default="csv"):
     val = _load_all().get(key + "_format")
-    return val if val in ("csv", "xlsx") else default
+    return val if val in ("csv", "xlsx", "pdf") else default
 
 
 def save_format(key, fmt):
     data = _load_all()
     data[key + "_format"] = fmt
+    _save_all(data)
+
+
+def load_value(key, default=None):
+    """Valeur simple mémorisée sous `key` (ex : dernier dossier utilisé
+    dans le Lobby SNG), ou `default` si rien n'a encore été enregistré."""
+    return _load_all().get(key, default)
+
+
+def save_value(key, value):
+    data = _load_all()
+    data[key] = value
     _save_all(data)

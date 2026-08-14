@@ -2,6 +2,7 @@
 """Fenêtre d'affichage du chronomètre, pensée pour être projetée sur un
 second écran pendant le tournoi."""
 import tkinter as tk
+import time
 
 
 class ClockWindow(tk.Toplevel):
@@ -42,6 +43,12 @@ class ClockWindow(tk.Toplevel):
         )
         self.next_lbl.pack(pady=(10, 0))
 
+        self.next_break_lbl = tk.Label(
+            self, text="", font=("Helvetica", 16),
+            bg="#0b1f14", fg="#aaaaaa"
+        )
+        self.next_break_lbl.pack(pady=(2, 0))
+
         bottom = tk.Frame(self, bg="#0b1f14")
         bottom.pack(side="bottom", fill="x", pady=20)
 
@@ -57,11 +64,14 @@ class ClockWindow(tk.Toplevel):
         )
         self.avg_lbl.pack(side="left", padx=40)
 
-        self.prize_lbl = tk.Label(
-            bottom, text="", font=("Helvetica", 20),
-            bg="#0b1f14", fg="#ffffff"
+        # Bandeau "Changement de tables en cours" : overlay clignotant
+        # par-dessus le reste de l'écran, affiché/masqué depuis refresh()
+        # selon movement_alert (voir App._trigger_movement_alert).
+        self.movement_alert_lbl = tk.Label(
+            self, text="⚠  Changement de tables en cours  ⚠",
+            font=("Helvetica", 40, "bold"), bg="#8a1f1f", fg="white",
+            relief="solid", borderwidth=5, padx=40, pady=26,
         )
-        self.prize_lbl.pack(side="right", padx=40)
 
         self.bind("<F11>", self._toggle_fullscreen)
         self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
@@ -71,7 +81,8 @@ class ClockWindow(tk.Toplevel):
         self._fullscreen = not self._fullscreen
         self.attributes("-fullscreen", self._fullscreen)
 
-    def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name, is_paused):
+    def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
+                is_paused, next_break_text="", movement_alert=False):
         self.name_lbl.config(text=tournament_name)
 
         mins, secs = divmod(max(0, int(remaining_seconds)), 60)
@@ -105,6 +116,9 @@ class ClockWindow(tk.Toplevel):
             text=f"Joueurs restants : {stats['active_count']} / {stats['total_players_ever']}"
         )
         self.avg_lbl.config(text=f"Tapis moyen : {int(stats['avg_stack']):,}".replace(",", " "))
-        self.prize_lbl.config(
-            text=f"Prize pool : {stats['prize_pool']:,.0f} €".replace(",", " ")
-        )
+        self.next_break_lbl.config(text=next_break_text)
+
+        if movement_alert and int(time.time()) % 2 == 0:
+            self.movement_alert_lbl.place(relx=0.5, rely=0.42, anchor="center")
+        else:
+            self.movement_alert_lbl.place_forget()

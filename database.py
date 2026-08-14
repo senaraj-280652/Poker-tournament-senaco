@@ -9,6 +9,94 @@ import math
 import os
 import glob
 
+# =====================================================================
+# Export PDF : petit utilitaire partagé par tous les export_*_pdf
+# ci-dessous (Joueurs, Primes, Résultats, Gains, Synthèse par période).
+# Utilise fpdf2 (police cœur "Helvetica", jeu de caractères latin-1) :
+# _pdf_text() remplace les quelques symboles hors de ce jeu (tiret
+# cadratin, euro) qui apparaissent dans nos en-têtes de colonnes, pour
+# éviter une erreur de rendu — les exports CSV/Excel restent en Unicode
+# complet, seul le PDF est concerné par cette petite simplification.
+# =====================================================================
+
+def _pdf_text(value):
+    if value is None:
+        return ""
+    return str(value).replace("—", "-").replace("€", "EUR")
+
+
+def _pdf_fit_font_size(pdf, texts, col_width, bold=False, max_size=9, min_size=5):
+    """Plus grande taille de police (entre `min_size` et `max_size`) à
+    laquelle chacun de `texts` tient dans une colonne de largeur
+    `col_width` (avec 2mm de marge) — évite que des en-têtes/valeurs longs
+    ne débordent sur la colonne suivante quand il y a beaucoup de
+    colonnes. Laisse la police active sur ce choix en sortie."""
+    style = "B" if bold else ""
+    for size in range(max_size, min_size - 1, -1):
+        pdf.set_font("Helvetica", style, size)
+        if all(pdf.get_string_width(t) <= col_width - 2 for t in texts):
+            return size
+    pdf.set_font("Helvetica", style, min_size)
+    return min_size
+
+
+def _write_pdf_table(path, title, subtitle_lines, headers, rows):
+    """Génère un PDF simple (titre, sous-titres, puis un tableau) à partir
+    de lignes déjà calculées (mêmes valeurs que pour les exports CSV/
+    Excel). `subtitle_lines` : liste de lignes de texte optionnelles sous
+    le titre (ex : entrées/prize pool). Paysage automatique au-delà de 6
+    colonnes, pour laisser assez de place à chacune. La taille de police
+    des en-têtes et des valeurs s'ajuste automatiquement (voir
+    _pdf_fit_font_size) pour ne jamais déborder d'une colonne."""
+    from fpdf import FPDF
+
+    orientation = "L" if len(headers) > 6 else "P"
+    pdf = FPDF(orientation=orientation, unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _pdf_text(title), border=0)
+    pdf.ln(10)
+    if subtitle_lines:
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(90, 90, 90)
+        for line in subtitle_lines:
+            pdf.cell(0, 6, _pdf_text(line), border=0)
+            pdf.ln(6)
+        pdf.set_text_color(0, 0, 0)
+    pdf.ln(4)
+
+    avail_width = pdf.w - pdf.l_margin - pdf.r_margin
+    col_width = avail_width / max(1, len(headers))
+    row_height = 7
+
+    header_texts = [_pdf_text(h) for h in headers]
+    _pdf_fit_font_size(pdf, header_texts, col_width, bold=True)
+    pdf.set_fill_color(31, 78, 36)
+    pdf.set_text_color(255, 255, 255)
+    for h in header_texts:
+        pdf.cell(col_width, row_height + 1, h, border=1, align="C", fill=True)
+    pdf.ln(row_height + 1)
+
+    body_texts = [_pdf_text(c) for row in rows for c in row] or [""]
+    _pdf_fit_font_size(pdf, body_texts, col_width, bold=False)
+    pdf.set_text_color(0, 0, 0)
+    fill_toggle = False
+    for row in rows:
+        if fill_toggle:
+            pdf.set_fill_color(247, 241, 227)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+        for cell in row:
+            pdf.cell(col_width, row_height, _pdf_text(cell), border=1, align="C", fill=True)
+        pdf.ln(row_height)
+        fill_toggle = not fill_toggle
+
+    pdf.output(path)
+    return path
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -36,6 +124,7 @@ CREATE TABLE IF NOT EXISTS players (
     elim_time TEXT,
     bounty INTEGER NOT NULL DEFAULT 0,       -- prime actuellement portée par ce joueur
     bounty_won INTEGER NOT NULL DEFAULT 0,   -- cumul des primes empochées (en cash)
+    kills INTEGER NOT NULL DEFAULT 0,        -- nb de joueurs éliminés par ce joueur (prime de bounty en points)
     FOREIGN KEY(table_id) REFERENCES tables_pk(id)
 );
 
@@ -102,6 +191,35 @@ DEFAULT_SETTINGS = {
 }
 
 
+def ranking_points(place, n_players, flat_value=0):
+    """Valeur en points de la prime de classement pour un rang `place`
+    parmi `n_players` joueurs au total dans le tournoi. Si `flat_value`
+    (réglage manuel, non nul) est fourni, il est utilisé tel quel pour
+    tout le monde ; sinon on applique la formule 100×√N/P, pensée pour ne
+    pas distribuer une masse de points disproportionnée sur les petites
+    tables (elle grandit avec le nombre de joueurs et décroît avec un
+    rang moins bon)."""
+    if flat_value:
+        return flat_value
+    if not place or place <= 0 or n_players <= 0:
+        return 0
+    return round(100 * math.sqrt(n_players) / place)
+
+
+def bounty_unit_value(n_players, flat_value=0):
+    """Valeur en points d'un bounty (un joueur éliminé) dans un tournoi de
+    `n_players` joueurs au total. Si `flat_value` (réglage manuel, non nul)
+    est fourni, il est utilisé tel quel pour tout le monde ; sinon on
+    applique la formule 10×√N — plus le champ est grand, plus éliminer un
+    adversaire y est statistiquement difficile, donc plus le bounty
+    rapporte."""
+    if flat_value:
+        return flat_value
+    if n_players <= 0:
+        return 0
+    return round(10 * math.sqrt(n_players))
+
+
 class Database:
     def __init__(self, path):
         self.path = path
@@ -115,12 +233,14 @@ class Database:
     def _migrate(self):
         """Ajoute les colonnes apparues après la création initiale du
         fichier .tournoi (les anciens fichiers n'ont pas 'bounty' /
-        'bounty_won' sur la table players)."""
+        'bounty_won' / 'kills' sur la table players)."""
         cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(players)")}
         if "bounty" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN bounty INTEGER NOT NULL DEFAULT 0")
         if "bounty_won" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN bounty_won INTEGER NOT NULL DEFAULT 0")
+        if "kills" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN kills INTEGER NOT NULL DEFAULT 0")
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -255,6 +375,34 @@ class Database:
             "SELECT * FROM players WHERE id=?", (player_id,)
         ).fetchone()
 
+    def find_active_conflict(self, player_name):
+        """Renvoie le chemin du fichier .tournoi (dans le même dossier que
+        celui-ci, non récursif, et daté du même jour — voir plus bas) où
+        `player_name` est actuellement un joueur actif, ou None s'il n'y
+        en a pas. Sert à empêcher d'inscrire par erreur un même joueur sur
+        deux tournois en cours à la fois (ex : deux Sit & Go simultanés
+        dans la même salle). Les autres fichiers ne sont consultés qu'en
+        lecture seule. Si ce tournoi n'a pas encore été sauvegardé sur
+        disque, aucune vérification n'est possible (renvoie None).
+
+        Seuls les tournois datés du même jour que celui-ci sont comparés :
+        un ancien fichier abandonné (jamais terminé, un autre jour) ne
+        doit pas bloquer indéfiniment un joueur qui n'est plus vraiment
+        "en jeu ailleurs"."""
+        if not self.path or not os.path.exists(self.path) or not player_name.strip():
+            return None
+        folder = os.path.dirname(os.path.abspath(self.path)) or "."
+        today = self.get_tournament_date()
+        name_lower = player_name.strip().lower()
+        for path in find_tournament_files(folder, recursive=False):
+            if os.path.abspath(path) == os.path.abspath(self.path):
+                continue
+            if today and _read_tournament_date_ro(path) != today:
+                continue
+            if _player_active_in_file(path, name_lower):
+                return path
+        return None
+
     def add_player(self, name):
         starting_chips = self.get_setting_int("starting_chips", 10000)
         bounty_amount = self.get_setting_int("bounty_amount", 0)
@@ -313,11 +461,14 @@ class Database:
         self.conn.commit()
 
     def eliminate_player(self, player_id, eliminated_by_id=None):
-        """Élimine un joueur. Si `eliminated_by_id` est fourni et que le
-        joueur éliminé porte une prime (bounty), celle-ci est versée à
-        l'éliminateur : intégralement en mode classique, ou selon le
-        partage PKO (une partie en cash immédiat, le reste ajouté à la
-        prime de l'éliminateur) en mode progressif."""
+        """Élimine un joueur. Si `eliminated_by_id` est fourni, l'éliminateur
+        voit son compteur de bounty (kills, prime de bounty en points —
+        voir get_bounty_bonuses) incrémenté de 1, quel que soit l'ancien
+        mécanisme de bounty en €. Si en plus le joueur éliminé portait une
+        prime (bounty €), celle-ci est versée à l'éliminateur : intégralement
+        en mode classique, ou selon le partage PKO (une partie en cash
+        immédiat, le reste ajouté à la prime de l'éliminateur) en mode
+        progressif."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
@@ -328,6 +479,11 @@ class Database:
             "table_id=NULL, seat=NULL WHERE id=?",
             (place, now, player_id),
         )
+
+        if eliminated_by_id:
+            self.conn.execute(
+                "UPDATE players SET kills = kills + 1 WHERE id=?", (eliminated_by_id,)
+            )
 
         if eliminated_by_id and eliminated and eliminated["bounty"] > 0:
             bounty = eliminated["bounty"]
@@ -431,12 +587,19 @@ class Database:
         table/siège -> nouvelle table/siège) dans l'historique des
         mouvements (onglet Mouvements) — ce n'est le cas que pour les
         rééquilibrages déclenchés par une élimination de joueur. Renvoie
-        dans tous les cas la liste des mouvements effectués."""
+        dans tous les cas la liste des mouvements effectués.
+
+        Ne fait rien quand il reste 0 ou 1 joueur actif : à 1 seul joueur
+        actif, le tournoi est terminé (il n'y a plus personne à équilibrer
+        entre tables) — sans ce garde-fou, le vainqueur pouvait se
+        retrouver déplacé vers une table "consolidée" au tout dernier
+        rééquilibrage et apparaître à tort dans l'historique des
+        mouvements alors que la partie est finie."""
         active_players = [
             dict(p) for p in self.list_players(status="active")
         ]
         n_active = len(active_players)
-        if n_active == 0:
+        if n_active <= 1:
             return []
 
         before_state = {p["id"]: (p["table_id"], p["seat"]) for p in active_players}
@@ -591,6 +754,13 @@ class Database:
     def count_seat_moves(self):
         return self.conn.execute("SELECT COUNT(*) c FROM seat_moves").fetchone()["c"]
 
+    def clear_seat_moves(self):
+        """Vide l'historique des déplacements (onglet Mouvements) — utilisé
+        par le bouton "Terminé" une fois les joueurs déplacés installés à
+        leur nouvelle table."""
+        self.conn.execute("DELETE FROM seat_moves")
+        self.conn.commit()
+
     # ---------- primes (bounty) ----------
     def get_bounty_events(self, limit=500):
         """Historique des primes gagnées (le plus récent en premier), pour
@@ -612,6 +782,301 @@ class Database:
         return self.conn.execute(
             "SELECT * FROM players WHERE bounty_won > 0 ORDER BY bounty_won DESC"
         ).fetchall()
+
+    def get_presence_bonuses(self):
+        """Prime de présence (en points) : chaque joueur du tournoi en
+        cours reçoit `attendance_bonus_points` (réglage) pour le simple
+        fait d'avoir participé à ce tournoi, 0 si le réglage est nul.
+        Renvoie {nom: points}."""
+        points = self.get_setting_int("attendance_bonus_points", 0)
+        return {p["name"]: points for p in self.list_players()}
+
+    def get_assiduity_bonuses(self):
+        """Calcule la prime d'assiduité (en points) de chaque joueur du
+        tournoi en cours. Contrôlée par deux réglages :
+        - `assiduity_bonus_points` : montant en points (0/nul = prime
+          désactivée) ;
+        - `assiduity_consecutive_days` : nombre de présences consécutives
+          requises, ce tournoi inclus (0/nul = prime désactivée aussi). 2
+          = présent ce tournoi-ci ET le précédent ; 3 = ce tournoi-ci et
+          les 2 précédents ; etc.
+        Un joueur est éligible s'il figure dans TOUS les
+        (`assiduity_consecutive_days` - 1) fichiers .tournoi précédents
+        immédiats (même dossier, non récursif) — s'il manque ne serait-ce
+        qu'un de ces tournois dans son historique, ou qu'il n'y a pas
+        encore assez de tournois précédents, il n'est pas éligible.
+        Renvoie une liste de dicts {name, present_previous, points} triée
+        par nom ; liste vide si la prime est désactivée (l'un des deux
+        réglages à 0)."""
+        points = self.get_setting_int("assiduity_bonus_points", 0)
+        consecutive_days = self.get_setting_int("assiduity_consecutive_days", 0)
+        if points <= 0 or consecutive_days <= 0:
+            return []
+
+        needed_previous = consecutive_days - 1
+        if needed_previous == 0:
+            # 1 seule présence "consécutive" requise : ce tournoi-ci suffit.
+            eligible_names = {p["name"].strip().lower() for p in self.list_players()}
+        else:
+            prev_files = find_previous_tournament_files(
+                self.path, self.get_tournament_date(), count=needed_previous
+            )
+            if len(prev_files) < needed_previous:
+                eligible_names = set()  # pas encore assez d'historique
+            else:
+                name_sets = [
+                    {n.strip().lower() for n in read_player_names_from_file(fp)}
+                    for fp in prev_files
+                ]
+                eligible_names = set.intersection(*name_sets)
+
+        result = [
+            {
+                "name": p["name"],
+                "present_previous": p["name"].strip().lower() in eligible_names,
+                "points": points if p["name"].strip().lower() in eligible_names else 0,
+            }
+            for p in self.list_players()
+        ]
+        result.sort(key=lambda r: r["name"].casefold())
+        return result
+
+    def get_ranking_bonuses(self):
+        """Calcule la prime de classement (en points) de chaque joueur dont
+        le rang est déjà connu : un joueur éliminé (place déjà attribuée),
+        ou le vainqueur une fois le tournoi terminé (même convention que le
+        rang affiché dans l'onglet Joueurs / les exports). Les joueurs
+        encore actifs en cours de tournoi (rang pas encore connu) n'ont pas
+        de ligne. Renvoie une liste de dicts {name, place, nombre, valeur,
+        montant} (montant = nombre × valeur), triée par rang croissant."""
+        flat_value = self.get_setting_int("ranking_bonus_points", 0)
+        n_players = self.get_stats()["total_players_ever"]
+        all_players = self.list_players()
+        active = [p for p in all_players if p["status"] == "active"]
+        finished = len(active) == 1
+
+        result = []
+        for p in all_players:
+            place = None
+            if p["status"] == "eliminated":
+                place = p["place"]
+            elif p["status"] == "active" and finished:
+                place = 1
+            if place is None:
+                continue
+            valeur = ranking_points(place, n_players, flat_value)
+            result.append({
+                "name": p["name"], "place": place,
+                "nombre": 1, "valeur": valeur, "montant": valeur,
+            })
+        result.sort(key=lambda r: r["place"])
+        return result
+
+    def get_bounty_bonuses(self):
+        """Calcule la prime de bounty (en points) de chaque joueur du
+        tournoi en cours : Nombre = nombre de joueurs qu'il a éliminés
+        (players.kills, incrémenté sur toute élimination avec éliminateur
+        désigné — indépendant de l'ancien mécanisme de bounty en €/PKO),
+        Valeur = réglage manuel `bounty_amount` s'il est non nul, sinon
+        10×√N points par bounty (N = nombre total de joueurs du tournoi),
+        Montant = Nombre × Valeur. Renvoie une liste de dicts
+        {name, nombre, valeur, montant} pour tous les joueurs, triée par
+        montant décroissant."""
+        flat_value = self.get_setting_int("bounty_amount", 0)
+        n_players = self.get_stats()["total_players_ever"]
+        valeur = bounty_unit_value(n_players, flat_value)
+        result = [
+            {
+                "name": p["name"], "nombre": p["kills"],
+                "valeur": valeur, "montant": p["kills"] * valeur,
+            }
+            for p in self.list_players()
+        ]
+        result.sort(key=lambda r: (-r["montant"], r["name"].casefold()))
+        return result
+
+    def get_primes_summary(self, sort_column=None, ascending=True):
+        """Construit, pour chaque joueur du tournoi en cours, la ligne
+        récapitulative des primes en points affichée dans l'onglet Primes
+        (présence, assiduité, rang, classement, bounty nombre/valeur/
+        montant, TOTAL). Utilisé aussi pour son export dédié.
+
+        `sort_column` : 'rang', 'bo_nombre' ou 'total' (autre valeur ou
+        None -> tri par défaut, TOTAL décroissant). Les valeurs manquantes
+        (ex : rang d'un joueur encore actif) sont toujours reléguées en
+        fin de liste, quel que soit le sens du tri."""
+        presence_by_name = self.get_presence_bonuses()
+        assiduity_by_name = {r["name"]: r for r in self.get_assiduity_bonuses()}
+        ranking_by_name = {r["name"]: r for r in self.get_ranking_bonuses()}
+        bounty_by_name = {r["name"]: r for r in self.get_bounty_bonuses()}
+
+        rows = []
+        for p in self.list_players():
+            name = p["name"]
+            presence = presence_by_name.get(name, 0)
+            assiduite = assiduity_by_name.get(name, {}).get("points", 0)
+            rk = ranking_by_name.get(name)
+            rang, cl_montant = (rk["place"], rk["montant"]) if rk else (None, 0)
+            bt = bounty_by_name.get(name, {"nombre": 0, "valeur": 0, "montant": 0})
+            total = presence + assiduite + cl_montant + bt["montant"]
+            rows.append({
+                "name": name, "presence": presence, "assiduite": assiduite,
+                "rang": rang, "cl_montant": cl_montant,
+                "bo_nombre": bt["nombre"], "bo_valeur": bt["valeur"], "bo_montant": bt["montant"],
+                "total": total,
+            })
+
+        if sort_column in ("rang", "bo_nombre", "total"):
+            def sort_key(r):
+                v = r[sort_column]
+                if v is None:
+                    return (1, 0, r["name"].casefold())
+                return (0, v if ascending else -v, r["name"].casefold())
+            rows.sort(key=sort_key)
+        else:
+            rows.sort(key=lambda r: (-r["total"], r["name"].casefold()))
+        return rows
+
+    def export_primes_csv(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Primes tel qu'affiché, en CSV.
+        `columns` : sous-ensemble de clés de PRIMES_COLUMNS (None =
+        toutes). `sort_column`/`ascending` : voir get_primes_summary."""
+        import csv
+
+        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for _, h, _ in cols])
+            for r in self.get_primes_summary(sort_column=sort_column, ascending=ascending):
+                writer.writerow([fn(r) for _, _, fn in cols])
+        return path
+
+    def export_primes_xlsx(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Primes au format Excel (.xlsx).
+        `columns`, `sort_column`, `ascending` : voir export_primes_csv.
+        Nécessite 'openpyxl'."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Primes"
+
+        name = self.get_setting("tournament_name", "Tournoi")
+        ws.append([name])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append(["Primes en points : présence, assiduité, classement, bounty"])
+        ws["A2"].font = Font(italic=True)
+        ws.append([])
+
+        headers = [h for _, h, _ in cols]
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
+
+        widths = {"name": 22, "presence": 12, "assiduite": 12, "rang": 10,
+                  "cl_montant": 14, "bo_nombre": 12, "bo_valeur": 12,
+                  "bo_montant": 12, "total": 12}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
+
+        wb.save(path)
+        return path
+
+    def export_primes_pdf(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Primes en PDF. `columns`,
+        `sort_column`, `ascending` : voir export_primes_csv. Nécessite
+        'fpdf2'."""
+        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
+        name = self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            ["Primes en points : présence, assiduité, classement, bounty"],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
+
+    def export_bounty_history_csv(self, path, columns=None):
+        """Exporte l'historique du bounty progressif (mécanisme PKO
+        interne, 2e tableau de l'onglet Primes), en CSV. `columns` :
+        sous-ensemble de clés de BOUNTY_HISTORY_COLUMNS (None = toutes)."""
+        import csv
+
+        cols = _selected_period_columns(BOUNTY_HISTORY_COLUMNS, columns)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for _, h, _ in cols])
+            for r in self.get_bounty_events(limit=10000):
+                writer.writerow([fn(r) for _, _, fn in cols])
+        return path
+
+    def export_bounty_history_xlsx(self, path, columns=None):
+        """Exporte l'historique du bounty progressif au format Excel
+        (.xlsx). `columns` : voir export_bounty_history_csv. Nécessite
+        'openpyxl'."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(BOUNTY_HISTORY_COLUMNS, columns)
+        rows = self.get_bounty_events(limit=10000)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Historique bounty"
+
+        name = self.get_setting("tournament_name", "Tournoi")
+        ws.append([name])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append(["Historique du bounty progressif (mécanisme PKO interne)"])
+        ws["A2"].font = Font(italic=True)
+        ws.append([])
+
+        headers = [h for _, h, _ in cols]
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
+
+        widths = {"time": 18, "eliminated": 20, "eliminator": 20, "amount": 14, "grow": 16}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
+
+        wb.save(path)
+        return path
+
+    def export_bounty_history_pdf(self, path, columns=None):
+        """Exporte l'historique du bounty progressif en PDF. `columns` :
+        voir export_bounty_history_csv. Nécessite 'fpdf2'."""
+        cols = _selected_period_columns(BOUNTY_HISTORY_COLUMNS, columns)
+        rows = self.get_bounty_events(limit=10000)
+        name = self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            ["Historique du bounty progressif (mécanisme PKO interne)"],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
 
     # ---------- blind structure ----------
     def get_blind_structure(self):
@@ -696,6 +1161,42 @@ class Database:
             "prize_pool": prize_pool,
             "total_chips": total_chips,
             "avg_stack": avg_stack,
+        }
+
+    def get_live_status(self):
+        """Résumé de l'état courant du tournoi, pour l'affichage dans le
+        Lobby SNG (liste de plusieurs tournois à la fois) : nom, date,
+        joueurs actifs/total, niveau de blindes courant (ou pause), temps
+        restant dans ce niveau, chrono démarré/en pause, tournoi terminé.
+        Ne modifie rien (ne fait pas avancer automatiquement de niveau,
+        contrairement à l'onglet Chronomètre — une simple consultation ne
+        doit pas altérer le déroulé du tournoi)."""
+        stats = self.get_stats()
+        level = self.get_current_level()
+        clock_started = self.get_setting_int("clock_started", 0) == 1
+        is_paused = self.get_setting_int("is_paused", 1) == 1
+        remaining_seconds = None
+        if level is not None:
+            duration = level["duration_minutes"] * 60
+            if not clock_started:
+                elapsed = 0
+            elif is_paused:
+                elapsed = self.get_setting_int("paused_accum_seconds", 0)
+            else:
+                start = self.get_setting_int("level_start_epoch", int(time.time()))
+                elapsed = int(time.time()) - start
+            remaining_seconds = max(0, duration - elapsed)
+        finished = stats["active_count"] <= 1 and stats["total_players_ever"] > 1
+        return {
+            "name": self.get_setting("tournament_name", "Tournoi"),
+            "date": self.get_tournament_date(),
+            "active_count": stats["active_count"],
+            "total_players_ever": stats["total_players_ever"],
+            "level": level,
+            "remaining_seconds": remaining_seconds,
+            "clock_started": clock_started,
+            "is_paused": is_paused,
+            "finished": finished,
         }
 
     def get_payouts_amounts(self):
@@ -875,6 +1376,22 @@ class Database:
         wb.save(path)
         return path
 
+    def export_results_pdf(self, path, columns=None):
+        """Exporte le classement final en PDF. `columns` : voir
+        export_results_csv. Nécessite le paquet 'fpdf2'."""
+        cols = _selected_period_columns(RESULT_COLUMNS, columns)
+        if columns is None and not self._bounty_in_use():
+            cols = [c for c in cols if c[0] != "bounty_won"]
+        rows = self._results_rows()
+        stats = self.get_stats()
+        name = self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            [f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} EUR"],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
+
     def export_payouts_csv(self, path, columns=None):
         """Exporte la grille de gains telle qu'affichée dans l'onglet
         Gains (place, pourcentage, montant — sans nom de joueur), en CSV.
@@ -931,6 +1448,20 @@ class Database:
 
         wb.save(path)
         return path
+
+    def export_payouts_pdf(self, path, columns=None):
+        """Exporte la grille de gains en PDF. `columns` : voir
+        export_payouts_csv. Nécessite le paquet 'fpdf2'."""
+        cols = _selected_period_columns(PAYOUT_COLUMNS, columns)
+        rows = self.get_payouts_amounts()
+        stats = self.get_stats()
+        name = self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            [f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} EUR"],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
 
     def export_players_csv(self, path, columns=None, sort_column=None, ascending=True):
         """Exporte le tableau de l'onglet Joueurs tel qu'affiché (nom,
@@ -994,6 +1525,21 @@ class Database:
         wb.save(path)
         return path
 
+    def export_players_pdf(self, path, columns=None, sort_column=None, ascending=True):
+        """Exporte le tableau de l'onglet Joueurs en PDF. `columns`,
+        `sort_column`, `ascending` : voir export_players_csv. Nécessite
+        le paquet 'fpdf2'."""
+        cols = _selected_period_columns(PLAYERS_TAB_COLUMNS, columns)
+        rows = self.players_rows(sort_column=sort_column, ascending=ascending)
+        stats = self.get_stats()
+        name = self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            [f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} EUR"],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
+
     def close(self):
         self.conn.close()
 
@@ -1030,6 +1576,206 @@ def find_tournament_files(folder, recursive=True):
     sous-dossiers si `recursive` est vrai."""
     pattern = os.path.join(folder, "**", "*.tournoi") if recursive else os.path.join(folder, "*.tournoi")
     return sorted(glob.glob(pattern, recursive=recursive))
+
+
+def _read_tournament_date_ro(path):
+    """Comme Database.get_tournament_date, mais en lecture seule (URI
+    mode=ro) pour ne jamais créer ni modifier le fichier consulté — même
+    précaution que read_player_names_from_file, appliquée ici pour pouvoir
+    comparer les dates de plusieurs tournois (dossier entier) sans toucher
+    aux fichiers des autres soirées."""
+    try:
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return ""
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key='tournament_date'"
+        ).fetchone()
+        if row and row[0]:
+            return row[0]
+        st = os.stat(path)
+        ts = getattr(st, "st_birthtime", None)
+        if ts is None:
+            ts = st.st_mtime
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+    except sqlite3.OperationalError:
+        return ""
+    finally:
+        conn.close()
+
+
+def _player_active_in_file(path, name_lower):
+    """Vrai si un joueur nommé `name_lower` (déjà en minuscules) est
+    actuellement 'active' dans le fichier .tournoi `path`, consulté en
+    lecture seule (même précaution que _read_tournament_date_ro)."""
+    try:
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM players WHERE status='active' AND lower(name)=? LIMIT 1",
+            (name_lower,),
+        ).fetchone()
+        return row is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        conn.close()
+
+
+def _active_player_names_lower_in_file(path):
+    """Ensemble des noms (en minuscules) actuellement 'active' dans le
+    fichier .tournoi `path`, consulté en lecture seule."""
+    try:
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return set()
+    try:
+        rows = conn.execute("SELECT lower(name) FROM players WHERE status='active'").fetchall()
+        return {r[0] for r in rows}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+
+
+def find_players_active_elsewhere(folder, names, exclude_path=None, date=None):
+    """Parmi `names`, renvoie l'ensemble de ceux actuellement actifs dans
+    un fichier .tournoi du dossier `folder` (recherche non récursive, hors
+    `exclude_path`) — utilisé pour griser, dans la fenêtre "Joueurs
+    participants", les joueurs déjà engagés dans un autre tournoi en cours
+    du même dossier (ex : un autre Sit & Go). Ne modifie aucun fichier.
+
+    Si `date` (AAAA-MM-JJ) est fourni, seuls les tournois datés du même
+    jour sont comparés : un ancien fichier abandonné (jamais terminé, un
+    autre jour) ne doit pas griser un joueur indéfiniment."""
+    if not folder or not names:
+        return set()
+    files = [
+        p for p in find_tournament_files(folder, recursive=False)
+        if not exclude_path or os.path.abspath(p) != os.path.abspath(exclude_path)
+    ]
+    if date:
+        files = [p for p in files if _read_tournament_date_ro(p) == date]
+    if not files:
+        return set()
+    wanted_by_lower = {n.strip().lower(): n for n in names}
+    conflicted = set()
+    for path in files:
+        for name_lower in _active_player_names_lower_in_file(path):
+            original = wanted_by_lower.get(name_lower)
+            if original:
+                conflicted.add(original)
+    return conflicted
+
+
+def _active_players_and_name_in_file(path):
+    """(nom_du_tournoi, [noms de joueurs actifs]) pour le fichier .tournoi
+    `path`, consulté en lecture seule."""
+    try:
+        uri = f"file:{os.path.abspath(path)}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.OperationalError:
+        return ("", [])
+    try:
+        name_row = conn.execute(
+            "SELECT value FROM settings WHERE key='tournament_name'"
+        ).fetchone()
+        tournament_name = (
+            name_row[0] if name_row and name_row[0]
+            else os.path.splitext(os.path.basename(path))[0]
+        )
+        rows = conn.execute("SELECT name FROM players WHERE status='active'").fetchall()
+        return (tournament_name, [r[0] for r in rows])
+    except sqlite3.OperationalError:
+        return ("", [])
+    finally:
+        conn.close()
+
+
+def find_stale_active_players(folder, before_date=None, recursive=True):
+    """Parcourt les fichiers .tournoi de `folder` (et ses sous-dossiers si
+    `recursive`), et renvoie ceux qui ont encore des joueurs 'active' —
+    utilisé par le bouton "Tout réactiver" du répertoire pour repérer les
+    joueurs restés coincés dans de vieux tournois abandonnés (jamais
+    terminés). Si `before_date` (AAAA-MM-JJ) est fourni, seuls les
+    tournois datés strictement avant sont pris en compte ; par défaut
+    (None), TOUS les tournois du dossier sont vérifiés, quelle que soit
+    leur date — la fenêtre de confirmation affichée avant application
+    (voir RosterManagerDialog._reactivate_all) reste le seul garde-fou.
+    Lecture seule (aucun fichier modifié ici). Renvoie une liste de dicts
+    {path, tournament_name, players: [noms]}."""
+    if not folder:
+        return []
+    results = []
+    for path in find_tournament_files(folder, recursive=recursive):
+        if before_date:
+            date = _read_tournament_date_ro(path)
+            if not date or date >= before_date:
+                continue
+        tournament_name, names = _active_players_and_name_in_file(path)
+        if names:
+            results.append({"path": path, "tournament_name": tournament_name, "players": names})
+    return results
+
+
+def withdraw_stale_active_players(stale_entries):
+    """Applique la correction repérée par find_stale_active_players : pour
+    chaque entrée, ouvre le fichier .tournoi en écriture et retire
+    (forfait, via Database.withdraw_player) chacun de ses joueurs encore
+    actifs. Renvoie le nombre total de joueurs libérés."""
+    total = 0
+    for entry in stale_entries:
+        db = Database(entry["path"])
+        try:
+            for p in db.list_players(status="active"):
+                db.withdraw_player(p["id"])
+                total += 1
+        finally:
+            db.close()
+    return total
+
+
+def find_previous_tournament_files(current_path, current_date=None, count=1):
+    """Renvoie jusqu'à `count` chemins de fichiers .tournoi datés avant
+    `current_date`, parmi les fichiers .tournoi présents dans le même
+    dossier que `current_path` (recherche non récursive : uniquement ce
+    dossier, pas ses sous-dossiers), du plus récent au plus ancien. Les
+    autres fichiers ne sont ouverts qu'en lecture seule (voir
+    `_read_tournament_date_ro`). Renvoie une liste vide si `current_path`
+    n'est pas encore sauvegardé sur disque, si `count` <= 0, ou si aucun
+    tournoi antérieur n'est trouvé (dates égales ou manquantes ignorées)."""
+    if not current_path or not os.path.exists(current_path) or count <= 0:
+        return []
+    folder = os.path.dirname(os.path.abspath(current_path)) or "."
+    if current_date is None:
+        current_date = _read_tournament_date_ro(current_path)
+    if not current_date:
+        return []
+
+    candidates = []  # (date, path)
+    for path in find_tournament_files(folder, recursive=False):
+        if os.path.abspath(path) == os.path.abspath(current_path):
+            continue
+        d = _read_tournament_date_ro(path)
+        if not d or d >= current_date:
+            continue
+        candidates.append((d, path))
+    candidates.sort(key=lambda c: c[0], reverse=True)  # plus récent en premier
+    return [path for _, path in candidates[:count]]
+
+
+def find_previous_tournament_file(current_path, current_date=None):
+    """Comme `find_previous_tournament_files` mais renvoie uniquement le
+    plus récent (ou None) — pratique quand on ne veut vérifier qu'un seul
+    tournoi précédent."""
+    found = find_previous_tournament_files(current_path, current_date, count=1)
+    return found[0] if found else None
 
 
 def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
@@ -1204,6 +1950,32 @@ PLAYERS_TAB_COLUMNS = [
     ("rang", "Rang", lambda p: p["rang"]),
 ]
 
+# Colonnes disponibles pour l'export de l'onglet Primes, dans le même ordre
+# que son tableau (nom, présence, assiduité, rang, classement, bounty
+# nombre/valeur/montant, total). Voir Database.get_primes_summary.
+PRIMES_COLUMNS = [
+    ("name", "Joueur", lambda r: r["name"]),
+    ("rang", "Rang", lambda r: r["rang"]),
+    ("presence", "Présence", lambda r: r["presence"]),
+    ("assiduite", "Assiduité", lambda r: r["assiduite"]),
+    ("cl_montant", "Classement", lambda r: r["cl_montant"]),
+    ("bo_nombre", "Bounty — Nb", lambda r: r["bo_nombre"]),
+    ("bo_valeur", "Bounty — Val", lambda r: r["bo_valeur"]),
+    ("bo_montant", "Bounty — Mt", lambda r: r["bo_montant"]),
+    ("total", "TOTAL", lambda r: r["total"]),
+]
+
+# Colonnes disponibles pour l'export de la 2e table de l'onglet Primes,
+# l'historique du bounty progressif (mécanisme PKO interne, voir
+# get_bounty_events) — distinct du récapitulatif ci-dessus.
+BOUNTY_HISTORY_COLUMNS = [
+    ("time", "Heure", lambda r: r["event_time"]),
+    ("eliminated", "Joueur éliminé", lambda r: r["eliminated_name"]),
+    ("eliminator", "Éliminé par", lambda r: r["eliminator_name"] or "-"),
+    ("amount", "Points gagnés", lambda r: r["amount_won"]),
+    ("grow", "Ajouté à sa prime", lambda r: r["added_to_eliminator_bounty"] or 0),
+]
+
 
 def _selected_period_columns(columns, keys):
     """Sous-ensemble de `columns` (une des listes ci-dessus) correspondant
@@ -1281,4 +2053,61 @@ def export_period_summary_xlsx(summary, path, tournament_keys=None, player_keys=
         wb.active.title = "Synthèse"
 
     wb.save(path)
+    return path
+
+
+def export_period_summary_pdf(summary, path, tournament_keys=None, player_keys=None):
+    """Exporte une synthèse en PDF : une page 'Tournois de la période', une
+    page 'Classement des joueurs sur la période' (chacune omise si sa
+    sélection de colonnes est vide), avec les mêmes options que
+    export_period_summary_csv. Nécessite le paquet 'fpdf2'."""
+    from fpdf import FPDF
+
+    t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
+    p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    def _draw_section(title, cols, rows):
+        pdf.add_page()
+        pdf.set_font("Helvetica", "B", 16)
+        pdf.cell(0, 10, _pdf_text(title), border=0)
+        pdf.ln(12)
+
+        headers = [h for _, h, _ in cols]
+        avail_width = pdf.w - pdf.l_margin - pdf.r_margin
+        col_width = avail_width / max(1, len(headers))
+        row_height = 7
+
+        header_texts = [_pdf_text(h) for h in headers]
+        _pdf_fit_font_size(pdf, header_texts, col_width, bold=True)
+        pdf.set_fill_color(31, 78, 36)
+        pdf.set_text_color(255, 255, 255)
+        for h in header_texts:
+            pdf.cell(col_width, row_height + 1, h, border=1, align="C", fill=True)
+        pdf.ln(row_height + 1)
+
+        body_texts = [_pdf_text(fn(row)) for row in rows for _, _, fn in cols] or [""]
+        _pdf_fit_font_size(pdf, body_texts, col_width, bold=False)
+        pdf.set_text_color(0, 0, 0)
+        fill_toggle = False
+        for row in rows:
+            if fill_toggle:
+                pdf.set_fill_color(247, 241, 227)
+            else:
+                pdf.set_fill_color(255, 255, 255)
+            for _, _, fn in cols:
+                pdf.cell(col_width, row_height, _pdf_text(fn(row)), border=1, align="C", fill=True)
+            pdf.ln(row_height)
+            fill_toggle = not fill_toggle
+
+    if t_cols:
+        _draw_section("Tournois de la période", t_cols, summary["tournaments"])
+    if p_cols:
+        _draw_section("Classement des joueurs sur la période", p_cols, summary["players"])
+    if not t_cols and not p_cols:
+        pdf.add_page()  # évite un PDF sans aucune page si tout est décoché
+
+    pdf.output(path)
     return path
