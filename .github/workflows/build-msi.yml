@@ -34,13 +34,16 @@ jobs:
         # Écrit _license_secret.py à partir du secret de dépôt LICENSE_SECRET
         # (Settings → Secrets and variables → Actions → New repository
         # secret) — jamais commité, voir license.py et .gitignore. Sans ce
-        # secret configuré, l'étape ne fait rien et l'exécutable produit ne
-        # demandera jamais d'activation.
-        if: ${{ secrets.LICENSE_SECRET != '' }}
+        # secret configuré, cette étape ne fait rien et l'exécutable produit
+        # ne demandera jamais d'activation. (Le test se fait dans le script
+        # plutôt que via un "if:" sur secrets.*, qui provoquait un "Startup
+        # failure" au démarrage du workflow.)
         env:
           LICENSE_SECRET: ${{ secrets.LICENSE_SECRET }}
         run: |
-          "SECRET = '$env:LICENSE_SECRET'" | Out-File -Encoding utf8 _license_secret.py
+          if ($env:LICENSE_SECRET) {
+            "SECRET = '$env:LICENSE_SECRET'" | Out-File -Encoding utf8 _license_secret.py
+          }
 
       - name: Génération de PokerTournament.exe (PyInstaller)
         run: |
