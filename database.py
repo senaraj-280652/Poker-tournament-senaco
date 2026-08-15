@@ -241,6 +241,10 @@ class Database:
             self.conn.execute("ALTER TABLE players ADD COLUMN bounty_won INTEGER NOT NULL DEFAULT 0")
         if "kills" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN kills INTEGER NOT NULL DEFAULT 0")
+        if "elim_round" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN elim_round INTEGER")
+        if "eliminated_by_name" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN eliminated_by_name TEXT")
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -468,16 +472,20 @@ class Database:
         prime (bounty €), celle-ci est versée à l'éliminateur : intégralement
         en mode classique, ou selon le partage PKO (une partie en cash
         immédiat, le reste ajouté à la prime de l'éliminateur) en mode
-        progressif."""
+        progressif. Enregistre aussi, pour l'onglet Joueurs, le round et le
+        nom de l'éliminateur (indépendamment de tout bounty en €)."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        current_round = self.get_current_round_number()
+        eliminator_row = self.get_player(eliminated_by_id) if eliminated_by_id else None
+        eliminator_name = eliminator_row["name"] if eliminator_row else None
 
         self.conn.execute(
             "UPDATE players SET status='eliminated', place=?, elim_time=?, "
-            "table_id=NULL, seat=NULL WHERE id=?",
-            (place, now, player_id),
+            "elim_round=?, eliminated_by_name=?, table_id=NULL, seat=NULL WHERE id=?",
+            (place, now, current_round, eliminator_name, player_id),
         )
 
         if eliminated_by_id:
@@ -1121,6 +1129,21 @@ class Database:
             "SELECT * FROM blind_levels WHERE level_order=?", (order + 1,)
         ).fetchone()
 
+    def get_current_round_number(self):
+        """Numéro de round au sens de l'onglet Blindes (une pause ne compte
+        pas comme un round à part entière, contrairement à
+        current_level_order qui numérote toutes les lignes de la
+        structure, pauses comprises) — utilisé pour horodater les
+        éliminations (colonne "Round" de l'onglet Joueurs)."""
+        order = self.get_setting_int("current_level_order", 0)
+        if not order:
+            return None
+        row = self.conn.execute(
+            "SELECT COUNT(*) c FROM blind_levels WHERE is_break=0 AND level_order<=?",
+            (order,),
+        ).fetchone()
+        return row["c"] or None
+
     # ---------- payout structure ----------
     def get_payout_structure(self):
         return self.conn.execute(
@@ -1288,6 +1311,9 @@ class Database:
                 "bounty": p["bounty"],
                 "status": status_labels.get(p["status"], p["status"]),
                 "rang": rang,
+                "elim_time": p["elim_time"] or "",
+                "elim_round": p["elim_round"],
+                "eliminated_by": p["eliminated_by_name"] or "",
             })
 
         if sort_column == "name":
@@ -1298,6 +1324,10 @@ class Database:
             rows.sort(key=lambda r: ((r["table"] or "").lower(), r["seat"] or 0))
         elif sort_column == "rang":
             rows.sort(key=lambda r: r["rang"] or 1)
+        elif sort_column == "elim_time":
+            rows.sort(key=lambda r: r["elim_time"] or "")
+        elif sort_column == "eliminated_by":
+            rows.sort(key=lambda r: r["eliminated_by"].lower())
         if sort_column and not ascending:
             rows.reverse()
         return rows
@@ -1518,7 +1548,8 @@ class Database:
 
         widths = {"name": 22, "table": 14, "seat": 10, "chips": 12,
                   "buyin": 10, "rebuy": 10, "addon": 10, "bounty": 12,
-                  "status": 12, "rang": 10}
+                  "status": 12, "rang": 10, "elim_time": 18, "elim_round": 10,
+                  "eliminated_by": 18}
         for i, (key, _, _) in enumerate(cols, start=1):
             ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
 
@@ -1948,6 +1979,9 @@ PLAYERS_TAB_COLUMNS = [
     ("bounty", "Prime", lambda p: p["bounty"]),
     ("status", "Statut", lambda p: p["status"]),
     ("rang", "Rang", lambda p: p["rang"]),
+    ("elim_time", "Éliminé le", lambda p: p["elim_time"]),
+    ("elim_round", "Round", lambda p: p["elim_round"]),
+    ("eliminated_by", "Éliminé par", lambda p: p["eliminated_by"]),
 ]
 
 # Colonnes disponibles pour l'export de l'onglet Primes, dans le même ordre

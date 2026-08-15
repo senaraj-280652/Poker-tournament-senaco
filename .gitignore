@@ -34,6 +34,11 @@ files.zip
 # Réglages locaux de l'outil Claude Code (spécifiques à cette machine)
 .claude/
 
+# Clé secrète du verrou de licence (voir license.py) — NE JAMAIS versionner :
+# ce dépôt est public, un secret commité permettrait de fabriquer de fausses
+# licences. Généré une seule fois localement, réinjecté à chaque build.
+_license_secret.py
+
 # Fichiers verrous temporaires de Microsoft Word (créés pendant l'édition,
 # supprimés automatiquement à la fermeture du document)
 ~$*.doc

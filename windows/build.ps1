@@ -35,7 +35,27 @@ Write-Host "== 2/5 : installation des dépendances (PyInstaller, openpyxl, openc
 Write-Host "== 3/5 : génération de PokerTournament.exe (PyInstaller) ==" -ForegroundColor Cyan
 if (Test-Path "windows\dist") { Remove-Item -Recurse -Force "windows\dist" }
 if (Test-Path "windows\build") { Remove-Item -Recurse -Force "windows\build" }
+
+# Verrou anti-copie (voir license.py) : si un secret de licence est
+# disponible dans la variable d'environnement LICENSE_SECRET (ou déjà
+# présent localement dans _license_secret.py), on l'embarque dans
+# l'exécutable pour que le poste installé exige une activation. Sans lui,
+# l'exécutable démarre sans jamais demander de licence (comme en
+# développement) — pratique pour des builds de test, à éviter pour une
+# vraie distribution.
+$injectedSecret = $false
+if (-not (Test-Path "_license_secret.py") -and $env:LICENSE_SECRET) {
+    "SECRET = '$($env:LICENSE_SECRET)'" | Out-File -Encoding utf8 "_license_secret.py"
+    $injectedSecret = $true
+}
+if (Test-Path "_license_secret.py") {
+    Write-Host "   (verrou de licence activé pour ce build)" -ForegroundColor DarkGray
+} else {
+    Write-Host "   ATTENTION : _license_secret.py absent -> ce build ne demandera jamais d'activation." -ForegroundColor Yellow
+}
+
 & $venvPython -m PyInstaller windows\poker_tournament.spec --distpath windows\dist --workpath windows\build --noconfirm
+if ($injectedSecret) { Remove-Item -Force "_license_secret.py" }
 if (-not (Test-Path "windows\dist\PokerTournament.exe")) {
     throw "PyInstaller n'a pas produit windows\dist\PokerTournament.exe — voir le journal ci-dessus."
 }

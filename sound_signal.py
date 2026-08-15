@@ -87,3 +87,34 @@ def play_tone(frequency_hz, duration_ms):
     except Exception:
         pass
     return False
+
+
+def play_file(path):
+    """Joue un fichier .wav existant (choisi par l'utilisateur — voir les
+    boutons "Son début Pause"/"Son Fin Pause"/"Son fin Round" de l'onglet
+    Chronomètre), sans bloquer l'interface. Renvoie True si la lecture a
+    pu être lancée."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return True
+        elif sys.platform.startswith("win"):
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return True
+        else:
+            for player in ("paplay", "aplay"):
+                try:
+                    subprocess.Popen(
+                        [player, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                    return True
+                except FileNotFoundError:
+                    continue
+    except Exception:
+        pass
+    return False

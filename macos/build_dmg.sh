@@ -29,6 +29,19 @@ echo "== 2/5 : installation des dépendances (PyInstaller, openpyxl, opencv, Pil
 
 echo "== 3/5 : génération de PokerTournament.app (PyInstaller) =="
 rm -rf macos/dist macos/build
+
+# Verrou anti-copie (voir license.py) : nécessite un fichier local
+# _license_secret.py (jamais versionné — voir .gitignore et l'en-tête de
+# license.py). Absent de ce dossier, l'app produite démarre sans jamais
+# demander d'activation (utile pour des builds de test, à éviter pour une
+# vraie distribution).
+if [ -f "_license_secret.py" ]; then
+    echo "   (verrou de licence activé pour ce build)"
+else
+    echo "   ATTENTION : _license_secret.py absent -> ce build ne demandera jamais d'activation."
+    echo "   Voir l'en-tête de license.py pour le générer (une seule fois)."
+fi
+
 "$VENV_PY" -m PyInstaller macos/poker_tournament.spec --distpath macos/dist --workpath macos/build --noconfirm
 if [ ! -d "macos/dist/${APP_NAME}.app" ]; then
     echo "Erreur : PyInstaller n'a pas produit macos/dist/${APP_NAME}.app" >&2

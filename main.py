@@ -11,10 +11,11 @@ import sys
 import subprocess
 import time
 import json
+import csv
 import shutil
 from datetime import datetime, timedelta
 import tkinter as tk
-from tkinter import ttk, simpledialog, messagebox, filedialog
+from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
 
 from database import (
     Database, build_period_summary, export_period_summary_csv,
@@ -32,8 +33,11 @@ import tournament_prefs
 import export_prefs
 import blind_templates
 import settings_templates
+import chip_templates
 import player_photos
 import sound_signal
+import license as licensing
+from version import APP_VERSION
 
 # Photos de joueurs (aperçu + capture caméra) : dépendances optionnelles.
 # La copie/suppression des fichiers photo (player_photos.py) ne nécessite
@@ -912,6 +916,15 @@ class RosterManagerDialog(tk.Toplevel):
             command=self._import_from_tournament,
         ).pack(fill="x")
 
+        btns_csv = ttk.Frame(self)
+        btns_csv.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(
+            btns_csv, text="Importer (CSV)...", command=self._import_csv,
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            btns_csv, text="Exporter (CSV)...", command=self._export_csv,
+        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+
         btns3 = ttk.Frame(self)
         btns3.pack(fill="x", padx=12, pady=(0, 8))
         reactivate_btn = ttk.Button(
@@ -1213,6 +1226,104 @@ class RosterManagerDialog(tk.Toplevel):
         messagebox.showinfo(
             "Import terminé",
             f"{len(names)} joueur(s) ajouté(s) au répertoire depuis :\n{os.path.basename(path)}",
+        )
+
+    def _import_csv(self):
+        path = filedialog.askopenfilename(
+            title="Importer le répertoire depuis un CSV",
+            filetypes=[("Fichier CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                sample = f.read(4096)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+                except csv.Error:
+                    dialect = csv.excel
+                    dialect.delimiter = ";"
+                rows = list(csv.reader(f, dialect))
+        except OSError as e:
+            messagebox.showerror("Erreur", f"Impossible de lire ce fichier :\n{e}", parent=self)
+            return
+
+        # Ignore une éventuelle ligne d'en-tête (NOM / CLUB, ou variantes).
+        if rows and rows[0] and rows[0][0].strip().lower() in ("nom", "name", "joueur"):
+            rows = rows[1:]
+
+        cleaned_rows = []
+        for row in rows:
+            cells = [c.strip() for c in row]
+            if not cells or not cells[0]:
+                continue  # ligne vide, ou sans nom -> rien à importer
+            cleaned_rows.append(cells)
+
+        if not cleaned_rows:
+            messagebox.showinfo(
+                "Import terminé", "Aucun joueur trouvé dans ce fichier.", parent=self,
+            )
+            return
+
+        # Fichier à une seule colonne (aucun club renseigné, sur aucune
+        # ligne) -> propose un club unique à attribuer à tous les joueurs
+        # importés, plutôt que de les laisser sans club.
+        single_column = all(len(cells) < 2 or not cells[1] for cells in cleaned_rows)
+        default_club = None
+        if single_column:
+            default_club = simpledialog.askstring(
+                "Club des joueurs importés",
+                "Ce fichier ne contient que des noms (pas de club).\n"
+                "Club à attribuer à tous les joueurs importés :",
+                initialvalue="CPC", parent=self,
+            )
+            if default_club is None:
+                return  # import annulé
+            default_club = default_club.strip() or None
+
+        added = 0
+        for cells in cleaned_rows:
+            name = cells[0]
+            club = cells[1] if len(cells) >= 2 and cells[1] else default_club
+            roster.add_to_roster(name, club)
+            added += 1
+
+        self._refresh()
+        messagebox.showinfo(
+            "Import terminé",
+            f"{added} joueur(s) importé(s) depuis :\n{os.path.basename(path)}",
+            parent=self,
+        )
+
+    def _export_csv(self):
+        entries = roster.load_roster_entries()
+        if not entries:
+            messagebox.showinfo("Info", "Le répertoire est vide, rien à exporter.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exporter le répertoire en CSV",
+            defaultextension=".csv",
+            filetypes=[("Fichier CSV", "*.csv")],
+            initialfile="repertoire_joueurs.csv",
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["NOM", "CLUB"])
+                for e in entries:
+                    writer.writerow([e["name"], e["club"]])
+        except OSError as e:
+            messagebox.showerror("Erreur", f"Impossible d'écrire ce fichier :\n{e}", parent=self)
+            return
+        messagebox.showinfo(
+            "Export terminé",
+            f"{len(entries)} joueur(s) exporté(s) vers :\n{os.path.basename(path)}",
+            parent=self,
         )
 
     def _reactivate_all(self):
@@ -1619,6 +1730,99 @@ class SettingsTemplatesDialog(tk.Toplevel):
             "Confirmer", f"Supprimer définitivement le modèle « {name} » ?", parent=self,
         ):
             settings_templates.delete_template(name)
+            self._refresh()
+
+
+class ChipTemplatesDialog(tk.Toplevel):
+    """Liste les jeux de jetons enregistrés (voir chip_templates.py,
+    bouton "Enregistrer Jetons sous..." de l'onglet Blindes) : sélectionner
+    un modèle et cliquer "Charger sur ce tournoi" remplace les jetons du
+    tournoi actuellement ouvert par ceux du modèle choisi."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.app = master
+        self.title("Récupérer Jetons")
+        self.geometry("420x420")
+        self.grab_set()
+
+        ttk.Label(
+            self, text="Jeux de jetons enregistrés :",
+            font=("Helvetica", 10, "bold"),
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill="both", expand=True, padx=12)
+        self.listbox = tk.Listbox(list_frame, exportselection=False)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.bind("<Double-Button-1>", lambda e: self._load_selected())
+
+        if not chip_templates.list_templates():
+            ttk.Label(
+                self, foreground=MUTED,
+                text="(Aucun modèle enregistré pour l'instant — utilisez\n"
+                     "\"Enregistrer Jetons sous...\" dans l'onglet Blindes.)",
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=(6, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=12)
+        ttk.Button(btns, text="Charger sur ce tournoi", command=self._load_selected).pack(side="left")
+        ttk.Button(
+            btns, text="Supprimer", command=self._delete_selected, style="Danger.TButton",
+        ).pack(side="left", padx=6)
+        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right")
+
+        self._refresh()
+
+    def _refresh(self):
+        self.listbox.delete(0, "end")
+        for name in chip_templates.list_templates():
+            self.listbox.insert("end", name)
+
+    def _selected_name(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        return self.listbox.get(sel[0])
+
+    def _load_selected(self):
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo(
+                "Récupérer Jetons", "Sélectionnez d'abord un modèle.", parent=self,
+            )
+            return
+        denominations = chip_templates.load_template(name)
+        if denominations is None:
+            messagebox.showerror(
+                "Erreur", f"Impossible de lire le modèle « {name} ».", parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirmer",
+            f"Remplacer les jetons actuels de ce tournoi par le modèle « {name} » ?",
+            parent=self,
+        ):
+            return
+        self.app._persist_chip_denominations(denominations)
+        self.app._refresh_chips_tab()
+        messagebox.showinfo(
+            "Récupérer Jetons", f"Jetons « {name} » appliqués à ce tournoi.", parent=self,
+        )
+        self.destroy()
+
+    def _delete_selected(self):
+        name = self._selected_name()
+        if not name:
+            return
+        if messagebox.askyesno(
+            "Confirmer", f"Supprimer définitivement le modèle « {name} » ?", parent=self,
+        ):
+            chip_templates.delete_template(name)
             self._refresh()
 
 
@@ -2432,16 +2636,109 @@ class PrimesExportDialog(tk.Toplevel):
         open_file_with_default_app(path)
 
 
+class ActivationDialog(tk.Toplevel):
+    """Fenêtre d'activation de licence, affichée au démarrage tant que ce
+    poste n'a pas encore été activé (voir license.py). Bloque le
+    lancement de l'application tant qu'elle est ouverte ; `self.activated`
+    indique si une licence valide a été enregistrée avant sa fermeture."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.activated = False
+        self.title("Activation requise")
+        self.geometry("480x360")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+
+        ttk.Label(
+            self, text="Activation du logiciel", font=("Helvetica", 13, "bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(
+            self,
+            text="Ce poste n'est pas encore activé. Communiquez l'identifiant "
+                 "ci-dessous à l'éditeur pour recevoir votre clé de licence, "
+                 "puis saisissez-la ci-dessous (à faire une seule fois).",
+            wraplength=440, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 12))
+
+        id_frame = ttk.Frame(self)
+        id_frame.pack(fill="x", padx=16, pady=(0, 12))
+        ttk.Label(id_frame, text="Identifiant de cette machine :").pack(anchor="w")
+        row = ttk.Frame(id_frame)
+        row.pack(fill="x", pady=(4, 0))
+        self.id_entry = ttk.Entry(row, font=("Courier", 11))
+        self.id_entry.insert(0, licensing.machine_id_display())
+        self.id_entry.configure(state="readonly")
+        self.id_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Copier", command=self._copy_id).pack(side="left", padx=(6, 0))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Label(form, text="Nom du club :").pack(anchor="w")
+        self.club_entry = ttk.Entry(form)
+        self.club_entry.pack(fill="x", pady=(2, 10))
+        ttk.Label(form, text="Clé de licence :").pack(anchor="w")
+        self.key_entry = ttk.Entry(form, font=("Courier", 11))
+        self.key_entry.pack(fill="x", pady=(2, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=16, pady=16, side="bottom")
+        ttk.Button(btns, text="Quitter", command=self._quit).pack(side="right")
+        ttk.Button(btns, text="Activer", command=self._activate).pack(side="right", padx=(0, 6))
+
+        self.transient(master)
+        self.grab_set()
+        self.club_entry.focus_set()
+        self.wait_window(self)
+
+    def _copy_id(self):
+        self.clipboard_clear()
+        self.clipboard_append(licensing.machine_id_display())
+
+    def _activate(self):
+        club = self.club_entry.get().strip()
+        key = self.key_entry.get().strip()
+        if not club or not key:
+            messagebox.showerror(
+                "Activation", "Renseignez le nom du club et la clé de licence.", parent=self,
+            )
+            return
+        if not licensing.check_key(club, key):
+            messagebox.showerror(
+                "Activation",
+                "Clé invalide pour ce club sur cette machine.\n"
+                "Vérifiez l'orthographe exacte du club (celle communiquée à "
+                "l'éditeur) et la clé reçue.",
+                parent=self,
+            )
+            return
+        licensing.save_license(club, key)
+        self.activated = True
+        self.destroy()
+
+    def _quit(self):
+        self.activated = False
+        self.destroy()
+
+
 class App(tk.Tk):
     def __init__(self, open_path=None):
         super().__init__()
         self.withdraw()
-        self.title("Gestionnaire de Poker Senaco")
+        self.title(f"Gestionnaire de Poker Senaco  —  v{APP_VERSION}")
         self.geometry("1200x750")
 
         self.db = None
         self.clock_window = None
         self._apply_theme()
+
+        # Verrou anti-copie (voir license.py) : sans effet tant que le
+        # logiciel tourne depuis les sources (aucun secret injecté) ;
+        # actif uniquement sur un exécutable compilé pour distribution.
+        if not licensing.is_licensed():
+            if not ActivationDialog(self).activated:
+                self.destroy()
+                return
 
         # `open_path` : ouvre directement ce fichier .tournoi, sans passer
         # par l'écran d'accueil — utilisé quand une nouvelle fenêtre est
@@ -2679,10 +2976,24 @@ class App(tk.Tk):
                 return
             export_prefs.save_value("last_tournament_dir", os.path.dirname(os.path.abspath(path)))
             if os.path.exists(path):
-                # Le sélecteur de fichier a déjà demandé confirmation pour
-                # remplacer ce fichier : on repart alors d'une base
-                # complètement vierge (joueurs, tables, mouvements...),
-                # plutôt que de rouvrir silencieusement l'ancien tournoi.
+                # La fenêtre "Save" de macOS a déjà demandé une confirmation
+                # générique ("remplacer ce fichier ?"), qui ne dit pas que ça
+                # efface tout le tournoi existant — on le précise noir sur
+                # blanc ici, avec "Ouvrir un tournoi existant" en rappel,
+                # avant de repartir d'une base complètement vierge (joueurs,
+                # tables, mouvements, blindes, jetons...).
+                if not messagebox.askyesno(
+                    "Remplacer ce tournoi ?",
+                    f"« {os.path.basename(path)} » existe déjà et contient un "
+                    "tournoi.\n\nContinuer va TOUT effacer (joueurs, blindes, "
+                    "jetons, gains...) et repartir d'une base entièrement "
+                    "vierge sous ce même nom.\n\n"
+                    "Pour reprendre ce tournoi tel quel, annulez et utilisez "
+                    "plutôt « 📂 Ouvrir un tournoi existant » depuis l'écran "
+                    "d'accueil.\n\nEffacer et repartir de zéro ?",
+                    icon="warning", default="no",
+                ):
+                    return
                 try:
                     os.remove(path)
                 except OSError as e:
@@ -2715,6 +3026,19 @@ class App(tk.Tk):
                 return
             export_prefs.save_value("last_tournament_dir", os.path.dirname(os.path.abspath(path)))
             if os.path.exists(path):
+                # Voir le commentaire équivalent dans new_tournament() ci-dessus.
+                if not messagebox.askyesno(
+                    "Remplacer ce tournoi ?",
+                    f"« {os.path.basename(path)} » existe déjà et contient un "
+                    "tournoi.\n\nContinuer va TOUT effacer (joueurs, blindes, "
+                    "jetons, gains...) et repartir d'une base entièrement "
+                    "vierge sous ce même nom.\n\n"
+                    "Pour reprendre ce tournoi tel quel, annulez et utilisez "
+                    "plutôt « 📂 Ouvrir un tournoi existant » depuis l'écran "
+                    "d'accueil.\n\nEffacer et repartir de zéro ?",
+                    icon="warning", default="no",
+                ):
+                    return
                 try:
                     os.remove(path)
                 except OSError as e:
@@ -2880,7 +3204,21 @@ class App(tk.Tk):
         statsmenu.add_command(label="Synthèse par période...", command=self._open_period_summary)
         menubar.add_cascade(label="Statistiques", menu=statsmenu)
 
+        helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="À propos...", command=self._show_about)
+        menubar.add_cascade(label="Aide", menu=helpmenu)
+
         self.config(menu=menubar)
+
+    def _show_about(self):
+        lines = [
+            "Gestionnaire de Poker Senaco",
+            f"Version {APP_VERSION}",
+        ]
+        info = licensing.license_info()
+        if info is not None:
+            lines += ["", f"Club activé : {info['club_name']}", f"Machine : {info['machine_id']}"]
+        messagebox.showinfo("À propos", "\n".join(lines), parent=self)
 
     def _open_period_summary(self):
         PeriodSummaryDialog(self)
@@ -3067,8 +3405,10 @@ class App(tk.Tk):
         Tooltip(reinstate_btn, "Remet en jeu un joueur désactivé (forfait) ou éliminé par erreur.")
         ttk.Button(actions, text="Supprimer", command=self._delete_selected).pack(side="left", padx=3)
 
-        columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang")
-        headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang"]
+        columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang",
+                   "elim_time", "elim_round", "eliminated_by")
+        headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang",
+                   "Éliminé le", "Round", "Éliminé par"]
         self.players_columns = columns
         self.players_headers = headers
         # Colonnes qu'on a réduites à presque rien (voir
@@ -3101,8 +3441,11 @@ class App(tk.Tk):
         # "Rang" : classement final du joueur (100 pour le 1er éliminé d'un
         # champ de 100, 99 pour le 2e, etc. — voir _sort_players_by), triable.
         self.players_tree.heading("rang", command=lambda: self._sort_players_by("rang"))
+        self.players_tree.heading("elim_time", command=lambda: self._sort_players_by("elim_time"))
+        self.players_tree.heading("eliminated_by", command=lambda: self._sort_players_by("eliminated_by"))
         self.players_tree.column("sel", width=56, anchor="center", stretch=False)
         self.players_tree.column("name", width=180, anchor="w")
+        self.players_tree.column("elim_time", width=130, anchor="center")
         TreeHeadingTooltip(self.players_tree, {
             "sel": "Cocher pour inclure ce joueur dans les actions groupées\n(Éliminer, etc.).",
             "rang": "Place finale du joueur : 1 = vainqueur, un chiffre plus élevé\n= éliminé plus tôt. Vide tant que le joueur est encore en jeu.",
@@ -3110,6 +3453,9 @@ class App(tk.Tk):
             "buyin": "Nombre de buy-ins (entrées) de ce joueur dans ce tournoi.",
             "rebuy": "Nombre de recaves (rebuys).",
             "addon": "Nombre de recharges (add-ons).",
+            "elim_time": "Date et heure d'élimination de ce joueur, triable.",
+            "elim_round": "Round de la structure de blindes (onglet Blindes) où ce\njoueur a été éliminé.",
+            "eliminated_by": "Nom du joueur qui l'a éliminé, triable.",
         })
         self.players_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.players_tree.bind("<Button-1>", self._on_players_tree_click)
@@ -3161,7 +3507,10 @@ class App(tk.Tk):
         self._refresh_players_tab()
 
     def _update_sort_headings(self):
-        base_headers = {"name": "Nom", "status": "Statut", "table": "Table", "rang": "Rang"}
+        base_headers = {
+            "name": "Nom", "status": "Statut", "table": "Table", "rang": "Rang",
+            "elim_time": "Éliminé le", "eliminated_by": "Éliminé par",
+        }
         for col, label in base_headers.items():
             if self.players_sort["column"] == col:
                 arrow = " ▲" if self.players_sort["ascending"] else " ▼"
@@ -3559,6 +3908,21 @@ class App(tk.Tk):
         ids = self._checked_or_selected_ids()
         if not ids:
             return
+        # Un joueur doit toujours rester en jeu : c'est le vainqueur. On
+        # bloque donc toute élimination qui viderait la table (élimination
+        # du tout dernier actif, seul ou en groupe).
+        n_active = len(self.db.list_players(status="active"))
+        n_eliminable = sum(
+            1 for pid in ids
+            if (p := self.db.get_player(pid)) is not None and p["status"] == "active"
+        )
+        if n_eliminable and n_eliminable >= n_active:
+            messagebox.showerror(
+                "Impossible",
+                "Impossible d'éliminer le dernier joueur encore actif : il "
+                "doit toujours en rester au moins un — c'est le vainqueur.",
+            )
+            return
         if len(ids) == 1:
             p = self.db.get_player(ids[0])
             question = f"Éliminer {p['name']} du tournoi ?"
@@ -3771,6 +4135,10 @@ class App(tk.Tk):
             # tournoi (rang indéterminé) sont classés en tête, cohérent avec
             # un classement "du meilleur au moins bon".
             players.sort(key=lambda p: p["rang"] or 1)
+        elif sort_col == "elim_time":
+            players.sort(key=lambda p: p["elim_time"] or "")
+        elif sort_col == "eliminated_by":
+            players.sort(key=lambda p: (p["eliminated_by_name"] or "").lower())
         if sort_col and not self.players_sort["ascending"]:
             players.reverse()
         self._update_sort_headings()
@@ -3801,6 +4169,7 @@ class App(tk.Tk):
                     f"{p['chips']:,}".replace(",", " "),
                     p["buyin_count"], p["rebuy_count"], p["addon_count"],
                     bounty_txt, status, p["rang"] or "-",
+                    p["elim_time"] or "-", p["elim_round"] or "-", p["eliminated_by_name"] or "-",
                 ),
                 tags=tags,
             )
@@ -4238,6 +4607,27 @@ class App(tk.Tk):
         ttk.Button(struct_btns, text="Modifier durée (tous niveaux)", command=self._edit_level_duration).pack(pady=3, fill="x")
         ttk.Button(struct_btns, text="Modifier durée de la Pause", command=self._edit_break_duration).pack(pady=3, fill="x")
 
+        ttk.Separator(struct_btns, orient="horizontal").pack(fill="x", pady=(10, 6))
+        ttk.Label(struct_btns, text="Sons (clic droit pour retirer) :", foreground=MUTED).pack(anchor="w")
+        self._clock_sound_buttons = {}
+        for key, label in (
+            ("sound_break_start_path", "Son début Pause"),
+            ("sound_break_end_path", "Son Fin Pause"),
+            ("sound_round_end_path", "Son fin Round"),
+        ):
+            btn = ttk.Button(struct_btns, text=self._clock_sound_button_text(key, label))
+            btn.pack(pady=3, fill="x")
+            btn.config(command=lambda k=key, l=label, b=btn: self._choose_clock_sound(k, l, b))
+            btn.bind("<Button-2>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
+            btn.bind("<Button-3>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
+            Tooltip(
+                btn,
+                f"Fichier .wav joué automatiquement à chaque « {label.lower()} ».\n"
+                "Clic gauche : choisir/remplacer le fichier.\n"
+                "Clic droit : retirer le son configuré.",
+            )
+            self._clock_sound_buttons[key] = btn
+
     def _clock_resume(self):
         if self.db.get_setting_int("clock_started", 0) == 0:
             self.db.set_settings({
@@ -4354,6 +4744,7 @@ class App(tk.Tk):
             # niveau terminé -> passe automatiquement au suivant
             next_row = self.db.get_next_level()
             if next_row is not None:
+                self._play_level_transition_sounds(level, next_row)
                 self.db.set_settings({
                     "current_level_order": next_row["level_order"],
                     "level_start_epoch": int(time.time()),
@@ -4364,6 +4755,53 @@ class App(tk.Tk):
                 remaining = 0
         next_level = self.db.get_next_level()
         return remaining, level, next_level
+
+    def _play_level_transition_sounds(self, old_level, new_level):
+        """Joue les sons configurés (boutons "Son début Pause"/"Son Fin
+        Pause"/"Son fin Round" de l'onglet Chronomètre) au moment précis
+        où un niveau se termine automatiquement et cède la place au
+        suivant. "Son fin Round" concerne la fin de tout niveau de
+        blindes normal (pause ou non juste après) ; "Son début/Fin
+        Pause" concernent spécifiquement l'entrée/la sortie d'une pause —
+        les deux peuvent donc se jouer l'un après l'autre (ex. : un
+        niveau de blindes qui débouche sur une pause)."""
+        if not old_level["is_break"]:
+            self._play_clock_sound("sound_round_end_path")
+        if new_level["is_break"] and not old_level["is_break"]:
+            self._play_clock_sound("sound_break_start_path")
+        elif old_level["is_break"] and not new_level["is_break"]:
+            self._play_clock_sound("sound_break_end_path")
+
+    def _play_clock_sound(self, setting_key):
+        path = export_prefs.load_value(setting_key, "")
+        if path:
+            sound_signal.play_file(path)
+
+    def _clock_sound_button_text(self, setting_key, label):
+        path = export_prefs.load_value(setting_key, "")
+        return f"{label} : {os.path.basename(path)}" if path else f"{label} : (aucun)"
+
+    def _choose_clock_sound(self, setting_key, label, btn):
+        initial = export_prefs.load_value("sound_folder") or os.path.expanduser("~")
+        path = filedialog.askopenfilename(
+            title=f"Choisir le fichier son pour « {label} »",
+            initialdir=initial,
+            filetypes=[("Fichier son WAV", "*.wav"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        # Réglage commun à tous les tournois/Sit & Go (pas propre à celui-ci) :
+        # mémorisé dans les préférences partagées, comme "sound_folder".
+        export_prefs.save_value(setting_key, path)
+        export_prefs.save_value("sound_folder", os.path.dirname(path))
+        btn.config(text=self._clock_sound_button_text(setting_key, label))
+
+    def _clear_clock_sound(self, setting_key, label, btn):
+        if not export_prefs.load_value(setting_key, ""):
+            return
+        if messagebox.askyesno("Confirmer", f"Retirer le son « {label} » ?"):
+            export_prefs.save_value(setting_key, "")
+            btn.config(text=self._clock_sound_button_text(setting_key, label))
 
     def _next_break_eta_text(self):
         """Texte 'Prochaine pause à HH:MM', calculé à partir du temps
@@ -4438,6 +4876,7 @@ class App(tk.Tk):
             self.clock_window.refresh(
                 remaining, level, next_level, stats, name, paused,
                 self._next_break_eta_text(), movement_alert,
+                self._load_chip_denominations(),
             )
 
     def _open_clock_window(self):
@@ -4490,13 +4929,23 @@ class App(tk.Tk):
             "Blindes\" juste à côté).",
         )
 
+        # Panneau "Jetons" (à droite) : empaqueté AVANT le conteneur du
+        # tableau de rounds ci-dessous, pour qu'il réserve sa place à
+        # droite en premier — sinon le tableau de rounds (expand=True)
+        # capterait tout l'espace disponible et ne laisserait rien pour
+        # ce panneau. Voir _build_chips_panel.
+        self._build_chips_panel()
+
         # Conteneur défilable : le nombre de rounds peut largement dépasser
         # la hauteur de l'écran.
         canvas = tk.Canvas(self.blinds_tab, bg=FELT, highlightthickness=0)
         vscroll = ttk.Scrollbar(self.blinds_tab, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vscroll.set)
-        canvas.pack(side="left", fill="both", expand=True, padx=(15, 0), pady=10)
+        # vscroll empaqueté AVANT canvas (expand=True) pour la même raison
+        # que le panneau Jetons ci-dessus : sinon canvas capterait tout
+        # l'espace restant et la scrollbar n'aurait plus de place.
         vscroll.pack(side="right", fill="y", pady=10)
+        canvas.pack(side="left", fill="both", expand=True, padx=(15, 0), pady=10)
 
         self.blinds_rows_frame = ttk.Frame(canvas)
         outer_id = canvas.create_window((0, 0), window=self.blinds_rows_frame, anchor="nw")
@@ -4518,6 +4967,270 @@ class App(tk.Tk):
 
         self._blind_row_vars = []
         self._refresh_blinds_tab()
+
+    # ---------------------------------------------------------------
+    # Panneau "Jetons" (onglet Blindes, à droite du tableau des rounds)
+    # ---------------------------------------------------------------
+    def _build_chips_panel(self):
+        chips_frame = ttk.LabelFrame(self.blinds_tab, text="Jetons")
+        chips_frame.pack(side="right", fill="y", padx=(10, 15), pady=10)
+
+        ttk.Label(
+            chips_frame, foreground=MUTED,
+            text="Couleurs de jetons utilisées pour ce tournoi (facultatif).",
+            wraplength=220, justify="left",
+        ).pack(anchor="w", padx=8, pady=(8, 6))
+
+        ttk.Button(
+            chips_frame, text="➕ Ajouter une couleur", command=self._add_chip_row,
+        ).pack(fill="x", padx=8, pady=(0, 6))
+
+        self.chips_rows_frame = ttk.Frame(chips_frame)
+        self.chips_rows_frame.pack(fill="both", padx=8, pady=(2, 4))
+
+        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
+        self.chips_count_total_lbl = ttk.Label(
+            chips_frame, text="", font=("Helvetica", 10, "bold"), foreground=CREAM,
+        )
+        self.chips_count_total_lbl.pack(anchor="w", padx=8)
+        self.chips_total_lbl = ttk.Label(
+            chips_frame, text="", font=("Helvetica", 10, "bold"), foreground=GOLD,
+        )
+        self.chips_total_lbl.pack(anchor="w", padx=8, pady=(0, 8))
+
+        chips_tpl_btns = ttk.Frame(chips_frame)
+        chips_tpl_btns.pack(fill="x", padx=8, pady=(0, 8))
+        load_chips_btn = ttk.Button(
+            chips_tpl_btns, text="📂 Récupérer Jetons...", command=self._open_chip_templates,
+        )
+        load_chips_btn.pack(fill="x", pady=(0, 4))
+        Tooltip(
+            load_chips_btn,
+            "Ouvre la liste des jeux de jetons déjà enregistrés (via\n"
+            "\"Enregistrer Jetons sous...\") pour en appliquer un à ce\n"
+            "tournoi.",
+        )
+        save_chips_btn = ttk.Button(
+            chips_tpl_btns, text="💾 Enregistrer Jetons sous...", command=self._save_chips_as_template,
+        )
+        save_chips_btn.pack(fill="x")
+        Tooltip(
+            save_chips_btn,
+            "Applique les jetons de ce tableau à ce tournoi ET les\n"
+            "enregistre sous un nom au choix, pour les réutiliser plus\n"
+            "tard sur d'autres tournois/Sit & Go.",
+        )
+
+        self._chip_row_vars = []
+        self._refresh_chips_tab()
+
+    def _load_chip_denominations(self):
+        raw = self.db.get_setting("chip_denominations_json", "")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        cleaned = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            try:
+                value = int(item.get("value", 0))
+            except (TypeError, ValueError):
+                value = 0
+            try:
+                count = int(item.get("count", 0))
+            except (TypeError, ValueError):
+                count = 0
+            cleaned.append({
+                "name": str(item.get("name", "") or "").strip(),
+                "color": str(item.get("color", "") or "#000000"),
+                "value": value,
+                "count": count,
+            })
+        return cleaned
+
+    def _refresh_chips_tab(self):
+        for w in self.chips_rows_frame.winfo_children():
+            w.destroy()
+        self._chip_row_vars = []
+
+        for col, h in enumerate(["Couleur", "", "Valeur", "Nb/joueur", "Total", ""]):
+            ttk.Label(
+                self.chips_rows_frame, text=h, font=("Helvetica", 9, "bold"), foreground=GOLD_DARK,
+            ).grid(row=0, column=col, padx=3, pady=(0, 4), sticky="w")
+
+        for i, d in enumerate(self._load_chip_denominations()):
+            self._add_chip_widget_row(i, d)
+        self._update_chips_total()
+
+    def _add_chip_widget_row(self, row_index, data):
+        grid_row = row_index + 1  # ligne 0 = en-têtes (voir _refresh_chips_tab)
+        row_vars = {
+            "name": tk.StringVar(value=data.get("name", "")),
+            "color": tk.StringVar(value=data.get("color", "#000000")),
+            "value": tk.StringVar(value=str(data.get("value", 0))),
+            "count": tk.StringVar(value=str(data.get("count", 0))),
+        }
+        name_entry = ttk.Entry(self.chips_rows_frame, textvariable=row_vars["name"], width=10)
+        name_entry.grid(row=grid_row, column=0, padx=3, pady=2)
+
+        swatch = tk.Canvas(
+            self.chips_rows_frame, width=20, height=20, highlightthickness=0, bg=FELT,
+        )
+        oval_id = swatch.create_oval(2, 2, 18, 18, fill=row_vars["color"].get(), outline=GOLD_DARK)
+        swatch.grid(row=grid_row, column=1, padx=3, pady=2)
+
+        def _pick_color(rv=row_vars, sw=swatch, oid=oval_id):
+            _, hex_color = colorchooser.askcolor(
+                color=rv["color"].get(), title="Choisir une couleur", parent=self,
+            )
+            if hex_color:
+                rv["color"].set(hex_color)
+                sw.itemconfigure(oid, fill=hex_color)
+                self._autosave_chips()
+
+        swatch.bind("<Button-1>", lambda e: _pick_color())
+        Tooltip(swatch, "Cliquer pour choisir la couleur de la pastille.")
+
+        value_entry = ttk.Entry(self.chips_rows_frame, textvariable=row_vars["value"], width=8)
+        value_entry.grid(row=grid_row, column=2, padx=3, pady=2)
+        count_entry = ttk.Entry(self.chips_rows_frame, textvariable=row_vars["count"], width=8)
+        count_entry.grid(row=grid_row, column=3, padx=3, pady=2)
+
+        total_lbl = ttk.Label(self.chips_rows_frame, text="0", width=8)
+        total_lbl.grid(row=grid_row, column=4, padx=3, pady=2, sticky="w")
+        row_vars["_total_lbl"] = total_lbl
+
+        # Sauvegarde automatique dès qu'un champ est modifié (nom, valeur,
+        # nombre) : évite de perdre la saisie si l'utilisateur quitte sans
+        # avoir pensé à cliquer "Enregistrer les jetons" — ce dernier reste
+        # utile pour signaler une valeur invalide (texte au lieu d'un
+        # nombre, valeur négative...).
+        for entry in (name_entry, value_entry, count_entry):
+            entry.bind("<KeyRelease>", lambda e: self._autosave_chips())
+
+        del_btn = ttk.Button(
+            self.chips_rows_frame, text="🗑", width=3,
+            command=lambda idx=row_index: self._delete_chip_row(idx),
+        )
+        del_btn.grid(row=grid_row, column=5, padx=3, pady=2)
+
+        self._chip_row_vars.append(row_vars)
+
+    def _collect_chips_from_widgets(self, strict=True):
+        """Lit les champs actuellement affichés. `strict=True` (utilisé
+        pour "Enregistrer les jetons") signale les valeurs invalides ;
+        `strict=False` (utilisé pour ajouter/supprimer une ligne) les
+        remplace silencieusement par 0 plutôt que de bloquer l'action."""
+        result = []
+        for i, rv in enumerate(self._chip_row_vars, start=1):
+            name = rv["name"].get().strip()
+            color = rv["color"].get().strip() or "#000000"
+            try:
+                value = int(rv["value"].get())
+            except (ValueError, tk.TclError):
+                if strict:
+                    messagebox.showerror(
+                        "Erreur", f"Ligne {i} : « Valeur » doit être un nombre entier.",
+                    )
+                    return None
+                value = 0
+            try:
+                count = int(rv["count"].get())
+            except (ValueError, tk.TclError):
+                if strict:
+                    messagebox.showerror(
+                        "Erreur", f"Ligne {i} : « Nombre/joueur » doit être un nombre entier.",
+                    )
+                    return None
+                count = 0
+            if strict and (value < 0 or count < 0):
+                messagebox.showerror("Erreur", f"Ligne {i} : les valeurs ne peuvent pas être négatives.")
+                return None
+            result.append({"name": name, "color": color, "value": max(0, value), "count": max(0, count)})
+        return result
+
+    def _update_chips_total(self):
+        rows = self._collect_chips_from_widgets(strict=False) or []
+        for rv, r in zip(self._chip_row_vars, rows):
+            rv["_total_lbl"].config(text=f"{r['value'] * r['count']:,}".replace(",", " "))
+        total_count = sum(r["count"] for r in rows)
+        total_value = sum(r["value"] * r["count"] for r in rows)
+        self.chips_count_total_lbl.config(
+            text=f"Nombre des jetons / joueur : {total_count:,}".replace(",", " ")
+        )
+        self.chips_total_lbl.config(
+            text=f"Valeur des jetons / joueur : {total_value:,}".replace(",", " ")
+        )
+
+    def _persist_chip_denominations(self, denominations):
+        self.db.set_settings({"chip_denominations_json": json.dumps(denominations, ensure_ascii=False)})
+
+    def _autosave_chips(self):
+        """Enregistre en continu ce qui est actuellement saisi (valeurs
+        invalides remplacées par 0, sans bloquer ni avertir — voir
+        "Enregistrer Jetons sous..." pour une sauvegarde avec validation
+        stricte, en plus nommée pour être réutilisée sur d'autres
+        tournois), et met à jour les totaux affichés."""
+        denominations = self._collect_chips_from_widgets(strict=False) or []
+        self._persist_chip_denominations(denominations)
+        self._update_chips_total()
+
+    def _add_chip_row(self):
+        denominations = self._collect_chips_from_widgets(strict=False) or []
+        denominations.append({"name": "", "color": "#000000", "value": 0, "count": 0})
+        self._persist_chip_denominations(denominations)
+        self._refresh_chips_tab()
+
+    def _delete_chip_row(self, index):
+        denominations = self._collect_chips_from_widgets(strict=False) or []
+        if 0 <= index < len(denominations):
+            denominations.pop(index)
+        self._persist_chip_denominations(denominations)
+        self._refresh_chips_tab()
+
+    def _save_chips_as_template(self):
+        """Applique les modifications du tableau à ce tournoi (comme
+        l'ancien bouton "Enregistrer les jetons"), ET enregistre le jeu de
+        jetons sous un nom choisi par l'utilisateur, pour pouvoir le
+        réappliquer plus tard à d'autres tournois via "Récupérer
+        Jetons..." (voir chip_templates.py)."""
+        denominations = self._collect_chips_from_widgets(strict=True)
+        if denominations is None:
+            return
+        self._persist_chip_denominations(denominations)
+        self._update_chips_total()
+
+        name = simpledialog.askstring(
+            "Enregistrer Jetons sous",
+            "Nom de ce jeu de jetons :",
+            parent=self,
+        )
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in chip_templates.list_templates():
+            if not messagebox.askyesno(
+                "Confirmer",
+                f"Un modèle nommé « {name} » existe déjà. Le remplacer ?",
+                parent=self,
+            ):
+                return
+        chip_templates.save_template(name, denominations)
+        messagebox.showinfo(
+            "Jetons enregistrés",
+            f"Les jetons ont été mis à jour pour ce tournoi, et enregistrés "
+            f"sous « {name} » pour une réutilisation future.",
+            parent=self,
+        )
+
+    def _open_chip_templates(self):
+        ChipTemplatesDialog(self)
 
     def _blind_rounds_from_db(self):
         """Regroupe la liste plate de la base (niveaux + pauses) en rounds
