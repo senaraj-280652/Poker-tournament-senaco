@@ -16,6 +16,13 @@ on:
 jobs:
   build-msi:
     runs-on: windows-latest
+    # Nécessaire pour l'étape "Publication dans la Release" ci-dessous
+    # (softprops/action-gh-release crée une Release + y attache le .msi) :
+    # sans ça, le GITHUB_TOKEN par défaut est en lecture seule et cette
+    # étape échoue avec "403 / Resource not accessible by integration",
+    # même si la génération du .msi elle-même a réussi.
+    permissions:
+      contents: write
     steps:
       - name: Récupération du dépôt
         uses: actions/checkout@v4
