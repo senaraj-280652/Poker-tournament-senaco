@@ -411,10 +411,13 @@ class Database:
         numérotation affichée après la fermeture d'une ou plusieurs tables
         (ex : il ne restait que « Table 8 », « Table 10 », « Table 11 »
         après plusieurs fermetures en cours de tournoi). Les tables
-        fermées gardent leur ancien nom : seul l'historique des
-        mouvements (déjà enregistré sous forme de texte figé) peut encore
-        y faire référence, aucun souci de doublon puisqu'elles ne sont
-        plus affichées nulle part."""
+        fermées gardent leur ancien nom (jamais réattribué) : ça ne pose
+        aucun souci pour l'affichage courant (onglet Tables, elles n'y
+        apparaissent plus), MAIS l'historique des mouvements, lui,
+        référence encore le nom d'une table qui vient tout juste de
+        fermer — un nom de table active fraîchement renumérotée ici peut
+        donc coïncider par hasard avec celui d'une table venant de
+        fermer ; voir le filet de sécurité dans rebalance_tables()."""
         tables = self.conn.execute(
             "SELECT id FROM tables_pk WHERE is_active=1 ORDER BY id"
         ).fetchall()
@@ -685,6 +688,15 @@ class Database:
             return []
 
         before_state = {p["id"]: (p["table_id"], p["seat"]) for p in active_players}
+        # Noms des tables tels qu'ils étaient AVANT ce rééquilibrage (donc
+        # avant le renumber_active_tables() plus bas) : c'est ce nom-là
+        # qu'il faut afficher comme "ancienne table" dans l'historique des
+        # mouvements — sans quoi une table qui vient de fermer pendant CE
+        # même rééquilibrage peut se voir attribuer par coïncidence le
+        # même numéro qu'une autre table active fraîchement renumérotée,
+        # et un vrai changement de table s'affiche à tort comme
+        # "Table 2 -> Table 2" (voir aussi le filet de sécurité plus bas).
+        old_table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
 
         max_seats = self.get_setting_int("max_seats_per_table", 9)
         min_players = self.get_setting_int("min_players_per_table", 4)
@@ -808,7 +820,7 @@ class Database:
         # table, ça évite une alerte à chaque élimination alors que
         # personne ne bouge réellement de table.
         after_players = [dict(p) for p in self.list_players(status="active")]
-        table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+        new_table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         moves = []
         for p in after_players:
@@ -816,11 +828,24 @@ class Database:
             new_table_id, new_seat = p["table_id"], p["seat"]
             if old_table_id == new_table_id:
                 continue
+            old_table_name = old_table_names.get(old_table_id)
+            new_table_name = new_table_names.get(new_table_id)
+            # Filet de sécurité : même avec les deux snapshots ci-dessus
+            # (avant/après), deux tables VRAIMENT différentes peuvent
+            # coïncidentiellement porter le même nom affiché à ces deux
+            # instants (ex : l'ancienne table du joueur vient de fermer et
+            # gardait "Table 2", tandis que renumber_active_tables()
+            # attribue par ailleurs ce même "Table 2" à une autre table
+            # active survivante). Sans cette précision, le tableau des
+            # mouvements afficherait à tort "Table 2 -> Table 2" pour un
+            # vrai changement de table.
+            if old_table_name and old_table_name == new_table_name:
+                old_table_name = f"{old_table_name} (ancienne)"
             move = {
                 "player_name": p["name"],
-                "old_table_name": table_names.get(old_table_id),
+                "old_table_name": old_table_name,
                 "old_seat": old_seat,
-                "new_table_name": table_names.get(new_table_id),
+                "new_table_name": new_table_name,
                 "new_seat": new_seat,
                 "moved_at": now,
             }
@@ -1220,20 +1245,28 @@ class Database:
             "SELECT * FROM blind_levels WHERE level_order=?", (order + 1,)
         ).fetchone()
 
-    def get_current_round_number(self):
-        """Numéro de round au sens de l'onglet Blindes (une pause ne compte
-        pas comme un round à part entière, contrairement à
-        current_level_order qui numérote toutes les lignes de la
-        structure, pauses comprises) — utilisé pour horodater les
-        éliminations (colonne "Round" de l'onglet Joueurs)."""
-        order = self.get_setting_int("current_level_order", 0)
-        if not order:
+    def get_round_number(self, level_order):
+        """Numéro de round au sens de l'onglet Blindes pour la ligne
+        level_order donnée (une pause n'y compte pas comme un round à
+        part entière, contrairement à level_order qui numérote toutes
+        les lignes de la structure, pauses comprises — voir "Niveau" au
+        Chronomètre/écran projecteur, qui utilisait jusqu'ici directement
+        level_order et pouvait donc afficher un numéro différent de la
+        colonne "Round" de l'onglet Blindes dès qu'une pause avait eu
+        lieu). Renvoie None si level_order est vide/invalide."""
+        if not level_order:
             return None
         row = self.conn.execute(
             "SELECT COUNT(*) c FROM blind_levels WHERE is_break=0 AND level_order<=?",
-            (order,),
+            (level_order,),
         ).fetchone()
         return row["c"] or None
+
+    def get_current_round_number(self):
+        """Numéro de round (voir get_round_number) du niveau actuellement
+        en cours — utilisé pour horodater les éliminations (colonne
+        "Round" de l'onglet Joueurs)."""
+        return self.get_round_number(self.get_setting_int("current_level_order", 0))
 
     # ---------- payout structure ----------
     def get_payout_structure(self):

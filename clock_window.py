@@ -196,7 +196,7 @@ class ClockWindow(tk.Toplevel):
 
     def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
                 is_paused, next_break_text="", movement_alert=False, chip_denominations=None,
-                moves=None):
+                moves=None, round_number=None):
         self.name_lbl.config(text=tournament_name)
 
         mins, secs = divmod(max(0, int(remaining_seconds)), 60)
@@ -218,7 +218,12 @@ class ClockWindow(tk.Toplevel):
             self.level_lbl.config(text=level_row["break_label"] or "Pause")
             self.blinds_lbl.config(text="")
         elif level_row is not None:
-            self.level_lbl.config(text=f"Niveau {level_row['level_order']}")
+            # round_number (voir Database.get_round_number) plutôt que
+            # level_row['level_order'] brut : doit afficher le même
+            # numéro que la colonne "Round" de l'onglet Blindes, qui ne
+            # compte pas les pauses comme une ligne à part entière —
+            # d'où "Round" (et non "Niveau") ici aussi, même terminologie.
+            self.level_lbl.config(text=f"Round {round_number}")
             ante_txt = f"   Ante {level_row['ante']}" if level_row["ante"] else ""
             self.blinds_lbl.config(
                 text=f"{level_row['small_blind']} / {level_row['big_blind']}{ante_txt}"
@@ -232,10 +237,10 @@ class ClockWindow(tk.Toplevel):
                 self.next_lbl.config(text=f"Prochain : {next_row['break_label'] or 'Pause'}")
             else:
                 self.next_lbl.config(
-                    text=f"Prochain niveau : {next_row['small_blind']} / {next_row['big_blind']}"
+                    text=f"Prochain round : {next_row['small_blind']} / {next_row['big_blind']}"
                 )
         else:
-            self.next_lbl.config(text="Dernier niveau de la structure")
+            self.next_lbl.config(text="Dernier round de la structure")
 
         self.players_lbl.config(
             text=f"Joueurs restants : {stats['active_count']} / {stats['total_players_ever']}"

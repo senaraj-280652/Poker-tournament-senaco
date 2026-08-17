@@ -383,6 +383,26 @@ class PlayerSelectionDialog(tk.Toplevel):
             command=self._import_from_previous_tournament,
         ).pack(side="left", padx=3)
 
+        # Cocher/décocher d'un coup tous les joueurs du répertoire
+        # rattachés à un même club (voir roster.get_club / list_clubs),
+        # pratique quand un club entier participe au tournoi plutôt que
+        # de cocher chaque joueur un par un.
+        club_check_frame = ttk.Frame(self)
+        club_check_frame.pack(fill="x", padx=12, pady=(0, 6))
+        ttk.Label(club_check_frame, text="Club :").pack(side="left")
+        self.club_filter_var = tk.StringVar()
+        self.club_filter_combo = ttk.Combobox(
+            club_check_frame, textvariable=self.club_filter_var, width=16,
+            values=roster.list_clubs(), state="readonly",
+        )
+        self.club_filter_combo.pack(side="left", padx=5)
+        ttk.Button(
+            club_check_frame, text="Cocher ce club", command=self._check_club,
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            club_check_frame, text="Décocher ce club", command=self._uncheck_club,
+        ).pack(side="left", padx=3)
+
         container = ttk.Frame(self)
         container.pack(fill="both", expand=True, padx=12, pady=5)
         canvas = tk.Canvas(container, borderwidth=0, highlightthickness=0)
@@ -520,6 +540,24 @@ class PlayerSelectionDialog(tk.Toplevel):
             self.check_vars.setdefault(name, tk.BooleanVar()).set(False)
         self._filter()
 
+    def _check_club(self):
+        club = self.club_filter_var.get().strip()
+        if not club:
+            return
+        for name in self.roster_names:
+            if roster.get_club(name) == club and name not in self.active_elsewhere:
+                self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
+        self._filter()
+
+    def _uncheck_club(self):
+        club = self.club_filter_var.get().strip()
+        if not club:
+            return
+        for name in self.roster_names:
+            if roster.get_club(name) == club:
+                self.check_vars.setdefault(name, tk.BooleanVar()).set(False)
+        self._filter()
+
     def _add_new_name(self):
         name = self.new_name_var.get().strip()
         if not name:
@@ -529,6 +567,7 @@ class PlayerSelectionDialog(tk.Toplevel):
             roster.add_to_roster(name, club=club or None)
             self.roster_names = roster.load_roster()
             self.new_name_club_combo.configure(values=roster.list_clubs())
+            self.club_filter_combo.configure(values=roster.list_clubs())
         elif club:
             roster.set_club(name, club)
         self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
@@ -585,6 +624,7 @@ class PlayerSelectionDialog(tk.Toplevel):
         if club is not None:
             roster.set_club(name, club)
             self.new_name_club_combo.configure(values=roster.list_clubs())
+            self.club_filter_combo.configure(values=roster.list_clubs())
             self._filter()
 
     def _skip(self):
@@ -1698,6 +1738,78 @@ class BlindTemplatesDialog(tk.Toplevel):
         ):
             blind_templates.delete_template(name)
             self._refresh()
+
+
+class SaveTemplateAsDialog(tk.Toplevel):
+    """Dialogue générique pour les boutons "Enregistrer ... sous..." :
+    affiche les modèles déjà enregistrés (cliquer sur l'un d'eux reprend
+    son nom dans le champ, pour l'écraser en confirmant) et un champ de
+    saisie libre pour créer un nouveau modèle. `self.result` contient le
+    nom choisi (str) après fermeture, ou None si annulé."""
+
+    def __init__(self, master, title, prompt, existing_names):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("380x400")
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+
+        ttk.Label(self, text=prompt, wraplength=350, justify="left").pack(
+            anchor="w", padx=12, pady=(12, 6)
+        )
+
+        ttk.Label(
+            self, text="Modèles déjà enregistrés (cliquer pour écraser) :",
+            foreground=MUTED,
+        ).pack(anchor="w", padx=12)
+
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=(4, 8))
+        self.listbox = tk.Listbox(list_frame, exportselection=False)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        for name in existing_names:
+            self.listbox.insert("end", name)
+        self.listbox.bind("<<ListboxSelect>>", self._on_select)
+        self.listbox.bind("<Double-Button-1>", lambda e: self._confirm())
+
+        if not existing_names:
+            ttk.Label(
+                self, foreground=MUTED,
+                text="(Aucun modèle enregistré pour l'instant.)",
+            ).pack(anchor="w", padx=12)
+
+        entry_frame = ttk.Frame(self)
+        entry_frame.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Label(entry_frame, text="Nom :").pack(side="left")
+        self.name_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=self.name_var)
+        entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self._confirm())
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(btns, text="Enregistrer", command=self._confirm).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        self.wait_window(self)
+
+    def _on_select(self, event):
+        sel = self.listbox.curselection()
+        if sel:
+            self.name_var.set(self.listbox.get(sel[0]))
+
+    def _confirm(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showinfo("Nom requis", "Entrez un nom pour ce modèle.", parent=self)
+            return
+        self.result = name
+        self.destroy()
 
 
 class SettingsTemplatesDialog(tk.Toplevel):
@@ -3410,8 +3522,8 @@ class App(tk.Tk):
         self.notebook.add(self.tables_tab, text="Tables")
         self.notebook.add(self.moves_tab, text="Mouvements")
         self.notebook.add(self.bounty_tab, text="Primes")
-        self.notebook.add(self.clock_tab, text="Chronomètre")
         self.notebook.add(self.blinds_tab, text="Blindes")
+        self.notebook.add(self.clock_tab, text="Chronomètre")
         self.notebook.add(self.payouts_tab, text="Classement")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
@@ -5066,8 +5178,22 @@ class App(tk.Tk):
         info_col = ttk.Frame(top_row)
         info_col.pack(side="left", fill="both", expand=True)
 
-        self.level_display = ttk.Label(info_col, text="", font=("Helvetica", 20, "bold"))
-        self.level_display.pack(pady=(20, 5))
+        # "Niveau" (numéro brut, pauses comprises — cohérent avec le
+        # tableau de structure et les boutons Niveau précédent/suivant
+        # ci-dessus) et "Round" côte à côte : le round, lui, n'avance pas
+        # pendant une pause (voir Database.get_round_number et
+        # _refresh_clock_tab) — les afficher tous les deux évite toute
+        # ambiguïté entre les deux numérotations.
+        level_row_frame = ttk.Frame(info_col)
+        level_row_frame.pack(pady=(20, 5))
+
+        self.level_display = ttk.Label(level_row_frame, text="", font=("Helvetica", 20, "bold"))
+        self.level_display.pack(side="left")
+
+        self.round_display = ttk.Label(
+            level_row_frame, text="", font=("Helvetica", 20), foreground=MUTED,
+        )
+        self.round_display.pack(side="left", padx=(16, 0))
 
         self.timer_display = ttk.Label(info_col, text="00:00", font=("Helvetica", 60, "bold"))
         self.timer_display.pack(pady=10)
@@ -5091,14 +5217,15 @@ class App(tk.Tk):
         tree_frame = ttk.Frame(struct_frame)
         tree_frame.pack(fill="both", expand=True, side="left", padx=5, pady=5)
 
-        cols = ("order", "sb", "bb", "ante", "duration", "break")
-        headers = ["Niveau", "SB", "BB", "Ante", "Durée (min)", "Pause ?"]
+        cols = ("order", "round", "sb", "bb", "ante", "duration", "break")
+        headers = ["Niveau", "Round", "SB", "BB", "Ante", "Durée (min)", "Pause"]
         self.blinds_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
         for c, h in zip(cols, headers):
             self.blinds_tree.heading(c, text=h)
             self.blinds_tree.column(c, width=100, anchor="center")
         TreeHeadingTooltip(self.blinds_tree, {
             "order": "Numéro de niveau, dans l'ordre de jeu (les pauses comptent\naussi comme une ligne).",
+            "round": "Numéro de round (voir colonne Round de l'onglet Blindes) :\nne compte pas les pauses comme une ligne à part entière,\ncontrairement à Niveau — n'avance donc pas pendant une pause.",
             "sb": "Petite blinde (small blind).",
             "bb": "Grosse blinde (big blind).",
             "ante": "Mise obligatoire de chaque joueur en début de main, en plus\ndes blindes (0 = pas d'ante à ce niveau).",
@@ -5386,6 +5513,14 @@ class App(tk.Tk):
         suffix = "  (en pause)" if paused else ""
         self.timer_display.config(text=f"{mins:02d}:{secs:02d}{suffix}")
 
+        # round_number (voir Database.get_round_number) : même numéro que
+        # la colonne "Round" de l'onglet Blindes, contrairement à
+        # level_order brut ("Niveau") qui compte aussi les pauses comme
+        # une ligne à part entière — les deux sont affichés côte à côte
+        # (round_display reste inchangé pendant une pause, justement pour
+        # montrer qu'il n'avance pas).
+        round_number = self.db.get_round_number(level["level_order"]) if level is not None else None
+        self.round_display.config(text=f"Round {round_number}" if round_number is not None else "")
         if level is not None and level["is_break"]:
             self.level_display.config(text=level["break_label"] or "Pause")
             self.blinds_display.config(text="")
@@ -5413,7 +5548,8 @@ class App(tk.Tk):
             tag = "current" if lvl["level_order"] == current_order else ""
             self.blinds_tree.insert(
                 "", "end", iid=str(lvl["level_order"]),
-                values=(lvl["level_order"], lvl["small_blind"], lvl["big_blind"],
+                values=(lvl["level_order"], self.db.get_round_number(lvl["level_order"]),
+                        lvl["small_blind"], lvl["big_blind"],
                         lvl["ante"], lvl["duration_minutes"], label),
                 tags=(tag,),
             )
@@ -5439,7 +5575,7 @@ class App(tk.Tk):
             self.clock_window.refresh(
                 remaining, level, next_level, stats, name, paused,
                 self._next_break_eta_text(), movement_alert,
-                self._load_chip_denominations(), moves,
+                self._load_chip_denominations(), moves, round_number,
             )
 
     def _open_clock_window(self):
@@ -5843,14 +5979,16 @@ class App(tk.Tk):
         self._persist_chip_denominations(denominations)
         self._update_chips_total()
 
-        name = simpledialog.askstring(
+        dlg = SaveTemplateAsDialog(
+            self,
             "Enregistrer Jetons sous",
-            "Nom de ce jeu de jetons :",
-            parent=self,
+            "Nom de ce jeu de jetons (cliquez un modèle existant "
+            "ci-dessous pour l'écraser, ou entrez un nouveau nom) :",
+            chip_templates.list_templates(),
         )
-        if not name or not name.strip():
+        name = dlg.result
+        if not name:
             return
-        name = name.strip()
         if name in chip_templates.list_templates():
             if not messagebox.askyesno(
                 "Confirmer",
@@ -5997,14 +6135,16 @@ class App(tk.Tk):
             return
         flat = self._rounds_to_flat_structure(rounds)
 
-        name = simpledialog.askstring(
+        dlg = SaveTemplateAsDialog(
+            self,
             "Enregistrer Blindes sous",
-            "Nom de ce modèle de structure de blindes :",
-            parent=self,
+            "Nom de ce modèle de structure de blindes (cliquez un modèle "
+            "existant ci-dessous pour l'écraser, ou entrez un nouveau nom) :",
+            blind_templates.list_templates(),
         )
-        if not name or not name.strip():
+        name = dlg.result
+        if not name:
             return
-        name = name.strip()
         if name in blind_templates.list_templates():
             if not messagebox.askyesno(
                 "Confirmer",
@@ -6799,14 +6939,16 @@ class App(tk.Tk):
         sous un nom choisi par l'utilisateur, pour les réappliquer plus
         tard à d'autres tournois via "Récupérer Paramètres..." (le nom du
         tournoi lui-même n'est jamais inclus dans le modèle)."""
-        name = simpledialog.askstring(
+        dlg = SaveTemplateAsDialog(
+            self,
             "Enregistrer Paramètres sous",
-            "Nom de ce modèle de réglages :",
-            parent=self,
+            "Nom de ce modèle de réglages (cliquez un modèle existant "
+            "ci-dessous pour l'écraser, ou entrez un nouveau nom) :",
+            settings_templates.list_templates(),
         )
-        if not name or not name.strip():
+        name = dlg.result
+        if not name:
             return
-        name = name.strip()
         if name in settings_templates.list_templates():
             if not messagebox.askyesno(
                 "Confirmer",
