@@ -5685,8 +5685,45 @@ class App(tk.Tk):
             chips_frame, text="➕ Ajouter une couleur", command=self._add_chip_row,
         ).pack(fill="x", padx=8, pady=(0, 6))
 
-        self.chips_rows_frame = ttk.Frame(chips_frame)
-        self.chips_rows_frame.pack(fill="both", padx=8, pady=(2, 4))
+        # Conteneur défilable : le nombre de couleurs de jetons peut
+        # dépasser la hauteur disponible (même principe que le tableau
+        # des rounds ci-dessus, voir _build_blinds_tab) — sans ça, les
+        # lignes en trop et les boutons/totaux sous le tableau devenaient
+        # inaccessibles.
+        chips_canvas = tk.Canvas(chips_frame, bg=FELT, highlightthickness=0)
+        chips_vscroll = ttk.Scrollbar(chips_frame, orient="vertical", command=chips_canvas.yview)
+        chips_canvas.configure(yscrollcommand=chips_vscroll.set)
+        # vscroll empaqueté AVANT canvas (expand=True) : sinon canvas
+        # capterait tout l'espace restant et la scrollbar n'aurait plus
+        # de place (même raison qu'ailleurs dans ce fichier).
+        chips_vscroll.pack(side="right", fill="y")
+        chips_canvas.pack(side="left", fill="both", expand=True, padx=8, pady=(2, 4))
+
+        self.chips_rows_frame = ttk.Frame(chips_canvas)
+        chips_canvas.create_window((0, 0), window=self.chips_rows_frame, anchor="nw")
+        self.chips_rows_frame.bind(
+            "<Configure>",
+            lambda e: (
+                chips_canvas.configure(scrollregion=chips_canvas.bbox("all")),
+                # Largeur du tableau fixée à celle de son contenu (les
+                # colonnes ont une largeur fixe, indépendante du nombre de
+                # lignes) : contrairement au tableau des rounds, il n'a
+                # pas à s'étirer sur l'espace restant, seule la hauteur
+                # doit défiler.
+                chips_canvas.configure(width=self.chips_rows_frame.winfo_reqwidth()),
+            ),
+        )
+
+        is_mac = self.tk.call("tk", "windowingsystem") == "aqua"
+
+        def _on_chips_mousewheel(event):
+            if is_mac:
+                chips_canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                chips_canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        chips_canvas.bind("<Enter>", lambda e: chips_canvas.bind_all("<MouseWheel>", _on_chips_mousewheel))
+        chips_canvas.bind("<Leave>", lambda e: chips_canvas.unbind_all("<MouseWheel>"))
 
         ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
         self.chips_count_total_lbl = ttk.Label(
