@@ -9,4 +9,4 @@ windows/app.wxs (attribut Version du <Package>) — voir la section
 « Changer le numéro de version » de windows/README.md — puisque WiX ne
 peut pas lire un fichier Python.
 """
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"

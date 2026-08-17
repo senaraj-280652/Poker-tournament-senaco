@@ -19,11 +19,19 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.0"
-           UpgradeCode="1702C0EB-14D2-4A17-B3B2-E1042B9298D3"
+           Version="1.2.1"
+           UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
            InstallerVersion="500">
+    <!-- UpgradeCode changé en 1.2.1 (l'ancien, 1702C0EB-14D2-4A17-B3B2-
+         E1042B9298D3, coïncidait par malchance avec celui d'un tout
+         autre logiciel installé chez un club utilisateur — Windows
+         Installer proposait donc de LE désinstaller en pensant remplacer
+         une ancienne version du nôtre !). Celui-ci vient de
+         `python3 -c "import uuid; print(uuid.uuid4())"`, donc garanti
+         unique. À conserver identique d'une version à l'autre à partir
+         de maintenant (voir windows/README.md). -->
 
     <SummaryInformation Description="Installateur - Gestionnaire de Tournoi de Poker" />
 
