@@ -31,7 +31,6 @@ PERSISTED_KEYS = [
     "ante_start_level",
     "start_ante",
     "break_duration_minutes",
-    "movement_signal_frequency_hz",
     "movement_signal_duration_ms",
     "bounty_amount",
     "pko_mode",

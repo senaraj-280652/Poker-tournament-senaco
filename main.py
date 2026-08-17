@@ -9,6 +9,8 @@ python3-tk si besoin).
 import os
 import sys
 import subprocess
+import threading
+import queue
 import time
 import json
 import csv
@@ -22,6 +24,8 @@ from database import (
     export_period_summary_xlsx, export_period_summary_pdf,
     read_player_names_from_file, bounty_unit_value, find_players_active_elsewhere,
     find_stale_active_players, withdraw_stale_active_players, find_tournament_files,
+    find_finished_tournament_files, archive_tournament_files,
+    format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
     BOUNTY_HISTORY_COLUMNS,
@@ -34,8 +38,11 @@ import export_prefs
 import blind_templates
 import settings_templates
 import chip_templates
+import chip_images
 import player_photos
 import sound_signal
+import remote_control
+from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
 from version import APP_VERSION
 
@@ -876,9 +883,19 @@ class RosterManagerDialog(tk.Toplevel):
 
     def __init__(self, master):
         super().__init__(master)
+        self.app = master
         self.title("Répertoire de joueurs")
         self.geometry("640x540")
         self.grab_set()
+        # Prend le pas sur le F1 global (voir App._show_context_help) tant
+        # que cette fenêtre a le focus : chapitre dédié plutôt que celui
+        # de l'onglet resté affiché derrière.
+        self.bind(
+            "<F1>",
+            lambda e: HelpBrowser.open_at(
+                master, chapter_title="16. Menu Répertoire — joueurs habituels et photos"
+            ),
+        )
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
         self.roster_sort = {"column": "name", "ascending": True}
 
@@ -1273,11 +1290,15 @@ class RosterManagerDialog(tk.Toplevel):
         single_column = all(len(cells) < 2 or not cells[1] for cells in cleaned_rows)
         default_club = None
         if single_column:
+            # Reprend le "Nom du Club" réglé dans Paramètres (commun à tous
+            # les tournois/Sit & Go, voir _build_settings_tab) ; "CPC" en
+            # dernier recours si rien n'y est encore renseigné.
+            club_setting = export_prefs.load_value("club_name", "")
             default_club = simpledialog.askstring(
                 "Club des joueurs importés",
                 "Ce fichier ne contient que des noms (pas de club).\n"
                 "Club à attribuer à tous les joueurs importés :",
-                initialvalue="CPC", parent=self,
+                initialvalue=club_setting or "CPC", parent=self,
             )
             if default_club is None:
                 return  # import annulé
@@ -1383,6 +1404,12 @@ class LobbyDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Lobby — Sit & Go / Tournois")
         self.geometry("860x420")
+        self.bind(
+            "<F1>",
+            lambda e: HelpBrowser.open_at(
+                master, chapter_title="14. Sit & Go et gestion de plusieurs tournois", section_title="Lobby"
+            ),
+        )
         # Dossier choisi explicitement pour le Lobby en priorité ; sinon,
         # se rabat automatiquement sur le dernier dossier utilisé pour
         # créer un tournoi (voir default_tournament_dir) — pour que les
@@ -1404,6 +1431,22 @@ class LobbyDialog(tk.Toplevel):
         )
         self.folder_lbl.pack(side="left", padx=10)
         ttk.Button(top, text="🔄  Rafraîchir", command=self._refresh).pack(side="right")
+        archive_btn = ttk.Button(
+            top, text="🗄  Archiver les terminés...", command=self._archive_finished,
+        )
+        archive_btn.pack(side="right", padx=(0, 8))
+        Tooltip(
+            archive_btn,
+            "Déplace chaque tournoi terminé de ce dossier dans un\n"
+            "sous-dossier \"archive\" créé (si besoin) dans son propre\n"
+            "dossier — celui où il a été créé, pas ailleurs.",
+        )
+
+        self.hide_finished_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            top, text="Masquer les tournois terminés",
+            variable=self.hide_finished_var, command=self._refresh,
+        ).pack(side="right", padx=8)
 
         cols = ("name", "date", "players", "level", "remaining", "status")
         headers = ["Tournoi", "Date", "Joueurs actifs", "Niveau", "Temps restant", "État"]
@@ -1467,6 +1510,9 @@ class LobbyDialog(tk.Toplevel):
                 m, s = divmod(status["remaining_seconds"], 60)
                 remaining_txt = f"{m:02d}:{s:02d}"
 
+            if status["finished"] and self.hide_finished_var.get():
+                continue
+
             if status["finished"]:
                 state_txt = "Terminé"
             elif not status["clock_started"]:
@@ -1480,7 +1526,7 @@ class LobbyDialog(tk.Toplevel):
             self.tree.insert(
                 "", "end", iid=iid,
                 values=(
-                    status["name"], status["date"],
+                    status["name"], format_date_fr(status["date"]),
                     f"{status['active_count']} / {status['total_players_ever']}",
                     level_txt, remaining_txt, state_txt,
                 ),
@@ -1498,6 +1544,31 @@ class LobbyDialog(tk.Toplevel):
         if not sel:
             return None
         return self._paths_by_iid.get(sel[0])
+
+    def _archive_finished(self):
+        if not self.folder or not os.path.isdir(self.folder):
+            messagebox.showinfo("Archiver", "Choisissez d'abord un dossier.", parent=self)
+            return
+        entries = find_finished_tournament_files(self.folder)
+        if not entries:
+            messagebox.showinfo(
+                "Archiver", "Aucun tournoi terminé à archiver dans ce dossier.", parent=self,
+            )
+            return
+        names = "\n".join(
+            f"- {e['name']} ({os.path.basename(e['path'])})" for e in entries
+        )
+        if not messagebox.askyesno(
+            "Archiver les tournois terminés",
+            f"{len(entries)} tournoi(s) terminé(s) va(ont) être déplacé(s) chacun dans un "
+            f"sous-dossier « archive » (créé si besoin, dans son propre dossier) :\n\n"
+            f"{names}\n\nContinuer ?",
+            parent=self,
+        ):
+            return
+        moved = archive_tournament_files([e["path"] for e in entries])
+        self._refresh()
+        messagebox.showinfo("Archiver", f"{moved} tournoi(s) archivé(s).", parent=self)
 
     def _open_selected(self):
         path = self._selected_path()
@@ -1837,6 +1908,10 @@ class PeriodSummaryDialog(tk.Toplevel):
         self.configure(bg=FELT_DARK)
         self.geometry("920x620")
         self.transient(master)
+        self.bind(
+            "<F1>",
+            lambda e: HelpBrowser.open_at(master, chapter_title="15. Statistiques — Synthèse par période"),
+        )
         self.summary = None
 
         default_folder = ""
@@ -1976,7 +2051,7 @@ class PeriodSummaryDialog(tk.Toplevel):
             self.tournaments_tree.insert(
                 "", "end",
                 values=(
-                    t["date"], t["name"], t["status"], t["entries"],
+                    format_date_fr(t["date"]), t["name"], t["status"], t["entries"],
                     f"{t['prize_pool']:.2f}", t["winner"],
                     f"{t['bounty_distributed']:,}".replace(",", " ") if t["bounty_distributed"] else "-",
                 ),
@@ -2252,26 +2327,45 @@ class ResultsExportDialog(tk.Toplevel):
         open_file_with_default_app(path)
 
 
-class PayoutExportDialog(tk.Toplevel):
-    """Choix du format (CSV / Excel) et des colonnes à exporter pour la
-    grille de gains telle qu'affichée dans l'onglet Gains (place,
-    pourcentage, montant — sans nom de joueur). Distinct de "Exporter les
-    résultats..." (menu Fichier), qui exporte le classement nominatif."""
+# Colonnes fixes de l'onglet Classement (Nom, Rang, Éliminé le, Round,
+# Éliminé par) — un sous-ensemble de PLAYERS_TAB_COLUMNS, réutilisé tel
+# quel pour l'export (voir ClassementExportDialog).
+CLASSEMENT_EXPORT_COLUMNS = ["name", "rang", "elim_time", "elim_round", "eliminated_by"]
+
+
+def _compute_tournament_export_title(db, tab_name):
+    """Titre standard "<Onglet> du SitnGo du <club> <tournoi> du <date>"
+    (Sit & Go) ou "<Onglet> du Tournoi du <club> <tournoi> du <date>"
+    (tournoi classique), utilisé par les exports Classement, Primes et
+    Joueurs — `tab_name` : "Classement", "Primes" ou "Joueurs". Voir
+    Database._apply_sng_defaults pour le réglage "is_sng"."""
+    club = export_prefs.load_value("club_name", "")
+    tournament_name = db.get_setting("tournament_name", "Tournoi")
+    date = format_date_fr(db.get_tournament_date())
+    prefix = "SitnGo" if db.get_setting_int("is_sng", 0) else "Tournoi"
+    parts = [p for p in [club, tournament_name] if p]
+    base = f"{prefix} du " + " ".join(parts) + f" du {date}"
+    return f"{tab_name} du {base}"
+
+
+class ClassementExportDialog(tk.Toplevel):
+    """Choix du format (CSV / Excel / PDF) pour l'export de l'onglet
+    Classement (Nom, Rang, Éliminé le, Round, Éliminé par) — colonnes
+    fixes, pas de sélection possible (contrairement aux autres exports).
+    Réutilise les fonctions d'export de l'onglet Joueurs (mêmes colonnes,
+    voir CLASSEMENT_EXPORT_COLUMNS), triées par Rang."""
 
     def __init__(self, master, db):
         super().__init__(master)
         self.db = db
-        self.title("Exporter la grille de gains")
+        self.title("Exporter le classement")
         self.configure(bg=FELT_DARK)
-        self.geometry("380x360")
+        self.geometry("340x260")
+        self.resizable(False, False)
         self.transient(master)
         self.grab_set()
 
-        self.format_var = tk.StringVar(value=export_prefs.load_format("payouts"))
-        saved_cols = export_prefs.load_columns("payouts", [k for k, _, _ in PAYOUT_COLUMNS])
-        self.col_vars = {
-            key: tk.BooleanVar(value=key in saved_cols) for key, _, _ in PAYOUT_COLUMNS
-        }
+        self.format_var = tk.StringVar(value=export_prefs.load_format("classement"))
 
         btns = ttk.Frame(self)
         btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
@@ -2279,44 +2373,19 @@ class PayoutExportDialog(tk.Toplevel):
         ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
 
         fmt_frame = ttk.LabelFrame(self, text="Format")
-        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        fmt_frame.pack(fill="x", padx=14, pady=8)
         ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
-            side="left", padx=10, pady=6
+            anchor="w", padx=10, pady=6
         )
         ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
-            side="left", padx=10, pady=6
+            anchor="w", padx=10, pady=6
         )
         ttk.Radiobutton(fmt_frame, text="PDF", variable=self.format_var, value="pdf").pack(
-            side="left", padx=10, pady=6
+            anchor="w", padx=10, pady=6
         )
 
-        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
-        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
-        bar = ttk.Frame(cols_frame)
-        bar.pack(fill="x", padx=8, pady=(4, 2))
-        ttk.Button(
-            bar, text="Tout cocher",
-            command=lambda: [v.set(True) for v in self.col_vars.values()],
-        ).pack(side="left", padx=(0, 6))
-        ttk.Button(
-            bar, text="Tout décocher",
-            command=lambda: [v.set(False) for v in self.col_vars.values()],
-        ).pack(side="left")
-        grid = ttk.Frame(cols_frame)
-        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
-        for idx, (key, header, _fn) in enumerate(PAYOUT_COLUMNS):
-            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
-                row=idx, column=0, sticky="w", padx=6, pady=2
-            )
-
     def _do_export(self):
-        keys = [k for k, v in self.col_vars.items() if v.get()]
-        if not keys:
-            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
-            return
-
-        export_prefs.save_columns("payouts", keys)
-        export_prefs.save_format("payouts", self.format_var.get())
+        export_prefs.save_format("classement", self.format_var.get())
 
         name = self.db.get_setting("tournament_name", "tournoi")
         safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in name).strip() or "tournoi"
@@ -2328,21 +2397,28 @@ class PayoutExportDialog(tk.Toplevel):
             "pdf": [("Fichier PDF", "*.pdf")],
         }[fmt]
         path = filedialog.asksaveasfilename(
-            title="Exporter la grille de gains",
+            title="Exporter le classement",
             defaultextension=ext,
             filetypes=filetypes,
-            initialfile=f"grille_gains_{safe_name}{ext}",
+            initialfile=f"classement_{safe_name}{ext}",
         )
         if not path:
             return
 
+        title = _compute_tournament_export_title(self.db, "Classement")
         try:
             if fmt == "xlsx":
-                self.db.export_payouts_xlsx(path, columns=keys)
+                self.db.export_players_xlsx(
+                    path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True,
+                    title=title, show_prize_pool=False,
+                )
             elif fmt == "pdf":
-                self.db.export_payouts_pdf(path, columns=keys)
+                self.db.export_players_pdf(
+                    path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True,
+                    title=title, show_prize_pool=False,
+                )
             else:
-                self.db.export_payouts_csv(path, columns=keys)
+                self.db.export_players_csv(path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True)
         except ImportError:
             show_missing_export_module(fmt)
             return
@@ -2450,14 +2526,17 @@ class PlayersExportDialog(tk.Toplevel):
 
         sort_column = self.sort_state.get("column")
         ascending = self.sort_state.get("ascending", True)
+        title = _compute_tournament_export_title(self.db, "Joueurs")
         try:
             if fmt == "xlsx":
                 self.db.export_players_xlsx(
-                    path, columns=keys, sort_column=sort_column, ascending=ascending
+                    path, columns=keys, sort_column=sort_column, ascending=ascending,
+                    title=title, show_prize_pool=False,
                 )
             elif fmt == "pdf":
                 self.db.export_players_pdf(
-                    path, columns=keys, sort_column=sort_column, ascending=ascending
+                    path, columns=keys, sort_column=sort_column, ascending=ascending,
+                    title=title, show_prize_pool=False,
                 )
             else:
                 self.db.export_players_csv(
@@ -2606,17 +2685,20 @@ class PrimesExportDialog(tk.Toplevel):
         if not path:
             return
 
+        title = _compute_tournament_export_title(self.db, "Primes")
         try:
             if kind == "summary":
                 sort_column = self.sort_state.get("column")
                 ascending = self.sort_state.get("ascending", True)
                 if fmt == "xlsx":
                     self.db.export_primes_xlsx(
-                        path, columns=keys, sort_column=sort_column, ascending=ascending
+                        path, columns=keys, sort_column=sort_column, ascending=ascending,
+                        title=title,
                     )
                 elif fmt == "pdf":
                     self.db.export_primes_pdf(
-                        path, columns=keys, sort_column=sort_column, ascending=ascending
+                        path, columns=keys, sort_column=sort_column, ascending=ascending,
+                        title=title,
                     )
                 else:
                     self.db.export_primes_csv(
@@ -2624,9 +2706,9 @@ class PrimesExportDialog(tk.Toplevel):
                     )
             else:
                 if fmt == "xlsx":
-                    self.db.export_bounty_history_xlsx(path, columns=keys)
+                    self.db.export_bounty_history_xlsx(path, columns=keys, title=title)
                 elif fmt == "pdf":
-                    self.db.export_bounty_history_pdf(path, columns=keys)
+                    self.db.export_bounty_history_pdf(path, columns=keys, title=title)
                 else:
                     self.db.export_bounty_history_csv(path, columns=keys)
         except ImportError:
@@ -2730,6 +2812,20 @@ class App(tk.Tk):
 
         self.db = None
         self.clock_window = None
+        # Actions "Élimination"/"Terminé"/"Chronomètre" (raccourcis clavier
+        # et contrôle à distance depuis un téléphone, voir
+        # _bind_voice_command_shortcuts / remote_control.py) : le thread du
+        # petit serveur web ne doit jamais appeler de méthode Tkinter
+        # directement (pas thread-safe), il dépose un mot dans cette file,
+        # relevée régulièrement par _poll_voice_queue sur le thread
+        # principal (voir _tick pour le même principe périodique).
+        # voice_awaiting_resume : True entre "Élimination" et soit
+        # "Chronomètre" (aucun mouvement causé), soit "Terminé" (un
+        # mouvement a eu lieu).
+        self.voice_command_queue = queue.Queue()
+        self.voice_awaiting_resume = False
+        # Contrôle à distance depuis un téléphone (voir remote_control.py).
+        self.remote_control_server = None
         self._apply_theme()
 
         # Verrou anti-copie (voir license.py) : sans effet tant que le
@@ -2768,6 +2864,13 @@ class App(tk.Tk):
         # mais flagrant pour un tournoi créé avec des joueurs déjà choisis.
         self._refresh_all()
         self._tick()
+        self._poll_voice_queue()
+        # silent=True : au lancement automatique d'une fenêtre, le port
+        # peut déjà être pris par une autre fenêtre de l'appli ouverte en
+        # parallèle (Sit & Go multiples) — cas normal, pas la peine
+        # d'interrompre l'ouverture avec une fenêtre d'erreur pour ça.
+        self._start_remote_control_if_enabled(silent=True)
+        self._bind_voice_command_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------
@@ -3165,11 +3268,17 @@ class App(tk.Tk):
         self.db.set_settings({
             "round_duration_minutes": 10, "ante_start_level": 3,
             "break_duration_minutes": 10,
+            # Mémorisé pour de bon (contrairement à result["is_sng"], qui
+            # n'existe que le temps de la création) : sert par exemple au
+            # titre des exports Classement et Primes (voir
+            # _compute_tournament_export_title).
+            "is_sng": 1,
         })
         if n_players > 0:
             self.db.set_payout_structure(standard_payout_structure(n_players))
 
     def _on_close(self):
+        self._stop_remote_control()
         if self.db:
             self.db.close()
         self.destroy()
@@ -3205,10 +3314,42 @@ class App(tk.Tk):
         menubar.add_cascade(label="Statistiques", menu=statsmenu)
 
         helpmenu = tk.Menu(menubar, tearoff=0)
+        helpmenu.add_command(label="Manuel (F1)...", command=self._show_context_help)
         helpmenu.add_command(label="À propos...", command=self._show_about)
         menubar.add_cascade(label="Aide", menu=helpmenu)
 
         self.config(menu=menubar)
+
+        # bind_all (et non bind) : capte F1 depuis n'importe quel widget de
+        # l'application, y compris les fenêtres séparées (Toplevel) comme
+        # l'écran projecteur — une fenêtre qui a besoin d'un chapitre
+        # différent (Lobby, Répertoire, Synthèse par période...) redéfinit
+        # sa propre touche F1 directement sur elle-même, ce qui prend le
+        # pas sur ce binding global tant qu'elle a le focus.
+        self.bind_all("<F1>", lambda e: self._show_context_help())
+
+    def _show_context_help(self):
+        """Ouvre l'aide (menu Aide, ou touche F1) directement sur le
+        chapitre du manuel correspondant à l'endroit où se trouve
+        l'utilisateur dans le logiciel : l'écran chronomètre projecteur
+        s'il a le focus, sinon l'onglet actuellement affiché (voir
+        TAB_TO_CHAPTER) — sur la première page du manuel si aucune
+        correspondance n'est trouvée."""
+        focused = self.focus_get()
+        if (
+            self.clock_window is not None
+            and self.clock_window.winfo_exists()
+            and focused is not None
+            and focused.winfo_toplevel() is self.clock_window
+        ):
+            HelpBrowser.open_at(self, chapter_title="9. Onglet Chronomètre", section_title="Écran projecteur")
+            return
+        try:
+            current_tab = self.notebook.tab(self.notebook.select(), "text")
+        except tk.TclError:
+            current_tab = None
+        chapter = TAB_TO_CHAPTER.get(current_tab)
+        HelpBrowser.open_at(self, chapter_title=chapter)
 
     def _show_about(self):
         lines = [
@@ -3239,10 +3380,10 @@ class App(tk.Tk):
             return
         ResultsExportDialog(self, self.db)
 
-    def _export_payouts(self):
+    def _export_classement(self):
         if not self.db:
             return
-        PayoutExportDialog(self, self.db)
+        ClassementExportDialog(self, self.db)
 
     def _export_players(self):
         if not self.db:
@@ -3271,7 +3412,7 @@ class App(tk.Tk):
         self.notebook.add(self.bounty_tab, text="Primes")
         self.notebook.add(self.clock_tab, text="Chronomètre")
         self.notebook.add(self.blinds_tab, text="Blindes")
-        self.notebook.add(self.payouts_tab, text="Gains")
+        self.notebook.add(self.payouts_tab, text="Classement")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
         self._build_players_tab()
@@ -3375,24 +3516,52 @@ class App(tk.Tk):
         ttk.Button(
             check_bar, text="Exporter les joueurs (Excel/CSV)...", command=self._export_players,
         ).pack(side="left", padx=3)
-        columns_btn = ttk.Button(check_bar, text="Colonnes...", command=self._manage_player_columns)
+        columns_btn = ttk.Button(check_bar, text="Bou/Col...", command=self._manage_player_columns)
         columns_btn.pack(side="left", padx=3)
-        Tooltip(columns_btn, "Choisir quelles colonnes du tableau ci-dessous afficher.")
+        Tooltip(
+            columns_btn,
+            "Choisir quelles colonnes du tableau, et quels boutons\n"
+            "(Rebuy, Add-on, Modifier chips, Modifier achats) afficher.",
+        )
         self.checked_count_lbl = ttk.Label(check_bar, text="", foreground=GOLD)
         self.checked_count_lbl.pack(side="left", padx=10)
 
         actions = ttk.Frame(self.players_tab)
         actions.pack(fill="x", padx=10, pady=(6, 10))
         ttk.Button(actions, text="Renommer...", command=self._rename_selected).pack(side="left", padx=3)
-        rebuy_btn = ttk.Button(actions, text="Rebuy (+)", command=self._rebuy_selected)
-        rebuy_btn.pack(side="left", padx=3)
-        Tooltip(rebuy_btn, "Recave : remet le joueur en jeu avec le nombre de\njetons réglé dans Paramètres, incrémente son compteur de rebuys.")
-        addon_btn = ttk.Button(actions, text="Add-on (+)", command=self._addon_selected)
-        addon_btn.pack(side="left", padx=3)
-        Tooltip(addon_btn, "Recharge (add-on) : ajoute des jetons au joueur (réglage\nParamètres), incrémente son compteur d'add-ons.")
-        ttk.Button(actions, text="Modifier chips...", command=self._edit_chips_selected).pack(side="left", padx=3)
-        ttk.Button(actions, text="Modifier achats...", command=self._edit_purchases_selected).pack(side="left", padx=3)
+
+        # Boutons réductibles à la souris (comme les colonnes du tableau) :
+        # glisser la poignée dorée à droite d'un bouton le rétrécit ; le
+        # relâcher en dessous d'un seuil le masque complètement. "Bou/Col..."
+        # (ci-dessus) les réaffiche, seul moyen de les récupérer une fois
+        # masqués. Voir _add_shrinkable_button.
+        self._PLAYER_BUTTON_MIN_WIDTH = 20  # px : à/en dessous, le bouton se masque
+        self._player_button_restore_widths = {
+            "rebuy": 110, "addon": 110, "edit_chips": 150, "edit_purchases": 165,
+        }
+        visible_buttons_saved = export_prefs.load_columns(
+            "players_tab_buttons_visible", list(self._player_button_restore_widths)
+        )
+        self.hidden_player_buttons = {
+            k for k in self._player_button_restore_widths if k not in visible_buttons_saved
+        }
+        self._player_button_slots = {}
+
+        self._add_shrinkable_button(
+            actions, "rebuy", "Rebuy (+)", self._rebuy_selected,
+            "Recave : remet le joueur en jeu avec le nombre de\njetons réglé dans Paramètres, incrémente son compteur de rebuys.",
+        )
+        self._add_shrinkable_button(
+            actions, "addon", "Add-on (+)", self._addon_selected,
+            "Recharge (add-on) : ajoute des jetons au joueur (réglage\nParamètres), incrémente son compteur d'add-ons.",
+        )
+        self._add_shrinkable_button(actions, "edit_chips", "Modifier chips...", self._edit_chips_selected)
+        self._add_shrinkable_button(actions, "edit_purchases", "Modifier achats...", self._edit_purchases_selected)
+
         withdraw_btn = ttk.Button(actions, text="Désactiver (forfait)", command=self._withdraw_selected)
+        # Repère pour réinsérer un bouton réduit à sa bonne place (avant les
+        # boutons suivants) quand "Bou/Col..." le réaffiche.
+        self._player_button_slots_anchor = withdraw_btn
         withdraw_btn.pack(side="left", padx=3)
         Tooltip(
             withdraw_btn,
@@ -3556,18 +3725,90 @@ class App(tk.Tk):
         # l'appli (indépendamment du tournoi ouvert).
         export_prefs.save_columns("players_tab_visible", visible)
 
+    def _add_shrinkable_button(self, parent, key, text, command, tooltip=None):
+        """Bouton d'action (Rebuy, Add-on, Modifier chips/achats) placé dans
+        un cadre de largeur fixe avec une poignée dorée sur son bord droit :
+        la glisser réduit le bouton, comme une colonne du tableau ; le
+        relâcher sous _PLAYER_BUTTON_MIN_WIDTH le masque complètement
+        (seul "Bou/Col..." le réaffiche — voir _manage_player_columns)."""
+        restore_w = self._player_button_restore_widths.get(key, 130)
+        slot = tk.Frame(parent, width=restore_w, height=30, bg=FELT)
+        slot.pack_propagate(False)
+        slot.pack(side="left", padx=3)
+
+        btn = ttk.Button(slot, text=text, command=command)
+        btn.pack(fill="both", expand=True)
+        if tooltip:
+            Tooltip(btn, tooltip)
+
+        grip = tk.Frame(slot, width=5, bg=GOLD_DARK, cursor="sb_h_double_arrow")
+        grip.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
+        Tooltip(
+            grip,
+            "Glisser pour réduire ce bouton (jusqu'à le masquer) —\n"
+            "\"Bou/Col...\" le réaffiche ensuite.",
+        )
+
+        self._player_button_slots[key] = slot
+        drag = {"start_x": 0, "start_w": restore_w}
+
+        def on_press(event):
+            drag["start_x"] = event.x_root
+            drag["start_w"] = slot.winfo_width()
+
+        def on_motion(event):
+            new_w = max(2, drag["start_w"] + (event.x_root - drag["start_x"]))
+            slot.configure(width=new_w)
+
+        def on_release(event):
+            if slot.winfo_width() <= self._PLAYER_BUTTON_MIN_WIDTH:
+                slot.pack_forget()
+                self.hidden_player_buttons.add(key)
+                self._save_hidden_player_buttons()
+
+        grip.bind("<ButtonPress-1>", on_press)
+        grip.bind("<B1-Motion>", on_motion)
+        grip.bind("<ButtonRelease-1>", on_release)
+
+        if key in self.hidden_player_buttons:
+            slot.pack_forget()
+        return slot
+
+    def _save_hidden_player_buttons(self):
+        visible = [
+            k for k in self._player_button_restore_widths if k not in self.hidden_player_buttons
+        ]
+        export_prefs.save_columns("players_tab_buttons_visible", visible)
+
     def _manage_player_columns(self):
         """Fenêtre pour réafficher (ou masquer manuellement) les colonnes
-        du tableau Joueurs — seul moyen de récupérer une colonne réduite
-        à rien, puisqu'elle n'a alors plus de bordure à ressaisir."""
+        et les boutons réductibles de l'onglet Joueurs — seul moyen de les
+        récupérer une fois réduits à rien, puisqu'ils n'ont alors plus de
+        bordure/poignée à ressaisir."""
         win = tk.Toplevel(self)
-        win.title("Colonnes affichées")
+        win.title("Boutons et colonnes affichés")
         win.configure(bg=FELT_DARK)
         win.transient(self)
         win.grab_set()
 
+        button_labels = {
+            "rebuy": "Rebuy (+)", "addon": "Add-on (+)",
+            "edit_chips": "Modifier chips...", "edit_purchases": "Modifier achats...",
+        }
+        btn_vars = {
+            k: tk.BooleanVar(value=k not in self.hidden_player_buttons) for k in button_labels
+        }
         tk.Label(
-            win, text="Colonnes affichées dans l'onglet Joueurs :",
+            win, text="Boutons affichés :",
+            bg=FELT_DARK, fg=CREAM, font=("Helvetica", 10, "bold"),
+        ).pack(padx=16, pady=(16, 8), anchor="w")
+        for k, label in button_labels.items():
+            ttk.Checkbutton(win, text=label, variable=btn_vars[k]).pack(
+                anchor="w", padx=16, pady=2
+            )
+
+        tk.Label(
+            win, text="Colonnes affichées dans le tableau :",
             bg=FELT_DARK, fg=CREAM, font=("Helvetica", 10, "bold"),
         ).pack(padx=16, pady=(16, 8), anchor="w")
 
@@ -3580,6 +3821,20 @@ class App(tk.Tk):
             )
 
         def apply_and_close():
+            for k, var in btn_vars.items():
+                if var.get():
+                    self.hidden_player_buttons.discard(k)
+                    slot = self._player_button_slots.get(k)
+                    if slot is not None and not slot.winfo_ismapped():
+                        slot.configure(width=self._player_button_restore_widths.get(k, 130))
+                        slot.pack(side="left", padx=3, before=self._player_button_slots_anchor)
+                else:
+                    self.hidden_player_buttons.add(k)
+                    slot = self._player_button_slots.get(k)
+                    if slot is not None:
+                        slot.pack_forget()
+            self._save_hidden_player_buttons()
+
             for c, var in col_vars.items():
                 if var.get():
                     self.hidden_player_columns.discard(c)
@@ -4065,11 +4320,15 @@ class App(tk.Tk):
             self._refresh_all()
 
     def _play_movement_signal(self):
-        """Émet le signal de mouvements (tonalité/durée réglables dans
-        Paramètres)."""
-        freq = self.db.get_setting_int("movement_signal_frequency_hz", 880)
+        """Émet le signal de mouvements : le fichier .wav choisi dans
+        Paramètres (commun à tous les tournois, voir _choose_clock_sound),
+        tronqué à "Durée max. du signal" s'il est plus long qu'elle ; à
+        défaut, un bip généré automatiquement de cette même durée."""
         duration = self.db.get_setting_int("movement_signal_duration_ms", 300)
-        if not sound_signal.play_tone(freq, duration):
+        wav_path = export_prefs.load_value("movement_signal_wav_path", "")
+        if wav_path and sound_signal.play_file(wav_path, max_duration_ms=duration):
+            return
+        if not sound_signal.play_tone(880, duration):
             self.bell()  # repli si la lecture audio n'a pas pu être lancée
 
     def _trigger_movement_alert(self):
@@ -4077,9 +4336,18 @@ class App(tk.Tk):
         (élimination ou bouton "Rééquilibrer les tables") : joue le signal
         sonore, met le chronomètre en pause (comme _clock_pause) s'il
         tournait, et active le bandeau clignotant "Changement de tables en
-        cours" (onglets Chronomètre + écran projecteur). Le bouton "Terminé"
-        de l'onglet Mouvements (_finish_movement_alert) referme le bandeau
-        et relance le chronomètre."""
+        cours" (onglets Chronomètre + écran projecteur). Bascule aussi
+        automatiquement l'onglet Mouvements au premier plan (au-dessus du
+        Chronomètre ou de tout autre onglet affiché) pour que le
+        responsable voie tout de suite qui doit changer de table, avant de
+        dire "Terminé". Le bouton "Terminé" de l'onglet Mouvements
+        (_finish_movement_alert) referme le bandeau et relance le
+        chronomètre — comme le raccourci clavier Ctrl+Maj+T ou le bouton
+        "Terminé" du contrôle à distance (voir _on_voice_word). Annule
+        aussi une éventuelle "élimination en attente" (voir
+        _voice_start_elimination) : si l'élimination qui vient de se
+        produire a justement causé ce rééquilibrage, c'est "Terminé" qui
+        clôt le tout maintenant, plus "Chronomètre"."""
         self._play_movement_signal()
         if (self.db.get_setting_int("clock_started", 0) == 1
                 and self.db.get_setting_int("is_paused", 1) == 0):
@@ -4087,17 +4355,207 @@ class App(tk.Tk):
             elapsed = int(time.time()) - start
             self.db.set_settings({"is_paused": 1, "paused_accum_seconds": elapsed})
         self.db.set_settings({"movement_alert_active": 1})
+        self.voice_awaiting_resume = False
+        self.notebook.select(self.moves_tab)
+        self._refresh_moves_tab()
         self._refresh_clock_tab()
+        # Ramène la fenêtre principale au premier plan (devant l'écran
+        # projecteur, potentiellement plein écran) : changer d'onglet ne
+        # suffit pas à rendre le bandeau visible si une autre fenêtre le
+        # recouvre encore (voir aussi _voice_start_elimination).
+        self.lift()
+        self.focus_force()
 
     def _finish_movement_alert(self):
-        """Bouton "Terminé" de l'onglet Mouvements : referme le bandeau
-        d'alerte, relance le chronomètre (comme _clock_resume) et vide la
-        liste des mouvements affichée (le prochain rééquilibrage la
-        repeuplera avec son propre lot)."""
+        """Bouton "Terminé" de l'onglet Mouvements (ou raccourci clavier/
+        contrôle à distance, voir _on_voice_word) : referme le bandeau d'alerte,
+        relance le chronomètre (comme _clock_resume), vide la liste des
+        mouvements affichée (le prochain rééquilibrage la repeuplera avec
+        son propre lot), rebascule l'onglet Chronomètre au premier plan
+        dans la fenêtre principale (symétrique du passage automatique sur
+        Mouvements fait par _trigger_movement_alert) et ramène aussi la
+        fenêtre séparée "écran projecteur" au premier plan si elle est
+        ouverte — sans ça elle peut rester cachée derrière la fenêtre
+        principale une fois l'alerte terminée."""
         self.db.set_settings({"movement_alert_active": 0})
+        self.voice_awaiting_resume = False
         self._clock_resume()
         self.db.clear_seat_moves()
         self._refresh_moves_tab()
+        self.notebook.select(self.clock_tab)
+        self._refresh_clock_tab()
+        if self.clock_window is not None and self.clock_window.winfo_exists():
+            self.clock_window.lift()
+
+    # ---------------------------------------------------------------
+    # Raccourcis clavier "Élimination" / "Terminé" / "Chronomètre" — même
+    # dispatch que le contrôle à distance (_on_voice_word) : chaque mot
+    # n'est traité que s'il a un sens dans l'état courant du tournoi.
+    # ---------------------------------------------------------------
+    def _bind_voice_command_shortcuts(self):
+        """Raccourcis clavier Ctrl+Maj+E / Ctrl+Maj+C / Ctrl+Maj+T pour les
+        3 actions "Élimination"/"Chronomètre"/"Terminé", TOUJOURS actifs.
+        Ctrl+Alt a été écarté (Ctrl+Maj utilisé à la place) : sur Mac,
+        Option("Alt")+E/C/T compose des caractères spéciaux (é/è, ç, †) au
+        niveau du système avant même que l'application ne voie la touche,
+        rendant Ctrl+Alt peu fiable là-bas — Maj ne compose jamais de
+        caractère spécial, donc fiable sur Windows et Mac. Passent par
+        _on_voice_word, exactement comme le contrôle à distance : mêmes
+        conditions (ex : "Ctrl+Maj+C" ne fait rien tant qu'aucune
+        élimination n'est en attente)."""
+        self.bind_all("<Control-Shift-E>", lambda e: self._on_voice_word("elimination"))
+        self.bind_all("<Control-Shift-C>", lambda e: self._on_voice_word("chronometre"))
+        self.bind_all("<Control-Shift-T>", lambda e: self._on_voice_word("terminer"))
+
+    # ---------------------------------------------------------------
+    # Contrôle à distance depuis un téléphone (voir remote_control.py) —
+    # une petite page web avec 3 boutons (Élimination/Chronomètre/
+    # Terminé), servie par un serveur local sur le wifi du club. Même
+    # dispatch que les raccourcis clavier (_on_voice_word), réglage
+    # indépendant.
+    # ---------------------------------------------------------------
+    def _start_remote_control_if_enabled(self, silent=False):
+        """Démarre le petit serveur web de contrôle à distance si le
+        réglage correspondant est activé (Paramètres). Silencieux si déjà
+        démarré. Le port ne peut être occupé que par une seule fenêtre à
+        la fois — normal et attendu si plusieurs tournois/Sit & Go tournent
+        en parallèle (voir "Nouveau SitnGO", chapitre 14) : la première
+        fenêtre ouverte garde le contrôle à distance, les suivantes ne
+        l'activent pas mais restent sinon parfaitement utilisables.
+        `silent=True` (utilisé au lancement automatique d'une fenêtre,
+        justement pour ce cas courant) n'affiche alors aucune fenêtre
+        d'erreur — seulement un message dans la console ; `silent=False`
+        (case à cocher cliquée explicitement dans Paramètres) affiche
+        l'erreur normalement, l'utilisateur a alors besoin du retour."""
+        if export_prefs.load_value("remote_control_enabled", False) is not True:
+            return
+        if self.remote_control_server is not None and self.remote_control_server.is_running:
+            return
+        server = remote_control.RemoteControlServer(
+            on_word=lambda word: self.voice_command_queue.put(word),
+            get_tournament_name=lambda: self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi",
+        )
+        try:
+            server.start()
+        except OSError as exc:
+            if silent:
+                print(
+                    f"[contrôle à distance] port {remote_control.DEFAULT_PORT} déjà utilisé "
+                    f"(probablement par une autre fenêtre de l'appli déjà ouverte) : {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                messagebox.showerror(
+                    "Contrôle à distance",
+                    f"Impossible de démarrer le serveur (port {remote_control.DEFAULT_PORT} "
+                    f"déjà utilisé ?) :\n{exc}",
+                )
+            return
+        self.remote_control_server = server
+        self._refresh_remote_control_status()
+
+    def _stop_remote_control(self):
+        if self.remote_control_server is not None:
+            self.remote_control_server.stop()
+            self.remote_control_server = None
+        self._refresh_remote_control_status()
+
+    def _on_remote_control_toggle(self):
+        """Case à cocher "Activer le contrôle à distance" (Paramètres) :
+        mémorise le choix (réglage commun à tous les tournois/Sit & Go,
+        comme la commande vocale) et démarre/arrête le serveur tout de
+        suite, sans redémarrer l'appli."""
+        enabled = self.remote_control_enabled_var.get()
+        export_prefs.save_value("remote_control_enabled", enabled)
+        if enabled:
+            self._start_remote_control_if_enabled()
+        else:
+            self._stop_remote_control()
+
+    def _refresh_remote_control_status(self):
+        """Met à jour le libellé affichant l'adresse à ouvrir sur le
+        téléphone (ou son absence si le serveur n'est pas démarré)."""
+        if not hasattr(self, "remote_control_status_lbl"):
+            return
+        if self.remote_control_server is not None and self.remote_control_server.is_running:
+            url = self.remote_control_server.url
+            self.remote_control_status_lbl.config(
+                text=f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
+            )
+        else:
+            self.remote_control_status_lbl.config(text="")
+
+    def _poll_voice_queue(self):
+        """Relève régulièrement les mots-clés déposés par le contrôle à
+        distance (voir remote_control.py) et les traite ici, sur le thread
+        Tkinter — même principe périodique que _tick. S'arrête
+        silencieusement de se reprogrammer si la fenêtre a été détruite
+        entre-temps (fenêtre secondaire fermée, appli quittée)."""
+        if not self.winfo_exists():
+            return
+        try:
+            while True:
+                item = self.voice_command_queue.get_nowait()
+                self._on_voice_word(item)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_voice_queue)
+
+    def _on_voice_word(self, word):
+        """Dispatché pour chaque mot-clé reçu ("elimination"/"terminer"/
+        "chronometre", depuis un raccourci clavier ou le contrôle à
+        distance) : n'agit que si ce mot a un sens dans l'état courant du
+        tournoi (ex : "chronomètre" ne fait rien tant qu'aucune
+        élimination n'est en attente)."""
+        if not self.db:
+            return
+        alert_active = self.db.get_setting_int("movement_alert_active", 0) == 1
+        if word == "terminer":
+            if alert_active:
+                self._finish_movement_alert()
+        elif word == "elimination":
+            if not alert_active and not self.voice_awaiting_resume:
+                self._voice_start_elimination()
+        elif word == "chronometre":
+            if not alert_active and self.voice_awaiting_resume:
+                self._voice_resume_clock()
+
+    def _voice_start_elimination(self):
+        """Commande "Élimination" (raccourci clavier ou contrôle à
+        distance) : met le chronomètre en pause (comme _clock_pause) et
+        bascule l'onglet Joueurs au premier plan pour que le responsable
+        élimine un joueur sans les mains. Si l'élimination déclenche un
+        rééquilibrage, _trigger_movement_alert prend normalement le relais
+        (bandeau + "Terminé") ; sinon, "Chronomètre" relance le chrono
+        (voir _voice_resume_clock). Ramène aussi la fenêtre principale au
+        premier plan (devant l'écran projecteur, potentiellement plein
+        écran sur son propre moniteur) : sans ça, changer d'onglet ne
+        suffit pas à le rendre visible si une autre fenêtre le recouvre
+        encore."""
+        if (self.db.get_setting_int("clock_started", 0) == 1
+                and self.db.get_setting_int("is_paused", 1) == 0):
+            start = self.db.get_setting_int("level_start_epoch", int(time.time()))
+            elapsed = int(time.time()) - start
+            self.db.set_settings({"is_paused": 1, "paused_accum_seconds": elapsed})
+        self.voice_awaiting_resume = True
+        self.notebook.select(self.players_tab)
+        self._refresh_players_tab()
+        self._refresh_clock_tab()
+        self.lift()
+        self.focus_force()
+
+    def _voice_resume_clock(self):
+        """Commande "Chronomètre" (raccourci clavier ou contrôle à
+        distance) : relance le chrono après une élimination (déclenchée
+        par "Élimination") qui n'a causé aucun mouvement de table (sinon
+        c'est "Terminé" qui s'en charge, voir _finish_movement_alert), et
+        ramène l'onglet Chronomètre + l'écran projecteur au premier plan."""
+        self.voice_awaiting_resume = False
+        self._clock_resume()
+        self.notebook.select(self.clock_tab)
+        self._refresh_clock_tab()
+        if self.clock_window is not None and self.clock_window.winfo_exists():
+            self.clock_window.lift()
 
     def _refresh_players_tab(self):
         # Garde la liste déroulante des clubs à jour (un club a pu être
@@ -4169,7 +4627,7 @@ class App(tk.Tk):
                     f"{p['chips']:,}".replace(",", " "),
                     p["buyin_count"], p["rebuy_count"], p["addon_count"],
                     bounty_txt, status, p["rang"] or "-",
-                    p["elim_time"] or "-", p["elim_round"] or "-", p["eliminated_by_name"] or "-",
+                    format_datetime_fr(p["elim_time"]) or "-", p["elim_round"] or "-", p["eliminated_by_name"] or "-",
                 ),
                 tags=tags,
             )
@@ -4265,6 +4723,12 @@ class App(tk.Tk):
 
     def _add_table(self):
         self.db.add_table()
+        # add_table() se base sur le nombre total de tables jamais créées
+        # (pour éviter un doublon de nom), ce qui peut donner un numéro
+        # élevé (ex : « Table 12 ») à côté de tables actives renumérotées
+        # « Table 1 », « Table 2 »... par un rééquilibrage précédent — on
+        # referme aussitôt ce trou.
+        self.db.renumber_active_tables()
         self._refresh_all()
 
     def _refresh_tables_tab(self):
@@ -4285,7 +4749,7 @@ class App(tk.Tk):
             for p in plist:
                 ttk.Label(
                     frame,
-                    text=f"Siège {p['seat']} — {p['name']}  ({p['chips']:,}".replace(",", " ") + ")",
+                    text=f"Siège {p['seat']} — {p['name']}",
                 ).pack(anchor="w", padx=10, pady=2)
 
         # Repart du haut à chaque rafraîchissement (rééquilibrage,
@@ -4381,7 +4845,7 @@ class App(tk.Tk):
             self.moves_tree.insert(
                 "", "end",
                 values=(
-                    m["moved_at"],
+                    format_datetime_fr(m["moved_at"]),
                     m["player_name"],
                     m["old_table_name"] or "—",
                     m["old_seat"] or "—",
@@ -4419,13 +4883,13 @@ class App(tk.Tk):
         cols1 = ("name", "rang", "presence", "assiduite", "cl_montant",
                   "bo_nombre", "bo_valeur", "bo_montant", "total")
         headers1 = ["Joueur", "Rang", "Présence", "Assiduité", "Classement",
-                    "Bounty — Nb", "Bounty — Val", "Bounty — Mt", "TOTAL"]
+                    "Nb Bounty", "Val Bounty", "Mon Bounty", "TOTAL"]
         self.primes_tree = ttk.Treeview(summary, columns=cols1, show="headings", height=14)
         for c, h in zip(cols1, headers1):
             self.primes_tree.heading(c, text=h)
             width = 150 if c == "name" else 95
             self.primes_tree.column(c, width=width, anchor="w" if c == "name" else "center")
-        # Tri par clic sur en-tête : Rang, Bounty — Nb, TOTAL (les autres
+        # Tri par clic sur en-tête : Rang, Nb Bounty, TOTAL (les autres
         # colonnes ne sont pas des critères de tri pertinents à eux seuls).
         for c in ("rang", "bo_nombre", "total"):
             self.primes_tree.heading(c, command=lambda col=c: self._sort_primes_by(col))
@@ -4456,7 +4920,7 @@ class App(tk.Tk):
         self.bounty_history_tree.pack(fill="both", expand=True, padx=6, pady=6)
 
     def _sort_primes_by(self, column):
-        """Tri par clic sur un en-tête (Rang / Bounty — Nb / TOTAL) : ré-
+        """Tri par clic sur un en-tête (Rang / Nb Bounty / TOTAL) : ré-
         appuyer sur le même en-tête inverse l'ordre."""
         if self.primes_sort["column"] == column:
             self.primes_sort["ascending"] = not self.primes_sort["ascending"]
@@ -4466,7 +4930,7 @@ class App(tk.Tk):
         self._refresh_bounty_tab()
 
     def _update_primes_sort_headings(self):
-        base_headers = {"rang": "Rang", "bo_nombre": "Bounty — Nb", "total": "TOTAL"}
+        base_headers = {"rang": "Rang", "bo_nombre": "Nb Bounty", "total": "TOTAL"}
         for col, label in base_headers.items():
             if self.primes_sort["column"] == col:
                 arrow = " ▲" if self.primes_sort["ascending"] else " ▼"
@@ -4523,7 +4987,7 @@ class App(tk.Tk):
             self.bounty_history_tree.insert(
                 "", "end",
                 values=(
-                    e["event_time"], e["eliminated_name"], e["eliminator_name"] or "—",
+                    format_datetime_fr(e["event_time"]), e["eliminated_name"], e["eliminator_name"] or "—",
                     f"{e['amount_won']:,} pts".replace(",", " "),
                     f"{e['added_to_eliminator_bounty']:,} pts".replace(",", " ")
                     if e["added_to_eliminator_bounty"] else "—",
@@ -4539,36 +5003,84 @@ class App(tk.Tk):
     def _build_clock_tab(self):
         frame = self.clock_tab
         # Bandeau d'alerte "Changement de tables en cours" : positionné en
-        # overlay (place(), pas pack()) par-dessus le reste de l'onglet,
-        # affiché/masqué en clignotant depuis _refresh_clock_tab tant que
-        # movement_alert_active est actif (voir _trigger_movement_alert /
-        # _finish_movement_alert, onglet Mouvements).
+        # overlay (place(), pas pack()) par-dessus le reste de l'onglet
+        # (directement sur `frame`, pas dans le conteneur défilable
+        # ci-dessous, pour rester visible quelle que soit la position de
+        # défilement), affiché/masqué en clignotant depuis
+        # _refresh_clock_tab tant que movement_alert_active est actif
+        # (voir _trigger_movement_alert / _finish_movement_alert, onglet
+        # Mouvements).
         self.movement_alert_lbl = tk.Label(
             frame, text="⚠  Changement de tables en cours  ⚠",
             font=("Helvetica", 20, "bold"), bg=DANGER_RED, fg="white",
             relief="solid", borderwidth=3, padx=24, pady=16,
         )
-        self.level_display = ttk.Label(frame, text="", font=("Helvetica", 20, "bold"))
+
+        # Conteneur défilable : les 5 boutons + la structure de blindes +
+        # les sons peuvent dépasser la hauteur visible sur un petit écran.
+        canvas = tk.Canvas(frame, bg=FELT, highlightthickness=0)
+        vscroll = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        vscroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width)
+        )
+
+        is_mac = self.tk.call("tk", "windowingsystem") == "aqua"
+
+        def _on_mousewheel(event):
+            if is_mac:
+                canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        # La molette ne fait défiler cet onglet que lorsque le curseur est
+        # dessus, pour ne pas perturber le défilement des autres onglets.
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        # Ligne du haut : les 5 boutons d'action en haut à droite (empilés),
+        # les infos du niveau en cours (niveau/minuteur/blindes/suivant) à
+        # gauche dans l'espace restant. "controls" est empaqueté AVANT
+        # "info_col" (qui a expand=True) pour que les boutons réservent
+        # bien leur place à droite en premier — sinon info_col capterait
+        # tout l'espace et ne laisserait rien pour eux.
+        top_row = ttk.Frame(inner)
+        top_row.pack(fill="x")
+
+        controls = ttk.Frame(top_row)
+        controls.pack(side="right", anchor="ne", padx=20, pady=20)
+        ttk.Button(controls, text="Démarrer / Reprendre", command=self._clock_resume).pack(fill="x", pady=3)
+        ttk.Button(controls, text="Pause", command=self._clock_pause).pack(fill="x", pady=3)
+        ttk.Button(controls, text="Niveau précédent", command=self._clock_prev_level).pack(fill="x", pady=3)
+        ttk.Button(controls, text="Niveau suivant", command=self._clock_next_level).pack(fill="x", pady=3)
+        ttk.Button(controls, text="Ouvrir l'écran projecteur", command=self._open_clock_window).pack(fill="x", pady=3)
+
+        info_col = ttk.Frame(top_row)
+        info_col.pack(side="left", fill="both", expand=True)
+
+        self.level_display = ttk.Label(info_col, text="", font=("Helvetica", 20, "bold"))
         self.level_display.pack(pady=(20, 5))
 
-        self.timer_display = ttk.Label(frame, text="00:00", font=("Helvetica", 60, "bold"))
+        self.timer_display = ttk.Label(info_col, text="00:00", font=("Helvetica", 60, "bold"))
         self.timer_display.pack(pady=10)
 
-        self.blinds_display = ttk.Label(frame, text="", font=("Helvetica", 28))
+        self.blinds_display = ttk.Label(info_col, text="", font=("Helvetica", 28))
         self.blinds_display.pack()
 
-        self.next_display = ttk.Label(frame, text="", font=("Helvetica", 12))
+        self.next_display = ttk.Label(info_col, text="", font=("Helvetica", 12))
         self.next_display.pack(pady=(5, 20))
 
-        controls = ttk.Frame(frame)
-        controls.pack(pady=10)
-        ttk.Button(controls, text="Démarrer / Reprendre", command=self._clock_resume).pack(side="left", padx=5)
-        ttk.Button(controls, text="Pause", command=self._clock_pause).pack(side="left", padx=5)
-        ttk.Button(controls, text="Niveau précédent", command=self._clock_prev_level).pack(side="left", padx=5)
-        ttk.Button(controls, text="Niveau suivant", command=self._clock_next_level).pack(side="left", padx=5)
-        ttk.Button(controls, text="Ouvrir l'écran projecteur", command=self._open_clock_window).pack(side="left", padx=15)
-
-        struct_frame = ttk.LabelFrame(frame, text="Structure de blindes")
+        # "Structure de blindes" juste sous top_row (donc sous "Niveau
+        # suivant"), et prend tout l'espace restant en dessous.
+        struct_frame = ttk.LabelFrame(inner, text="Structure de blindes")
         struct_frame.pack(fill="both", expand=True, padx=15, pady=10)
 
         ttk.Label(
@@ -4616,7 +5128,7 @@ class App(tk.Tk):
             ("sound_round_end_path", "Son fin Round"),
         ):
             btn = ttk.Button(struct_btns, text=self._clock_sound_button_text(key, label))
-            btn.pack(pady=3, fill="x")
+            btn.pack(pady=(3, 0), fill="x")
             btn.config(command=lambda k=key, l=label, b=btn: self._choose_clock_sound(k, l, b))
             btn.bind("<Button-2>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
             btn.bind("<Button-3>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
@@ -4628,6 +5140,26 @@ class App(tk.Tk):
             )
             self._clock_sound_buttons[key] = btn
 
+            # Durée max. (tronque le fichier s'il est plus long, comme pour
+            # le Signal de mouvements) + Test, sur la même ligne.
+            sub = ttk.Frame(struct_btns)
+            sub.pack(fill="x", pady=(0, 3))
+            ttk.Label(sub, text="Durée (ms) :").pack(side="left")
+            dur_var = tk.StringVar(value=export_prefs.load_value(f"{key}_duration_ms", ""))
+            dur_entry = ttk.Entry(sub, textvariable=dur_var, width=6)
+            dur_entry.pack(side="left", padx=(4, 4))
+            Tooltip(
+                dur_entry,
+                "Tronque ce fichier s'il dure plus longtemps que ça\n"
+                "(en millisecondes). Laisser vide pour le jouer en entier.",
+            )
+            dur_var.trace_add(
+                "write", lambda *a, k=key, v=dur_var: self._save_clock_sound_duration(k, v)
+            )
+            ttk.Button(
+                sub, text="Test", width=5, command=lambda k=key: self._test_clock_sound(k),
+            ).pack(side="left")
+
     def _clock_resume(self):
         if self.db.get_setting_int("clock_started", 0) == 0:
             self.db.set_settings({
@@ -4635,6 +5167,10 @@ class App(tk.Tk):
                 "level_start_epoch": int(time.time()),
                 "is_paused": 0,
                 "paused_accum_seconds": 0,
+                # Fixé une seule fois, au tout premier démarrage : sert de
+                # référence pour la "Durée" affichée sur le chrono
+                # projecteur (voir Database.get_stats).
+                "tournament_start_epoch": int(time.time()),
             })
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
@@ -4775,7 +5311,29 @@ class App(tk.Tk):
     def _play_clock_sound(self, setting_key):
         path = export_prefs.load_value(setting_key, "")
         if path:
-            sound_signal.play_file(path)
+            sound_signal.play_file(path, max_duration_ms=self._clock_sound_duration_ms(setting_key))
+
+    def _clock_sound_duration_ms(self, setting_key):
+        """Durée max. (ms) configurée pour ce son (voir le champ "Durée"
+        à côté de chaque bouton), ou None si vide/invalide (joue le
+        fichier en entier)."""
+        raw = export_prefs.load_value(f"{setting_key}_duration_ms", "")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _save_clock_sound_duration(self, setting_key, var):
+        export_prefs.save_value(f"{setting_key}_duration_ms", var.get())
+
+    def _test_clock_sound(self, setting_key):
+        path = export_prefs.load_value(setting_key, "")
+        if not path:
+            messagebox.showinfo("Test", "Aucun fichier son choisi pour l'instant.")
+            return
+        if not sound_signal.play_file(path, max_duration_ms=self._clock_sound_duration_ms(setting_key)):
+            self.bell()
 
     def _clock_sound_button_text(self, setting_key, label):
         path = export_prefs.load_value(setting_key, "")
@@ -4873,10 +5431,15 @@ class App(tk.Tk):
         if self.clock_window is not None and self.clock_window.winfo_exists():
             stats = self.db.get_stats()
             name = self.db.get_setting("tournament_name", "Tournoi")
+            # La liste des joueurs concernés n'est utile à l'écran
+            # projecteur que pendant l'alerte elle-même (voir
+            # ClockWindow._update_movement_moves_table) : inutile
+            # d'interroger la base à chaque tick le reste du temps.
+            moves = self.db.get_seat_moves() if movement_alert else []
             self.clock_window.refresh(
                 remaining, level, next_level, stats, name, paused,
                 self._next_break_eta_text(), movement_alert,
-                self._load_chip_denominations(),
+                self._load_chip_denominations(), moves,
             )
 
     def _open_clock_window(self):
@@ -4977,7 +5540,8 @@ class App(tk.Tk):
 
         ttk.Label(
             chips_frame, foreground=MUTED,
-            text="Couleurs de jetons utilisées pour ce tournoi (facultatif).",
+            text="Jetons utilisés pour ce tournoi (facultatif). Cliquer sur "
+                 "la pastille pour choisir une couleur ou une image de jeton.",
             wraplength=220, justify="left",
         ).pack(anchor="w", padx=8, pady=(8, 6))
 
@@ -5049,6 +5613,10 @@ class App(tk.Tk):
             cleaned.append({
                 "name": str(item.get("name", "") or "").strip(),
                 "color": str(item.get("color", "") or "#000000"),
+                # Nom de fichier dans ~/.poker_tournament/chip_images/ (voir
+                # chip_images.py) si cette dénomination utilise une image
+                # de jeton plutôt qu'une pastille de couleur ; vide sinon.
+                "image": str(item.get("image", "") or "").strip(),
                 "value": value,
                 "count": count,
             })
@@ -5059,7 +5627,7 @@ class App(tk.Tk):
             w.destroy()
         self._chip_row_vars = []
 
-        for col, h in enumerate(["Couleur", "", "Valeur", "Nb/joueur", "Total", ""]):
+        for col, h in enumerate(["Jeton", "", "Valeur", "Nb/joueur", "Total", ""]):
             ttk.Label(
                 self.chips_rows_frame, text=h, font=("Helvetica", 9, "bold"), foreground=GOLD_DARK,
             ).grid(row=0, column=col, padx=3, pady=(0, 4), sticky="w")
@@ -5075,6 +5643,10 @@ class App(tk.Tk):
             "color": tk.StringVar(value=data.get("color", "#000000")),
             "value": tk.StringVar(value=str(data.get("value", 0))),
             "count": tk.StringVar(value=str(data.get("count", 0))),
+            # Pas une tk.Var : seulement modifié depuis _pick_color/_pick_image
+            # ci-dessous (jamais tapé directement), lu par
+            # _collect_chips_from_widgets.
+            "image": data.get("image", "") or "",
         }
         name_entry = ttk.Entry(self.chips_rows_frame, textvariable=row_vars["name"], width=10)
         name_entry.grid(row=grid_row, column=0, padx=3, pady=2)
@@ -5082,20 +5654,77 @@ class App(tk.Tk):
         swatch = tk.Canvas(
             self.chips_rows_frame, width=20, height=20, highlightthickness=0, bg=FELT,
         )
-        oval_id = swatch.create_oval(2, 2, 18, 18, fill=row_vars["color"].get(), outline=GOLD_DARK)
         swatch.grid(row=grid_row, column=1, padx=3, pady=2)
+        row_vars["_swatch"] = swatch
 
-        def _pick_color(rv=row_vars, sw=swatch, oid=oval_id):
+        def _render_swatch(rv=row_vars, sw=swatch):
+            """Dessine la pastille : l'image de jeton choisie si elle est
+            renseignée et son fichier existe encore, sinon la couleur
+            unie — jamais les deux à la fois."""
+            sw.delete("all")
+            path = chip_images.get_chip_image_path(rv["image"]) if rv["image"] else None
+            photo = load_thumbnail(path, 20) if path else None
+            if photo is not None:
+                sw.create_image(10, 10, image=photo)
+                sw.image = photo  # garder une référence (sinon GC par Tk)
+            else:
+                sw.create_oval(2, 2, 18, 18, fill=rv["color"].get(), outline=GOLD_DARK)
+
+        _render_swatch()
+
+        def _pick_color(rv=row_vars):
             _, hex_color = colorchooser.askcolor(
                 color=rv["color"].get(), title="Choisir une couleur", parent=self,
             )
             if hex_color:
                 rv["color"].set(hex_color)
-                sw.itemconfigure(oid, fill=hex_color)
+                if rv["image"]:
+                    chip_images.delete_chip_image(rv["image"])
+                    rv["image"] = ""
+                _render_swatch()
                 self._autosave_chips()
 
-        swatch.bind("<Button-1>", lambda e: _pick_color())
-        Tooltip(swatch, "Cliquer pour choisir la couleur de la pastille.")
+        def _pick_image(rv=row_vars):
+            path = filedialog.askopenfilename(
+                title="Choisir une image de jeton",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.gif"), ("Tous les fichiers", "*.*")],
+                parent=self,
+            )
+            if not path:
+                return
+            if not PIL_AVAILABLE:
+                messagebox.showerror(
+                    "Module manquant",
+                    "L'aperçu des images de jetons nécessite le paquet 'Pillow', "
+                    "qui n'est pas installé.\n\nOuvrez un terminal et tapez :\n\n"
+                    "    pip3 install Pillow",
+                    parent=self,
+                )
+                return
+            old_image = rv["image"]
+            rv["image"] = chip_images.save_chip_image_from_file(path)
+            if old_image:
+                chip_images.delete_chip_image(old_image)
+            _render_swatch()
+            self._autosave_chips()
+
+        def _remove_image(rv=row_vars):
+            if rv["image"]:
+                chip_images.delete_chip_image(rv["image"])
+                rv["image"] = ""
+                _render_swatch()
+                self._autosave_chips()
+
+        def _show_swatch_menu(event, rv=row_vars):
+            menu = tk.Menu(self, tearoff=0)
+            menu.add_command(label="Choisir une couleur...", command=_pick_color)
+            menu.add_command(label="Choisir une image de jeton...", command=_pick_image)
+            if rv["image"]:
+                menu.add_command(label="Retirer l'image (revenir à la couleur)", command=_remove_image)
+            menu.tk_popup(event.x_root, event.y_root)
+
+        swatch.bind("<Button-1>", _show_swatch_menu)
+        Tooltip(swatch, "Cliquer pour choisir une couleur ou une image de jeton.")
 
         value_entry = ttk.Entry(self.chips_rows_frame, textvariable=row_vars["value"], width=8)
         value_entry.grid(row=grid_row, column=2, padx=3, pady=2)
@@ -5152,7 +5781,10 @@ class App(tk.Tk):
             if strict and (value < 0 or count < 0):
                 messagebox.showerror("Erreur", f"Ligne {i} : les valeurs ne peuvent pas être négatives.")
                 return None
-            result.append({"name": name, "color": color, "value": max(0, value), "count": max(0, count)})
+            result.append({
+                "name": name, "color": color, "image": rv.get("image", ""),
+                "value": max(0, value), "count": max(0, count),
+            })
         return result
 
     def _update_chips_total(self):
@@ -5183,14 +5815,19 @@ class App(tk.Tk):
 
     def _add_chip_row(self):
         denominations = self._collect_chips_from_widgets(strict=False) or []
-        denominations.append({"name": "", "color": "#000000", "value": 0, "count": 0})
+        denominations.append({"name": "", "color": "#000000", "image": "", "value": 0, "count": 0})
         self._persist_chip_denominations(denominations)
         self._refresh_chips_tab()
 
     def _delete_chip_row(self, index):
         denominations = self._collect_chips_from_widgets(strict=False) or []
         if 0 <= index < len(denominations):
-            denominations.pop(index)
+            removed = denominations.pop(index)
+            # Ne pas laisser un fichier image orphelin dans le stockage
+            # (~/.poker_tournament/chip_images/) une fois sa dénomination
+            # supprimée.
+            if removed.get("image"):
+                chip_images.delete_chip_image(removed["image"])
         self._persist_chip_denominations(denominations)
         self._refresh_chips_tab()
 
@@ -5427,78 +6064,161 @@ class App(tk.Tk):
     # ---------------------------------------------------------------
     # Onglet Gains
     # ---------------------------------------------------------------
+    # Vitesse du défilement automatique de l'onglet Classement (utilisé
+    # seulement quand le nombre de lignes dépasse la hauteur visible) :
+    # ttk.Treeview ne défile qu'en lignes entières (pas en pixels comme
+    # le Canvas de l'onglet Tables), donc une ligne toutes les 700 ms —
+    # assez lent pour rester lisible sur un écran de vidéoprojecteur.
+    CLASSEMENT_AUTOSCROLL_INTERVAL_MS = 700
+    CLASSEMENT_AUTOSCROLL_PAUSE_MS = 2500  # pause en haut et en bas avant de reboucler
+
     def _build_payouts_tab(self):
         top = ttk.Frame(self.payouts_tab)
         top.pack(fill="x", padx=10, pady=10)
-        standard_payouts_btn = ttk.Button(
-            top, text="Générer grille standard (selon le nombre d'entrées)",
-            command=self._generate_standard_payouts,
-        )
-        standard_payouts_btn.pack(side="left", padx=3)
-        Tooltip(
-            standard_payouts_btn,
-            "Remplace la grille actuelle par une répartition standard\n"
-            "(nombre de places payées et pourcentages) adaptée au\n"
-            "nombre d'entrées de ce tournoi.",
-        )
-        edit_pct_btn = ttk.Button(top, text="Modifier % d'une place", command=self._edit_payout_pct)
-        edit_pct_btn.pack(side="left", padx=3)
-        Tooltip(edit_pct_btn, "Sélectionnez d'abord une ligne dans le tableau ci-dessous,\npuis cliquez ici pour changer son pourcentage.")
         ttk.Button(
-            top, text="Exporter la grille de gains (Excel/CSV)...", command=self._export_payouts,
+            top, text="Exporter le classement (Excel/CSV)...", command=self._export_classement,
         ).pack(side="left", padx=3)
 
         self.payout_summary_lbl = ttk.Label(self.payouts_tab, text="", font=("Helvetica", 11, "bold"))
         self.payout_summary_lbl.pack(padx=10, anchor="w")
 
-        cols = ("place", "pct", "amount")
-        headers = ["Place", "Pourcentage", "Montant"]
-        self.payouts_tree = ttk.Treeview(self.payouts_tab, columns=cols, show="headings", height=15)
+        tree_frame = ttk.Frame(self.payouts_tab)
+        tree_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        cols = ("name", "rang", "elim_time", "elim_round", "eliminated_by")
+        headers = ["Nom", "Rang", "Éliminé le", "Round", "Éliminé par"]
+        self.payouts_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=15)
         for c, h in zip(cols, headers):
             self.payouts_tree.heading(c, text=h)
             self.payouts_tree.column(c, width=150, anchor="center")
-        self.payouts_tree.pack(fill="both", expand=True, padx=10, pady=10)
+        self.payouts_tree.column("name", anchor="w")
+        # Tri au clic, seulement sur Nom et Rang (voir _sort_classement_by
+        # / _classement_rows) ; ré-appuyer sur le même en-tête inverse
+        # l'ordre.
+        self.classement_sort = {"column": None, "ascending": True}
+        self.payouts_tree.heading("name", command=lambda: self._sort_classement_by("name"))
+        self.payouts_tree.heading("rang", command=lambda: self._sort_classement_by("rang"))
+        self._update_classement_sort_headings()
+        payouts_scrollbar = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.payouts_tree.yview
+        )
+        self.payouts_tree.configure(yscrollcommand=payouts_scrollbar.set)
+        self.payouts_tree.pack(side="left", fill="both", expand=True)
+        payouts_scrollbar.pack(side="right", fill="y")
+        # Molette de souris, en complément du défilement automatique.
+        self.payouts_tree.bind(
+            "<MouseWheel>",
+            lambda e: self.payouts_tree.yview_scroll(int(-e.delta / 120 * 3) or (-3 if e.delta > 0 else 3), "units"),
+        )
 
-    def _generate_standard_payouts(self):
-        stats = self.db.get_stats()
-        structure = standard_payout_structure(stats["entries"])
-        self.db.set_payout_structure(structure)
+        self._classement_scroll_after_id = None
+        self._classement_scroll_paused = False
+        self._classement_autoscroll_tick()
+
+    def _sort_classement_by(self, column):
+        if self.classement_sort["column"] == column:
+            self.classement_sort["ascending"] = not self.classement_sort["ascending"]
+        else:
+            self.classement_sort["column"] = column
+            self.classement_sort["ascending"] = True
         self._refresh_payouts_tab()
 
-    def _edit_payout_pct(self):
-        sel = self.payouts_tree.selection()
-        if not sel:
-            return
-        place = int(sel[0])
-        current = self.db.conn.execute(
-            "SELECT percentage FROM payout_structure WHERE place=?", (place,)
-        ).fetchone()
-        val = simpledialog.askfloat(
-            "Pourcentage", f"Nouveau pourcentage pour la place {place} :",
-            initialvalue=current["percentage"] if current else 0, minvalue=0, maxvalue=100,
-        )
-        if val is not None:
-            self.db.conn.execute(
-                "INSERT INTO payout_structure(place, percentage) VALUES (?, ?) "
-                "ON CONFLICT(place) DO UPDATE SET percentage=excluded.percentage",
-                (place, val),
-            )
-            self.db.conn.commit()
-            self._refresh_payouts_tab()
+    def _update_classement_sort_headings(self):
+        labels = {"name": "Nom", "rang": "Rang"}
+        for col, label in labels.items():
+            if self.classement_sort["column"] == col:
+                arrow = " ▲" if self.classement_sort["ascending"] else " ▼"
+                self.payouts_tree.heading(col, text=label + arrow)
+            else:
+                self.payouts_tree.heading(col, text=label)
+
+    def _classement_rows(self):
+        """Lignes du Classement : uniquement les joueurs déjà classés (un
+        rang déterminé — vainqueur ou éliminé), pour rester simple. Un
+        joueur encore actif en cours de tournoi n'a pas encore de rang
+        (voir Database.players_rows) et n'apparaît donc jamais ici — le
+        compteur "En cours" du résumé suffit à savoir combien il en
+        reste. Par défaut : du plus récemment classé (rang le plus bas)
+        au plus ancien ; cliquer Nom/Rang trie autrement."""
+        rows = [r for r in self.db.players_rows() if r["rang"] is not None]
+        column = self.classement_sort["column"]
+        ascending = self.classement_sort["ascending"]
+
+        if column == "name":
+            rows.sort(key=lambda r: r["name"].lower())
+        else:
+            rows.sort(key=lambda r: r["rang"])
+        if not ascending:
+            rows.reverse()
+        return rows
 
     def _refresh_payouts_tab(self):
-        stats = self.db.get_stats()
+        players = self.db.list_players()
+        eliminated_count = sum(1 for p in players if p["status"] == "eliminated")
+        active_count = sum(1 for p in players if p["status"] == "active")
         self.payout_summary_lbl.config(
-            text=(f"Entrées : {stats['entries']}  |  Prize pool : "
-                  f"{stats['prize_pool']:,.0f} €").replace(",", " ")
+            text=f"Éliminés : {eliminated_count}   |   En cours : {active_count}   |   "
+                 f"Total : {eliminated_count + active_count}"
         )
+
+        self._update_classement_sort_headings()
         for row in self.payouts_tree.get_children():
             self.payouts_tree.delete(row)
-        for p in self.db.get_payouts_amounts():
+        for r in self._classement_rows():
             self.payouts_tree.insert(
-                "", "end", iid=str(p["place"]),
-                values=(p["place"], f"{p['percentage']:.1f} %", f"{p['amount']:,.0f} €".replace(",", " ")),
+                "", "end",
+                values=(
+                    r["name"], r["rang"] or "-", format_datetime_fr(r["elim_time"]) or "-",
+                    r["elim_round"] or "-", r["eliminated_by"] or "-",
+                ),
             )
+        # Repart du haut à chaque rafraîchissement plutôt que de rester sur
+        # une position de défilement qui ne correspond plus forcément au
+        # même contenu (comme l'onglet Tables).
+        self.payouts_tree.yview_moveto(0.0)
+        self._classement_scroll_paused = False
+
+    def _classement_autoscroll_tick(self):
+        """Boucle de défilement automatique et lent de l'onglet Classement,
+        active seulement quand le nombre de lignes dépasse la capacité
+        d'affichage à l'écran (sinon rien ne défile)."""
+        if not self.winfo_exists() or not self.payouts_tree.winfo_exists():
+            return
+
+        # N'anime que si l'onglet Classement est actuellement affiché, pour
+        # ne pas défiler inutilement en arrière-plan.
+        if self.notebook.tab(self.notebook.select(), "text") != "Classement":
+            self._classement_scroll_after_id = self.after(500, self._classement_autoscroll_tick)
+            return
+
+        children = self.payouts_tree.get_children()
+        # bbox() d'une ligne renvoie '' tant qu'elle n'est pas réellement
+        # visible à l'écran : la dernière ligne a un bbox vide si, et
+        # seulement si, le tableau déborde de la zone visible — un
+        # indicateur direct, sans les arrondis de fraction de yview().
+        overflow = bool(children) and not self.payouts_tree.bbox(children[-1])
+
+        if overflow and not self._classement_scroll_paused:
+            top_frac, bottom_frac = self.payouts_tree.yview()
+            if bottom_frac < 1.0:
+                self.payouts_tree.yview_scroll(1, "units")
+                if not self.payouts_tree.bbox(children[-1]):
+                    # Toujours pas visible : encore à faire défiler.
+                    pass
+                else:
+                    self._classement_scroll_paused = True
+                    self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_resume_autoscroll)
+            elif top_frac > 0.0:
+                # Arrivé en bas : pause puis retour en haut.
+                self._classement_scroll_paused = True
+                self.payouts_tree.yview_moveto(0.0)
+                self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_resume_autoscroll)
+
+        self._classement_scroll_after_id = self.after(
+            self.CLASSEMENT_AUTOSCROLL_INTERVAL_MS, self._classement_autoscroll_tick
+        )
+
+    def _classement_resume_autoscroll(self):
+        self._classement_scroll_paused = False
 
     # ---------------------------------------------------------------
     # Onglet Paramètres
@@ -5549,6 +6269,7 @@ class App(tk.Tk):
 
         # -- Colonne gauche : réglages généraux --------------------
         fields = [
+            ("club_name", "Nom du Club"),
             ("tournament_name", "Nom du tournoi"),
             ("buyin_amount", "Montant du buy-in (€)"),
             ("rebuy_amount", "Montant d'un rebuy (€)"),
@@ -5572,7 +6293,35 @@ class App(tk.Tk):
             lbl.grid(row=i, column=0, sticky="w", pady=4)
             if key in field_tips:
                 Tooltip(lbl, field_tips[key])
-            var = tk.StringVar(value=self.db.get_setting(key, ""))
+            if key == "club_name":
+                # Commun à tous les tournois/Sit & Go (voir _save_club_name) :
+                # mémorisé dans les préférences partagées, pas dans ce
+                # fichier .tournoi, contrairement aux autres réglages
+                # ci-dessous.
+                initial = export_prefs.load_value("club_name", "")
+                var = tk.StringVar(value=initial)
+                var.trace_add("write", lambda *a: self._save_club_name())
+            elif key == "tournament_name":
+                # Auto-enregistré à la frappe (voir _save_tournament_name) :
+                # un champ purement cosmétique, sans effet de bord sur les
+                # tables, contrairement aux autres réglages ci-dessous qui
+                # eux ne s'appliquent qu'au clic sur "Enregistrer
+                # Paramètres sous...".
+                current = self.db.get_setting(key, "")
+                if current in ("", "Nouveau tournoi", "Tournoi"):
+                    # Nom encore générique (jamais renseigné) : reprend le
+                    # même repli que _update_window_title (nom de fichier)
+                    # et l'enregistre pour de bon, pour que ce champ, le
+                    # titre de la fenêtre et les exports affichent tous la
+                    # même valeur.
+                    fallback = os.path.splitext(os.path.basename(self.db.path))[0]
+                    if fallback:
+                        current = fallback
+                        self.db.set_settings({"tournament_name": current})
+                var = tk.StringVar(value=current)
+                var.trace_add("write", lambda *a: self._save_tournament_name())
+            else:
+                var = tk.StringVar(value=self.db.get_setting(key, ""))
             ttk.Entry(left, textvariable=var, width=25).grid(row=i, column=1, pady=4, padx=10)
             self.settings_vars[key] = var
 
@@ -5602,16 +6351,71 @@ class App(tk.Tk):
         ttk.Separator(left, orient="horizontal").grid(
             row=len(fields) + 2, column=0, columnspan=2, sticky="ew", pady=(5, 15)
         )
-        edit_duration_btn = ttk.Button(
-            left, text="⏱  Modifier la durée des niveaux (tous)...",
-            command=self._edit_level_duration,
+        signal_title = ttk.Label(
+            left, text="Signal de mouvements",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
         )
-        edit_duration_btn.grid(row=len(fields) + 3, column=0, columnspan=2, pady=(0, 15))
+        signal_title.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="w", pady=(0, 8))
         Tooltip(
-            edit_duration_btn,
-            "Change la durée (en minutes) de tous les niveaux de blindes\n"
-            "existants d'un coup, sans toucher aux montants ni aux pauses.",
+            signal_title,
+            "Bip sonore joué sur l'écran projecteur quand un joueur vient\n"
+            "d'être déplacé de table (voir Mouvements) — permet de le\n"
+            "repérer sans regarder l'écran en continu.",
         )
+
+        signal_row = len(fields) + 4
+
+        # Fichier son (commun à tous les tournois/Sit & Go, comme les sons
+        # du Chronomètre — voir _choose_clock_sound), et "Tester le son"
+        # côte à côte sur la même ligne.
+        movement_sound_btn = ttk.Button(
+            left, text=self._clock_sound_button_text("movement_signal_wav_path", "Fichier Wav"),
+        )
+        movement_sound_btn.grid(row=signal_row, column=0, sticky="ew", pady=4, padx=(0, 5))
+        movement_sound_btn.config(
+            command=lambda b=movement_sound_btn: self._choose_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            )
+        )
+        movement_sound_btn.bind(
+            "<Button-2>",
+            lambda e, b=movement_sound_btn: self._clear_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            ),
+        )
+        movement_sound_btn.bind(
+            "<Button-3>",
+            lambda e, b=movement_sound_btn: self._clear_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            ),
+        )
+        Tooltip(
+            movement_sound_btn,
+            "Fichier .wav joué à chaque déplacement de joueur entre\n"
+            "tables. Commun à tous les tournois/Sit & Go.\n"
+            "Clic gauche : choisir/remplacer le fichier.\n"
+            "Clic droit : retirer (repli sur un bip généré automatiquement).",
+        )
+
+        ttk.Button(
+            left, text="🔊  Tester le son",
+            command=self._test_movement_signal,
+        ).grid(row=signal_row, column=1, sticky="ew", pady=4, padx=(5, 0))
+
+        duration_row = signal_row + 1
+        duration_lbl = ttk.Label(left, text="Durée max. du signal (millisecondes, ex : 300) :")
+        duration_lbl.grid(row=duration_row, column=0, sticky="w", pady=4)
+        Tooltip(
+            duration_lbl,
+            "Tronque le fichier Wav choisi ci-dessus s'il dure plus\n"
+            "longtemps que ça ; sert aussi de durée pour le bip de\n"
+            "repli si aucun fichier n'est choisi.",
+        )
+        duration_var = tk.StringVar(value=self.db.get_setting("movement_signal_duration_ms", "300"))
+        ttk.Entry(left, textvariable=duration_var, width=25).grid(
+            row=duration_row, column=1, pady=4, padx=10
+        )
+        self.settings_vars["movement_signal_duration_ms"] = duration_var
 
         ttk.Label(
             left,
@@ -5619,9 +6423,9 @@ class App(tk.Tk):
                   "et se sauvegarde automatiquement à chaque action. Vous pouvez le copier\n"
                   "pour en garder une sauvegarde."),
             foreground=MUTED,
-        ).grid(row=len(fields) + 4, column=0, columnspan=2, sticky="w", pady=10)
+        ).grid(row=duration_row + 1, column=0, columnspan=2, sticky="w", pady=10)
 
-        # -- Colonne droite : structure de blindes + signal de mouvements --
+        # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
             right, text="Structure de blindes — niveau 1 et antes",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
@@ -5670,39 +6474,7 @@ class App(tk.Tk):
             "paramètres\" — pas besoin de cliquer les deux.",
         )
 
-        ttk.Separator(right, orient="horizontal").grid(
-            row=blind_next_row + 1, column=0, columnspan=2, sticky="ew", pady=(0, 15)
-        )
-        signal_title = ttk.Label(
-            right, text="Signal de mouvements",
-            font=("Helvetica", 11, "bold"), foreground=GOLD,
-        )
-        signal_title.grid(row=blind_next_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        Tooltip(
-            signal_title,
-            "Bip sonore joué sur l'écran projecteur quand un joueur vient\n"
-            "d'être déplacé de table (voir Mouvements) — permet de le\n"
-            "repérer sans regarder l'écran en continu.",
-        )
-
-        signal_fields = [
-            ("movement_signal_frequency_hz", "Tonalité du signal (Hz, ex : 880)"),
-            ("movement_signal_duration_ms", "Durée du signal (millisecondes, ex : 300)"),
-        ]
-        signal_row = blind_next_row + 3
-        for k, (key, label) in enumerate(signal_fields):
-            default = {"movement_signal_frequency_hz": 880, "movement_signal_duration_ms": 300}[key]
-            ttk.Label(right, text=label + " :").grid(row=signal_row + k, column=0, sticky="w", pady=4)
-            var = tk.StringVar(value=self.db.get_setting(key, str(default)))
-            ttk.Entry(right, textvariable=var, width=25).grid(row=signal_row + k, column=1, pady=4, padx=10)
-            self.settings_vars[key] = var
-
-        ttk.Button(
-            right, text="🔊  Tester le signal",
-            command=self._test_movement_signal,
-        ).grid(row=signal_row + len(signal_fields), column=0, columnspan=2, pady=(4, 15))
-
-        bounty_start_row = signal_row + len(signal_fields) + 1
+        bounty_start_row = blind_next_row + 1
         ttk.Separator(right, orient="horizontal").grid(
             row=bounty_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
         )
@@ -5836,16 +6608,81 @@ class App(tk.Tk):
             foreground=MUTED,
         ).grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
+        # -- Raccourcis clavier "Élimination"/"Terminé"/"Chronomètre" :
+        # toujours actifs, rien à activer. Voir aussi le contrôle à
+        # distance ci-dessous (mêmes 3 actions, depuis un téléphone).
+        voice_start_row = bounty_start_row + 11
+        ttk.Separator(right, orient="horizontal").grid(
+            row=voice_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
+        )
+        shortcuts_title = ttk.Label(
+            right, text="Raccourcis clavier",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        shortcuts_title.grid(row=voice_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        Tooltip(
+            shortcuts_title,
+            "Ctrl+Maj+E met le chrono en pause et bascule sur l'onglet\n"
+            "Joueurs ; Ctrl+Maj+C le relance (si aucun mouvement n'a eu\n"
+            "lieu) ; Ctrl+Maj+T referme l'alerte de mouvement. Toujours\n"
+            "actifs, rien à activer dans les réglages.",
+        )
+        ttk.Label(
+            right,
+            text=("Ctrl+Maj+E Élimination   |   Ctrl+Maj+C Chronomètre   |   Ctrl+Maj+T Terminé"),
+            foreground=MUTED, wraplength=340, justify="left",
+        ).grid(row=voice_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        # -- Contrôle à distance depuis un téléphone (voir
+        # remote_control.py) : 3 mêmes actions (Élimination/Chronomètre/
+        # Terminé) accessibles depuis une page web ouverte sur un
+        # téléphone connecté au même wifi que cet ordinateur — rien à
+        # installer sur le téléphone.
+        remote_start_row = voice_start_row + 3
+        ttk.Separator(right, orient="horizontal").grid(
+            row=remote_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
+        )
+        remote_title = ttk.Label(
+            right, text="Contrôle à distance (téléphone)",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        remote_title.grid(row=remote_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        Tooltip(
+            remote_title,
+            "Sert une petite page web (3 boutons : Élimination/\n"
+            "Chronomètre/Terminé, identiques aux raccourcis clavier)\n"
+            "consultable depuis n'importe quel téléphone connecté au\n"
+            "même réseau Wifi que cet ordinateur — rien à installer,\n"
+            "juste ouvrir l'adresse affichée dans un navigateur.",
+        )
+
+        self.remote_control_enabled_var = tk.BooleanVar(
+            value=export_prefs.load_value("remote_control_enabled", False) is True
+        )
+        remote_check = ttk.Checkbutton(
+            right, text="Activer le contrôle à distance",
+            variable=self.remote_control_enabled_var, command=self._on_remote_control_toggle,
+        )
+        remote_check.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        self.remote_control_status_lbl = ttk.Label(right, foreground=MUTED, justify="left")
+        self.remote_control_status_lbl.grid(
+            row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        self._refresh_remote_control_status()
+
     def _test_movement_signal(self):
         try:
-            freq = int(self.settings_vars["movement_signal_frequency_hz"].get())
             duration = int(self.settings_vars["movement_signal_duration_ms"].get())
         except (ValueError, KeyError):
             messagebox.showerror(
-                "Erreur", "Veuillez saisir des nombres entiers valides pour la tonalité et la durée."
+                "Erreur", "Veuillez saisir un nombre entier valide pour la durée max. du signal."
             )
             return
-        if not sound_signal.play_tone(freq, duration):
+        wav_path = export_prefs.load_value("movement_signal_wav_path", "")
+        if wav_path and sound_signal.play_file(wav_path, max_duration_ms=duration):
+            return
+        if not sound_signal.play_tone(880, duration):
             self.bell()
 
     def _generate_custom_blind_structure(self):
@@ -5923,7 +6760,12 @@ class App(tk.Tk):
             if isinstance(raw, bool):
                 raw = "1" if raw else "0"
             values[k] = raw
-        self.db.set_settings(values)
+        # "club_name" est commun à tous les tournois/Sit & Go (préférences
+        # partagées, voir le trace_add posé sur son StringVar) : jamais
+        # écrit dans ce fichier .tournoi, pour éviter une copie qui
+        # divergerait silencieusement de la valeur réellement affichée.
+        db_values = {k: v for k, v in values.items() if k != "club_name"}
+        self.db.set_settings(db_values)
         tournament_prefs.save_last_settings(values)
         try:
             new_max_seats = int(values.get("max_seats_per_table", ""))
@@ -5936,6 +6778,20 @@ class App(tk.Tk):
         if moves:
             self._trigger_movement_alert()
         return values
+
+    def _save_club_name(self):
+        """Enregistre en continu le "Nom du Club" (préférence partagée,
+        commune à tous les tournois/Sit & Go — voir _build_settings_tab)
+        au fur et à mesure de la saisie, comme pour les jetons."""
+        export_prefs.save_value("club_name", self.settings_vars["club_name"].get())
+
+    def _save_tournament_name(self):
+        """Enregistre en continu le "Nom du tournoi" pour CE tournoi, au fur
+        et à mesure de la saisie (voir _build_settings_tab) — sans passer
+        par _collect_and_save_all_settings, qui a d'autres effets de bord
+        (rééquilibrage des tables...) non souhaités à chaque frappe."""
+        self.db.set_settings({"tournament_name": self.settings_vars["tournament_name"].get()})
+        self._update_window_title()
 
     def _save_settings_as_template(self):
         """Applique tous les réglages du formulaire à ce tournoi (comme
@@ -5987,7 +6843,7 @@ class App(tk.Tk):
             self._refresh_clock_tab()
         elif current == "Blindes":
             self._refresh_blinds_tab()
-        elif current == "Gains":
+        elif current == "Classement":
             self._refresh_payouts_tab()
 
     def _tick(self):

@@ -31,6 +31,14 @@
         DowngradeErrorMessage="Une version plus récente du Gestionnaire de Tournoi de Poker est déjà installée." />
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- Icône (logo Sena Computer) utilisée par les raccourcis Bureau et
+         Menu Démarrer ci-dessous. PokerTournament.exe l'embarque déjà
+         (voir windows/poker_tournament.spec) ; la redéclarer ici via
+         Icon/IconIndex est la façon standard WiX de fixer explicitement
+         l'icône d'un raccourci plutôt que de compter sur l'extraction
+         automatique depuis l'exécutable cible. -->
+    <Icon Id="AppIcon.ico" SourceFile="windows\assets\app_icon.ico" />
+
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Gestionnaire de Tournoi de Poker">
         <Component Id="MainExecutable" Guid="*">
@@ -45,10 +53,12 @@
       <Directory Id="ApplicationProgramsFolder" Name="Gestionnaire de Tournoi de Poker">
         <Component Id="ApplicationShortcut" Guid="*">
           <Shortcut Id="ApplicationStartMenuShortcut"
-                    Name="Gestionnaire de Tournoi de Poker"
+                    Name="Poker Senaco"
                     Description="Gestionnaire de tournoi de poker multi-tables"
                     Target="[#PokerTournamentEXE]"
-                    WorkingDirectory="INSTALLFOLDER" />
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIcon.ico"
+                    IconIndex="0" />
           <RemoveFolder Id="CleanUpProgramMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
           <RegistryValue Root="HKCU"
                           Key="Software\PokerTournament"
@@ -61,10 +71,12 @@
     <StandardDirectory Id="DesktopFolder">
       <Component Id="DesktopShortcut" Guid="*">
         <Shortcut Id="ApplicationDesktopShortcut"
-                  Name="Gestionnaire de Tournoi de Poker"
+                  Name="Poker Senaco"
                   Description="Gestionnaire de tournoi de poker multi-tables"
                   Target="[#PokerTournamentEXE]"
-                  WorkingDirectory="INSTALLFOLDER" />
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIcon.ico"
+                  IconIndex="0" />
         <RegistryValue Root="HKCU"
                         Key="Software\PokerTournament"
                         Name="DesktopShortcutInstalled"

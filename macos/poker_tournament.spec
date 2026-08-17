@@ -16,7 +16,10 @@ a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    # help_content.json : contenu de l'aide intégrée (menu Aide / touche
+    # F1, voir help_browser.py), lu au runtime via sys._MEIPASS — sans
+    # cette entrée, l'aide s'ouvrirait vide dans l'app packagée.
+    datas=[(str(ROOT / "help_content.json"), ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

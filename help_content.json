@@ -1,0 +1,352 @@
+[
+  {
+    "level": 1,
+    "title": "1. Présentation",
+    "body": "Ce logiciel permet d'organiser et de suivre en direct un tournoi de poker multi-tables — ou plusieurs à la fois (Sit & Go compris), chacun dans sa propre fenêtre —, du premier joueur inscrit jusqu'au classement final : inscriptions, rebuys et add-ons, placement et rééquilibrage automatique des tables, chronomètre de blindes projetable sur grand écran, grille de gains, système de primes en points (présence, assiduité, classement, bounty), et une synthèse des résultats sur plusieurs tournois à la fois.\n\nIl a été testé avec plus de 100 joueurs simultanés."
+  },
+  {
+    "level": 2,
+    "title": "Où sont stockées les données ?",
+    "body": "Chaque tournoi correspond à un seul fichier portant l'extension .tournoi (une base de données). Toutes les actions effectuées (inscription, rebuy, élimination...) y sont enregistrées immédiatement — il n'y a pas de bouton « Sauvegarder » séparé à penser à cliquer.\n\n💡 Pour sauvegarder une copie de sûreté d'un tournoi, il suffit de copier son fichier .tournoi ailleurs (clé USB, cloud...)."
+  },
+  {
+    "level": 1,
+    "title": "2. Installation",
+    "body": "Le logiciel nécessite uniquement Python 3.8 ou plus récent — aucune autre dépendance obligatoire."
+  },
+  {
+    "level": 2,
+    "title": "macOS et Windows",
+    "body": "Python inclut déjà Tkinter (l'interface graphique utilisée par le logiciel) : rien à installer en plus.\n\n• macOS — double-cliquez sur « Lancer_le_tournoi.command ». Une fenêtre de Terminal s'ouvre brièvement (normal), puis l'application démarre.\n\n💡 La toute première fois, macOS peut refuser en disant que l'éditeur n'est pas vérifié : faites un clic droit (ou Ctrl+clic) sur le fichier → « Ouvrir » → confirmez « Ouvrir » dans la boîte de dialogue. Cette étape n'est nécessaire qu'une seule fois.\n\n• Windows — il n'existe pas d'équivalent double-clic. Installez Python depuis python.org en cochant « Add python.exe to PATH » pendant l'installation, puis ouvrez une invite de commandes dans le dossier du logiciel et tapez :\n\npython main.py"
+  },
+  {
+    "level": 2,
+    "title": "Dépendances optionnelles",
+    "body": ""
+  },
+  {
+    "level": 3,
+    "title": "Export au format Excel (.xlsx)",
+    "body": "L'export au format CSV fonctionne sans rien installer de plus. Pour exporter au format Excel, il faut le paquet openpyxl :\n\npip3 install openpyxl        (sous Windows : pip install openpyxl)\n\n💡 S'il n'est pas installé, le logiciel le rappelle automatiquement au moment de l'export, et l'export CSV reste disponible en attendant."
+  },
+  {
+    "level": 3,
+    "title": "Export au format PDF",
+    "body": "Certains exports (résultats, primes, synthèse par période...) proposent aussi le format PDF, en plus du CSV et de l'Excel. Il faut le paquet fpdf2 :\n\npip3 install fpdf2\n\n💡 Sans ce paquet, les formats CSV et Excel restent disponibles ; seul le PDF est désactivé."
+  },
+  {
+    "level": 3,
+    "title": "Photos de joueurs",
+    "body": "Importer une photo depuis un fichier existant fonctionne sans rien installer de plus. Pour prendre une photo avec la caméra de l'ordinateur et afficher les aperçus/vignettes, il faut :\n\npip3 install opencv-python pillow\n\n💡 Sans ces paquets, l'import de fichier reste disponible ; seules la capture caméra et les vignettes sont désactivées."
+  },
+  {
+    "level": 1,
+    "title": "3. Premier lancement et prise en main",
+    "body": "Au démarrage, une fenêtre de bienvenue propose plusieurs choix :\n\n• Nouveau tournoi — crée un nouveau fichier .tournoi. Une liste de joueurs (issue du répertoire, voir section 16) permet de cocher d'emblée les participants présents ; le nom et le club de chaque joueur y sont affichés dans deux colonnes triables (cliquer un en-tête, re-cliquer pour inverser l'ordre), et un champ Club accompagne l'ajout d'un nouveau nom ; cliquer sur la cellule Club d'un joueur déjà listé permet de le définir ou le corriger directement ; on peut aussi ajouter des joueurs plus tard, ou démarrer sans personne.\n\n• Sit & Go rapide — comme « Nouveau tournoi », mais préremplit tout de suite une structure de blindes rapide (10 min/niveau, antes dès le niveau 3) et une grille de gains standard selon le nombre de joueurs choisis — à ajuster ensuite si besoin, exactement comme un tournoi normal. Voir section 14 pour gérer plusieurs Sit & Go à la fois.\n\n• Ouvrir un tournoi existant — reprend un tournoi déjà commencé, à partir de son fichier .tournoi.\n\n• Lobby (plusieurs tournois) — ouvre une vue d'ensemble de tous les tournois d'un dossier, sans en ouvrir ni fermer aucun (voir section 14).\n\n⚠ Si vous choisissez « Nouveau tournoi » ou « Sit & Go rapide » en donnant le nom d'un fichier .tournoi déjà existant, une fenêtre prévient clairement que continuer va TOUT effacer (joueurs, blindes, jetons...) et repartir d'une base vierge sous ce même nom. Pour reprendre un tournoi déjà commencé, utilisez toujours « Ouvrir un tournoi existant ».\n\n💡 Les derniers réglages utilisés (montants de buy-in, nombre de sièges par table, structure de blindes personnalisée...) sont automatiquement repris pour un nouveau tournoi — inutile de tout ressaisir à chaque fois. Seul le nom du tournoi n'est jamais repris. Pour appliquer un jeu de réglages ou une structure de blindes enregistrés sous un nom précis plutôt que les derniers utilisés, voir « Enregistrer/Récupérer » dans les onglets Blindes et Paramètres (sections 9 et 11)."
+  },
+  {
+    "level": 1,
+    "title": "4. Pour les clubs gérant plusieurs tournois dans la semaine",
+    "body": "• Il s’agit de regrouper au départ dans un répertoire spécifique les tournois du JourX dans un répertoire intitulé JourX.\n\n• Ainsi, les tournois du Vendredi seront mis dans un dossier nommé Vendredi, les SitnGo du dimanche dans le dossier Dimanche, les tournois open dans un dossier Open etc"
+  },
+  {
+    "level": 2,
+    "title": "Aperçu de l'interface",
+    "body": "La fenêtre principale est organisée en onglets, un par domaine du tournoi :\n\nOnglet — Contenu\n----------------\nJoueurs — Inscription, rebuy/add-on, élimination, classement\nTables — Répartition des joueurs par table et par siège\nMouvements — Historique des changements de table\nPrimes — Primes en points par joueur : présence, assiduité, classement, bounty\nChronomètre — Niveau de blindes en cours, minuteur, structure\nBlindes — Édition détaillée de la structure de blindes, round par round\nGains — Grille des gains par place, prize pool\nParamètres — Tous les réglages du tournoi\n\nS'y ajoutent des menus en haut de la fenêtre (Fichier, Affichage, Répertoire, Statistiques) ainsi que deux boutons dans le bandeau (🏠 Menu principal, 🚀 Nouveau SitnGO) pour gérer plusieurs tournois à la fois — détaillés dans les sections suivantes."
+  },
+  {
+    "level": 1,
+    "title": "5. Onglet Joueurs",
+    "body": "C'est l'onglet le plus utilisé pendant le tournoi : inscription et suivi de chaque joueur."
+  },
+  {
+    "level": 2,
+    "title": "Inscrire un joueur",
+    "body": "Saisissez le nom dans le champ en haut et cliquez sur « Ajouter » (ou touche Entrée). Le joueur est automatiquement placé à la table la moins remplie, sur le premier siège libre.\n\n• Auto-complétion du nom — dès la première lettre tapée, une liste déroulante propose les joueurs du répertoire dont le nom correspond (déjà inscrits au tournoi exclus) ; cliquer une suggestion inscrit le joueur immédiatement, sans passer par le bouton « Ajouter ».\n\n• Club — menu déroulant à côté du nom, proposant les clubs déjà connus du répertoire (voir section 16) ; on peut aussi taper directement un club inédit. Il se pré-remplit automatiquement si le nom saisi correspond à un joueur déjà présent dans le répertoire.\n\n• Temp (ne pas ajouter au répertoire) — case à cocher avant l'ajout : le joueur est inscrit normalement au tournoi, mais ni son nom ni son club ne sont sauvegardés dans le répertoire de joueurs habituels — utile pour un invité ponctuel.\n\n• Ajouter depuis le répertoire... — permet de piocher directement parmi les joueurs habituels déjà connus (voir section 16), utile pour une inscription tardive. Un joueur déjà actif dans un autre tournoi du même dossier daté du même jour apparaît grisé et non sélectionnable, pour éviter de l'inscrire à deux endroits à la fois (voir section 14)."
+  },
+  {
+    "level": 2,
+    "title": "Sélection des joueurs",
+    "body": "Chaque ligne du tableau a une case à cocher (☐/☑) à gauche, indépendante de la simple sélection de ligne. Les boutons d'action ci-dessous agissent sur les joueurs cochés (ou, à défaut, sur la ligne sélectionnée).\n\n• Tout cocher / Tout décocher — pour agir en une fois sur tous les joueurs affichés. Juste à côté : « Éliminer » (voir plus bas) et « Exporter les joueurs (Excel/CSV)... » (voir « Exporter le tableau Joueurs » ci-dessous)."
+  },
+  {
+    "level": 2,
+    "title": "Actions disponibles",
+    "body": "• Renommer... — corrige le nom d'un joueur (répercuté aussi dans le répertoire).\n\n• Rebuy (+) — ajoute un rebuy : chips et montant définis dans Paramètres.\n\n• Add-on (+) — ajoute un add-on (chips supplémentaires, généralement en fin de période d'inscription).\n\n• Modifier chips... — correction manuelle du tapis d'un joueur.\n\n• Modifier achats... — corrige manuellement le nombre de buy-ins/rebuys/add-ons en cas d'erreur de saisie, sans toucher aux chips.\n\n• Éliminer — (bouton rouge, à côté de « Tout décocher ») retire le joueur de la partie ; son rang est calculé automatiquement (voir « Colonne Rang » ci-dessous). Pour une élimination d'un seul joueur, une fenêtre demande systématiquement qui l'a éliminé : ça compte pour son bounty en points (onglet Primes, section 8), et si un bounty fixe est configuré (mécanisme PKO), ça le lui attribue aussi. Impossible d'éliminer le tout dernier joueur encore actif : il doit toujours en rester au moins un — le vainqueur.\n\n• Désactiver (forfait) — retire un joueur SANS lui attribuer de rang — pour une inscription annulée ou un forfait, à distinguer d'une élimination normale.\n\n• Réinscrire — remet un joueur désactivé ou éliminé en jeu, avec un tapis neuf.\n\n• Supprimer — retire définitivement le joueur du tournoi (à utiliser avec précaution — non réversible depuis l'interface).\n\n⚠ Une élimination groupée (plusieurs joueurs cochés à la fois) ne demande pas d'éliminateur : ni le bounty en points ni une éventuelle prime fixe ne sont attribués dans ce cas. Éliminez les joueurs un par un si vous voulez enregistrer qui élimine qui."
+  },
+  {
+    "level": 2,
+    "title": "Colonne Rang",
+    "body": "Le rang final d'un joueur se calcule à partir du nombre de joueurs encore actifs au moment de son élimination (1er éliminé sur un champ de 100 joueurs → rang 100, 2e éliminé → rang 99, etc.). Le vainqueur affiche le rang 1 une fois le tournoi terminé (un seul joueur encore actif) ; tant que plusieurs joueurs sont encore en jeu, aucun rang n'est affiché (indéterminé).\n\nCliquer sur l'en-tête « Rang » trie le tableau du meilleur au moins bon classement ; re-cliquer inverse l'ordre — comme les colonnes Nom, Statut et Table."
+  },
+  {
+    "level": 2,
+    "title": "Colonnes « Éliminé le », « Round », « Éliminé par »",
+    "body": "Trois colonnes supplémentaires renseignent chaque joueur éliminé : la date et l'heure de son élimination, le round de la structure de blindes où elle a eu lieu (les pauses ne comptent pas comme un round à part entière), et le nom du joueur qui l'a éliminé. Comme pour Nom, Statut, Table et Rang, cliquer sur l'en-tête « Éliminé le » ou « Éliminé par » trie le tableau (re-cliquer inverse l'ordre).\n\n💡 Ces colonnes se masquent/réaffichent et s'exportent exactement comme les autres — voir « Colonnes du tableau » et « Exporter le tableau Joueurs » ci-dessous.\n\n💡 Comme toutes les dates affichées par le logiciel (Lobby, titres d'export...), « Éliminé le » utilise le format français JJ/MM/AAAA."
+  },
+  {
+    "level": 2,
+    "title": "Colonnes du tableau",
+    "body": "Si vous réduisez une colonne à sa largeur minimale à la souris (il ne reste plus qu'une lettre), elle disparaît automatiquement du tableau au relâchement du clic, pour ne pas laisser un filet inutile à l'écran. Les colonnes « Nom » et la case à cocher restent toujours affichées.\n\n• Bou/Col... — (à côté de « Tout décocher ») rouvre une fenêtre à cocher/décocher pour réafficher une colonne masquée — seul moyen de la récupérer, puisqu'elle n'a alors plus de bordure à ressaisir.\n\n💡 Les colonnes masquées sont mémorisées d'un lancement de l'application à l'autre : inutile de tout remasquer à chaque fois.\n\n💡 Les boutons Rebuy, Add-on, Modifier chips... et Modifier achats... se rétractent de la même façon (glisser leur bord droit vers la gauche jusqu'à ce qu'ils disparaissent) et se réaffichent depuis la même fenêtre « Bou/Col... », sous « Boutons affichés »."
+  },
+  {
+    "level": 2,
+    "title": "Exporter le tableau Joueurs",
+    "body": "Le bouton « Exporter les joueurs (Excel/CSV)... » (à côté de « Tout décocher ») ouvre une fenêtre pour choisir le format (CSV, Excel ou PDF) et les colonnes à inclure parmi celles affichées dans l'onglet. L'export reprend automatiquement le tri actuellement appliqué à l'écran.\n\n💡 Le format et les colonnes cochées sont mémorisés d'un export à l'autre, et le fichier généré s'ouvre automatiquement dans l'application par défaut une fois l'export terminé — inutile d'aller le rechercher. Le titre du fichier suit le même format que pour le Classement (« Joueurs du SitnGo/Tournoi du [Club] [Nom du tournoi] du [date] »), sans la ligne Prize pool."
+  },
+  {
+    "level": 1,
+    "title": "6. Onglet Tables",
+    "body": "Affiche la répartition en cours : une carte par table, avec la liste des joueurs assis (siège).\n\n• Rééquilibrer les tables — force un rééquilibrage manuel (utile après une action groupée).\n\n• Ajouter une table — ouvre une table supplémentaire.\n\nLe rééquilibrage se fait aussi automatiquement après chaque inscription ou élimination : les tables devenues inutiles se ferment, et les joueurs sont déplacés pour garder les tables aussi équilibrées que possible.\n\nIl n’y a pas de rééquilibrage pour des SnG puisq’ il n’y a qu’une table  par SnG."
+  },
+  {
+    "level": 2,
+    "title": "Défilement automatique",
+    "body": "Si le nombre de tables dépasse la hauteur d'affichage de l'écran, l'onglet défile tout seul, lentement, vers le bas, puis reboucle en haut après une courte pause — pratique pour laisser cet onglet affiché en continu sur un écran dédié, sans intervention. Si tout tient à l'écran, rien ne défile. La molette de la souris permet aussi de défiler manuellement à tout moment."
+  },
+  {
+    "level": 1,
+    "title": "7. Onglet Mouvements",
+    "body": "Historique des déplacements de joueurs d'une table/siège à l'autre, suite aux rééquilibrages. Les mouvements les plus récents sont surlignés pendant quelques minutes (durée réglable dans Paramètres) pour repérer facilement qui vient de changer de table.\n\nDès qu'un rééquilibrage déplace réellement des joueurs, le chronomètre se met automatiquement en pause et un bandeau « Changement de tables en cours » s'affiche — clignotant sur l'onglet Chronomètre, fixe et complété d'un tableau des joueurs concernés (Joueur, Ancienne table, Ancien siège, Nouvelle table, Nouveau siège) sur l'écran projecteur, avec défilement automatique si la liste est trop longue pour tenir à l'écran — le temps que tout le monde s'installe. L'onglet Mouvements passe aussi automatiquement au premier plan (devant le Chronomètre ou tout autre onglet affiché, fenêtre principale ramenée devant l'écran projecteur si besoin), pour que le responsable voie tout de suite qui doit changer de table.\n\n• Terminé — une fois les joueurs déplacés bien installés à leur nouvelle table, cliquez ici : ça referme le bandeau, relance le chronomètre, vide la liste des mouvements affichée, revient sur l'onglet Chronomètre et ramène l'écran projecteur au premier plan s'il est ouvert.\n\n💡 En fin de tournoi (plus qu'un seul joueur actif), une alerte de mouvement encore en attente se referme automatiquement, sans avoir besoin de cliquer sur « Terminé ».\n\n💡 « Terminé » peut aussi se déclencher au clavier (Ctrl+Maj+T) ou depuis un téléphone — voir chapitre 13."
+  },
+  {
+    "level": 1,
+    "title": "8. Onglet Primes",
+    "body": "Chaque tournoi calcule, pour chaque joueur, quatre primes en points, cumulées dans un TOTAL — plutôt qu'une simple prime en jeu qui grossit pendant la partie."
+  },
+  {
+    "level": 2,
+    "title": "Les quatre primes",
+    "body": "• Présence — points attribués à tout joueur inscrit à ce tournoi, quel que soit son résultat.\n\n• Assiduité — points attribués si le joueur a été présent aux N derniers tournois consécutifs (ce tournoi-ci inclus) — nombre de jours consécutifs réglable (0 = prime désactivée). Ne fonctionne que si les tournois précédents se trouvent dans le même dossier que celui-ci.\n\n• Classement — calculé à partir du rang final du joueur : Points = 100 × √N / P (N = nombre de joueurs du tournoi, P = rang), pour ne pas sur-récompenser les petits champs. Un montant fixe (réglage manuel non nul) peut remplacer cette formule pour tout le monde.\n\n• Bounty — Nombre = nombre de joueurs éliminés par ce joueur (kills) ; Valeur = 10 × √N points par élimination (ou un montant fixe réglable) ; Montant = Nombre × Valeur.\n\nLe TOTAL de chaque joueur est la somme de ces quatre primes."
+  },
+  {
+    "level": 2,
+    "title": "Tableau récapitulatif",
+    "body": "Colonnes : Joueur, Rang, Présence, Assiduité, Classement, Nb Bounty, Val Bounty, Mon Bounty, TOTAL. Cliquer sur les en-têtes Rang, Nb Bounty ou TOTAL trie le tableau (re-cliquer inverse l'ordre) — trié par TOTAL décroissant par défaut.\n\n💡 L'ordre du tableau (par TOTAL) ne suit pas forcément le Rang : un joueur éliminé plus tôt mais avec beaucoup de bounties peut apparaître devant un joueur mieux classé."
+  },
+  {
+    "level": 2,
+    "title": "Exporter les primes",
+    "body": "Le bouton « Exporter les primes (Excel/CSV)... » ouvre une fenêtre pour choisir : le tableau à exporter (Récapitulatif ou Historique, voir ci-dessous), le format (CSV, Excel ou PDF) et les colonnes. Le titre du fichier généré suit le même format que pour le Classement (« Primes du SitnGo/Tournoi du [Club] [Nom du tournoi] du [date] »).\n\n💡 L'export PDF nécessite le paquet optionnel fpdf2 (voir section 2) ; CSV et Excel restent disponibles sans lui."
+  },
+  {
+    "level": 2,
+    "title": "Historique du bounty progressif (mécanisme PKO interne)",
+    "body": "Sous le récapitulatif, un second tableau — dans un volet dont on peut faire glisser la frontière à la souris pour l'agrandir — journalise l'ancien mécanisme de bounty en points fixe (mode PKO, voir section 12) : chaque élimination avec bounty attribué, la part empochée en Perso immédiat, et la part ajoutée à la prime de l'éliminateur.\n\n💡 Ce tableau reste vide si le réglage « Montant du bounty en points » (onglet Paramètres) est à 0 — c'est normal : tout le suivi se fait alors uniquement via le récapitulatif ci-dessus (formule automatique)."
+  },
+  {
+    "level": 1,
+    "title": "9. Onglet Chronomètre",
+    "body": "Une structure de blindes standard est préchargée à la création du tournoi (modifiable en détail dans l'onglet Blindes, section 10, ou régénérée d'un coup dans Paramètres, section 12).\n\n• Démarrer / Reprendre, Pause — pilotent le minuteur du niveau en cours.\n\n• Niveau précédent / suivant — navigation manuelle entre les niveaux.\n\nLe passage au niveau suivant se fait aussi automatiquement à la fin du temps imparti. Double-cliquer sur un niveau dans le tableau y va directement.\n\nLes 5 boutons ci-dessus sont regroupés en haut à droite de l'onglet, les uns sous les autres ; les informations du niveau en cours (niveau, minuteur, blindes, niveau suivant) occupent le reste de la largeur, à gauche."
+  },
+  {
+    "level": 2,
+    "title": "Structure de blindes",
+    "body": ""
+  },
+  {
+    "level": 2,
+    "title": "Sons",
+    "body": "Sous « Modifier durée de la Pause », trois boutons associent un fichier son (.wav) à des moments clés du chronomètre :\n\n• Son début Pause — joué quand un round de blindes se termine en débouchant sur une pause.\n\n• Son Fin Pause — joué quand une pause se termine.\n\n• Son fin Round — joué à la fin de tout round de blindes normal (les deux sons peuvent donc s'enchîner si un round débouche sur une pause).\n\nClic gauche sur un bouton pour choisir/remplacer le fichier .wav ; clic droit pour retirer le son configuré. Le texte du bouton indique le fichier actuellement choisi, ou « (aucun) ».\n\nSous chacun de ces 3 boutons, un champ Durée (en millisecondes) tronque le fichier choisi s'il dure plus longtemps qu'elle, et un bouton Test permet de l'écouter immédiatement, sans attendre le déclenchement réel.\n\n💡 Ces sons sont communs à tous les tournois et Sit & Go — choisis une fois, ils sont automatiquement proposés partout ensuite, sans avoir à les reconfigurer à chaque nouveau tournoi.\n\n💡 Si le contenu de cet onglet dépasse la hauteur de l'écran, un ascenseur apparaît sur le côté droit — comme dans les onglets Paramètres et Blindes."
+  },
+  {
+    "level": 1,
+    "title": "10. Onglet Blindes",
+    "body": ""
+  },
+  {
+    "level": 2,
+    "title": "Tableau des rounds",
+    "body": "Chaque ligne représente un round : Round (numéro), Hr de Début (temps écoulé depuis le début du tournoi, pauses comprises — 0:00 pour le premier round), Durée, Petite Blind, Grosse Blind, Ante, Durée Pause. Laissez « Durée Pause » à 0 pour un round sans pause.\n\n• ➕ (en bout de ligne) — insère un nouveau round juste après celui-ci (copie ses blindes/ante).\n\n• 🗑 (en bout de ligne) — supprime ce round."
+  },
+  {
+    "level": 2,
+    "title": "Boutons du haut",
+    "body": "• ➕ Ajouter un round — ajoute un round à la fin.\n\n• Structure standard — remplace toute la structure actuelle par la structure par défaut.\n\n• 📂 Récupérer Blindes... — ouvre la liste des structures déjà enregistrées comme modèles, pour en charger une sur ce tournoi.\n\n• 💾 Enregistrer Blindes sous... — applique les modifications de ce tableau à ce tournoi ET les enregistre sous un nom au choix, pour les réutiliser plus tard sur d'autres tournois/Sit & Go.\n\n💡 Un modèle de blindes enregistré est indépendant de tout tournoi : il reste disponible même après avoir supprimé le fichier .tournoi dans lequel il a été créé.\n\n• Structure standard — recharge la structure préchargée par défaut.\n\n• Modifier durée (tous niveaux) — change la durée de chaque niveau de blindes (hors pauses).\n\n• Modifier durée de la Pause — change spécifiquement la durée des pauses.\n\n• On peut enregistrer une structure de blindes pour une utilisation ultérieure via le bouton Récupérer Blindes\n\n• On peut aussi générer automatiquement le tableau à partir des paramètres dans la section"
+  },
+  {
+    "level": 2,
+    "title": "Jetons",
+    "body": "A droite du tableau des rounds, un panneau permet de renseigner les jetons utilisés pour ce tournoi (facultatif) : nom, pastille cliquable (couleur unie ou image de jeton importée, au choix dans le menu qui s'ouvre au clic), valeur, et nombre par joueur, avec un Total calculé automatiquement pour chaque ligne (Valeur x Nombre).\n\n• ➕ Ajouter une couleur — ajoute une ligne au tableau.\n\n• 🗑 (en bout de ligne) — supprime cette ligne.\n\n• 📂 Récupérer Jetons... / 💾 Enregistrer Jetons sous... — mêmes principes que pour les structures de blindes (voir « Boutons du haut » ci-dessus) : appliquer un jeu de jetons déjà enregistré, ou enregistrer celui de ce tableau sous un nom pour le réutiliser sur d'autres tournois/Sit & Go.\n\nEn bas du panneau : « Nombre des jetons / joueur » (somme des colonnes Nombre) et « Valeur des jetons / joueur » (somme des colonnes Total) — mis à jour en direct pendant la saisie.\n\n💡 Chaque champ s'enregistre automatiquement pour ce tournoi au fur et à mesure de la saisie — inutile de cliquer un bouton particulier pour ne pas perdre vos modifications. Cliquer sur la pastille propose de choisir une couleur ou une image de jeton (PNG/JPG/GIF) ; l'image, si choisie, remplace la pastille partout où les jetons sont affichés (ce panneau et l'écran projecteur), et un second clic permet d'y revenir."
+  },
+  {
+    "level": 2,
+    "title": "Écran projecteur",
+    "body": "Le menu Affichage → « Ouvrir l'écran chronomètre » ouvre une fenêtre séparée, pensée pour être affichée en plein écran (touche F11, Échap pour sortir) sur un vidéoprojecteur ou un second écran : rappel des raccourcis clavier en haut à gauche, niveau en cours, minuteur en grand (clignote en doré pendant les pauses), prochain niveau, heure de la prochaine pause, puis, centrés en bas, joueurs restants, tapis moyen et durée du tournoi (temps écoulé depuis le tout premier démarrage, figée une fois la partie terminée).\n\n💡 Pendant un rééquilibrage de tables, un bandeau « Changement de tables en cours » s'affiche au centre de cet écran avec le détail des joueurs concernés (voir section 7) ; une fois le tournoi terminé (un seul joueur actif restant), ce même bandeau affiche « Partie terminée ».\n\n💡 Si des jetons sont renseignés (onglet Blindes, section 10), leur tableau (couleur ou image, valeur, nombre par joueur) s'affiche aussi en haut à droite de cet écran."
+  },
+  {
+    "level": 1,
+    "title": "11. Onglet Classement",
+    "body": "Trace l'ordre d'élimination des joueurs au fur et à mesure du tournoi — qui a été éliminé quand, par qui, et à quel round — plutôt qu'une grille de gains à configurer.\n\n💡 Seuls les joueurs déjà classés (éliminés, ou le vainqueur une fois le tournoi terminé) apparaissent dans ce tableau ; les joueurs encore actifs n'y figurent pas, pour rester lisible pendant le jeu."
+  },
+  {
+    "level": 2,
+    "title": "Colonnes",
+    "body": "Nom, Rang, Éliminé le (date et heure, au format JJ/MM/AAAA), Round (round de la structure de blindes où l'élimination a eu lieu), Éliminé par.\n\nCliquer sur l'en-tête « Nom » ou « Rang » trie le tableau (re-cliquer inverse l'ordre) ; par défaut, le tri part du plus récemment éliminé (rang le plus bas, donc le plus proche de la victoire) vers le plus ancien."
+  },
+  {
+    "level": 2,
+    "title": "Résumé et défilement automatique",
+    "body": "Au-dessus du tableau : Éliminés | En cours | Total, mis à jour en direct. Si le tableau dépasse la hauteur affichée à l'écran, il défile automatiquement (comme l'onglet Tables, chapitre 6) ; sinon rien ne défile. La molette de la souris permet aussi de défiler manuellement."
+  },
+  {
+    "level": 2,
+    "title": "Exporter le classement",
+    "body": "Le bouton « Exporter le classement (Excel/CSV)... » exporte exactement le tableau affiché (colonnes fixes, pas de sélection possible), trié par Rang. Le titre du fichier généré suit le format « Classement du SitnGo/Tournoi du [Club] [Nom du tournoi] du [date] » selon que le tournoi a été créé via « Sit & Go rapide » ou non.\n\n💡 Pour un classement nominatif complet avec les gains (Gain €, Buy-ins, Rebuys, Add-ons...), utilisez plutôt « Exporter les résultats (Excel/CSV)... » du menu Fichier — voir ci-dessous. La grille de pourcentages par place n'a plus d'écran dédié : elle reste calculée automatiquement (répartition standard selon le nombre d'entrées pour un Sit & Go, 100% au vainqueur sinon)."
+  },
+  {
+    "level": 2,
+    "title": "Exporter les résultats (classement nominatif)",
+    "body": "Le bouton « Exporter les résultats (Excel/CSV)... » du menu Fichier (distinct de l'export ci-dessus) ouvre une fenêtre pour choisir le format et les colonnes d'un classement nominatif complet du tournoi : Rang, Nom, Statut, Gain, Buy-ins, Rebuys, Add-ons, et Prime gagnée si le bounty est utilisé.\n\n💡 Comme pour tous les exports du logiciel : le format et les colonnes cochées sont mémorisés d'une fois sur l'autre, et le fichier généré s'ouvre automatiquement une fois l'export terminé. L'Excel nécessite openpyxl, le PDF nécessite fpdf2 (voir chapitre 2)."
+  },
+  {
+    "level": 1,
+    "title": "12. Onglet Paramètres",
+    "body": "Regroupe tous les réglages du tournoi, en deux colonnes."
+  },
+  {
+    "level": 2,
+    "title": "Colonne de gauche — réglages généraux",
+    "body": "Réglage — Rôle\n--------------\nNom du Club — Utilisé par défaut comme club des joueurs importés (CSV) ; commun à tous les tournois/Sit & Go\nNom du tournoi — Affiché dans le titre de la fenêtre\nMontant du buy-in / rebuy / add-on (€) — Utilisés pour le calcul du prize pool\nTapis de départ / chips rebuy / chips add-on — Chips créditées à chaque achat\nNombre de sièges par table — Capacité maximale d'une table\nNombre minimum de joueurs par table — Seuil de regroupement avant fermeture d'une table\nDurée de surbrillance des joueurs déplacés — Minutes (onglet Mouvements)\nRake / frais d'organisation (%) — Déduit du prize pool\n\n• 💾 Enregistrer Paramètres sous... — applique tous les réglages ci-dessus à ce tournoi ET les enregistre sous un nom au choix, pour les réutiliser plus tard sur d'autres tournois/Sit & Go (le nom du tournoi et la structure de blindes elle-même ne sont pas inclus).\n\n• 📂 Récupérer Paramètres... — ouvre la liste des modèles de réglages déjà enregistrés, pour en appliquer un à ce tournoi."
+  },
+  {
+    "level": 2,
+    "title": "Colonne de droite",
+    "body": "• Structure de blindes — small/big blind de départ, niveau de début des antes et sa valeur, durée d'un round (en minutes), durée des pauses ; le bouton « Régénérer la structure de blindes avec ces valeurs » recrée toute la structure ET enregistre en même temps tous les réglages de cet onglet (fonctionne aussi en cours de tournoi).\n\n• Signal de mouvements — fichier .wav joué à chaque déplacement de joueur entre tables (à défaut, un bip généré automatiquement), avec une durée maximale réglable ; bouton « Tester le son ».\n\n• Primes — montants en points des 4 primes (voir section 8), détaillées ci-dessous.\n\n• Contrôle à distance (téléphone) — active/désactive une petite page web pilotable depuis un téléphone sur le même réseau Wifi (voir chapitre 13)."
+  },
+  {
+    "level": 3,
+    "title": "Section Primes en détail",
+    "body": "• Montant de la prime de présence (en points) — 0 = prime désactivée.\n\n• Montant de la prime d'assiduité en points + Nombre de jours consécutifs — 0 sur l'un ou l'autre désactive la prime d'assiduité ; 2 = ce tournoi + le précédent, 3 = + les 2 précédents, etc.\n\n• Montant de la prime de classement en points — 0 = formule automatique 100×√N/P ; toute autre valeur remplace la formule pour tout le monde.\n\n• Montant du bounty en points — 0 = formule automatique 10×√N ; toute autre valeur remplace la formule pour tout le monde.\n\n• Mode PKO (prime progressive) — mécanisme interne « Perso » : quand un joueur qui porte un bounty est éliminé, son éliminateur en garde une partie en Perso immédiat, et le reste grossit sur sa propre tête pour la suite du tournoi (journalisé dans l'Historique de l'onglet Primes, section 8).\n\n• Part en Perso immédiat en PKO (%) — pourcentage empoché immédiatement ; le reste s'ajoute au bounty de l'éliminateur.\n\n💡 Chaque champ de cet onglet a une info-bulle au survol expliquant sa formule/son rôle en détail — survolez-le quelques instants pour l'afficher.\n\n💡 Le bounty s'applique aux nouvelles inscriptions et rebuys effectués après avoir enregistré le réglage — pas rétroactivement sur les joueurs déjà inscrits."
+  },
+  {
+    "level": 1,
+    "title": "13. Raccourcis clavier et contrôle à distance",
+    "body": "Deux façons, en plus de la souris, de piloter les 3 actions clés du déroulé d'un tournoi — Élimination, Chronomètre, Terminé — sans forcément être devant le clavier : un raccourci clavier, ou une page web depuis un téléphone. Le contrôle à distance s'active dans l'onglet Paramètres, sous la section Primes (voir chapitre 12) ; le raccourci clavier, lui, n'a rien à activer."
+  },
+  {
+    "level": 2,
+    "title": "Les trois actions",
+    "body": "• Élimination — met le chronomètre en pause et bascule l'onglet Joueurs au premier plan, pour éliminer un joueur sans les mains.\n\n• Chronomètre — une fois l'élimination faite, si elle n'a causé aucun mouvement de table : relance le chronomètre et revient sur l'onglet Chronomètre.\n\n• Terminé — si l'élimination a causé un rééquilibrage (bandeau « Changement de tables en cours », onglet Mouvements, voir chapitre 7) : referme ce bandeau et relance le chronomètre, à la place de « Chronomètre »."
+  },
+  {
+    "level": 2,
+    "title": "Raccourcis clavier",
+    "body": "Ctrl+Maj+E (Élimination), Ctrl+Maj+C (Chronomètre), Ctrl+Maj+T (Terminé) — toujours actifs, rien à activer dans les réglages.\n\n💡 Ctrl+Alt a été volontairement écarté au profit de Ctrl+Maj : sur Mac, Option (« Alt ») + E/C/T compose des caractères spéciaux au niveau du système avant même que l'application ne voie la touche, ce qui le rend peu fiable — Maj ne pose ce problème sur aucune plateforme (Windows comme Mac)."
+  },
+  {
+    "level": 2,
+    "title": "Contrôle à distance (téléphone)",
+    "body": "Sert une petite page web avec 3 gros boutons (Élimination / Chronomètre / Terminé) consultable depuis n'importe quel téléphone (ou tablette) connecté au même réseau Wifi que l'ordinateur qui fait tourner l'application — rien à installer sur le téléphone, ni compte ni App Store. À activer dans Paramètres, case « Activer le contrôle à distance » ; l'adresse à ouvrir dans le navigateur du téléphone (par exemple http://192.168.x.x:8765) s'affiche alors juste en dessous.\n\n• Sans routeur Wifi disponible sur les lieux — le téléphone peut créer son propre réseau Wifi (Réglages > Point d'accès personnel, sur iPhone) ; l'ordinateur le rejoint alors comme n'importe quel autre réseau Wifi, sans passer par un vrai routeur.\n\n💡 Aucun mot de passe n'est demandé pour ouvrir cette page : l'accès est limité à qui est déjà sur le même réseau Wifi, exactement comme le reste de l'application, qui n'a pas non plus de système de comptes."
+  },
+  {
+    "level": 1,
+    "title": "14. Sit & Go et gestion de plusieurs tournois",
+    "body": "Pour faire tourner plusieurs Sit & Go/tournois en même temps (plusieurs tables un même jour), chacun a son propre fichier. Tournoi et sa propre fenêtre."
+  },
+  {
+    "level": 2,
+    "title": "Ouvrir une nouvelle fenêtre",
+    "body": "🚀 Nouveau SitnGO (bandeau du haut, ou menu Fichier) lance une nouvelle instance indépendante de l'application, avec son propre écran d'accueil, sans fermer celle déjà ouverte. Sur macOS, la nouvelle fenêtre tente de passer au premier plan automatiquement.\n\n💡 Chaque fenêtre correspond à un processus séparé : fermer l'une n'affecte jamais les autres, ni leurs données."
+  },
+  {
+    "level": 2,
+    "title": "Lobby",
+    "body": "Vue d'ensemble de tous les tournois d'un dossier au choix : joueurs actifs, niveau de blindes, temps restant, état (Pas démarré / En cours / En pause / Terminé) — se rafraîchit automatiquement toutes les quelques secondes tant qu'il reste ouvert.\n\n• Double-clic sur un tournoi de la liste (ou « Ouvrir dans une nouvelle fenêtre ») — l'ouvre directement dans une nouvelle fenêtre.\n\nLe Lobby se rabat automatiquement sur le dernier dossier utilisé pour créer un tournoi si aucun n'a encore été choisi dans le Lobby lui-même — accessible depuis l'écran d'accueil ou le menu Fichier.\n\n⚠ Le Lobby lit l'état réellement enregistré dans chaque fichier : un tournoi reste « en cours » tant qu'il lui reste plus d'un joueur actif, même si sa fenêtre a été fermée. Fermer l'application ne termine ni ne met en pause un tournoi (sauf si le chrono a été explicitement mis en pause avant de quitter).\n\n• Masquer les tournois terminés — case à cocher (activée par défaut) : n'affiche que les tournois encore en cours dans la liste.\n\n• 🗄 Archiver les terminés... — déplace tous les tournois terminés du dossier choisi dans un sous-dossier archive (créé sur place, dans leur propre dossier), après un récapitulatif détaillé demandant confirmation."
+  },
+  {
+    "level": 2,
+    "title": "Éviter qu'un joueur joue à deux tables à la fois",
+    "body": "Quand vous ajoutez un joueur (création d'un tournoi ou « Ajouter depuis le répertoire »), l'application vérifie s'il est déjà actif dans un autre tournoi du même dossier daté du même jour : il apparaît alors grisé (non sélectionnable) dans la liste, avec un message d'avertissement en cas d'ajout individuel malgré tout.\n\n💡 Pour des tests répétés (pas de vraies parties), utilisez « Tout réactiver... » (menu Répertoire, section 16) pour libérer d'un coup les joueurs restés coincés « actifs » dans d'anciens tournois abandonnés, plutôt que de les nettoyer un par un."
+  },
+  {
+    "level": 1,
+    "title": "15. Statistiques — Synthèse par période",
+    "body": "Le menu Statistiques → « Synthèse par période... » permet de consulter les résultats de plusieurs tournois à la fois (par exemple tous ceux d'une saison), primes comprises — utile pour un classement de club sur plusieurs soirées."
+  },
+  {
+    "level": 2,
+    "title": "Générer une synthèse",
+    "body": "• Dossier des tournois — dossier à parcourir pour y trouver les fichiers .tournoi (case « Inclure les sous-dossiers » pour aller plus loin qu'un seul niveau).\n\n• Période (du / au) — dates au format AAAA-MM-JJ ; laisser vide pour ne pas borner d'un côté ou de l'autre.\n\nLe bouton « Générer la synthèse » affiche alors deux tableaux :\n\n• Tournois de la période — date, statut, entrées, prize pool, vainqueur, primes distribuées, pour chaque tournoi trouvé ;\n\n• Classement des joueurs sur la période — cumulé sur tous les tournois trouvés : nombre de tournois joués, victoires, Meilleur Rang, total investi, gains de classement, primes empochées et solde net (gains + primes − investi).\n\n💡 La date d'un tournoi est celle fixée à sa création ; pour un fichier créé avant l'existence de ce réglage, elle est déduite de la date de création du fichier lui-même."
+  },
+  {
+    "level": 2,
+    "title": "Exporter la synthèse",
+    "body": "Chacun des deux tableaux a son propre bouton « Exporter ce tableau... » : il n'exporte que les colonnes cochées de CE tableau, dans un fichier séparé — pour ne jamais avoir d'ambiguïté sur ce qu'on est en train d'exporter.\n\n• le format (CSV, Excel ou PDF) se choisit une fois pour la fenêtre ;\n\n• les colonnes à inclure se cochent séparément pour chaque tableau (cases à cocher, toutes cochées par défaut ; boutons « Tout cocher »/« Tout décocher »).\n\n💡 Le format et les colonnes cochées de chaque tableau sont mémorisés d'un export à l'autre, et chaque fichier généré s'ouvre automatiquement à la fin de l'export."
+  },
+  {
+    "level": 1,
+    "title": "16. Menu Répertoire — joueurs habituels et photos",
+    "body": "Le répertoire mémorise vos joueurs habituels indépendamment de chaque tournoi : ils sont proposés sous forme de liste à cocher à la création d'un nouveau tournoi, et restent disponibles pour piocher dedans à tout moment (« Ajouter depuis le répertoire... », onglet Joueurs).\n\nLe menu Répertoire → « Gérer le répertoire de joueurs... » ouvre la fenêtre de gestion :\n\nLes joueurs sont affichés dans un tableau à deux colonnes, Nom et Club. Cliquer sur l'un ou l'autre en-tête trie la liste en conséquence ; cliquer une seconde fois inverse l'ordre (croissant/décroissant).\n\n• Ajouter / Renommer / Supprimer — gestion de la liste elle-même.\n\n• Modifier le club... — renseigne ou corrige le club du joueur sélectionné, via la même liste déroulante (clubs déjà connus, ou saisie libre) que dans l'onglet Joueurs.\n\n• Prendre une photo... / Importer une photo... / Supprimer la photo — une photo peut être associée à chaque joueur du répertoire (nécessite les paquets optionnels pour la caméra et l'aperçu, voir section 2).\n\n• Importer les joueurs d'un tournoi existant... — ajoute au répertoire tous les noms trouvés dans un fichier .tournoi choisi — pratique pour repartir d'un tournoi déjà joué sans ressaisir chaque nom.\n\n• Importer (CSV)... — importe une liste de joueurs depuis un fichier CSV (colonnes NOM et CLUB, avec ou sans ligne d'en-tête, séparateur « ; » ou « , »). Si le fichier ne contient qu'une seule colonne (juste des noms), une fenêtre propose un club à attribuer à tous les joueurs importés, pré-rempli avec « CPC ».\n\n• Exporter (CSV)... — exporte le répertoire complet au format NOM;CLUB.\n\n• Tout réactiver... — cherche, dans un dossier au choix (et ses sous-dossiers), tous les tournois où des joueurs sont restés coincés « actifs » sans que la partie ait été vraiment terminée (utile après des tests, ou un tournoi jamais fini) ; un récapitulatif détaillé demande confirmation avant de les marquer Forfait dans ces fichiers, pour qu'ils ne bloquent plus la détection de conflit (section 14).\n\n⚠ « Tout réactiver » vérifie systématiquement tous les tournois du dossier choisi, y compris ceux datés d'aujourd'hui : vérifiez bien la liste avant de confirmer si l'un d'eux est réellement en train d'être joué."
+  },
+  {
+    "level": 1,
+    "title": "17. Sauvegarde et bonnes pratiques",
+    "body": "• Toutes les actions sont enregistrées immédiatement dans le fichier .tournoi — pas de sauvegarde manuelle à penser à faire.\n\n• Pour sauvegarder une copie de sûreté : copiez simplement le fichier .tournoi ailleurs (le tournoi peut rester ouvert pendant la copie).\n\n• Le répertoire de joueurs, les préférences de réglages/export, les photos et les modèles de blindes/réglages enregistrés (sections 9 et 11) sont stockés indépendamment de chaque tournoi (dossier .poker_tournament du compte utilisateur) — ils survivent à la suppression d'un fichier .tournoi.\n\n• Pensez à renommer clairement vos fichiers .tournoi (date, nom de l'événement) : c'est ce nom de fichier qui sert de repli pour la date affichée dans les synthèses par période si aucun nom de tournoi n'a été précisé."
+  },
+  {
+    "level": 1,
+    "title": "18. Dépannage (pour le technicien)",
+    "body": ""
+  },
+  {
+    "level": 3,
+    "title": "« L'export Excel nécessite le paquet openpyxl »",
+    "body": "Installez-le avec pip3 install openpyxl (voir section 2), ou utilisez l'export CSV en attendant, qui ne nécessite rien de plus."
+  },
+  {
+    "level": 3,
+    "title": "« L'export PDF nécessite le paquet fpdf2 »",
+    "body": "Installez-le avec pip3 install fpdf2 (voir section 2), ou utilisez CSV/Excel en attendant."
+  },
+  {
+    "level": 3,
+    "title": "La capture photo par caméra est indisponible",
+    "body": "Installez opencv-python et Pillow (voir section 2). L'import d'une photo depuis un fichier reste possible sans ces paquets."
+  },
+  {
+    "level": 3,
+    "title": "macOS refuse d'ouvrir Lancer_le_tournoi.command",
+    "body": "Clic droit (ou Ctrl+clic) sur le fichier → « Ouvrir » → confirmez « Ouvrir ». Cette étape n'est nécessaire qu'une seule fois."
+  },
+  {
+    "level": 3,
+    "title": "Sous Windows, le fichier .command ne fait rien",
+    "body": "Normal : c'est un script réservé à macOS. Utilisez la ligne de commande (python main.py), voir section 2."
+  },
+  {
+    "level": 3,
+    "title": "Une colonne de l'onglet Joueurs a disparu",
+    "body": "Elle a été réduite en dessous de sa largeur minimale à la souris, ce qui la masque automatiquement (voir section 5, « Colonnes du tableau »). Utilisez le bouton « Bou/Col... » (à côté de « Tout décocher ») pour la réafficher."
+  },
+  {
+    "level": 3,
+    "title": "Le Lobby affiche une liste vide",
+    "body": "Aucun dossier n'a encore été choisi (cliquez sur « Choisir un dossier... »), ou le dossier choisi ne contient pas de fichiers .tournoi. Voir section 14."
+  },
+  {
+    "level": 3,
+    "title": "Des joueurs restent grisés dans la fenêtre de sélection alors que leur tournoi est terminé",
+    "body": "Ils sont probablement restés « actifs » dans un vieux tournoi jamais terminé proprement (test interrompu, oubli de finir la partie). Utilisez « Tout réactiver... » (menu Répertoire, section 16) pour les libérer."
+  },
+  {
+    "level": 3,
+    "title": "Un joueur affiché « en cours » n'a pas de gain calculé dans la synthèse par période",
+    "body": "Tant qu'un tournoi n'est pas terminé (plus d'un joueur encore actif), aucun gain de classement n'est comptabilisé pour ces joueurs dans la synthèse — seuls le nombre de tournois joués et les primes déjà empochées le sont."
+  },
+  {
+    "level": 3,
+    "title": "J'ai supprimé un joueur par erreur",
+    "body": "La suppression n'est pas réversible depuis l'interface. Si vous avez une copie de sauvegarde récente du fichier .tournoi, c'est le seul moyen de revenir en arrière."
+  },
+  {
+    "level": 1,
+    "title": "Licence et version",
+    "body": "Le numéro de version du logiciel est affiché dans le titre de la fenêtre et dans le menu Aide → « A propos... ».\n\nLes exécutables compilés (.msi Windows, .dmg macOS) peuvent exiger une activation unique par machine, hors ligne, la première fois qu'ils sont lancés : une fenêtre affiche alors un identifiant à communiquer à l'éditeur pour recevoir une clé. Lancé depuis les sources (comme actuellement), le logiciel ne demande jamais d'activation.\n\n💡 Ce verrou n'est pas encore actif sur les exécutables actuellement en circulation — il pourra l'être sur une future version, sans rien changer pour les postes déjà activés."
+  },
+  {
+    "level": 1,
+    "title": "Annexe — structure des fichiers du logiciel",
+    "body": "Pour référence technique (utile si vous transférez le logiciel sur un autre ordinateur, voir section 2) :\n\nFichier — Rôle\n--------------\nmain.py — Interface graphique (tous les onglets et fenêtres)\ndatabase.py — Accès aux données et logique métier de chaque tournoi\nstructures.py — Structure de blindes par défaut et grille de gains standard\nclock_window.py — Fenêtre du chronomètre en mode projecteur\nroster.py — Répertoire de joueurs habituels (indépendant des tournois)\ntournament_prefs.py — Derniers réglages utilisés, repris par défaut\nplayer_photos.py — Photos de joueurs associées au répertoire\nsound_signal.py — Signal sonore de déplacement de joueur\nexport_prefs.py — Préférences d'export (colonnes, format) et colonnes masquées\nblind_templates.py — Modèles de structures de blindes réutilisables (onglet Blindes)\nsettings_templates.py — Modèles de réglages réutilisables (onglet Paramètres)\nversion.py — Numéro de version affiché dans l'application\nlicense.py — Verrou de licence (activation par machine, hors ligne)\nchip_templates.py — Modèles de jeux de jetons réutilisables (onglet Blindes)\n\n💡 Ces 14 fichiers .py doivent rester ensemble dans le même dossier : ils s'importent entre eux."
+  }
+]

@@ -8,6 +8,7 @@ import time
 import math
 import os
 import glob
+import shutil
 
 # =====================================================================
 # Export PDF : petit utilitaire partagé par tous les export_*_pdf
@@ -23,6 +24,45 @@ def _pdf_text(value):
     if value is None:
         return ""
     return str(value).replace("—", "-").replace("€", "EUR")
+
+
+# =====================================================================
+# Format français des dates (JJ/MM/AAAA) : toutes les dates/heures sont
+# stockées en interne au format ISO (AAAA-MM-JJ [HH:MM:SS]), pratique
+# pour le tri et les comparaisons (voir get_tournament_date,
+# _read_tournament_date_ro...). Ces deux fonctions ne servent qu'à
+# l'AFFICHAGE (colonnes des onglets, exports) : ne jamais les utiliser
+# pour stocker ou comparer des dates.
+# =====================================================================
+
+def format_date_fr(iso_date):
+    """Convertit une date "AAAA-MM-JJ" en "JJ/MM/AAAA". Renvoie la valeur
+    telle quelle si elle est vide ou ne correspond pas au format attendu."""
+    if not iso_date:
+        return iso_date
+    try:
+        y, m, d = iso_date.split("-")
+        if len(y) == 4 and len(m) == 2 and len(d) == 2:
+            return f"{d}/{m}/{y}"
+    except (ValueError, AttributeError):
+        pass
+    return iso_date
+
+
+def format_datetime_fr(iso_dt):
+    """Convertit "AAAA-MM-JJ HH:MM:SS" en "JJ/MM/AAAA HH:MM:SS". Renvoie la
+    valeur telle quelle si elle est vide ou ne correspond pas au format
+    attendu."""
+    if not iso_dt:
+        return iso_dt
+    try:
+        date_part, time_part = iso_dt.split(" ", 1)
+        formatted_date = format_date_fr(date_part)
+        if formatted_date == date_part:
+            return iso_dt
+        return f"{formatted_date} {time_part}"
+    except (ValueError, AttributeError):
+        return iso_dt
 
 
 def _pdf_fit_font_size(pdf, texts, col_width, bold=False, max_size=9, min_size=5):
@@ -175,7 +215,6 @@ DEFAULT_SETTINGS = {
     "max_seats_per_table": "9",
     "min_players_per_table": "4",
     "break_duration_minutes": "15",
-    "movement_signal_frequency_hz": "880",
     "movement_signal_duration_ms": "300",
     "highlight_duration_minutes": "5",
     "rake_percent": "0",
@@ -188,6 +227,8 @@ DEFAULT_SETTINGS = {
     "paused_accum_seconds": "0",
     "clock_started": "0",
     "tournament_date": "",  # AAAA-MM-JJ, fixée à la création (voir get_tournament_date)
+    "tournament_start_epoch": "0",  # fixé au tout premier "Démarrer" (voir App._clock_resume)
+    "tournament_end_epoch": "0",  # fixé quand il ne reste plus qu'1 joueur actif (voir eliminate_player)
 }
 
 
@@ -364,6 +405,25 @@ class Database:
         )
         self.conn.commit()
 
+    def renumber_active_tables(self):
+        """Renomme les tables actives en 'Table 1', 'Table 2'... dans
+        l'ordre (par id croissant), pour ne jamais laisser de trou dans la
+        numérotation affichée après la fermeture d'une ou plusieurs tables
+        (ex : il ne restait que « Table 8 », « Table 10 », « Table 11 »
+        après plusieurs fermetures en cours de tournoi). Les tables
+        fermées gardent leur ancien nom : seul l'historique des
+        mouvements (déjà enregistré sous forme de texte figé) peut encore
+        y faire référence, aucun souci de doublon puisqu'elles ne sont
+        plus affichées nulle part."""
+        tables = self.conn.execute(
+            "SELECT id FROM tables_pk WHERE is_active=1 ORDER BY id"
+        ).fetchall()
+        for i, t in enumerate(tables, start=1):
+            self.conn.execute(
+                "UPDATE tables_pk SET name=? WHERE id=?", (f"Table {i}", t["id"])
+            )
+        self.conn.commit()
+
     # ---------- players ----------
     def list_players(self, status=None):
         q = "SELECT * FROM players"
@@ -519,6 +579,14 @@ class Database:
             )
 
         self.conn.commit()
+
+        # Fige l'heure de fin dès qu'il ne reste plus qu'1 joueur actif
+        # (le vainqueur) — sert à figer l'affichage "Durée" du chrono
+        # projecteur au lieu de continuer à défiler après la fin de la
+        # partie, et à y afficher "Partie terminée" (voir get_stats()).
+        if len(self.list_players(status="active")) <= 1:
+            self.set_setting("tournament_end_epoch", int(time.time()))
+
         return self.rebalance_tables(record_moves=True)
 
     def withdraw_player(self, player_id):
@@ -543,6 +611,12 @@ class Database:
         )
         self.conn.commit()
         self._seat_player(player_id)
+        # Réintégrer un joueur peut faire repasser le nombre d'actifs
+        # au-dessus de 1 : la partie n'est alors plus terminée, on efface
+        # l'heure de fin figée (voir eliminate_player) pour que "Durée"
+        # se remette à compter sur le chrono projecteur.
+        if len(self.list_players(status="active")) > 1:
+            self.set_setting("tournament_end_epoch", 0)
         return self.rebalance_tables(record_moves=False)
 
     def delete_player(self, player_id):
@@ -718,7 +792,21 @@ class Database:
                     )
         self.conn.commit()
 
+        # Referme les trous dans la numérotation des tables actives
+        # restantes (ex : une fermeture pendant le rééquilibrage laissait
+        # jusque-là « Table 8 », « Table 10 », « Table 11 » affichées) —
+        # avant le calcul des déplacements ci-dessous, pour que
+        # new_table_name reflète directement le nom corrigé.
+        self.renumber_active_tables()
+
         # Calcule les déplacements réels (avant -> après) et les archive.
+        # Seul un changement de TABLE compte comme un "mouvement" (alerte,
+        # pause du chrono, historique) : un simple recompactage de numéro
+        # de siège au sein de la même table (ex : combler le siège laissé
+        # vide par un joueur éliminé) ne demande à personne de se déplacer
+        # physiquement, donc pas d'alerte pour ça — sur un SNG à une seule
+        # table, ça évite une alerte à chaque élimination alors que
+        # personne ne bouge réellement de table.
         after_players = [dict(p) for p in self.list_players(status="active")]
         table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
         now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -726,7 +814,7 @@ class Database:
         for p in after_players:
             old_table_id, old_seat = before_state.get(p["id"], (None, None))
             new_table_id, new_seat = p["table_id"], p["seat"]
-            if old_table_id == new_table_id and old_seat == new_seat:
+            if old_table_id == new_table_id:
                 continue
             move = {
                 "player_name": p["name"],
@@ -959,9 +1047,10 @@ class Database:
                 writer.writerow([fn(r) for _, _, fn in cols])
         return path
 
-    def export_primes_xlsx(self, path, columns=None, sort_column=None, ascending=True):
+    def export_primes_xlsx(self, path, columns=None, sort_column=None, ascending=True, title=None):
         """Exporte le tableau de l'onglet Primes au format Excel (.xlsx).
         `columns`, `sort_column`, `ascending` : voir export_primes_csv.
+        `title` : remplace le titre par défaut (nom du tournoi) si fourni.
         Nécessite 'openpyxl'."""
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
@@ -974,7 +1063,7 @@ class Database:
         ws = wb.active
         ws.title = "Primes"
 
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
         ws.append([name])
         ws["A1"].font = Font(bold=True, size=14)
         ws.append(["Primes en points : présence, assiduité, classement, bounty"])
@@ -1003,13 +1092,13 @@ class Database:
         wb.save(path)
         return path
 
-    def export_primes_pdf(self, path, columns=None, sort_column=None, ascending=True):
+    def export_primes_pdf(self, path, columns=None, sort_column=None, ascending=True, title=None):
         """Exporte le tableau de l'onglet Primes en PDF. `columns`,
-        `sort_column`, `ascending` : voir export_primes_csv. Nécessite
-        'fpdf2'."""
+        `sort_column`, `ascending` : voir export_primes_csv. `title` : voir
+        export_primes_xlsx. Nécessite 'fpdf2'."""
         cols = _selected_period_columns(PRIMES_COLUMNS, columns)
         rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
         return _write_pdf_table(
             path, name,
             ["Primes en points : présence, assiduité, classement, bounty"],
@@ -1031,9 +1120,10 @@ class Database:
                 writer.writerow([fn(r) for _, _, fn in cols])
         return path
 
-    def export_bounty_history_xlsx(self, path, columns=None):
+    def export_bounty_history_xlsx(self, path, columns=None, title=None):
         """Exporte l'historique du bounty progressif au format Excel
-        (.xlsx). `columns` : voir export_bounty_history_csv. Nécessite
+        (.xlsx). `columns` : voir export_bounty_history_csv. `title` :
+        remplace le titre par défaut (nom du tournoi) si fourni. Nécessite
         'openpyxl'."""
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
@@ -1046,7 +1136,7 @@ class Database:
         ws = wb.active
         ws.title = "Historique bounty"
 
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
         ws.append([name])
         ws["A1"].font = Font(bold=True, size=14)
         ws.append(["Historique du bounty progressif (mécanisme PKO interne)"])
@@ -1073,12 +1163,13 @@ class Database:
         wb.save(path)
         return path
 
-    def export_bounty_history_pdf(self, path, columns=None):
+    def export_bounty_history_pdf(self, path, columns=None, title=None):
         """Exporte l'historique du bounty progressif en PDF. `columns` :
-        voir export_bounty_history_csv. Nécessite 'fpdf2'."""
+        voir export_bounty_history_csv. `title` : voir
+        export_bounty_history_xlsx. Nécessite 'fpdf2'."""
         cols = _selected_period_columns(BOUNTY_HISTORY_COLUMNS, columns)
         rows = self.get_bounty_events(limit=10000)
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
         return _write_pdf_table(
             path, name,
             ["Historique du bounty progressif (mécanisme PKO interne)"],
@@ -1172,8 +1263,56 @@ class Database:
         rake_pct = self.get_setting_float("rake_percent", 0)
         gross = entries * buyin_amount + rebuys * rebuy_amount + addons * addon_amount
         prize_pool = gross * (1 - rake_pct / 100.0)
-        total_chips = sum(p["chips"] for p in active)
+        # Tapis moyen = total des chips en jeu / joueurs encore actifs. Le
+        # total doit porter sur les actifs ET les éliminés (mais pas les
+        # forfaits — voir plus bas) : les chips d'un joueur éliminé ne
+        # disparaissent pas de la table, elles passent dans le tapis de
+        # celui qui l'a éliminé — mais ce transfert n'est pas forcément
+        # ressaisi manuellement (onglet Joueurs > Modifier les chips)
+        # pour chaque main. Se limiter aux actifs ferait baisser le total
+        # à chaque élimination et donnerait un tapis moyen sous-évalué.
+        # Les forfaits (status='withdrawn') sont exclus : leurs chips ne
+        # sont jamais entrées en jeu / en sont sorties avec eux, elles ne
+        # doivent pas gonfler le total.
+        total_chips = sum(p["chips"] for p in all_players if p["status"] != "withdrawn")
         avg_stack = total_chips / len(active) if active else 0
+
+        # Durée du tournoi (temps réel écoulé depuis le tout premier
+        # "Démarrer" — voir App._clock_resume) : continue de courir tant
+        # que la partie n'est pas terminée (y compris pendant les pauses
+        # du chrono de niveau, qui n'arrêtent pas le temps réel), puis se
+        # fige à l'heure de fin dès qu'il ne reste plus qu'1 joueur actif
+        # (voir eliminate_player) plutôt que de continuer à défiler alors
+        # que tout le monde est déjà parti.
+        start_epoch = self.get_setting_int("tournament_start_epoch", 0)
+        if start_epoch == 0 and self.get_setting_int("clock_started", 0) == 1:
+            # Tournoi déjà en cours avant l'ajout de ce réglage (le chrono
+            # avait déjà été démarré) : l'heure du tout premier "Démarrer"
+            # n'a jamais été enregistrée, donc "Durée" resterait bloquée à
+            # 00:00:00 pour toujours sans ce rattrapage ponctuel. On
+            # l'approxime une bonne fois pour toutes avec l'heure de la
+            # première élimination déjà enregistrée si elle existe
+            # (meilleure estimation disponible), sinon avec l'heure
+            # actuelle — puis on la fige en réglage pour ne plus jamais y
+            # revenir (sans quoi la durée repartirait de zéro à chaque
+            # rafraîchissement).
+            earliest = None
+            for p in all_players:
+                if p["elim_time"]:
+                    try:
+                        t = time.mktime(time.strptime(p["elim_time"], "%Y-%m-%d %H:%M:%S"))
+                    except ValueError:
+                        continue
+                    if earliest is None or t < earliest:
+                        earliest = t
+            start_epoch = int(earliest) if earliest else int(time.time())
+            self.set_setting("tournament_start_epoch", start_epoch)
+        end_epoch = self.get_setting_int("tournament_end_epoch", 0)
+        if start_epoch:
+            duration_seconds = max(0, (end_epoch or int(time.time())) - start_epoch)
+        else:
+            duration_seconds = 0
+
         return {
             "total_players_ever": len(all_players),
             "active_count": len(active),
@@ -1184,6 +1323,8 @@ class Database:
             "prize_pool": prize_pool,
             "total_chips": total_chips,
             "avg_stack": avg_stack,
+            "duration_seconds": duration_seconds,
+            "tournament_finished": end_epoch != 0,
         }
 
     def get_live_status(self):
@@ -1509,10 +1650,15 @@ class Database:
                 writer.writerow([fn(r) for _, _, fn in cols])
         return path
 
-    def export_players_xlsx(self, path, columns=None, sort_column=None, ascending=True):
+    def export_players_xlsx(self, path, columns=None, sort_column=None, ascending=True,
+                             title=None, show_prize_pool=True):
         """Exporte le tableau de l'onglet Joueurs au format Excel (.xlsx).
         `columns`, `sort_column`, `ascending` : voir export_players_csv.
-        Nécessite 'openpyxl'."""
+        `title` : remplace le titre par défaut (nom du tournoi) si fourni —
+        utilisé par exemple par l'export du Classement. `show_prize_pool` :
+        si False, n'affiche pas la ligne "Entrées : ... Prize pool : ..."
+        (également utilisé par l'export du Classement, où ça n'a pas de
+        sens). Nécessite 'openpyxl'."""
         from openpyxl import Workbook
         from openpyxl.styles import Font, Alignment, PatternFill
         from openpyxl.utils import get_column_letter
@@ -1525,12 +1671,13 @@ class Database:
         ws.title = "Joueurs"
 
         stats = self.get_stats()
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
 
         ws.append([name])
         ws["A1"].font = Font(bold=True, size=14)
-        ws.append([f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} €"])
-        ws["A2"].font = Font(italic=True)
+        if show_prize_pool:
+            ws.append([f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} €"])
+            ws[f"A{ws.max_row}"].font = Font(italic=True)
         ws.append([])
 
         headers = [h for _, h, _ in cols]
@@ -1556,17 +1703,20 @@ class Database:
         wb.save(path)
         return path
 
-    def export_players_pdf(self, path, columns=None, sort_column=None, ascending=True):
+    def export_players_pdf(self, path, columns=None, sort_column=None, ascending=True,
+                            title=None, show_prize_pool=True):
         """Exporte le tableau de l'onglet Joueurs en PDF. `columns`,
-        `sort_column`, `ascending` : voir export_players_csv. Nécessite
-        le paquet 'fpdf2'."""
+        `sort_column`, `ascending` : voir export_players_csv. `title`,
+        `show_prize_pool` : voir export_players_xlsx. Nécessite le paquet
+        'fpdf2'."""
         cols = _selected_period_columns(PLAYERS_TAB_COLUMNS, columns)
         rows = self.players_rows(sort_column=sort_column, ascending=ascending)
         stats = self.get_stats()
-        name = self.get_setting("tournament_name", "Tournoi")
+        name = title or self.get_setting("tournament_name", "Tournoi")
+        subtitle_lines = [f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} EUR"] if show_prize_pool else []
         return _write_pdf_table(
             path, name,
-            [f"Entrées : {stats['entries']}    Prize pool : {stats['prize_pool']:.2f} EUR"],
+            subtitle_lines,
             [h for _, h, _ in cols],
             [[fn(r) for _, _, fn in cols] for r in rows],
         )
@@ -1607,6 +1757,50 @@ def find_tournament_files(folder, recursive=True):
     sous-dossiers si `recursive` est vrai."""
     pattern = os.path.join(folder, "**", "*.tournoi") if recursive else os.path.join(folder, "*.tournoi")
     return sorted(glob.glob(pattern, recursive=recursive))
+
+
+def find_finished_tournament_files(folder):
+    """Fichiers .tournoi terminés (get_live_status()['finished']) trouvés
+    directement dans `folder` (non récursif, comme le Lobby SNG) — liste
+    de dicts {path, name}, utilisée pour "Archiver les terminés..."."""
+    results = []
+    for path in find_tournament_files(folder, recursive=False):
+        try:
+            db = Database(path)
+            status = db.get_live_status()
+            db.close()
+        except Exception:
+            continue
+        if status["finished"]:
+            results.append({"path": path, "name": status["name"]})
+    return results
+
+
+def archive_tournament_files(paths):
+    """Déplace chaque fichier .tournoi de `paths` dans un sous-dossier
+    "archive" créé (si besoin) dans son propre dossier parent — celui où
+    il a été créé, pas un emplacement d'archive centralisé. En cas de nom
+    déjà présent dans ce sous-dossier, ajoute un suffixe numérique plutôt
+    que d'écraser. Renvoie le nombre de fichiers effectivement déplacés ;
+    une erreur sur un fichier (verrouillé, permissions...) n'interrompt
+    pas le traitement des autres."""
+    moved = 0
+    for path in paths:
+        folder = os.path.dirname(path)
+        archive_dir = os.path.join(folder, "archive")
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            base, ext = os.path.splitext(os.path.basename(path))
+            dest = os.path.join(archive_dir, base + ext)
+            i = 2
+            while os.path.exists(dest):
+                dest = os.path.join(archive_dir, f"{base}_{i}{ext}")
+                i += 1
+            shutil.move(path, dest)
+            moved += 1
+        except OSError:
+            continue
+    return moved
 
 
 def _read_tournament_date_ro(path):
@@ -1920,7 +2114,7 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
 # sélection des colonnes (main.py) — ainsi les trois restent toujours en
 # phase.
 PERIOD_TOURNAMENT_COLUMNS = [
-    ("date", "Date", lambda t: t["date"]),
+    ("date", "Date", lambda t: format_date_fr(t["date"])),
     ("name", "Tournoi", lambda t: t["name"]),
     ("status", "Statut", lambda t: t["status"]),
     ("entries", "Entrées", lambda t: t["entries"]),
@@ -1979,7 +2173,7 @@ PLAYERS_TAB_COLUMNS = [
     ("bounty", "Prime", lambda p: p["bounty"]),
     ("status", "Statut", lambda p: p["status"]),
     ("rang", "Rang", lambda p: p["rang"]),
-    ("elim_time", "Éliminé le", lambda p: p["elim_time"]),
+    ("elim_time", "Éliminé le", lambda p: format_datetime_fr(p["elim_time"])),
     ("elim_round", "Round", lambda p: p["elim_round"]),
     ("eliminated_by", "Éliminé par", lambda p: p["eliminated_by"]),
 ]
@@ -1993,9 +2187,9 @@ PRIMES_COLUMNS = [
     ("presence", "Présence", lambda r: r["presence"]),
     ("assiduite", "Assiduité", lambda r: r["assiduite"]),
     ("cl_montant", "Classement", lambda r: r["cl_montant"]),
-    ("bo_nombre", "Bounty — Nb", lambda r: r["bo_nombre"]),
-    ("bo_valeur", "Bounty — Val", lambda r: r["bo_valeur"]),
-    ("bo_montant", "Bounty — Mt", lambda r: r["bo_montant"]),
+    ("bo_nombre", "Nb Bounty", lambda r: r["bo_nombre"]),
+    ("bo_valeur", "Val Bounty", lambda r: r["bo_valeur"]),
+    ("bo_montant", "Mon Bounty", lambda r: r["bo_montant"]),
     ("total", "TOTAL", lambda r: r["total"]),
 ]
 
@@ -2003,7 +2197,7 @@ PRIMES_COLUMNS = [
 # l'historique du bounty progressif (mécanisme PKO interne, voir
 # get_bounty_events) — distinct du récapitulatif ci-dessus.
 BOUNTY_HISTORY_COLUMNS = [
-    ("time", "Heure", lambda r: r["event_time"]),
+    ("time", "Heure", lambda r: format_datetime_fr(r["event_time"])),
     ("eliminated", "Joueur éliminé", lambda r: r["eliminated_name"]),
     ("eliminator", "Éliminé par", lambda r: r["eliminator_name"] or "-"),
     ("amount", "Points gagnés", lambda r: r["amount_won"]),

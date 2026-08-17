@@ -11,12 +11,19 @@ from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH).resolve().parent  # racine du dépôt (parent de windows/)
+# Icône du .exe (logo Sena Computer) : reprise telle quelle par les
+# raccourcis Bureau/Menu Démarrer créés par le .msi (voir windows/app.wxs),
+# qui n'a pas besoin de la redéclarer séparément.
+ICON = Path(SPECPATH) / "assets" / "app_icon.ico"
 
 a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[],
+    # help_content.json : contenu de l'aide intégrée (menu Aide / touche
+    # F1, voir help_browser.py), lu au runtime via sys._MEIPASS — sans
+    # cette entrée, l'aide s'ouvrirait vide dans l'exécutable packagé.
+    datas=[(str(ROOT / "help_content.json"), ".")],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -47,5 +54,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon=str(ICON),
 )

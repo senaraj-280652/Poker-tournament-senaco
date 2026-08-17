@@ -13,6 +13,7 @@ import os
 import struct
 import subprocess
 import sys
+import threading
 import wave
 
 _SAMPLE_RATE = 44100
@@ -89,29 +90,46 @@ def play_tone(frequency_hz, duration_ms):
     return False
 
 
-def play_file(path):
+def play_file(path, max_duration_ms=None):
     """Joue un fichier .wav existant (choisi par l'utilisateur — voir les
     boutons "Son début Pause"/"Son Fin Pause"/"Son fin Round" de l'onglet
-    Chronomètre), sans bloquer l'interface. Renvoie True si la lecture a
-    pu être lancée."""
+    Chronomètre, et "Fichier Wav" du Signal de mouvements), sans bloquer
+    l'interface. Renvoie True si la lecture a pu être lancée.
+
+    `max_duration_ms`, si fourni, tronque la lecture à cette durée même
+    si le fichier est plus long : nativement via `afplay -t` sur macOS,
+    sinon (Windows, Linux) en coupant le son après ce délai."""
     if not path or not os.path.exists(path):
         return False
     try:
         if sys.platform == "darwin":
-            subprocess.Popen(
-                ["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            args = ["afplay"]
+            if max_duration_ms:
+                args += ["-t", str(max(0.05, max_duration_ms / 1000))]
+            args.append(path)
+            subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             return True
         elif sys.platform.startswith("win"):
             import winsound
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            if max_duration_ms:
+                timer = threading.Timer(
+                    max(0.05, max_duration_ms / 1000),
+                    lambda: winsound.PlaySound(None, winsound.SND_PURGE),
+                )
+                timer.daemon = True
+                timer.start()
             return True
         else:
             for player in ("paplay", "aplay"):
                 try:
-                    subprocess.Popen(
+                    proc = subprocess.Popen(
                         [player, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                     )
+                    if max_duration_ms:
+                        timer = threading.Timer(max(0.05, max_duration_ms / 1000), proc.terminate)
+                        timer.daemon = True
+                        timer.start()
                     return True
                 except FileNotFoundError:
                     continue
