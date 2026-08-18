@@ -1450,11 +1450,14 @@ class LobbyDialog(tk.Toplevel):
                 master, chapter_title="14. Sit & Go et gestion de plusieurs tournois", section_title="Lobby"
             ),
         )
-        # Dossier choisi explicitement pour le Lobby en priorité ; sinon,
-        # se rabat automatiquement sur le dernier dossier utilisé pour
-        # créer un tournoi (voir default_tournament_dir) — pour que les
-        # SNG tout juste créés apparaissent sans avoir à re-choisir un
-        # dossier à la main.
+        # Dossier choisi explicitement pour le Lobby (via "Choisir un
+        # dossier...") en priorité ; sinon, se rabat sur le dernier
+        # dossier utilisé pour créer un tournoi (voir default_tournament_dir)
+        # — et LE SUIT À CHAQUE RAFRAÎCHISSEMENT tant qu'aucun dossier
+        # explicite n'a été choisi (voir _refresh), pour qu'un tournoi/SNG
+        # créé dans un nouveau dossier apparaisse sans avoir à fermer et
+        # rouvrir le Lobby, ni à re-choisir un dossier à la main.
+        self._explicit_folder = bool(export_prefs.load_value("lobby_folder"))
         self.folder = (
             export_prefs.load_value("lobby_folder")
             or export_prefs.load_value("last_tournament_dir")
@@ -1517,11 +1520,22 @@ class LobbyDialog(tk.Toplevel):
         if not folder:
             return
         self.folder = folder
+        self._explicit_folder = True
         export_prefs.save_value("lobby_folder", folder)
         self.folder_lbl.config(text=folder)
         self._refresh()
 
     def _refresh(self):
+        if not self._explicit_folder:
+            # Aucun dossier choisi à la main : reprend le dernier dossier
+            # utilisé pour créer un tournoi à CHAQUE rafraîchissement (pas
+            # seulement à l'ouverture du Lobby), pour qu'un tournoi/SNG
+            # tout juste créé dans un nouveau dossier apparaisse sans
+            # avoir à fermer/rouvrir cette fenêtre.
+            latest = export_prefs.load_value("last_tournament_dir") or ""
+            if latest and latest != self.folder:
+                self.folder = latest
+                self.folder_lbl.config(text=latest)
         selected_path = self._selected_path()
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -4497,7 +4511,7 @@ class App(tk.Tk):
         self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
         if self.clock_window is not None and self.clock_window.winfo_exists():
-            self.clock_window.lift()
+            self.clock_window.bring_to_front()
 
     # ---------------------------------------------------------------
     # Raccourcis clavier "Élimination" / "Terminé" / "Chronomètre" — même
@@ -4638,8 +4652,17 @@ class App(tk.Tk):
             if not alert_active and not self.voice_awaiting_resume:
                 self._voice_start_elimination()
         elif word == "chronometre":
-            if not alert_active and self.voice_awaiting_resume:
+            if alert_active:
+                pass
+            elif self.voice_awaiting_resume:
                 self._voice_resume_clock()
+            else:
+                # Hors du contexte "reprendre après une élimination" :
+                # sert simplement à ramener l'écran projecteur au premier
+                # plan (utile s'il a été rapetissé/réduit pour faire autre
+                # chose dans le logiciel entre-temps) — sans quoi Ctrl+Maj+C
+                # ne faisait rien du tout en dehors de ce contexte précis.
+                self._voice_show_clock()
 
     def _voice_start_elimination(self):
         """Commande "Élimination" (raccourci clavier ou contrôle à
@@ -4676,7 +4699,21 @@ class App(tk.Tk):
         self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
         if self.clock_window is not None and self.clock_window.winfo_exists():
-            self.clock_window.lift()
+            self.clock_window.bring_to_front()
+
+    def _voice_show_clock(self):
+        """Commande "Chronomètre" (raccourci clavier Ctrl+Maj+C) hors du
+        contexte "reprendre après une élimination" (voir _on_voice_word) :
+        ramène simplement l'onglet Chronomètre et l'écran projecteur au
+        premier plan, en restaurant son plein écran s'il l'était avant
+        d'être rapetissé pour faire autre chose dans le logiciel — sans
+        toucher à l'état pause/lecture du chrono ni à quoi que ce soit
+        d'autre."""
+        self.notebook.select(self.clock_tab)
+        self._refresh_clock_tab()
+        if self.clock_window is not None and self.clock_window.winfo_exists():
+            self.clock_window.bring_to_front()
+        self.lift()
 
     def _refresh_players_tab(self):
         # Garde la liste déroulante des clubs à jour (un club a pu être
@@ -5589,7 +5626,7 @@ class App(tk.Tk):
 
     def _open_clock_window(self):
         if self.clock_window is not None and self.clock_window.winfo_exists():
-            self.clock_window.lift()
+            self.clock_window.bring_to_front()
             return
         self.clock_window = ClockWindow(self, self)
 

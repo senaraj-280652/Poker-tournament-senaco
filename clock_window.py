@@ -187,12 +187,32 @@ class ClockWindow(tk.Toplevel):
         self._moves_autoscroll_tick()
 
         self.bind("<F11>", self._toggle_fullscreen)
-        self.bind("<Escape>", lambda e: self.attributes("-fullscreen", False))
+        self.bind("<Escape>", self._exit_fullscreen)
         self._fullscreen = False
 
     def _toggle_fullscreen(self, event=None):
         self._fullscreen = not self._fullscreen
         self.attributes("-fullscreen", self._fullscreen)
+
+    def _exit_fullscreen(self, event=None):
+        # Distincte de _toggle_fullscreen (Echap ne bascule pas, ne quitte
+        # que le plein écran) mais doit quand même mettre _fullscreen à
+        # jour — sinon bring_to_front() ci-dessous le repasserait à tort
+        # en plein écran en croyant que c'est toujours son état voulu.
+        self._fullscreen = False
+        self.attributes("-fullscreen", False)
+
+    def bring_to_front(self):
+        """Ramène cette fenêtre au premier plan, quitte son état réduit/
+        rapetissé le cas échéant (voir Ctrl+Maj+C, App._voice_show_clock) :
+        restaure le plein écran si c'était son état avant d'être réduite
+        pour faire autre chose dans le logiciel, sinon la ramène juste au
+        premier plan sans changer sa taille actuelle."""
+        self.deiconify()
+        if self._fullscreen:
+            self.attributes("-fullscreen", True)
+        self.lift()
+        self.focus_force()
 
     def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
                 is_paused, next_break_text="", movement_alert=False, chip_denominations=None,
