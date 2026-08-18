@@ -45,7 +45,7 @@ import remote_control
 import open_windows
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
-from version import APP_VERSION
+from version import APP_NAME, APP_VERSION
 
 # Photos de joueurs (aperçu + capture caméra) : dépendances optionnelles.
 # La copie/suppression des fichiers photo (player_photos.py) ne nécessite
@@ -170,29 +170,19 @@ def spawn_app_process(extra_args=None):
 
 
 def raise_process_when_ready(widget, pid, attempt=0):
-    """Tente (macOS uniquement, via AppleScript/System Events) de faire
-    passer au premier plan le processus `pid` tout juste lancé par
-    spawn_app_process. `widget` : n'importe quel widget Tk vivant, utilisé
-    seulement pour planifier les tentatives (.after) — pas besoin que ce
-    soit la fenêtre App elle-même. Plusieurs essais espacés de 700 ms : le
-    temps que Tk démarre et affiche sa fenêtre dans le nouveau processus
-    varie. Échoue silencieusement si l'accès Accessibilité n'est pas
-    accordé à l'application qui lance ceci (Terminal, IDE...) — la
+    """Tente de faire passer au premier plan le processus `pid` tout
+    juste lancé par spawn_app_process (macOS et Windows, voir
+    open_windows.bring_pid_to_front — no-op silencieux ailleurs).
+    `widget` : n'importe quel widget Tk vivant, utilisé seulement pour
+    planifier les tentatives (.after) — pas besoin que ce soit la
+    fenêtre App elle-même. Plusieurs essais espacés de 700 ms : le temps
+    que Tk démarre et affiche sa fenêtre dans le nouveau processus varie,
+    et sa fenêtre n'existe pas encore lors des tout premiers essais.
+    Échoue silencieusement si l'accès Accessibilité n'est pas accordé
+    (macOS) à l'application qui lance ceci (Terminal, IDE...) — la
     fenêtre reste alors ouverte, juste pas mise en avant automatiquement."""
-    if sys.platform != "darwin":
-        return
-    script = (
-        f'tell application "System Events" to set frontmost of '
-        f'(first process whose unix id is {pid}) to true'
-    )
-    try:
-        subprocess.Popen(
-            ["osascript", "-e", script],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except OSError:
-        pass
-    if attempt < 3:
+    open_windows.bring_pid_to_front(pid)
+    if attempt < 5:
         widget.after(700, lambda: raise_process_when_ready(widget, pid, attempt + 1))
 
 
@@ -1445,6 +1435,11 @@ class LobbyDialog(tk.Toplevel):
         super().__init__(master)
         self.title("Lobby — Sit & Go / Tournois")
         self.geometry("860x420")
+        # Empêche de réduire la fenêtre au point de cacher la barre de
+        # boutons du bas ("🔀 Basculer vers"/"Fermer") — repéré sur une
+        # capture où la fenêtre, réduite trop petit, ne montrait plus que
+        # le tableau, sans aucun moyen visible d'agir dessus.
+        self.minsize(560, 320)
         self.bind(
             "<F1>",
             lambda e: HelpBrowser.open_at(
@@ -2967,7 +2962,7 @@ class App(tk.Tk):
     def __init__(self, open_path=None):
         super().__init__()
         self.withdraw()
-        self.title(f"Gestionnaire de Poker Senaco  —  v{APP_VERSION}")
+        self.title(f"{APP_NAME}  —  v{APP_VERSION}")
         self.geometry("1200x750")
 
         self.db = None
@@ -3159,7 +3154,7 @@ class App(tk.Tk):
             "Sit & Go rapide / Ouvrir).",
         )
         self.header_title_lbl = tk.Label(
-            inner, text="♠ ♥  Gestionnaire de Poker Senaco  ♦ ♣",
+            inner, text=f"♠ ♥  {APP_NAME}  ♦ ♣",
             bg=FELT_DARK, fg=GOLD, font=("Helvetica", 18, "bold"),
         )
         self.header_title_lbl.pack(side="left", padx=(24, 0), pady=(14, 12))
@@ -3174,12 +3169,12 @@ class App(tk.Tk):
             fallback = os.path.splitext(os.path.basename(self.db.path))[0]
             if fallback:
                 name = fallback
-        title = f"Gestionnaire de Poker Senaco — {name}" if name else "Gestionnaire de Poker Senaco"
+        title = f"{APP_NAME} — {name}" if name else APP_NAME
         self.title(title)
         if hasattr(self, "header_title_lbl"):
             self.header_title_lbl.config(
-                text=f"♠ ♥  Gestionnaire de Poker Senaco — {name}  ♦ ♣" if name
-                else "♠ ♥  Gestionnaire de Poker Senaco  ♦ ♣"
+                text=f"♠ ♥  {APP_NAME} — {name}  ♦ ♣" if name
+                else f"♠ ♥  {APP_NAME}  ♦ ♣"
             )
 
     def _back_to_main_menu(self):
@@ -3215,7 +3210,7 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        win.geometry("480x400")
+        win.geometry("480x460")
         win.resizable(False, False)
         win.grab_set()
         result = {"path": None}
@@ -3225,7 +3220,7 @@ class App(tk.Tk):
             bg=FELT_DARK, fg=GOLD, font=("Helvetica", 22, "bold"),
         ).pack(pady=(28, 4))
         tk.Label(
-            win, text="Gestionnaire de Tournoi de Poker",
+            win, text=APP_NAME,
             bg=FELT_DARK, fg=CREAM, font=("Helvetica", 16, "bold"),
         ).pack(pady=(0, 6))
         tk.Label(
@@ -3372,6 +3367,9 @@ class App(tk.Tk):
             "(ramène sa fenêtre si déjà ouverte, sinon l'ouvre). N'ouvre\n"
             "ni ne ferme celle-ci.",
         )
+        ttk.Button(
+            btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
+        ).pack(pady=6)
 
         self.wait_window(win)
         if not result["path"]:
@@ -3529,15 +3527,17 @@ class App(tk.Tk):
         chapter = TAB_TO_CHAPTER.get(current_tab)
         HelpBrowser.open_at(self, chapter_title=chapter)
 
-    def _show_about(self):
+    def _show_about(self, parent=None):
         lines = [
-            "Gestionnaire de Poker Senaco",
+            APP_NAME,
             f"Version {APP_VERSION}",
+            "",
+            "Développé par Sena Raj Juganaikloo, membre de Chemillé Poker Club",
         ]
         info = licensing.license_info()
         if info is not None:
             lines += ["", f"Club activé : {info['club_name']}", f"Machine : {info['machine_id']}"]
-        messagebox.showinfo("À propos", "\n".join(lines), parent=self)
+        messagebox.showinfo("À propos", "\n".join(lines), parent=parent or self)
 
     def _open_period_summary(self):
         PeriodSummaryDialog(self)
