@@ -10,4 +10,4 @@ la section « Changer le numéro de version » de windows/README.md —
 puisque WiX ne peut pas lire un fichier Python.
 """
 APP_NAME = "Gestionnaire de Tournoi de Poker - Senaco"
-APP_VERSION = "1.2.10"
+APP_VERSION = "1.2.11"
