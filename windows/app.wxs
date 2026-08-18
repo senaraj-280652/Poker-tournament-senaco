@@ -19,7 +19,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.3"
+           Version="1.2.4"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
@@ -98,7 +98,14 @@
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
 
-    <ui:WixUI Id="WixUI_Minimal" />
+    <!-- WIXUI_INSTALLDIR doit correspondre à l'Id du <Directory> ci-dessus
+         (INSTALLFOLDER) : c'est ce qui indique à WixUI_InstallDir quel
+         dossier proposer/laisser modifier à l'écran "Choisir le dossier
+         d'installation" (WixUI_Minimal, utilisé jusqu'ici, ne montrait
+         pas cet écran et installait toujours dans le même dossier par
+         défaut sous Program Files). -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <ui:WixUI Id="WixUI_InstallDir" />
     <WixVariable Id="WixUILicenseRtf" Value="windows\License.rtf" />
 
   </Package>
