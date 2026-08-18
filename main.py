@@ -42,6 +42,7 @@ import chip_images
 import player_photos
 import sound_signal
 import remote_control
+import open_windows
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
 from version import APP_VERSION
@@ -1631,6 +1632,15 @@ class LobbyDialog(tk.Toplevel):
                 "Lobby", "Sélectionnez d'abord un tournoi dans la liste.", parent=self,
             )
             return
+        # Déjà ouvert dans une autre fenêtre (voir open_windows.py) : la
+        # ramène au premier plan plutôt que d'en ouvrir une deuxième sur
+        # le même fichier (deux fenêtres qui écrivent en même temps dans
+        # le même .tournoi, à éviter) — utile pour basculer d'un Sit & Go
+        # à l'autre sans se souvenir de quelle fenêtre contient lequel.
+        existing_pid = open_windows.find_open_pid(path)
+        if existing_pid:
+            open_windows.bring_pid_to_front(existing_pid)
+            return
         try:
             proc = spawn_app_process([path])
         except OSError as e:
@@ -2979,6 +2989,12 @@ class App(tk.Tk):
             self.destroy()
             return
 
+        # Enregistre ce processus comme affichant ce tournoi (voir
+        # open_windows.py) : permet au Lobby SNG de détecter qu'il est
+        # déjà ouvert ici et de ramener CETTE fenêtre au premier plan
+        # plutôt que d'en ouvrir une deuxième sur le même fichier.
+        open_windows.register(self.db.path)
+
         self.deiconify()
         self._build_header()
         self._build_menu()
@@ -3403,10 +3419,21 @@ class App(tk.Tk):
         if n_players > 0:
             self.db.set_payout_structure(standard_payout_structure(n_players))
 
-    def _on_close(self):
+    def _cleanup_for_close(self):
+        """Nettoyage commun avant de fermer ce tournoi dans ce processus,
+        que ce soit pour de bon (_on_close) ou pour revenir au menu
+        principal et en ouvrir un autre dans la même fenêtre
+        (_new_tournament) : arrête le contrôle à distance, désinscrit ce
+        tournoi du registre des fenêtres ouvertes (voir open_windows.py
+        — sinon il resterait signalé "ouvert ici" alors que ce n'est
+        plus vrai) et ferme la base."""
         self._stop_remote_control()
         if self.db:
+            open_windows.unregister(self.db.path)
             self.db.close()
+
+    def _on_close(self):
+        self._cleanup_for_close()
         self.destroy()
 
     # ---------------------------------------------------------------
@@ -3494,6 +3521,7 @@ class App(tk.Tk):
         RosterManagerDialog(self)
 
     def _new_tournament(self):
+        self._cleanup_for_close()
         self.destroy()
         app = App()
         app.mainloop()
