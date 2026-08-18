@@ -1496,6 +1496,12 @@ class LobbyDialog(tk.Toplevel):
         self.tree.column("name", width=220, anchor="w")
         self.tree.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self.tree.bind("<Double-Button-1>", lambda e: self._open_selected())
+        # Clic droit : bascule directement vers le tournoi sous le curseur
+        # (Button-3 la plupart des plateformes, Button-2 sur Mac avec
+        # certains trackpads/souris — les deux sont liés par précaution,
+        # même principe qu'ailleurs dans ce fichier).
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self.tree.bind("<Button-2>", self._on_tree_right_click)
 
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=12, pady=(0, 12))
@@ -1643,6 +1649,18 @@ class LobbyDialog(tk.Toplevel):
         moved = archive_tournament_files([e["path"] for e in entries])
         self._refresh()
         messagebox.showinfo("Archiver", f"{moved} tournoi(s) archivé(s).", parent=self)
+
+    def _on_tree_right_click(self, event):
+        """Clic droit sur une ligne : la sélectionne (si pas déjà) puis
+        propose "Basculer vers" dans un petit menu contextuel, plutôt que
+        de devoir cliquer la ligne PUIS aller chercher le bouton du bas."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="🔀 Basculer vers ce tournoi", command=self._open_selected)
+        menu.tk_popup(event.x_root, event.y_root)
 
     def _open_selected(self):
         path = self._selected_path()
@@ -3674,8 +3692,13 @@ class App(tk.Tk):
             "(utile pour un invité ponctuel).",
         )
 
-        self.stats_lbl = ttk.Label(top, text="", font=("Helvetica", 10, "bold"))
-        self.stats_lbl.pack(side="right")
+        # Sur sa propre ligne, sous la case "Temp" (plutôt que serré à
+        # droite de la barre du haut, déjà chargée) : plus lisible,
+        # surtout sur une fenêtre pas très large.
+        stats_row = ttk.Frame(self.players_tab)
+        stats_row.pack(fill="x", padx=10, pady=(0, 6))
+        self.stats_lbl = ttk.Label(stats_row, text="", font=("Helvetica", 10, "bold"))
+        self.stats_lbl.pack(side="left")
 
         check_bar = ttk.Frame(self.players_tab)
         check_bar.pack(fill="x", padx=10)
