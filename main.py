@@ -4843,13 +4843,13 @@ class App(tk.Tk):
             self._trigger_movement_alert()
 
     def _add_table(self):
-        self.db.add_table()
         # add_table() se base sur le nombre total de tables jamais créées
-        # (pour éviter un doublon de nom), ce qui peut donner un numéro
-        # élevé (ex : « Table 12 ») à côté de tables actives renumérotées
-        # « Table 1 », « Table 2 »... par un rééquilibrage précédent — on
-        # referme aussitôt ce trou.
-        self.db.renumber_active_tables()
+        # (pour éviter un doublon de nom) : le numéro attribué ici est
+        # définitif, jamais réattribué ensuite (voir rebalance_tables,
+        # qui ferme toujours la table au numéro le plus haut en premier —
+        # comme dans un vrai tournoi, les numéros de table ne bougent
+        # jamais une fois posés).
+        self.db.add_table()
         self._refresh_all()
 
     def _refresh_tables_tab(self):

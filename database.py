@@ -423,28 +423,6 @@ class Database:
         )
         self.conn.commit()
 
-    def renumber_active_tables(self):
-        """Renomme les tables actives en 'Table 1', 'Table 2'... dans
-        l'ordre (par id croissant), pour ne jamais laisser de trou dans la
-        numérotation affichée après la fermeture d'une ou plusieurs tables
-        (ex : il ne restait que « Table 8 », « Table 10 », « Table 11 »
-        après plusieurs fermetures en cours de tournoi). Les tables
-        fermées gardent leur ancien nom (jamais réattribué) : ça ne pose
-        aucun souci pour l'affichage courant (onglet Tables, elles n'y
-        apparaissent plus), MAIS l'historique des mouvements, lui,
-        référence encore le nom d'une table qui vient tout juste de
-        fermer — un nom de table active fraîchement renumérotée ici peut
-        donc coïncider par hasard avec celui d'une table venant de
-        fermer ; voir le filet de sécurité dans rebalance_tables()."""
-        tables = self.conn.execute(
-            "SELECT id FROM tables_pk WHERE is_active=1 ORDER BY id"
-        ).fetchall()
-        for i, t in enumerate(tables, start=1):
-            self.conn.execute(
-                "UPDATE tables_pk SET name=? WHERE id=?", (f"Table {i}", t["id"])
-            )
-        self.conn.commit()
-
     # ---------- players ----------
     def list_players(self, status=None):
         q = "SELECT * FROM players"
@@ -685,8 +663,10 @@ class Database:
     def rebalance_tables(self, record_moves=False):
         """Rééquilibre les tables actives : comble les sièges vides en déplaçant
         des joueurs des tables les plus pleines, et ferme les tables devenues
-        inutiles quand le nombre de joueurs restants tient sur moins de tables.
-        Si record_moves est vrai, archive chaque déplacement réel (ancienne
+        inutiles quand le nombre de joueurs restants tient sur moins de
+        tables — toujours en partant du numéro de table le plus haut (les
+        tables gardent leur numéro toute la partie, jamais renumérotées :
+        voir plus bas). Si record_moves est vrai, archive chaque déplacement réel (ancienne
         table/siège -> nouvelle table/siège) dans l'historique des
         mouvements (onglet Mouvements) — ce n'est le cas que pour les
         rééquilibrages déclenchés par une élimination de joueur. Renvoie
@@ -706,15 +686,6 @@ class Database:
             return []
 
         before_state = {p["id"]: (p["table_id"], p["seat"]) for p in active_players}
-        # Noms des tables tels qu'ils étaient AVANT ce rééquilibrage (donc
-        # avant le renumber_active_tables() plus bas) : c'est ce nom-là
-        # qu'il faut afficher comme "ancienne table" dans l'historique des
-        # mouvements — sans quoi une table qui vient de fermer pendant CE
-        # même rééquilibrage peut se voir attribuer par coïncidence le
-        # même numéro qu'une autre table active fraîchement renumérotée,
-        # et un vrai changement de table s'affiche à tort comme
-        # "Table 2 -> Table 2" (voir aussi le filet de sécurité plus bas).
-        old_table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
 
         max_seats = self.get_setting_int("max_seats_per_table", 9)
         min_players = self.get_setting_int("min_players_per_table", 4)
@@ -740,15 +711,23 @@ class Database:
                 self.add_table()
             tables = list(self.list_tables())
 
-        # Ferme les tables en trop (en commençant par les plus récentes / moins peuplées)
+        # Ferme les tables en trop — toujours en partant du numéro le PLUS
+        # HAUT (comme dans un vrai tournoi : les tables sont pré-numérotées
+        # à leur installation et gardent ce numéro toute la partie ; on
+        # regroupe progressivement les joueurs vers les tables 1, 2, 3...
+        # jusqu'à la table finale n°1, jamais l'inverse). Trier par nombre
+        # de joueurs (vider la plus petite d'abord) déplacerait moins de
+        # monde en moyenne, mais casserait cette convention : une table
+        # basse pourrait fermer avant une table haute plus vide, ce qui ne
+        # correspond à aucune pratique réelle de gestion de tournoi et
+        # obligeait jusqu'ici à renuméroter les tables restantes (source
+        # de confusion dans l'historique des mouvements — deux tables
+        # différentes affichées sous le même nom à des moments différents).
         if len(tables) > n_tables_needed:
             occ_by_table = {}
             for p in active_players:
                 occ_by_table.setdefault(p["table_id"], []).append(p)
-            # trie les tables par nb de joueurs (asc) -> on vide les plus petites d'abord
-            tables_sorted = sorted(
-                tables, key=lambda t: len(occ_by_table.get(t["id"], []))
-            )
+            tables_sorted = sorted(tables, key=lambda t: -t["id"])
             to_close = tables_sorted[: len(tables) - n_tables_needed]
             for t in to_close:
                 players_to_move = occ_by_table.get(t["id"], [])
@@ -835,13 +814,6 @@ class Database:
                     )
         self.conn.commit()
 
-        # Referme les trous dans la numérotation des tables actives
-        # restantes (ex : une fermeture pendant le rééquilibrage laissait
-        # jusque-là « Table 8 », « Table 10 », « Table 11 » affichées) —
-        # avant le calcul des déplacements ci-dessous, pour que
-        # new_table_name reflète directement le nom corrigé.
-        self.renumber_active_tables()
-
         # Calcule les déplacements réels (avant -> après) et les archive.
         # Seul un changement de TABLE compte comme un "mouvement" (alerte,
         # pause du chrono, historique) : un simple recompactage de numéro
@@ -849,9 +821,14 @@ class Database:
         # vide par un joueur éliminé) ne demande à personne de se déplacer
         # physiquement, donc pas d'alerte pour ça — sur un SNG à une seule
         # table, ça évite une alerte à chaque élimination alors que
-        # personne ne bouge réellement de table.
+        # personne ne bouge réellement de table. Les tables ne sont plus
+        # jamais renommées (voir plus haut : on ferme toujours la table la
+        # plus haute, jamais de renumérotation), donc un même id de table a
+        # forcément le même nom avant et après — un seul dictionnaire de
+        # noms suffit, plus besoin de distinguer avant/après ni de filet de
+        # sécurité contre une coïncidence de nom.
         after_players = [dict(p) for p in self.list_players(status="active")]
-        new_table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+        table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         moves = []
         for p in after_players:
@@ -859,19 +836,8 @@ class Database:
             new_table_id, new_seat = p["table_id"], p["seat"]
             if old_table_id == new_table_id:
                 continue
-            old_table_name = old_table_names.get(old_table_id)
-            new_table_name = new_table_names.get(new_table_id)
-            # Filet de sécurité : même avec les deux snapshots ci-dessus
-            # (avant/après), deux tables VRAIMENT différentes peuvent
-            # coïncidentiellement porter le même nom affiché à ces deux
-            # instants (ex : l'ancienne table du joueur vient de fermer et
-            # gardait "Table 2", tandis que renumber_active_tables()
-            # attribue par ailleurs ce même "Table 2" à une autre table
-            # active survivante). Sans cette précision, le tableau des
-            # mouvements afficherait à tort "Table 2 -> Table 2" pour un
-            # vrai changement de table.
-            if old_table_name and old_table_name == new_table_name:
-                old_table_name = f"{old_table_name} (ancienne)"
+            old_table_name = table_names.get(old_table_id)
+            new_table_name = table_names.get(new_table_id)
             move = {
                 "player_name": p["name"],
                 "old_table_name": old_table_name,
