@@ -1541,9 +1541,26 @@ class LobbyDialog(tk.Toplevel):
         for row in self.tree.get_children():
             self.tree.delete(row)
         self._paths_by_iid = {}
-        if not self.folder or not os.path.isdir(self.folder):
-            return
-        for idx, path in enumerate(find_tournament_files(self.folder, recursive=False)):
+
+        # Fichiers du dossier affiché + tournois actuellement ouverts
+        # ailleurs (voir open_windows.py), même hors de ce dossier — sans
+        # ça, un tournoi ouvert depuis un autre emplacement (clé USB,
+        # dossier différent...) n'apparaissait jamais dans le Lobby tant
+        # qu'on n'avait pas explicitement pointé celui-ci dessus.
+        paths = []
+        seen = set()
+        if self.folder and os.path.isdir(self.folder):
+            for path in find_tournament_files(self.folder, recursive=False):
+                key = os.path.abspath(path)
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(path)
+        for path in open_windows.list_open_paths():
+            if path not in seen and os.path.exists(path):
+                seen.add(path)
+                paths.append(path)
+
+        for idx, path in enumerate(paths):
             try:
                 db = Database(path, read_only=True)
                 status = db.get_live_status()

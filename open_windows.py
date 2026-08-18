@@ -121,6 +121,16 @@ def find_open_pid(path):
     return entry.get("pid") if entry else None
 
 
+def list_open_paths():
+    """Chemins absolus de tous les fichiers .tournoi actuellement ouverts
+    (un par processus vivant), quel que soit leur dossier — utilisé par
+    le Lobby SNG pour toujours lister les tournois en cours même s'ils
+    ne sont pas dans le dossier actuellement affiché (voir
+    LobbyDialog._refresh)."""
+    data = _prune(_load())
+    return list(data.keys())
+
+
 def bring_pid_to_front(pid):
     """Ramène au premier plan la fenêtre du processus `pid` (best-effort,
     silencieux en cas d'échec — ex : permission Accessibilité macOS non
