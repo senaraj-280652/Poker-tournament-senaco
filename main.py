@@ -5295,13 +5295,20 @@ class App(tk.Tk):
         top_row = ttk.Frame(inner)
         top_row.pack(fill="x")
 
+        # Espacements resserrés dans toute cette rangée du haut (boutons +
+        # infos de niveau) : sur un écran Windows pas très haut, ce bloc
+        # pouvait à lui seul remplir tout l'espace visible, obligeant à
+        # défiler beaucoup (même avec l'ascenseur) pour seulement
+        # apercevoir "Structure de blindes" en dessous. Les tailles de
+        # police, elles, restent grandes exprès (lisibles depuis loin,
+        # écran projecteur) — seuls les espaces autour sont réduits.
         controls = ttk.Frame(top_row)
-        controls.pack(side="right", anchor="ne", padx=20, pady=20)
-        ttk.Button(controls, text="Démarrer / Reprendre", command=self._clock_resume).pack(fill="x", pady=3)
-        ttk.Button(controls, text="Pause", command=self._clock_pause).pack(fill="x", pady=3)
-        ttk.Button(controls, text="Niveau précédent", command=self._clock_prev_level).pack(fill="x", pady=3)
-        ttk.Button(controls, text="Niveau suivant", command=self._clock_next_level).pack(fill="x", pady=3)
-        ttk.Button(controls, text="Ouvrir l'écran projecteur", command=self._open_clock_window).pack(fill="x", pady=3)
+        controls.pack(side="right", anchor="ne", padx=20, pady=8)
+        ttk.Button(controls, text="Démarrer / Reprendre", command=self._clock_resume).pack(fill="x", pady=2)
+        ttk.Button(controls, text="Pause", command=self._clock_pause).pack(fill="x", pady=2)
+        ttk.Button(controls, text="Niveau précédent", command=self._clock_prev_level).pack(fill="x", pady=2)
+        ttk.Button(controls, text="Niveau suivant", command=self._clock_next_level).pack(fill="x", pady=2)
+        ttk.Button(controls, text="Ouvrir l'écran projecteur", command=self._open_clock_window).pack(fill="x", pady=2)
 
         info_col = ttk.Frame(top_row)
         info_col.pack(side="left", fill="both", expand=True)
@@ -5313,7 +5320,7 @@ class App(tk.Tk):
         # _refresh_clock_tab) — les afficher tous les deux évite toute
         # ambiguïté entre les deux numérotations.
         level_row_frame = ttk.Frame(info_col)
-        level_row_frame.pack(pady=(20, 5))
+        level_row_frame.pack(pady=(8, 2))
 
         self.level_display = ttk.Label(level_row_frame, text="", font=("Helvetica", 20, "bold"))
         self.level_display.pack(side="left")
@@ -5324,18 +5331,18 @@ class App(tk.Tk):
         self.round_display.pack(side="left", padx=(16, 0))
 
         self.timer_display = ttk.Label(info_col, text="00:00", font=("Helvetica", 60, "bold"))
-        self.timer_display.pack(pady=10)
+        self.timer_display.pack(pady=4)
 
         self.blinds_display = ttk.Label(info_col, text="", font=("Helvetica", 28))
         self.blinds_display.pack()
 
         self.next_display = ttk.Label(info_col, text="", font=("Helvetica", 12))
-        self.next_display.pack(pady=(5, 20))
+        self.next_display.pack(pady=(5, 6))
 
         # "Structure de blindes" juste sous top_row (donc sous "Niveau
         # suivant"), et prend tout l'espace restant en dessous.
         struct_frame = ttk.LabelFrame(inner, text="Structure de blindes")
-        struct_frame.pack(fill="both", expand=True, padx=15, pady=10)
+        struct_frame.pack(fill="both", expand=True, padx=15, pady=(4, 10))
 
         ttk.Label(
             struct_frame, foreground=MUTED,
