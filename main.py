@@ -23,7 +23,7 @@ from database import (
     Database, build_period_summary, export_period_summary_csv,
     export_period_summary_xlsx, export_period_summary_pdf,
     read_player_names_from_file, bounty_unit_value, find_players_active_elsewhere,
-    find_stale_active_players, withdraw_stale_active_players, find_tournament_files,
+    find_stale_active_players, withdraw_stale_active_players,
     find_finished_tournament_files, archive_tournament_files,
     format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
@@ -1464,11 +1464,19 @@ class LobbyDialog(tk.Toplevel):
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
-        ttk.Button(top, text="📂  Choisir un dossier...", command=self._choose_folder).pack(side="left")
+        choose_folder_btn = ttk.Button(top, text="📂  Choisir un dossier...", command=self._choose_folder)
+        choose_folder_btn.pack(side="left")
         self.folder_lbl = ttk.Label(
             top, text=self.folder or "(aucun dossier choisi)", foreground=MUTED,
         )
         self.folder_lbl.pack(side="left", padx=10)
+        Tooltip(
+            choose_folder_btn,
+            "Ne sert qu'à \"Archiver les terminés...\" ci-contre : la\n"
+            "liste ci-dessous montre toujours tous les tournois\n"
+            "actuellement ouverts (peu importe leur dossier), jamais\n"
+            "les autres fichiers .tournoi d'un dossier.",
+        )
         ttk.Button(top, text="🔄  Rafraîchir", command=self._refresh).pack(side="right")
         archive_btn = ttk.Button(
             top, text="🗄  Archiver les terminés...", command=self._archive_finished,
@@ -1550,19 +1558,17 @@ class LobbyDialog(tk.Toplevel):
             self.tree.delete(row)
         self._paths_by_iid = {}
 
-        # Fichiers du dossier affiché + tournois actuellement ouverts
-        # ailleurs (voir open_windows.py), même hors de ce dossier — sans
-        # ça, un tournoi ouvert depuis un autre emplacement (clé USB,
-        # dossier différent...) n'apparaissait jamais dans le Lobby tant
-        # qu'on n'avait pas explicitement pointé celui-ci dessus.
+        # UNIQUEMENT les tournois actuellement ouverts (voir
+        # open_windows.py), peu importe leur dossier — plus le contenu
+        # d'un dossier scanné : un tournoi juste présent sur disque (pas
+        # ouvert dans une fenêtre en ce moment) n'a pas sa place ici,
+        # seul "Archiver les terminés..." ci-dessus continue de
+        # s'appuyer sur le dossier choisi. "Masquer les tournois
+        # terminés" (coché par défaut) filtre encore ensuite : un
+        # tournoi ouvert mais déjà terminé (fenêtre pas encore refermée)
+        # ne doit pas non plus y figurer.
         paths = []
         seen = set()
-        if self.folder and os.path.isdir(self.folder):
-            for path in find_tournament_files(self.folder, recursive=False):
-                key = os.path.abspath(path)
-                if key not in seen:
-                    seen.add(key)
-                    paths.append(path)
         for path in open_windows.list_open_paths():
             if path not in seen and os.path.exists(path):
                 seen.add(path)
@@ -3379,11 +3385,11 @@ class App(tk.Tk):
         lobby_btn.pack(pady=6)
         Tooltip(
             lobby_btn,
-            "Vue d'ensemble de tous les tournois/Sit & Go ouverts (et de\n"
-            "ceux d'un dossier) : joueurs actifs, niveau, temps restant,\n"
-            "en un coup d'œil — double-cliquez un tournoi pour y basculer\n"
-            "(ramène sa fenêtre si déjà ouverte, sinon l'ouvre). N'ouvre\n"
-            "ni ne ferme celle-ci.",
+            "Vue d'ensemble de tous les tournois/Sit & Go actuellement\n"
+            "ouverts (dans n'importe quelle fenêtre) et pas encore\n"
+            "terminés : joueurs actifs, niveau, temps restant, en un\n"
+            "coup d'œil — double-cliquez pour basculer vers l'un d'eux.\n"
+            "N'ouvre ni ne ferme celle-ci.",
         )
         ttk.Button(
             btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
