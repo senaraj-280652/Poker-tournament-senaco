@@ -1504,9 +1504,16 @@ class LobbyDialog(tk.Toplevel):
 
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(
-            bottom, text="Ouvrir dans une nouvelle fenêtre", command=self._open_selected,
-        ).pack(side="left")
+        switch_btn = ttk.Button(
+            bottom, text="🔀 Basculer vers", command=self._open_selected,
+        )
+        switch_btn.pack(side="left")
+        Tooltip(
+            switch_btn,
+            "Si ce tournoi est déjà ouvert dans une autre fenêtre, la\n"
+            "ramène au premier plan. Sinon, l'ouvre dans une nouvelle\n"
+            "fenêtre (double-clic sur la ligne fait la même chose).",
+        )
         ttk.Button(bottom, text="Fermer", command=self._on_close).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -3359,10 +3366,11 @@ class App(tk.Tk):
         lobby_btn.pack(pady=6)
         Tooltip(
             lobby_btn,
-            "Vue d'ensemble de tous les tournois/Sit & Go d'un dossier :\n"
-            "joueurs actifs, niveau, temps restant, en un coup d'œil —\n"
-            "double-cliquez un tournoi pour l'ouvrir dans une nouvelle\n"
-            "fenêtre. N'ouvre ni ne ferme celle-ci.",
+            "Vue d'ensemble de tous les tournois/Sit & Go ouverts (et de\n"
+            "ceux d'un dossier) : joueurs actifs, niveau, temps restant,\n"
+            "en un coup d'œil — double-cliquez un tournoi pour y basculer\n"
+            "(ramène sa fenêtre si déjà ouverte, sinon l'ouvre). N'ouvre\n"
+            "ni ne ferme celle-ci.",
         )
 
         self.wait_window(win)
