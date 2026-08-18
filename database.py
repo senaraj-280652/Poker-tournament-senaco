@@ -262,8 +262,26 @@ def bounty_unit_value(n_players, flat_value=0):
 
 
 class Database:
-    def __init__(self, path):
+    def __init__(self, path, read_only=False):
+        """`read_only=True` : pour une simple consultation (Lobby SNG,
+        synthèse par période...) d'un fichier .tournoi potentiellement
+        déjà ouvert par une autre fenêtre/processus en ce moment même
+        (voir _read_tournament_date_ro plus bas dans ce module, même
+        principe). Ouvre en mode URI "ro" et saute la création/migration
+        du schéma (executescript + _migrate + _init_defaults + commit,
+        qui prennent chacun un verrou d'écriture) : un fichier .tournoi
+        existant a forcément déjà tout ça en place, inutile de le refaire
+        juste pour lire. Sous Windows en particulier, répéter ces
+        écritures à chaque rafraîchissement du Lobby (toutes les 4s, sur
+        chaque fichier du dossier) entrait en conflit avec les écritures
+        de la fenêtre qui a ce même tournoi ouvert, et le fichier
+        disparaissait alors silencieusement de la liste (exception
+        avalée par l'appelant) le temps du conflit."""
         self.path = path
+        if read_only:
+            self.conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+            self.conn.row_factory = sqlite3.Row
+            return
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
@@ -764,12 +782,25 @@ class Database:
                 break
             if smallest_count >= smallest_table["max_seats"]:
                 break
-            mover = self.conn.execute(
-                "SELECT id FROM players WHERE table_id=? AND status='active' LIMIT 1",
+            candidates = self.conn.execute(
+                "SELECT id FROM players WHERE table_id=? AND status='active'",
                 (largest_table["id"],),
-            ).fetchone()
-            if not mover:
+            ).fetchall()
+            if not candidates:
                 break
+            # Préfère déplacer un joueur déjà en mouvement ce rééquilibrage
+            # (replacé ici suite à la fermeture d'une autre table, ou par
+            # un tour précédent de cette même boucle) plutôt qu'un joueur
+            # assis à cette table depuis le début : celui-ci compte déjà
+            # comme "déplacé" quoi qu'il arrive, le déranger ne coûte
+            # donc rien de plus — alors que déplacer quelqu'un de stable
+            # sans nécessité crée un mouvement évitable dans l'historique
+            # (voir onglet Mouvements). Ne change rien au résultat final
+            # (nombre de joueurs par table) : seulement LEQUEL bouge.
+            mover = next(
+                (c for c in candidates if before_state.get(c["id"], (None, None))[0] != largest_table["id"]),
+                candidates[0],
+            )
             taken = {
                 r["seat"]
                 for r in self.conn.execute(
@@ -1799,7 +1830,7 @@ def find_finished_tournament_files(folder):
     results = []
     for path in find_tournament_files(folder, recursive=False):
         try:
-            db = Database(path)
+            db = Database(path, read_only=True)
             status = db.get_live_status()
             db.close()
         except Exception:
@@ -2058,7 +2089,7 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
 
     for path in find_tournament_files(folder, recursive=recursive):
         try:
-            db = Database(path)
+            db = Database(path, read_only=True)
         except Exception:
             continue
         try:

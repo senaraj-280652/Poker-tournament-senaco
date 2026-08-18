@@ -1530,7 +1530,7 @@ class LobbyDialog(tk.Toplevel):
             return
         for idx, path in enumerate(find_tournament_files(self.folder, recursive=False)):
             try:
-                db = Database(path)
+                db = Database(path, read_only=True)
                 status = db.get_live_status()
                 db.close()
             except Exception:
@@ -4515,9 +4515,18 @@ class App(tk.Tk):
         _on_voice_word, exactement comme le contrôle à distance : mêmes
         conditions (ex : "Ctrl+Maj+C" ne fait rien tant qu'aucune
         élimination n'est en attente)."""
-        self.bind_all("<Control-Shift-E>", lambda e: self._on_voice_word("elimination"))
-        self.bind_all("<Control-Shift-C>", lambda e: self._on_voice_word("chronometre"))
-        self.bind_all("<Control-Shift-T>", lambda e: self._on_voice_word("terminer"))
+        # Chaque raccourci est lié en MAJUSCULE et en minuscule : avec
+        # Control enfoncé, Tk ne met pas toujours le keysym en majuscule
+        # comme il le ferait pour Maj+lettre seule (constaté sous Windows,
+        # où <Control-Shift-E> ne se déclenchait jamais alors que
+        # <Control-Shift-e> fonctionne) — lier les deux couvre tous les
+        # cas sans dépendre de ce détail d'implémentation par plateforme.
+        for key in ("E", "e"):
+            self.bind_all(f"<Control-Shift-{key}>", lambda e: self._on_voice_word("elimination"))
+        for key in ("C", "c"):
+            self.bind_all(f"<Control-Shift-{key}>", lambda e: self._on_voice_word("chronometre"))
+        for key in ("T", "t"):
+            self.bind_all(f"<Control-Shift-{key}>", lambda e: self._on_voice_word("terminer"))
 
     # ---------------------------------------------------------------
     # Contrôle à distance depuis un téléphone (voir remote_control.py) —
