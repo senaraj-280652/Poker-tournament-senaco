@@ -5381,16 +5381,38 @@ class App(tk.Tk):
         ttk.Button(struct_btns, text="Modifier durée (tous niveaux)", command=self._edit_level_duration).pack(pady=3, fill="x")
         ttk.Button(struct_btns, text="Modifier durée de la Pause", command=self._edit_break_duration).pack(pady=3, fill="x")
 
-        ttk.Separator(struct_btns, orient="horizontal").pack(fill="x", pady=(10, 6))
-        ttk.Label(struct_btns, text="Sons (clic droit pour retirer) :", foreground=MUTED).pack(anchor="w")
+        # Réglage des 3 sons (début Pause / Fin Pause / fin Round) déplacé
+        # dans sa propre petite fenêtre (voir _open_clock_sounds_dialog) :
+        # affiché en ligne ici, ce bloc (3 boutons + 3 lignes durée/Test)
+        # rendait l'onglet trop haut sur un écran pas très grand, obligeant
+        # à beaucoup défiler pour voir le tableau des blindes en dessous.
+        ttk.Button(
+            struct_btns, text="🔊 Sons de fin de Round/Pause...",
+            command=self._open_clock_sounds_dialog,
+        ).pack(pady=(10, 3), fill="x")
+
+    def _open_clock_sounds_dialog(self):
+        win = tk.Toplevel(self)
+        win.title("Sons de fin de Round/Pause")
+        win.transient(self)
+        win.grab_set()
+        ttk.Label(
+            win, foreground=MUTED,
+            text="Sons joués automatiquement sur l'écran projecteur\n"
+                 "(clic droit sur un bouton pour retirer le son configuré) :",
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(12, 6))
+
         self._clock_sound_buttons = {}
         for key, label in (
             ("sound_break_start_path", "Son début Pause"),
             ("sound_break_end_path", "Son Fin Pause"),
             ("sound_round_end_path", "Son fin Round"),
         ):
-            btn = ttk.Button(struct_btns, text=self._clock_sound_button_text(key, label))
-            btn.pack(pady=(3, 0), fill="x")
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=12, pady=4)
+            btn = ttk.Button(row, text=self._clock_sound_button_text(key, label), width=26)
+            btn.pack(side="left")
             btn.config(command=lambda k=key, l=label, b=btn: self._choose_clock_sound(k, l, b))
             btn.bind("<Button-2>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
             btn.bind("<Button-3>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
@@ -5404,11 +5426,9 @@ class App(tk.Tk):
 
             # Durée max. (tronque le fichier s'il est plus long, comme pour
             # le Signal de mouvements) + Test, sur la même ligne.
-            sub = ttk.Frame(struct_btns)
-            sub.pack(fill="x", pady=(0, 3))
-            ttk.Label(sub, text="Durée (ms) :").pack(side="left")
+            ttk.Label(row, text="  Durée (ms) :").pack(side="left")
             dur_var = tk.StringVar(value=export_prefs.load_value(f"{key}_duration_ms", ""))
-            dur_entry = ttk.Entry(sub, textvariable=dur_var, width=6)
+            dur_entry = ttk.Entry(row, textvariable=dur_var, width=6)
             dur_entry.pack(side="left", padx=(4, 4))
             Tooltip(
                 dur_entry,
@@ -5419,8 +5439,10 @@ class App(tk.Tk):
                 "write", lambda *a, k=key, v=dur_var: self._save_clock_sound_duration(k, v)
             )
             ttk.Button(
-                sub, text="Test", width=5, command=lambda k=key: self._test_clock_sound(k),
+                row, text="Test", width=5, command=lambda k=key: self._test_clock_sound(k),
             ).pack(side="left")
+
+        ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(6, 12))
 
     def _clock_resume(self):
         if self.db.get_setting_int("clock_started", 0) == 0:
