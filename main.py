@@ -423,6 +423,11 @@ class PlayerSelectionDialog(tk.Toplevel):
                      "Ils seront proposés automatiquement pour vos prochains tournois.)",
             ).pack(padx=12, pady=(0, 5), anchor="w")
 
+        # Liste actuellement affichée (recherche en cours comprise) — tenue
+        # à jour par _filter ; initialisée ici pour que "Tout cocher"/"Tout
+        # décocher" aient une valeur valide même avant toute frappe dans le
+        # champ Rechercher (voir _check_all/_uncheck_all).
+        self.visible_names = self.roster_names
         self._build_list(self.roster_names)
 
         add_frame = ttk.LabelFrame(self, text="Ajouter un joueur au répertoire")
@@ -526,17 +531,24 @@ class PlayerSelectionDialog(tk.Toplevel):
     def _filter(self):
         term = self.search_var.get().strip().lower()
         filtered = [n for n in self.roster_names if term in n.lower()] if term else self.roster_names
+        self.visible_names = filtered
         self._build_list(filtered)
 
     def _check_all(self):
-        for name in self.roster_names:
+        # Sur les seuls joueurs actuellement AFFICHÉS (recherche en cours
+        # comprise) — pas tout le répertoire : sinon, taper "an" dans
+        # Rechercher puis "Tout cocher" cochait bien les 2 joueurs visibles
+        # mais AUSSI, en silence, tous les autres joueurs du répertoire
+        # (jamais réaffichés avant de cliquer "Ajouter les joueurs
+        # sélectionnés", d'où la confirmation avec 20 joueurs au lieu de 2).
+        for name in self.visible_names:
             if name in self.active_elsewhere:
                 continue  # déjà actif ailleurs : jamais coché, même par "Tout cocher"
             self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
         self._filter()
 
     def _uncheck_all(self):
-        for name in self.roster_names:
+        for name in self.visible_names:
             self.check_vars.setdefault(name, tk.BooleanVar()).set(False)
         self._filter()
 
