@@ -344,6 +344,13 @@ class PlayerSelectionDialog(tk.Toplevel):
         super().__init__(master)
         self.title(title)
         self.geometry("500x560")
+        # transient() lie cette fenêtre à la fenêtre principale : sans ça,
+        # un clic sur la fenêtre principale pouvait la faire passer devant
+        # cette boîte de dialogue (grab_set() bloque bien les clics, mais
+        # ne force pas l'ordre d'affichage) — donnant l'impression qu'elle
+        # « disparaissait » et perdait le focus alors qu'elle était juste
+        # masquée derrière.
+        self.transient(master)
         self.grab_set()
         self.selected_names = []
         self.check_vars = {}
@@ -663,6 +670,7 @@ class CameraCaptureDialog(tk.Toplevel):
         self.title(f"Prendre une photo — {player_name}")
         self.geometry("520x480")
         self.resizable(False, False)
+        self.transient(master)
         self.grab_set()
         self.configure(bg=FELT_DARK)
 
@@ -938,6 +946,7 @@ class RosterManagerDialog(tk.Toplevel):
         self.app = master
         self.title("Répertoire de joueurs")
         self.geometry("640x540")
+        self.transient(master)
         self.grab_set()
         # Prend le pas sur le F1 global (voir App._show_context_help) tant
         # que cette fenêtre a le focus : chapitre dédié plutôt que celui
@@ -1744,6 +1753,7 @@ class BlindTemplatesDialog(tk.Toplevel):
         self.app = master
         self.title("Récupérer Blindes")
         self.geometry("420x420")
+        self.transient(master)
         self.grab_set()
 
         ttk.Label(
@@ -1912,6 +1922,7 @@ class SettingsTemplatesDialog(tk.Toplevel):
         self.app = master
         self.title("Récupérer Paramètres")
         self.geometry("420x420")
+        self.transient(master)
         self.grab_set()
 
         ttk.Label(
@@ -2015,6 +2026,7 @@ class ChipTemplatesDialog(tk.Toplevel):
         self.app = master
         self.title("Récupérer Jetons")
         self.geometry("420x420")
+        self.transient(master)
         self.grab_set()
 
         ttk.Label(
@@ -3265,6 +3277,7 @@ class App(tk.Tk):
         win.configure(bg=FELT_DARK)
         win.geometry("480x460")
         win.resizable(False, False)
+        win.transient(self)
         win.grab_set()
         result = {"path": None}
 
@@ -4355,6 +4368,7 @@ class App(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title(f"Modifier les achats — {p['name']}")
+        win.transient(self)
         win.grab_set()
 
         vars_ = {}
@@ -4465,6 +4479,7 @@ class App(tk.Tk):
         win.title("Qui a éliminé ce joueur ?")
         win.configure(bg=FELT_DARK)
         win.resizable(False, False)
+        win.transient(self)
         win.grab_set()
         result = {"id": None}
 
