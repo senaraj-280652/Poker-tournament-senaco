@@ -3861,7 +3861,17 @@ class App(tk.Tk):
         reinstate_btn = ttk.Button(actions, text="Réinscrire", command=self._reinstate_selected)
         reinstate_btn.pack(side="left", padx=3)
         Tooltip(reinstate_btn, "Remet en jeu un joueur désactivé (forfait) ou éliminé par erreur.")
-        ttk.Button(actions, text="Supprimer", command=self._delete_selected).pack(side="left", padx=3)
+        self.delete_player_btn = ttk.Button(actions, text="Supprimer", command=self._delete_selected)
+        self.delete_player_btn.pack(side="left", padx=3)
+        # Grisé une fois le tournoi commencé (chronomètre déjà démarré au
+        # moins une fois, voir clock_started) — état et texte de l'info-
+        # bulle tenus à jour par _update_delete_player_button, appelée à
+        # chaque rafraîchissement de cet onglet : supprimer un joueur en
+        # cours de partie fausserait l'historique (mouvements, élimination
+        # par...) sans qu'on puisse revenir en arrière, mieux vaut
+        # Désactiver (forfait), qui garde une trace. Se réactive de
+        # lui-même pour un nouveau tournoi (clock_started y repart à 0).
+        self.delete_player_btn_tooltip = Tooltip(self.delete_player_btn, "")
 
         columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang",
                    "elim_time", "elim_round", "eliminated_by")
@@ -4884,10 +4894,27 @@ class App(tk.Tk):
             self.clock_window.bring_to_front()
         self.lift()
 
+    def _update_delete_player_button(self):
+        """Grise 'Supprimer' (onglet Joueurs) dès que le tournoi a démarré
+        (chronomètre déjà lancé au moins une fois, voir clock_started) :
+        supprimer un joueur en cours de partie fausserait l'historique
+        (mouvements, 'éliminé par'...) sans recours possible — 'Désactiver
+        (forfait)' garde une trace, à utiliser à la place. Lu à chaque
+        rafraîchissement (pas mis en cache) : se réactive de lui-même pour
+        un nouveau tournoi, où clock_started repart à 0."""
+        started = self.db.get_setting_int("clock_started", 0) == 1
+        self.delete_player_btn.configure(state="disabled" if started else "normal")
+        self.delete_player_btn_tooltip.text = (
+            "Suppression désactivée : le tournoi a déjà démarré. Utilisez\n"
+            "plutôt « Désactiver (forfait) », qui garde une trace du\n"
+            "joueur au lieu de l'effacer."
+        ) if started else ""
+
     def _refresh_players_tab(self):
         # Garde la liste déroulante des clubs à jour (un club a pu être
         # ajouté/modifié entre-temps depuis le répertoire de joueurs).
         self.new_player_club_combo.configure(values=roster.list_clubs())
+        self._update_delete_player_button()
         for row in self.players_tree.get_children():
             self.players_tree.delete(row)
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
