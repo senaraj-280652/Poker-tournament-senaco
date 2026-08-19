@@ -97,7 +97,7 @@
   {
     "level": 1,
     "title": "6. Onglet Tables",
-    "body": "Affiche la répartition en cours : une carte par table, avec la liste des joueurs assis (siège).\n\n• Rééquilibrer les tables — force un rééquilibrage manuel (utile après une action groupée).\n\n• Ajouter une table — ouvre une table supplémentaire.\n\nLe rééquilibrage se fait aussi automatiquement après chaque inscription ou élimination : les tables devenues inutiles se ferment, et les joueurs sont déplacés pour garder les tables aussi équilibrées que possible.\n\nIl n’y a pas de rééquilibrage pour des SnG puisq’ il n’y a qu’une table  par SnG."
+    "body": "Affiche la répartition en cours : une carte par table, avec la liste des joueurs assis (siège).\n\n• Rééquilibrer les tables — force un rééquilibrage manuel (utile après une action groupée).\n\nLe rééquilibrage se fait aussi automatiquement après chaque inscription ou élimination : les tables devenues inutiles se ferment, et les joueurs sont déplacés pour garder les tables aussi équilibrées que possible.\n\nIl n’y a pas de rééquilibrage pour des SnG puisq’ il n’y a qu’une table  par SnG."
   },
   {
     "level": 2,

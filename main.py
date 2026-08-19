@@ -4959,7 +4959,6 @@ class App(tk.Tk):
             "joueurs par table (utile après des éliminations). Se fait\n"
             "aussi automatiquement à chaque élimination.",
         )
-        ttk.Button(top, text="Ajouter une table", command=self._add_table).pack(side="left", padx=3)
 
         scroll_container = ttk.Frame(self.tables_tab)
         scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -5012,16 +5011,6 @@ class App(tk.Tk):
         self._refresh_all()
         if moves:
             self._trigger_movement_alert()
-
-    def _add_table(self):
-        # add_table() se base sur le nombre total de tables jamais créées
-        # (pour éviter un doublon de nom) : le numéro attribué ici est
-        # définitif, jamais réattribué ensuite (voir rebalance_tables,
-        # qui ferme toujours la table au numéro le plus haut en premier —
-        # comme dans un vrai tournoi, les numéros de table ne bougent
-        # jamais une fois posés).
-        self.db.add_table()
-        self._refresh_all()
 
     def _refresh_tables_tab(self):
         for w in self.tables_inner.winfo_children():
