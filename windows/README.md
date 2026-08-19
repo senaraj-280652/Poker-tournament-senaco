@@ -74,3 +74,72 @@ Modifiez `Version="1.0.0"` dans [`app.wxs`](app.wxs) avant de
 reconstruire. Conservez le même `UpgradeCode` d'une version à l'autre :
 c'est lui qui permet à une mise à jour de remplacer proprement une
 installation précédente.
+
+## Comment Claude (l'assistant IA) génère et livre ce .msi
+
+Cette section documente noir sur blanc la procédure suivie quand on
+demande à Claude « génère/refais un .msi » depuis ce Mac — pour qu'elle
+survive à un crash de session, un changement de machine ou d'assistant.
+Rien ici ne dépend d'une mémoire propre à Claude : tout ce qui est
+nécessaire est soit dans ce dépôt (donc sur GitHub), soit dans la
+configuration de ce Mac (Trousseau macOS).
+
+**Prérequis déjà en place** (rien à reconfigurer) :
+- Ce dépôt local pointe déjà vers
+  `https://github.com/senaraj-280652/Poker-tournament-senaco.git`
+  (`git remote -v`).
+- L'authentification pour `git push` est gérée par le Trousseau macOS
+  (`git config credential.helper` → `osxkeychain`) : le jeton GitHub y
+  est stocké une fois pour toutes, indépendamment de toute session
+  Claude.
+- Le workflow `.github/workflows/build-msi.yml` est déjà commité — il
+  compile sur un runner Windows fourni par GitHub (PyInstaller + WiX
+  Toolset 5.0.2), sans rien installer sur ce Mac.
+- `gh` (GitHub CLI) **n'est pas installé** sur ce Mac : les appels à
+  l'API GitHub se font en HTTPS anonyme via `curl` (le dépôt est
+  public, la lecture ne demande pas d'authentification).
+
+**Étapes pour livrer un nouveau `.msi` après une modification du code :**
+
+1. Monter le numéro de version dans **les deux fichiers** qui doivent
+   rester synchronisés (voir la section précédente) :
+   [`version.py`](../version.py) (`APP_VERSION`) et
+   [`windows/app.wxs`](app.wxs) (`Version=`).
+2. Committer et pousser sur `main` :
+   ```bash
+   git add -A && git commit -m "..." && git push origin main
+   ```
+3. Poser un tag `vX.Y.Z` et le pousser — c'est ce qui déclenche le
+   build ET la publication automatique dans une Release GitHub :
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+4. Suivre le build (± 5-8 min, pas de `gh` donc via l'API REST) :
+   ```bash
+   curl -s "https://api.github.com/repos/senaraj-280652/Poker-tournament-senaco/actions/runs?event=push&per_page=3"
+   ```
+   Repérer le run dont `head_branch` est le tag posé, attendre que
+   `status` passe à `completed` (`conclusion: success`).
+5. Récupérer l'URL de l'asset une fois la Release publiée :
+   ```bash
+   curl -s "https://api.github.com/repos/senaraj-280652/Poker-tournament-senaco/releases/tags/vX.Y.Z"
+   ```
+   (champ `assets[0].browser_download_url`, fichier
+   `PokerTournament-16.msi`).
+6. Télécharger ce `.msi` **dans `~/Downloads/`**, sous un nom incluant
+   le numéro de version (ex. `PokerTournament-vX.Y.Z.msi`) plutôt que
+   d'écraser un fichier existant du même nom : sur APFS, écraser un
+   fichier en place conserve son ancienne date de création, ce qui a
+   déjà causé une confusion (« pourquoi ce fichier date du 11/08 ? »)
+   alors que le contenu était à jour. Un nom neuf = une date de
+   création fiable.
+
+**Repères utiles pour ce Mac spécifiquement** (évite de re-découvrir à
+chaque fois) :
+- Ni `pandoc`, ni LibreOffice (`soffice`), ni `poppler`
+  (`pdftoppm`/`pdftotext`) ne sont installés. `python-docx` et
+  `pymupdf` (`fitz`) le sont, et **Microsoft Word** est installé — pour
+  produire un PDF à partir d'un `.docx` modifié (ex. le manuel
+  utilisateur), passer par Word en AppleScript (`osascript`, commande
+  `save as ... file format format PDF`) plutôt que par LibreOffice.
+- `brew` n'est pas installé non plus.
