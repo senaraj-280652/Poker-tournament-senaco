@@ -355,7 +355,17 @@ class PlayerSelectionDialog(tk.Toplevel):
         self.selected_names = []
         self.check_vars = {}
         self.exclude_names = exclude_names or set()
-        self.roster_names = [n for n in roster.load_roster() if n not in self.exclude_names]
+        # Contrairement à avant, on ne retire plus purement et simplement
+        # les joueurs déjà inscrits à CE tournoi (self.exclude_names) de la
+        # liste : ça les faisait disparaître sans explication (ex : un
+        # joueur tout juste ajouté depuis l'onglet Joueurs restait
+        # introuvable ici, alors qu'il était bien enregistré au répertoire
+        # — visible seulement depuis "Gérer le répertoire"). Ils sont
+        # maintenant affichés grisés/non cochables, comme les joueurs
+        # "déjà actifs ailleurs" juste en dessous — _check_all/_check_club/
+        # _confirm continuent de les ignorer pour ne jamais les ajouter en
+        # double.
+        self.roster_names = list(roster.load_roster())
         self.sort_state = {"column": "name", "ascending": True}
         self.header_labels = {}
         # Joueurs déjà actifs dans un autre tournoi en cours du même dossier
@@ -478,15 +488,30 @@ class PlayerSelectionDialog(tk.Toplevel):
                 var = tk.BooleanVar(value=False)
                 self.check_vars[name] = var
             conflicted = name in self.active_elsewhere
-            if conflicted:
+            already_here = name in self.exclude_names
+            disabled = conflicted or already_here
+            if disabled:
                 var.set(False)
+            if already_here:
+                suffix = "  (déjà dans ce tournoi)"
+            elif conflicted:
+                suffix = "  (déjà actif ailleurs)"
+            else:
+                suffix = ""
             check = ttk.Checkbutton(
                 self.list_frame,
-                text=f"{name}  (déjà actif ailleurs)" if conflicted else name,
-                variable=var, state="disabled" if conflicted else "normal",
+                text=name + suffix,
+                variable=var, state="disabled" if disabled else "normal",
             )
             check.grid(row=idx, column=0, sticky="w", pady=1, padx=(0, 20))
-            if conflicted:
+            if already_here:
+                Tooltip(
+                    check,
+                    "Déjà inscrit à ce tournoi (ajouté depuis l'onglet\n"
+                    "Joueurs, ou depuis cette fenêtre plus tôt) — non\n"
+                    "sélectionnable ici pour éviter de l'ajouter en double.",
+                )
+            elif conflicted:
                 Tooltip(
                     check,
                     "Ce joueur est actuellement actif dans un autre tournoi\n"
@@ -549,8 +574,8 @@ class PlayerSelectionDialog(tk.Toplevel):
         # (jamais réaffichés avant de cliquer "Ajouter les joueurs
         # sélectionnés", d'où la confirmation avec 20 joueurs au lieu de 2).
         for name in self.visible_names:
-            if name in self.active_elsewhere:
-                continue  # déjà actif ailleurs : jamais coché, même par "Tout cocher"
+            if name in self.active_elsewhere or name in self.exclude_names:
+                continue  # déjà actif ailleurs / déjà dans ce tournoi : jamais coché, même par "Tout cocher"
             self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
         self._filter()
 
@@ -564,7 +589,8 @@ class PlayerSelectionDialog(tk.Toplevel):
         if not club:
             return
         for name in self.roster_names:
-            if roster.get_club(name) == club and name not in self.active_elsewhere:
+            if (roster.get_club(name) == club
+                    and name not in self.active_elsewhere and name not in self.exclude_names):
                 self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
         self._filter()
 
@@ -653,7 +679,7 @@ class PlayerSelectionDialog(tk.Toplevel):
     def _confirm(self):
         self.selected_names = [
             n for n, v in self.check_vars.items()
-            if v.get() and n not in self.active_elsewhere
+            if v.get() and n not in self.active_elsewhere and n not in self.exclude_names
         ]
         self.destroy()
 
