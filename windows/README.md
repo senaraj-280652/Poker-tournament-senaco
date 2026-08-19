@@ -39,7 +39,12 @@ Le fichier obtenu est `windows\dist\PokerTournament.msi`.
 
 1. **PyInstaller** empaquette `main.py` (+ Tkinter, openpyxl, OpenCV,
    Pillow) en un exécutable autonome `PokerTournament.exe` — rien à
-   installer sur le poste de l'utilisateur final, tout est inclus.
+   installer sur le poste de l'utilisateur final, tout est inclus. Un
+   écran de démarrage (« Chargement en cours... », `assets/splash.png`)
+   s'affiche dès le lancement de l'`.exe`, le temps que celui-ci
+   s'extraie et que la fenêtre principale soit prête (voir la section
+   `Splash` de `poker_tournament.spec` et l'appel `pyi_splash.close()`
+   dans `main.py`).
 2. **WiX Toolset** enveloppe cet `.exe` dans un vrai programme
    d'installation Windows (`PokerTournament.msi`) : dossier dans
    *Program Files*, raccourcis dans le menu Démarrer et sur le Bureau,
@@ -56,6 +61,7 @@ comme sur macOS.
 | Fichier | Rôle |
 |---|---|
 | `poker_tournament.spec` | Configuration PyInstaller (génère l'`.exe`) |
+| `assets/splash.png` | Image de l'écran de démarrage (« Chargement en cours... ») |
 | `requirements.txt` | Dépendances Python nécessaires au build |
 | `app.wxs` | Description de l'installateur (WiX Toolset) |
 | `License.rtf` | Texte affiché sur l'écran de licence de l'installateur |

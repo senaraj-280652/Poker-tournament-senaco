@@ -34,12 +34,33 @@ a = Analysis(
 )
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Écran de démarrage ("Chargement en cours...") : affiché par le
+# bootloader lui-même, AVANT que Python ne démarre — c'est le seul
+# moyen de couvrir le délai d'extraction du .exe (mode onefile), pendant
+# lequel aucune fenêtre Tkinter ne peut encore exister. Le texte est
+# ensuite fermé depuis le code (main.py, via pyi_splash.close()) dès
+# qu'une fenêtre de l'application est prête à s'afficher.
+splash = Splash(
+    str(Path(SPECPATH) / "assets" / "splash.png"),
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(240, 264),
+    text_size=13,
+    text_color="#e8c05c",
+    text_default="Chargement en cours...",
+    text_font="Arial",
+    text_align="center",
+    always_on_top=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.zipfiles,
     a.datas,
+    splash,
+    splash.binaries,
     [],
     name="PokerTournament",
     debug=False,

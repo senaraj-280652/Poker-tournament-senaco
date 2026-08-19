@@ -47,6 +47,15 @@ from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
 from version import APP_NAME, APP_VERSION
 
+# Écran de démarrage ("Chargement en cours...", voir
+# windows/poker_tournament.spec) : le module pyi_splash n'existe que
+# dans l'exécutable Windows compilé avec un écran de démarrage — absent
+# en lancement depuis les sources ou sur macOS, d'où ce try/except.
+try:
+    import pyi_splash
+except ImportError:
+    pyi_splash = None
+
 # Photos de joueurs (aperçu + capture caméra) : dépendances optionnelles.
 # La copie/suppression des fichiers photo (player_photos.py) ne nécessite
 # rien de plus que la bibliothèque standard ; seuls l'AFFICHAGE d'un
@@ -3006,6 +3015,14 @@ class App(tk.Tk):
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._apply_theme()
+
+        # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
+        # est maintenant prêt à afficher une fenêtre (activation de
+        # licence ou choix du fichier .tournoi, juste en dessous) — inutile
+        # de laisser le splash devant plus longtemps. Sans effet si l'appli
+        # n'a pas été lancée avec ce splash (voir import pyi_splash).
+        if pyi_splash is not None:
+            pyi_splash.close()
 
         # Verrou anti-copie (voir license.py) : sans effet tant que le
         # logiciel tourne depuis les sources (aucun secret injecté) ;
