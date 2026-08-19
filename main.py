@@ -3277,7 +3277,15 @@ class App(tk.Tk):
         win.configure(bg=FELT_DARK)
         win.geometry("480x460")
         win.resizable(False, False)
-        win.transient(self)
+        # PAS de win.transient(self) ici, volontairement : à ce stade du
+        # démarrage, self (la fenêtre racine) est encore self.withdraw()
+        # (voir App.__init__, avant self.deiconify()) — lier une fenêtre
+        # transient() à un parent pas encore affiché l'empêche elle-même de
+        # s'afficher (testé : aucune erreur, mais rien à l'écran, y compris
+        # sous le Dock). Même précaution déjà prise pour ActivationDialog,
+        # affiché encore plus tôt dans ce même état. grab_set() seul suffit
+        # à rendre la fenêtre modale ici ; les fenêtres ouvertes plus tard
+        # (une fois l'appli affichée) doivent, elles, garder transient().
         win.grab_set()
         result = {"path": None}
 
