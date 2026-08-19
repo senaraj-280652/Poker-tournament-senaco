@@ -5866,6 +5866,33 @@ class App(tk.Tk):
         top_btns.pack(fill="x", padx=15, pady=(0, 10))
         ttk.Button(top_btns, text="➕ Ajouter un round", command=lambda: self._add_blind_round()).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Structure standard", command=self._reset_blind_structure_from_tab).pack(side="left", padx=3)
+
+        # Largeur (en caractères) des champs Durée/Petite Blind/Grosse
+        # Blind/Ante/Durée Pause du tableau ci-dessous — réglable par
+        # l'utilisateur (et mémorisée d'une session à l'autre) plutôt que
+        # fixée en dur, pour que les valeurs saisies restent toujours
+        # entièrement visibles quelle que soit la résolution d'écran.
+        self.blinds_field_width_var = tk.IntVar(
+            value=export_prefs.load_value("blinds_field_width", 10)
+        )
+        width_frame = ttk.Frame(top_btns)
+        width_frame.pack(side="left", padx=(16, 3))
+        ttk.Label(width_frame, text="Largeur des champs :").pack(side="left")
+        width_spin = ttk.Spinbox(
+            width_frame, from_=5, to=25, width=3,
+            textvariable=self.blinds_field_width_var,
+            command=self._on_blinds_field_width_change,
+        )
+        width_spin.pack(side="left", padx=(4, 0))
+        width_spin.bind("<Return>", lambda e: self._on_blinds_field_width_change())
+        width_spin.bind("<FocusOut>", lambda e: self._on_blinds_field_width_change())
+        Tooltip(
+            width_spin,
+            "Largeur des champs Durée/Petite Blind/Grosse Blind/Ante/\n"
+            "Durée Pause ci-dessous (en caractères) — pour tout voir à\n"
+            "l'écran quelle que soit la résolution. Mémorisée pour la\n"
+            "prochaine fois.",
+        )
         load_btn = ttk.Button(
             top_btns, text="📂 Récupérer Blindes...", command=self._open_blind_templates,
         )
@@ -6340,6 +6367,19 @@ class App(tk.Tk):
             })
         return rounds
 
+    def _on_blinds_field_width_change(self):
+        """Valide et mémorise la largeur choisie (voir le Spinbox "Largeur
+        des champs" de _build_blinds_tab), puis réaffiche le tableau des
+        rounds avec cette nouvelle largeur."""
+        try:
+            width = int(self.blinds_field_width_var.get())
+        except (tk.TclError, ValueError):
+            width = 10
+        width = max(5, min(25, width))
+        self.blinds_field_width_var.set(width)
+        export_prefs.save_value("blinds_field_width", width)
+        self._refresh_blinds_tab()
+
     def _refresh_blinds_tab(self):
         for w in self.blinds_rows_frame.winfo_children():
             w.destroy()
@@ -6375,11 +6415,12 @@ class App(tk.Tk):
             ttk.Label(self.blinds_rows_frame, text=f"{start_h}:{start_m:02d}").grid(
                 row=i, column=1, padx=6, pady=2
             )
-            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["duration"], width=10).grid(row=i, column=2, padx=6, pady=2)
-            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["sb"], width=10).grid(row=i, column=3, padx=6, pady=2)
-            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["bb"], width=10).grid(row=i, column=4, padx=6, pady=2)
-            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["ante"], width=10).grid(row=i, column=5, padx=6, pady=2)
-            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["pause"], width=10).grid(row=i, column=6, padx=6, pady=2)
+            field_width = self.blinds_field_width_var.get()
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["duration"], width=field_width).grid(row=i, column=2, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["sb"], width=field_width).grid(row=i, column=3, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["bb"], width=field_width).grid(row=i, column=4, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["ante"], width=field_width).grid(row=i, column=5, padx=6, pady=2)
+            ttk.Entry(self.blinds_rows_frame, textvariable=row_vars["pause"], width=field_width).grid(row=i, column=6, padx=6, pady=2)
             elapsed_minutes += rnd["duration"] + rnd["pause"]
 
             actions = ttk.Frame(self.blinds_rows_frame)
