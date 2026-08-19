@@ -597,17 +597,39 @@ class Database:
             "table_id=NULL, seat=NULL WHERE id=?",
             (time.strftime("%Y-%m-%d %H:%M:%S"), player_id),
         )
+        # Ce joueur était compté dans "active" (voir eliminate_player :
+        # place = nb d'actifs restants au moment de l'élimination) pour
+        # TOUT joueur déjà éliminé jusqu'ici, tant qu'il n'avait pas
+        # encore forfait. Comme un forfait ne prend jamais de place au
+        # classement (place reste NULL ci-dessus), il faut le retirer
+        # rétroactivement du calcul : le nombre réel de participants
+        # classés diminue d'une unité, donc chaque rang déjà attribué
+        # doit être décalé d'une place vers le haut (ex : 3e devient 2e)
+        # pour ne pas laisser de trou dans le classement final.
+        self.conn.execute(
+            "UPDATE players SET place = place - 1 WHERE status='eliminated' AND place IS NOT NULL"
+        )
         self.conn.commit()
         return self.rebalance_tables(record_moves=False)
 
     def reinstate_player(self, player_id):
         starting_chips = self.get_setting_int("starting_chips", 10000)
         bounty_amount = self.get_setting_int("bounty_amount", 0)
+        was_withdrawn = self.get_player(player_id)["status"] == "withdrawn"
         self.conn.execute(
             "UPDATE players SET status='active', place=NULL, elim_time=NULL, "
             "chips=?, bounty=? WHERE id=?",
             (starting_chips, bounty_amount, player_id),
         )
+        if was_withdrawn:
+            # Symétrique du décalage fait dans withdraw_player : ce joueur
+            # réintègre le décompte des participants classés, chaque rang
+            # déjà attribué redescend donc d'une place (ex : 2e redevient
+            # 3e). Sans effet s'il était éliminé (pas forfait) : son
+            # départ n'avait alors jamais touché aux rangs des autres.
+            self.conn.execute(
+                "UPDATE players SET place = place + 1 WHERE status='eliminated' AND place IS NOT NULL"
+            )
         self.conn.commit()
         self._seat_player(player_id)
         # Réintégrer un joueur peut faire repasser le nombre d'actifs
