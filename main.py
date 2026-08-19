@@ -2179,8 +2179,12 @@ class PeriodSummaryDialog(tk.Toplevel):
 
         top_pane = ttk.LabelFrame(panes, text="Tournois de la période")
         top_pane.pack(fill="both", expand=True, pady=(0, 6))
-        cols_t = ("date", "name", "status", "entries", "pool", "winner", "bounty")
-        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Prize pool (€)", "Vainqueur", "Primes distribuées (€)"]
+        # Pas de colonne "Prize pool (€)" ici : ce club ne distribue pas de
+        # gains en argent réel (voir Classement, colonnes Total investi/
+        # Gains classement retirées pour la même raison) — la donnée reste
+        # calculée normalement (build_period_summary), juste pas affichée.
+        cols_t = ("date", "name", "status", "entries", "winner", "bounty")
+        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (€)"]
         self.tournaments_tree = ttk.Treeview(top_pane, columns=cols_t, show="headings", height=8)
         for c, h in zip(cols_t, headers_t):
             self.tournaments_tree.heading(c, text=h)
@@ -2190,10 +2194,12 @@ class PeriodSummaryDialog(tk.Toplevel):
 
         bottom_pane = ttk.LabelFrame(panes, text="Classement des joueurs sur la période (primes incluses)")
         bottom_pane.pack(fill="both", expand=True)
-        cols_p = ("name", "played", "wins", "best", "cost", "gain", "bounty", "net")
+        # Pas de "Total investi (€)" ni "Gains classement (€)" : voir la
+        # remarque équivalente ci-dessus pour "Tournois de la période".
+        cols_p = ("name", "played", "wins", "best", "bounty", "net")
         headers_p = [
             "Joueur", "Tournois joués", "Victoires", "Meilleur Rang",
-            "Total investi (€)", "Gains classement (€)", "Primes gagnées (€)", "Net (€)",
+            "Primes gagnées (€)", "Net (€)",
         ]
         self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=10)
         for c, h in zip(cols_p, headers_p):
@@ -2264,7 +2270,7 @@ class PeriodSummaryDialog(tk.Toplevel):
                 "", "end",
                 values=(
                     format_date_fr(t["date"]), t["name"], t["status"], t["entries"],
-                    f"{t['prize_pool']:.2f}", t["winner"],
+                    t["winner"],
                     f"{t['bounty_distributed']:,}".replace(",", " ") if t["bounty_distributed"] else "-",
                 ),
                 tags=(tag,),
@@ -2278,7 +2284,6 @@ class PeriodSummaryDialog(tk.Toplevel):
                 "", "end",
                 values=(
                     a["name"], a["tournaments_played"], a["wins"], a["best_place"] or "-",
-                    f"{a['total_cost']:.2f}", f"{a['total_gain']:.2f}",
                     f"{a['total_bounty_won']:,}".replace(",", " ") if a["total_bounty_won"] else "-",
                     f"{a['net']:.2f}",
                 ),
