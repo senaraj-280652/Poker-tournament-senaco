@@ -4235,19 +4235,23 @@ class App(tk.Tk):
     def _hide_autocomplete(self):
         if self._autocomplete_popup is not None and self._autocomplete_popup.winfo_exists():
             self._autocomplete_popup.withdraw()
-            # Redonne explicitement la main (au niveau fenêtre) à la
-            # fenêtre principale : sous macOS, une fenêtre overrideredirect
-            # qui a reçu un clic peut sinon laisser l'appli entière
-            # insensible aux clics une fois masquée (voir commentaire dans
-            # _show_autocomplete). On ne force pas le focus clavier sur un
-            # champ précis ici, pour ne pas perturber une saisie déjà
-            # entamée ailleurs (ex : champ Club) au moment où ce masquage
-            # différé se déclenche.
-            self.lift()
-            try:
-                self.focus_force()
-            except tk.TclError:
-                pass
+            # Le correctif ci-dessous (lift + focus_force sur la fenêtre
+            # racine) sert seulement à débloquer l'appli si elle est
+            # restée "collée" sans AUCUN widget focalisé — ce qui peut
+            # arriver sous macOS après un clic sur cette fenêtre sans
+            # style (overrideredirect), voir _show_autocomplete, sinon
+            # l'appli entière reste insensible aux clics. Ne s'applique
+            # QUE dans ce cas précis (focus_get() vaut None) : sinon, il
+            # volait le focus clavier au champ Nom du joueur en cours de
+            # saisie à CHAQUE lettre tapée ne donnant aucune suggestion
+            # (ex : un nom tout nouveau, absent du répertoire) — signalé
+            # comme une perte de focus continue pendant la frappe.
+            if self.focus_get() is None:
+                self.lift()
+                try:
+                    self.focus_force()
+                except tk.TclError:
+                    pass
 
     def _on_player_name_focus_out(self, event=None):
         self._prefill_club_from_roster()
@@ -5929,6 +5933,37 @@ class App(tk.Tk):
             wraplength=120, justify="left",
         ).pack(side="left", anchor="n", padx=(10, 0))
 
+        # "Enregistrer"/"Récupérer" juste sous "Valeur des jetons" (et non
+        # plus tout en bas, après le tableau de couleurs) : ce sont les
+        # actions principales de ce panneau, autant les avoir tout de
+        # suite sous les yeux plutôt qu'après avoir défilé la liste des
+        # couleurs. "Enregistrer" avant "Récupérer" : c'est l'action la
+        # plus fréquente une fois le tableau de jetons rempli.
+        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
+        chips_tpl_btns = ttk.Frame(chips_frame)
+        chips_tpl_btns.pack(fill="x", padx=8, pady=(0, 8))
+        save_chips_btn = ttk.Button(
+            chips_tpl_btns, text="💾 Enregistrer Jetons sous...", command=self._save_chips_as_template,
+        )
+        save_chips_btn.pack(fill="x", pady=(0, 4))
+        Tooltip(
+            save_chips_btn,
+            "Applique les jetons de ce tableau à ce tournoi ET les\n"
+            "enregistre sous un nom au choix, pour les réutiliser plus\n"
+            "tard sur d'autres tournois/Sit & Go.",
+        )
+        load_chips_btn = ttk.Button(
+            chips_tpl_btns, text="📂 Récupérer Jetons...", command=self._open_chip_templates,
+        )
+        load_chips_btn.pack(fill="x")
+        Tooltip(
+            load_chips_btn,
+            "Ouvre la liste des jeux de jetons déjà enregistrés (via\n"
+            "\"Enregistrer Jetons sous...\") pour en appliquer un à ce\n"
+            "tournoi.",
+        )
+        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(0, 6))
+
         ttk.Button(
             chips_frame, text="➕ Ajouter une couleur", command=self._add_chip_row,
         ).pack(fill="x", padx=8, pady=(0, 6))
@@ -5972,34 +6007,6 @@ class App(tk.Tk):
 
         chips_canvas.bind("<Enter>", lambda e: chips_canvas.bind_all("<MouseWheel>", _on_chips_mousewheel))
         chips_canvas.bind("<Leave>", lambda e: chips_canvas.unbind_all("<MouseWheel>"))
-
-        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
-
-        # "Enregistrer" avant "Récupérer" : c'est l'action la plus
-        # fréquente une fois le tableau de jetons rempli (l'enregistrer
-        # pour le réutiliser plus tard), autant l'avoir en premier.
-        chips_tpl_btns = ttk.Frame(chips_frame)
-        chips_tpl_btns.pack(fill="x", padx=8, pady=(0, 8))
-        save_chips_btn = ttk.Button(
-            chips_tpl_btns, text="💾 Enregistrer Jetons sous...", command=self._save_chips_as_template,
-        )
-        save_chips_btn.pack(fill="x", pady=(0, 4))
-        Tooltip(
-            save_chips_btn,
-            "Applique les jetons de ce tableau à ce tournoi ET les\n"
-            "enregistre sous un nom au choix, pour les réutiliser plus\n"
-            "tard sur d'autres tournois/Sit & Go.",
-        )
-        load_chips_btn = ttk.Button(
-            chips_tpl_btns, text="📂 Récupérer Jetons...", command=self._open_chip_templates,
-        )
-        load_chips_btn.pack(fill="x")
-        Tooltip(
-            load_chips_btn,
-            "Ouvre la liste des jeux de jetons déjà enregistrés (via\n"
-            "\"Enregistrer Jetons sous...\") pour en appliquer un à ce\n"
-            "tournoi.",
-        )
 
         self._chip_row_vars = []
         self._refresh_chips_tab()
