@@ -40,16 +40,19 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 # lequel aucune fenêtre Tkinter ne peut encore exister. Le texte est
 # ensuite fermé depuis le code (main.py, via pyi_splash.close()) dès
 # qu'une fenêtre de l'application est prête à s'afficher.
+#
+# Le message "Chargement en cours..." est dessiné directement DANS
+# l'image assets/splash.png plutôt que via text_pos/text_default :
+# dès qu'une zone de texte dynamique est configurée sur le splash, le
+# bootloader s'en sert lui-même pour afficher, pendant l'extraction, le
+# nom de chaque fichier qu'il décompresse (ex. "zlib1.dll") — écrasant
+# notre message par un défilement de noms de fichiers. Sans text_pos,
+# aucune zone de texte n'existe et l'image reste inchangée du début à
+# la fermeture du splash.
 splash = Splash(
     str(Path(SPECPATH) / "assets" / "splash.png"),
     binaries=a.binaries,
     datas=a.datas,
-    text_pos=(240, 264),
-    text_size=13,
-    text_color="#e8c05c",
-    text_default="Chargement en cours...",
-    text_font="Arial",
-    text_align="center",
     always_on_top=True,
 )
 
