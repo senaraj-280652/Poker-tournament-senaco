@@ -10,7 +10,7 @@
 # Utilisation : ouvrez PowerShell à la racine du dépôt, puis :
 #   .\windows\build.ps1
 #
-# Résultat : windows\dist\PokerTournament.msi
+# Résultat : windows\dist\PokerTournament-16.msi
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot   # racine du dépôt (parent de windows/)
@@ -73,16 +73,16 @@ if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
 }
 wix extension add WixToolset.UI.wixext/5.0.2 --global 2>$null
 
-Write-Host "== 5/5 : génération de PokerTournament.msi (WiX) ==" -ForegroundColor Cyan
+Write-Host "== 5/5 : génération de PokerTournament-16.msi (WiX) ==" -ForegroundColor Cyan
 wix build windows\app.wxs `
     -arch x64 `
     -ext WixToolset.UI.wixext `
     -d Dist=windows\dist `
-    -out windows\dist\PokerTournament.msi
+    -out windows\dist\PokerTournament-16.msi
 
 Write-Host ""
-if (Test-Path "windows\dist\PokerTournament.msi") {
-    Write-Host "Terminé : windows\dist\PokerTournament.msi" -ForegroundColor Green
+if (Test-Path "windows\dist\PokerTournament-16.msi") {
+    Write-Host "Terminé : windows\dist\PokerTournament-16.msi" -ForegroundColor Green
 } else {
     throw "La génération du .msi a échoué — voir le journal ci-dessus."
 }

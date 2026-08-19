@@ -61,19 +61,19 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           wix extension add WixToolset.UI.wixext/5.0.2 --global
 
-      - name: Génération de PokerTournament.msi (WiX)
+      - name: Génération de PokerTournament-16.msi (WiX)
         run: |
-          wix build windows/app.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament.msi
+          wix build windows/app.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-16.msi
 
       - name: Publication de l'artifact
         uses: actions/upload-artifact@v4
         with:
           name: PokerTournament-msi
-          path: windows/dist/PokerTournament.msi
+          path: windows/dist/PokerTournament-16.msi
           if-no-files-found: error
 
       - name: Publication dans la Release (si déclenché par un tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: windows/dist/PokerTournament.msi
+          files: windows/dist/PokerTournament-16.msi

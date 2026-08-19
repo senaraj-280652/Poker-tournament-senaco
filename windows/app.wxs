@@ -8,7 +8,7 @@
 
   Construction manuelle (depuis la racine du dépôt) :
     wix build windows\app.wxs -arch x64 -ext WixToolset.UI.wixext ^
-        -d Dist=windows\dist -out windows\dist\PokerTournament.msi
+        -d Dist=windows\dist -out windows\dist\PokerTournament-16.msi
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">

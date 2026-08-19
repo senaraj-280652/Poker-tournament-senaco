@@ -2,7 +2,7 @@
 
 Ce dossier contient tout ce qu'il faut pour transformer l'application
 Python (`main.py` et les autres fichiers à la racine du dépôt) en un
-programme d'installation Windows classique : `PokerTournament.msi`.
+programme d'installation Windows classique : `PokerTournament-16.msi`.
 
 Deux façons d'obtenir ce fichier :
 
@@ -16,7 +16,7 @@ Windows fournie par GitHub — vous n'avez besoin de rien installer.
   *Run workflow*.
 - Ou poussez un tag `v*` (ex. `git tag v1.0.0 && git push --tags`) : le
   `.msi` est alors aussi joint automatiquement à une *Release* GitHub.
-- Une fois terminé (quelques minutes), téléchargez `PokerTournament.msi`
+- Une fois terminé (quelques minutes), téléchargez `PokerTournament-16.msi`
   dans les *Artifacts* de l'exécution (ou dans la Release).
 
 ## 2. Localement, sur un PC Windows
@@ -33,7 +33,7 @@ Puis, dans PowerShell, à la racine du dépôt :
 .\windows\build.ps1
 ```
 
-Le fichier obtenu est `windows\dist\PokerTournament.msi`.
+Le fichier obtenu est `windows\dist\PokerTournament-16.msi`.
 
 ## Ce que fait le build
 
@@ -46,7 +46,7 @@ Le fichier obtenu est `windows\dist\PokerTournament.msi`.
    `Splash` de `poker_tournament.spec` et l'appel `pyi_splash.close()`
    dans `main.py`).
 2. **WiX Toolset** enveloppe cet `.exe` dans un vrai programme
-   d'installation Windows (`PokerTournament.msi`) : dossier dans
+   d'installation Windows (`PokerTournament-16.msi`) : dossier dans
    *Program Files*, raccourcis dans le menu Démarrer et sur le Bureau,
    entrée dans "Applications et fonctionnalités" pour la désinstallation.
 
@@ -66,7 +66,7 @@ comme sur macOS.
 | `app.wxs` | Description de l'installateur (WiX Toolset) |
 | `License.rtf` | Texte affiché sur l'écran de licence de l'installateur |
 | `build.ps1` | Script tout-en-un (exe → msi) |
-| `dist/` *(généré)* | Contient `PokerTournament.exe` puis `PokerTournament.msi` |
+| `dist/` *(généré)* | Contient `PokerTournament.exe` puis `PokerTournament-16.msi` |
 
 ## Changer le numéro de version
 
