@@ -5030,9 +5030,7 @@ class App(tk.Tk):
         # joueur désactivé (forfait) n'en fait plus partie.
         entries_current = sum(p["buyin_count"] for p in players if p["status"] != "withdrawn")
         self.stats_lbl.config(
-            text=(f"Actifs : {stats['active_count']}  |  Entrées : {entries_current}  |  "
-                  f"Rebuys : {stats['rebuys']}  |  Add-ons : {stats['addons']}  |  "
-                  f"Prize pool : {stats['prize_pool']:,.0f} €").replace(",", " ")
+            text=f"Actifs : {stats['active_count']}  |  Entrées : {entries_current}"
         )
 
     # ---------------------------------------------------------------
