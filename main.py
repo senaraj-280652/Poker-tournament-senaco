@@ -3791,16 +3791,24 @@ class App(tk.Tk):
         check_bar.pack(fill="x", padx=10)
         ttk.Button(check_bar, text="Tout cocher", command=self._check_all_players).pack(side="left", padx=3)
         ttk.Button(check_bar, text="Tout décocher", command=self._uncheck_all_players).pack(side="left", padx=3)
-        eliminate_btn = ttk.Button(
+        self.eliminate_player_btn = ttk.Button(
             check_bar, text="Éliminer", command=self._eliminate_selected, style="Danger.TButton",
         )
-        eliminate_btn.pack(side="left", padx=3)
-        Tooltip(
-            eliminate_btn,
+        self.eliminate_player_btn.pack(side="left", padx=3)
+        # Grisé TANT QUE le tournoi n'a pas démarré — voir
+        # _update_tournament_started_buttons, appelée à chaque
+        # rafraîchissement (comportement inverse de "Supprimer" ci-dessous :
+        # rien à éliminer avant que la partie ait commencé). Texte de
+        # l'info-bulle basculé entre les deux ci-dessous plutôt que
+        # d'ajouter un second Tooltip sur le même bouton.
+        self._eliminate_btn_tooltip_normal_text = (
             "Élimine tous les joueurs cochés ci-dessus. Pour un seul\n"
             "joueur, demande qui l'a éliminé (calcule bounty et prime\n"
             "de classement) ; pour plusieurs à la fois, aucun éliminateur\n"
-            "n'est demandé.",
+            "n'est demandé."
+        )
+        self.eliminate_player_btn_tooltip = Tooltip(
+            self.eliminate_player_btn, self._eliminate_btn_tooltip_normal_text,
         )
         ttk.Button(
             check_bar, text="Exporter les joueurs (Excel/CSV)...", command=self._export_players,
@@ -3865,8 +3873,8 @@ class App(tk.Tk):
         self.delete_player_btn.pack(side="left", padx=3)
         # Grisé une fois le tournoi commencé (chronomètre déjà démarré au
         # moins une fois, voir clock_started) — état et texte de l'info-
-        # bulle tenus à jour par _update_delete_player_button, appelée à
-        # chaque rafraîchissement de cet onglet : supprimer un joueur en
+        # bulle tenus à jour par _update_tournament_started_buttons,
+        # appelée à chaque rafraîchissement de cet onglet : supprimer un joueur en
         # cours de partie fausserait l'historique (mouvements, élimination
         # par...) sans qu'on puisse revenir en arrière, mieux vaut
         # Désactiver (forfait), qui garde une trace. Se réactive de
@@ -4522,9 +4530,13 @@ class App(tk.Tk):
         compter ses bounties (kills, onglet Primes) et, si un bounty fixe
         en € est configuré (mécanisme PKO), à le lui attribuer. Renvoie
         l'id du joueur choisi, ou None si ignoré/annulé."""
-        candidates = [
-            p for p in self.db.list_players(status="active") if p["id"] != exclude_id
-        ]
+        # list_players() trie par table/siège (pratique pour l'affichage du
+        # tableau Joueurs, pas pour retrouver un nom ici) — trié par nom
+        # pour ce menu, plus facile à parcourir.
+        candidates = sorted(
+            (p for p in self.db.list_players(status="active") if p["id"] != exclude_id),
+            key=lambda p: p["name"].lower(),
+        )
         if not candidates:
             return None
 
@@ -4894,15 +4906,23 @@ class App(tk.Tk):
             self.clock_window.bring_to_front()
         self.lift()
 
-    def _update_delete_player_button(self):
-        """Grise 'Supprimer' (onglet Joueurs) dès que le tournoi a démarré
-        (chronomètre déjà lancé au moins une fois, voir clock_started) :
-        supprimer un joueur en cours de partie fausserait l'historique
-        (mouvements, 'éliminé par'...) sans recours possible — 'Désactiver
-        (forfait)' garde une trace, à utiliser à la place. Lu à chaque
-        rafraîchissement (pas mis en cache) : se réactive de lui-même pour
-        un nouveau tournoi, où clock_started repart à 0."""
+    def _update_tournament_started_buttons(self):
+        """Ajuste 'Supprimer' et 'Éliminer' (onglet Joueurs) selon que le
+        tournoi a démarré ou non (chronomètre déjà lancé au moins une
+        fois, voir clock_started) — sens opposés :
+
+        - 'Supprimer' se grise UNE FOIS le tournoi démarré : l'effacer en
+          cours de partie fausserait l'historique (mouvements, 'éliminé
+          par'...) sans recours possible — 'Désactiver (forfait)' garde
+          une trace, à utiliser à la place.
+        - 'Éliminer' se grise TANT QUE le tournoi n'a pas démarré : rien
+          à éliminer avant que la partie ait commencé.
+
+        Lu à chaque rafraîchissement (pas mis en cache) : les deux se
+        remettent d'eux-mêmes dans leur état initial pour un nouveau
+        tournoi, où clock_started repart à 0."""
         started = self.db.get_setting_int("clock_started", 0) == 1
+
         self.delete_player_btn.configure(state="disabled" if started else "normal")
         self.delete_player_btn_tooltip.text = (
             "Suppression désactivée : le tournoi a déjà démarré. Utilisez\n"
@@ -4910,11 +4930,18 @@ class App(tk.Tk):
             "joueur au lieu de l'effacer."
         ) if started else ""
 
+        self.eliminate_player_btn.configure(state="normal" if started else "disabled")
+        self.eliminate_player_btn_tooltip.text = (
+            self._eliminate_btn_tooltip_normal_text if started else
+            "Élimination désactivée : le tournoi n'a pas encore démarré\n"
+            "(cliquez « Démarrer » dans l'onglet Chronomètre)."
+        )
+
     def _refresh_players_tab(self):
         # Garde la liste déroulante des clubs à jour (un club a pu être
         # ajouté/modifié entre-temps depuis le répertoire de joueurs).
         self.new_player_club_combo.configure(values=roster.list_clubs())
-        self._update_delete_player_button()
+        self._update_tournament_started_buttons()
         for row in self.players_tree.get_children():
             self.players_tree.delete(row)
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
@@ -4993,8 +5020,17 @@ class App(tk.Tk):
         self.checked_player_ids &= present_ids
         self._update_checked_count_label()
         stats = self.db.get_stats()
+        # Entrées affichées ici = buy-ins des joueurs encore réellement
+        # dans le tournoi (actifs + éliminés), désistements exclus — pas
+        # stats["entries"] (tous les buy-ins jamais encaissés, y compris
+        # les désistés : sert au calcul du prize pool ailleurs dans
+        # l'appli, où un forfait ne doit pas faire baisser la cagnotte
+        # déjà collectée). Ici, dans l'onglet Joueurs, on veut plutôt
+        # "combien de joueurs sont dans ce tournoi en ce moment" : un
+        # joueur désactivé (forfait) n'en fait plus partie.
+        entries_current = sum(p["buyin_count"] for p in players if p["status"] != "withdrawn")
         self.stats_lbl.config(
-            text=(f"Actifs : {stats['active_count']}  |  Entrées : {stats['entries']}  |  "
+            text=(f"Actifs : {stats['active_count']}  |  Entrées : {entries_current}  |  "
                   f"Rebuys : {stats['rebuys']}  |  Add-ons : {stats['addons']}  |  "
                   f"Prize pool : {stats['prize_pool']:,.0f} €").replace(",", " ")
         )
