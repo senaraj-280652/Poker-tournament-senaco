@@ -12,12 +12,12 @@
   {
     "level": 1,
     "title": "2. Installation",
-    "body": "Le logiciel nécessite uniquement Python 3.8 ou plus récent — aucune autre dépendance obligatoire."
+    "body": "Sur Windows et macOS, aucune installation préalable n'est nécessaire : le logiciel est distribué sous forme d'exécutable autonome (voir ci-dessous). Lancé depuis ses sources (technicien, autre plateforme), il nécessite Python 3.8 ou plus récent — aucune autre dépendance obligatoire."
   },
   {
     "level": 2,
     "title": "macOS et Windows",
-    "body": "Python inclut déjà Tkinter (l'interface graphique utilisée par le logiciel) : rien à installer en plus.\n\n• macOS — double-cliquez sur « Lancer_le_tournoi.command ». Une fenêtre de Terminal s'ouvre brièvement (normal), puis l'application démarre.\n\n💡 La toute première fois, macOS peut refuser en disant que l'éditeur n'est pas vérifié : faites un clic droit (ou Ctrl+clic) sur le fichier → « Ouvrir » → confirmez « Ouvrir » dans la boîte de dialogue. Cette étape n'est nécessaire qu'une seule fois.\n\n• Windows — il n'existe pas d'équivalent double-clic. Installez Python depuis python.org en cochant « Add python.exe to PATH » pendant l'installation, puis ouvrez une invite de commandes dans le dossier du logiciel et tapez :\n\npython main.py"
+    "body": "Le logiciel est distribué sous forme d'un programme prêt à l'emploi pour chaque plateforme — aucune installation de Python n'est nécessaire pour l'utilisateur final.\n\n• macOS — double-cliquez sur « PokerTournament.dmg », puis glissez l'application dans le raccourci « Applications » affiché à côté ; éjectez ensuite le disque et lancez l'app depuis le Launchpad ou le dossier Applications.\n\n💡 Au tout premier lancement, macOS peut afficher un avertissement de sécurité (éditeur non identifié) : faites un clic droit (ou Ctrl+clic) sur l'application → « Ouvrir » → confirmez « Ouvrir » dans la boîte de dialogue. Cette étape n'est nécessaire qu'une seule fois.\n\n• Windows — double-cliquez sur « PokerTournament.msi ». L'assistant demande d'accepter la licence, puis propose (et laisse modifier) le dossier d'installation, avant de créer les raccourcis sur le Bureau et dans le menu Démarrer. Au tout premier lancement, un bref écran « Chargement en cours... » s'affiche le temps que le programme démarre.\n\n💡 Pour un technicien : le logiciel peut aussi tourner directement depuis ses sources Python (utile pour le dépanner ou le transférer sans passer par un installateur), avec la commande python main.py — voir l'Annexe en fin de manuel."
   },
   {
     "level": 2,
@@ -136,22 +136,7 @@
   },
   {
     "level": 1,
-    "title": "9. Onglet Chronomètre",
-    "body": "Une structure de blindes standard est préchargée à la création du tournoi (modifiable en détail dans l'onglet Blindes, section 10, ou régénérée d'un coup dans Paramètres, section 12).\n\n• Démarrer / Reprendre, Pause — pilotent le minuteur du niveau en cours.\n\n• Niveau précédent / suivant — navigation manuelle entre les niveaux.\n\nLe passage au niveau suivant se fait aussi automatiquement à la fin du temps imparti. Double-cliquer sur un niveau dans le tableau y va directement.\n\nLes 5 boutons ci-dessus sont regroupés en haut à droite de l'onglet, les uns sous les autres ; les informations du niveau en cours (niveau, minuteur, blindes, niveau suivant) occupent le reste de la largeur, à gauche."
-  },
-  {
-    "level": 2,
-    "title": "Structure de blindes",
-    "body": ""
-  },
-  {
-    "level": 2,
-    "title": "Sons",
-    "body": "Sous « Modifier durée de la Pause », trois boutons associent un fichier son (.wav) à des moments clés du chronomètre :\n\n• Son début Pause — joué quand un round de blindes se termine en débouchant sur une pause.\n\n• Son Fin Pause — joué quand une pause se termine.\n\n• Son fin Round — joué à la fin de tout round de blindes normal (les deux sons peuvent donc s'enchîner si un round débouche sur une pause).\n\nClic gauche sur un bouton pour choisir/remplacer le fichier .wav ; clic droit pour retirer le son configuré. Le texte du bouton indique le fichier actuellement choisi, ou « (aucun) ».\n\nSous chacun de ces 3 boutons, un champ Durée (en millisecondes) tronque le fichier choisi s'il dure plus longtemps qu'elle, et un bouton Test permet de l'écouter immédiatement, sans attendre le déclenchement réel.\n\n💡 Ces sons sont communs à tous les tournois et Sit & Go — choisis une fois, ils sont automatiquement proposés partout ensuite, sans avoir à les reconfigurer à chaque nouveau tournoi.\n\n💡 Si le contenu de cet onglet dépasse la hauteur de l'écran, un ascenseur apparaît sur le côté droit — comme dans les onglets Paramètres et Blindes."
-  },
-  {
-    "level": 1,
-    "title": "10. Onglet Blindes",
+    "title": "9. Onglet Blindes",
     "body": ""
   },
   {
@@ -172,7 +157,22 @@
   {
     "level": 2,
     "title": "Écran projecteur",
-    "body": "Le menu Affichage → « Ouvrir l'écran chronomètre » ouvre une fenêtre séparée, pensée pour être affichée en plein écran (touche F11, Échap pour sortir) sur un vidéoprojecteur ou un second écran : rappel des raccourcis clavier en haut à gauche, niveau en cours, minuteur en grand (clignote en doré pendant les pauses), prochain niveau, heure de la prochaine pause, puis, centrés en bas, joueurs restants, tapis moyen et durée du tournoi (temps écoulé depuis le tout premier démarrage, figée une fois la partie terminée).\n\n💡 Pendant un rééquilibrage de tables, un bandeau « Changement de tables en cours » s'affiche au centre de cet écran avec le détail des joueurs concernés (voir section 7) ; une fois le tournoi terminé (un seul joueur actif restant), ce même bandeau affiche « Partie terminée ».\n\n💡 Si des jetons sont renseignés (onglet Blindes, section 10), leur tableau (couleur ou image, valeur, nombre par joueur) s'affiche aussi en haut à droite de cet écran."
+    "body": "Le menu Affichage → « Ouvrir l'écran chronomètre » ouvre une fenêtre séparée, pensée pour être affichée en plein écran (touche F11, Échap pour sortir) sur un vidéoprojecteur ou un second écran : rappel des raccourcis clavier en haut à gauche, round en cours, minuteur en grand (clignote en doré pendant les pauses), prochain round, heure de la prochaine pause, puis, centrés en bas, joueurs restants, tapis moyen et durée du tournoi (temps écoulé depuis le tout premier démarrage, figée une fois la partie terminée).\n\n💡 Pendant un rééquilibrage de tables, un bandeau « Changement de tables en cours » s'affiche au centre de cet écran avec le détail des joueurs concernés (voir section 7) ; une fois le tournoi terminé (un seul joueur actif restant), ce même bandeau affiche « Partie terminée ».\n\n💡 Si des jetons sont renseignés (onglet Blindes, section 9), leur tableau (couleur ou image, valeur, nombre par joueur) s'affiche aussi en haut à droite de cet écran."
+  },
+  {
+    "level": 1,
+    "title": "10. Onglet Chronomètre",
+    "body": "Une structure de blindes standard est préchargée à la création du tournoi (modifiable en détail dans l'onglet Blindes, section 9, ou régénérée d'un coup dans Paramètres, section 12).\n\n• Démarrer / Reprendre, Pause — pilotent le minuteur du niveau en cours.\n\n• Niveau précédent / suivant — navigation manuelle entre les niveaux.\n\nLe passage au niveau suivant se fait aussi automatiquement à la fin du temps imparti. Double-cliquer sur un niveau dans le tableau y va directement.\n\nLes 5 boutons ci-dessus sont regroupés en haut à droite de l'onglet, les uns sous les autres ; les informations du niveau en cours (niveau, minuteur, blindes, niveau suivant) occupent le reste de la largeur, à gauche, avec « Round » affiché juste à droite de « Niveau ». Contrairement à Niveau (numéro brut, pauses comprises — comme le tableau de structure ci-dessous et les boutons Niveau précédent/suivant), Round n'avance pas pendant une pause ; le tableau de structure reprend d'ailleurs cette même colonne Round, pour repérer facilement à quel round correspond chaque ligne — voir aussi la colonne Round de l'onglet Blindes, section 9."
+  },
+  {
+    "level": 2,
+    "title": "Structure de blindes",
+    "body": ""
+  },
+  {
+    "level": 2,
+    "title": "Sons",
+    "body": "Sous « Modifier durée de la Pause », trois boutons associent un fichier son (.wav) à des moments clés du chronomètre :\n\n• Son début Pause — joué quand un round de blindes se termine en débouchant sur une pause.\n\n• Son Fin Pause — joué quand une pause se termine.\n\n• Son fin Round — joué à la fin de tout round de blindes normal (les deux sons peuvent donc s'enchîner si un round débouche sur une pause).\n\nClic gauche sur un bouton pour choisir/remplacer le fichier .wav ; clic droit pour retirer le son configuré. Le texte du bouton indique le fichier actuellement choisi, ou « (aucun) ».\n\nSous chacun de ces 3 boutons, un champ Durée (en millisecondes) tronque le fichier choisi s'il dure plus longtemps qu'elle, et un bouton Test permet de l'écouter immédiatement, sans attendre le déclenchement réel.\n\n💡 Ces sons sont communs à tous les tournois et Sit & Go — choisis une fois, ils sont automatiquement proposés partout ensuite, sans avoir à les reconfigurer à chaque nouveau tournoi.\n\n💡 Si le contenu de cet onglet dépasse la hauteur de l'écran, un ascenseur apparaît sur le côté droit — comme dans les onglets Paramètres et Blindes."
   },
   {
     "level": 1,
@@ -312,7 +312,7 @@
   {
     "level": 3,
     "title": "Sous Windows, le fichier .command ne fait rien",
-    "body": "Normal : c'est un script réservé à macOS. Utilisez la ligne de commande (python main.py), voir section 2."
+    "body": "Normal : c'est un script réservé à macOS. Sous Windows, utilisez l'installateur PokerTournament.msi (voir section 2)."
   },
   {
     "level": 3,
