@@ -5907,43 +5907,34 @@ class App(tk.Tk):
         chips_frame = ttk.LabelFrame(self.blinds_tab, text="Jetons")
         chips_frame.pack(side="right", fill="y", padx=(10, 15), pady=10)
 
-        # Rangée du haut : total jetons/joueur (nombre + valeur) à gauche —
-        # remonté ici depuis le bas du panneau pour être visible sans
-        # défiler — et le texte d'aide, poussé à droite avec un
-        # wraplength réduit (220 -> 120), pour une section Jetons globalement
-        # moins large et laisser plus de place au tableau des blindes.
+        # Rangée du haut : à gauche, une colonne compacte avec le total
+        # jetons/joueur (nombre + valeur) SUIVI directement des boutons
+        # Enregistrer/Récupérer, l'un sous l'autre ; à droite, le texte
+        # d'aide (wraplength réduit, 220 -> 110) qui s'enroule sur
+        # plusieurs lignes et donne donc à cette rangée toute sa hauteur.
+        # Mettre les boutons dans cette même colonne de gauche (plutôt
+        # qu'en rangée séparée sous top_row) comble l'espace resté vide
+        # sous "Valeur des jetons" pendant que le texte de droite
+        # s'enroule — et garde la section Jetons plus compacte, plus de
+        # place pour le tableau des blindes.
         top_row = ttk.Frame(chips_frame)
         top_row.pack(fill="x", padx=8, pady=(8, 6))
 
-        counts_col = ttk.Frame(top_row)
-        counts_col.pack(side="left", anchor="n")
+        left_col = ttk.Frame(top_row)
+        left_col.pack(side="left", anchor="n")
         self.chips_count_total_lbl = ttk.Label(
-            counts_col, text="", font=("Helvetica", 10, "bold"), foreground=CREAM,
+            left_col, text="", font=("Helvetica", 10, "bold"), foreground=CREAM,
         )
         self.chips_count_total_lbl.pack(anchor="w")
         self.chips_total_lbl = ttk.Label(
-            counts_col, text="", font=("Helvetica", 10, "bold"), foreground=GOLD,
+            left_col, text="", font=("Helvetica", 10, "bold"), foreground=GOLD,
         )
-        self.chips_total_lbl.pack(anchor="w")
+        self.chips_total_lbl.pack(anchor="w", pady=(0, 8))
 
-        ttk.Label(
-            top_row, foreground=MUTED,
-            text="Jetons utilisés pour ce tournoi (facultatif). Cliquer sur "
-                 "la pastille pour choisir une couleur ou une image de jeton.",
-            wraplength=120, justify="left",
-        ).pack(side="left", anchor="n", padx=(10, 0))
-
-        # "Enregistrer"/"Récupérer" juste sous "Valeur des jetons" (et non
-        # plus tout en bas, après le tableau de couleurs) : ce sont les
-        # actions principales de ce panneau, autant les avoir tout de
-        # suite sous les yeux plutôt qu'après avoir défilé la liste des
-        # couleurs. "Enregistrer" avant "Récupérer" : c'est l'action la
-        # plus fréquente une fois le tableau de jetons rempli.
-        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
-        chips_tpl_btns = ttk.Frame(chips_frame)
-        chips_tpl_btns.pack(fill="x", padx=8, pady=(0, 8))
+        # "Enregistrer" avant "Récupérer" : c'est l'action la plus
+        # fréquente une fois le tableau de jetons rempli.
         save_chips_btn = ttk.Button(
-            chips_tpl_btns, text="💾 Enregistrer Jetons sous...", command=self._save_chips_as_template,
+            left_col, text="💾 Enregistrer Jetons sous...", command=self._save_chips_as_template,
         )
         save_chips_btn.pack(fill="x", pady=(0, 4))
         Tooltip(
@@ -5953,7 +5944,7 @@ class App(tk.Tk):
             "tard sur d'autres tournois/Sit & Go.",
         )
         load_chips_btn = ttk.Button(
-            chips_tpl_btns, text="📂 Récupérer Jetons...", command=self._open_chip_templates,
+            left_col, text="📂 Récupérer Jetons...", command=self._open_chip_templates,
         )
         load_chips_btn.pack(fill="x")
         Tooltip(
@@ -5962,7 +5953,15 @@ class App(tk.Tk):
             "\"Enregistrer Jetons sous...\") pour en appliquer un à ce\n"
             "tournoi.",
         )
-        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(0, 6))
+
+        ttk.Label(
+            top_row, foreground=MUTED,
+            text="Jetons utilisés pour ce tournoi (facultatif). Cliquer sur "
+                 "la pastille pour choisir une couleur ou une image de jeton.",
+            wraplength=110, justify="left",
+        ).pack(side="left", anchor="n", padx=(10, 0))
+
+        ttk.Separator(chips_frame, orient="horizontal").pack(fill="x", padx=8, pady=(4, 6))
 
         ttk.Button(
             chips_frame, text="➕ Ajouter une couleur", command=self._add_chip_row,
