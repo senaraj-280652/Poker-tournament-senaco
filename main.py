@@ -996,10 +996,11 @@ class RosterManagerDialog(ttk.Frame):
         add_frame = ttk.Frame(self)
         add_frame.pack(fill="x", padx=12, pady=(0, 8))
         self.new_name_var = tk.StringVar()
-        # width=8 : environ le quart des ~32 caractères qu'occupait ce
-        # champ auparavant (fill="x", expand=True — il s'étirait sur
-        # toute la largeur disponible dans add_frame).
-        entry = ttk.Entry(add_frame, textvariable=self.new_name_var, width=8)
+        # width=24 : triple de la largeur précédente (8), elle-même
+        # environ le quart des ~32 caractères qu'occupait ce champ à
+        # l'origine (fill="x", expand=True — il s'étirait sur toute la
+        # largeur disponible dans add_frame).
+        entry = ttk.Entry(add_frame, textvariable=self.new_name_var, width=24)
         entry.pack(side="left")
         entry.bind("<Return>", lambda e: self._add())
         ttk.Button(add_frame, text="Ajouter", command=self._add).pack(side="left", padx=5)
@@ -1318,8 +1319,29 @@ class RosterManagerDialog(ttk.Frame):
         except Exception as e:
             messagebox.showerror("Erreur", f"Impossible de lire ce fichier :\n{e}")
             return
+        if not names:
+            messagebox.showinfo(
+                "Import terminé", "Aucun joueur trouvé dans ce fichier.", parent=self,
+            )
+            return
+
+        # Un fichier .tournoi ne mémorise jamais de club par joueur (voir
+        # _import_csv, même principe pour un CSV sans colonne CLUB) :
+        # propose un club unique à attribuer à tous les joueurs importés,
+        # plutôt que de les laisser sans club.
+        club_setting = export_prefs.load_value("club_name", "")
+        default_club = simpledialog.askstring(
+            "Club des joueurs importés",
+            "Un fichier .tournoi ne mémorise pas le club de ses joueurs.\n"
+            "Club à attribuer à tous les joueurs importés :",
+            initialvalue=club_setting or "CPC", parent=self,
+        )
+        if default_club is None:
+            return  # import annulé
+        default_club = default_club.strip() or None
+
         for name in names:
-            roster.add_to_roster(name)
+            roster.add_to_roster(name, default_club)
         self._refresh()
         messagebox.showinfo(
             "Import terminé",
