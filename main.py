@@ -998,10 +998,14 @@ class RosterManagerDialog(ttk.Frame):
         # de toute cette colonne en même temps que sa hauteur.
         top_row = ttk.Frame(self)
         top_row.pack(fill="x", padx=12, pady=(12, 6))
+        # anchor="nw" (pas juste "w") : sans ça, ce titre — bien plus
+        # court en hauteur que le tableau "Joueurs par club" à côté —
+        # se retrouvait centré verticalement contre lui, avec un grand
+        # vide au-dessus qui donnait l'impression d'un décalage.
         ttk.Label(
             top_row, text="Joueurs habituels (proposés à la création d'un tournoi)",
             font=("Helvetica", 10, "bold"),
-        ).pack(side="left", anchor="w")
+        ).pack(side="left", anchor="nw")
 
         # "Sans" regroupe les joueurs sans club, toujours affiché en
         # premier ; recalculé à chaque _refresh() (donc à chaque ajout/
@@ -1128,7 +1132,10 @@ class RosterManagerDialog(ttk.Frame):
             list_frame, columns=("name", "club"), show="tree headings", selectmode="browse",
         )
         self.roster_tree.heading("#0", text="Photo")
-        self.roster_tree.column("#0", width=ROSTER_ROW_THUMB_SIZE + 16, stretch=False, anchor="center")
+        # +32 (pas +16) : le libellé "Photo" de l'en-tête ne tenait pas
+        # dans une colonne calée juste sur la largeur de la vignette,
+        # et se retrouvait tronqué en "Phot".
+        self.roster_tree.column("#0", width=ROSTER_ROW_THUMB_SIZE + 32, stretch=False, anchor="center")
         self.roster_tree.heading("name", text="Nom", command=lambda: self._sort_roster_by("name"))
         self.roster_tree.heading("club", text="Club", command=lambda: self._sort_roster_by("club"))
         self.roster_tree.column("name", width=180, anchor="w")
