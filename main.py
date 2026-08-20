@@ -1087,14 +1087,46 @@ class RosterManagerDialog(ttk.Frame):
         photo_frame = ttk.Frame(body)
         photo_frame.pack(side="left", fill="y", padx=(12, 0))
 
-        # Petit tableau de synthèse "Club / Nombre" — au-dessus de
-        # l'aperçu/prise de photo, recalculé à chaque _refresh() (donc à
+        # Petit tableau de synthèse "Club / Nombre" — tout en haut, au-dessus
+        # de l'aperçu/prise de photo, recalculé à chaque _refresh() (donc à
         # chaque ajout/modification d'un joueur, comme demandé). "Sans"
         # regroupe les joueurs sans club, toujours affiché en premier.
+        #
+        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT), avec ascenseur : le nombre
+        # de clubs distincts n'est pas borné (variantes/fautes de frappe
+        # incluses, ex. "CPC" et "CPC&") et grossirait ce tableau sans
+        # limite, poussant le cadre de prise de photo juste en dessous de
+        # plus en plus bas — même principe (Canvas + Scrollbar) que les
+        # tableaux Jetons/Blindes de l'onglet Blindes.
+        CLUB_SUMMARY_HEIGHT = 130
         summary_box = ttk.LabelFrame(photo_frame, text="Joueurs par club")
         summary_box.pack(fill="x")
-        self.club_summary_frame = ttk.Frame(summary_box)
-        self.club_summary_frame.pack(fill="x", padx=6, pady=6)
+        summary_canvas = tk.Canvas(
+            summary_box, bg=FELT, highlightthickness=0, height=CLUB_SUMMARY_HEIGHT,
+        )
+        summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
+        summary_canvas.configure(yscrollcommand=summary_vscroll.set)
+        # vscroll empaqueté AVANT canvas (expand=True) : sinon canvas
+        # capterait tout l'espace restant et la scrollbar n'aurait plus
+        # de place (même raison qu'ailleurs dans ce fichier).
+        summary_vscroll.pack(side="right", fill="y")
+        summary_canvas.pack(side="left", fill="x", expand=True, padx=6, pady=6)
+
+        self.club_summary_frame = ttk.Frame(summary_canvas)
+        summary_canvas.create_window((0, 0), window=self.club_summary_frame, anchor="nw")
+        self.club_summary_frame.bind(
+            "<Configure>",
+            lambda e: summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
+        )
+
+        def _on_summary_mousewheel(event):
+            if self.tk.call("tk", "windowingsystem") == "aqua":
+                summary_canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                summary_canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        summary_canvas.bind("<Enter>", lambda e: summary_canvas.bind_all("<MouseWheel>", _on_summary_mousewheel))
+        summary_canvas.bind("<Leave>", lambda e: summary_canvas.unbind_all("<MouseWheel>"))
 
         preview_container = tk.Frame(
             photo_frame, width=ROSTER_PREVIEW_SIZE, height=ROSTER_PREVIEW_SIZE, bg=CREAM
