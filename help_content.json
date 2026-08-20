@@ -342,7 +342,7 @@
   {
     "level": 1,
     "title": "Licence et version",
-    "body": "Le numéro de version du logiciel est affiché dans le titre de la fenêtre et dans le menu Aide → « A propos... ».\n\nLes exécutables compilés (.msi Windows, .dmg macOS) peuvent exiger une activation unique par machine, hors ligne, la première fois qu'ils sont lancés : une fenêtre affiche alors un identifiant à communiquer à l'éditeur pour recevoir une clé. Lancé depuis les sources (comme actuellement), le logiciel ne demande jamais d'activation.\n\n💡 Ce verrou n'est pas encore actif sur les exécutables actuellement en circulation — il pourra l'être sur une future version, sans rien changer pour les postes déjà activés."
+    "body": "Le numéro de version du logiciel est affiché dans le menu Aide → « A propos... » (le titre de la fenêtre affiche plutôt le nom du tournoi et la date du jour).\n\nLes exécutables compilés (.msi Windows, .dmg macOS) peuvent exiger une activation unique par machine, hors ligne, la première fois qu'ils sont lancés : une fenêtre affiche alors un identifiant à communiquer à l'éditeur pour recevoir une clé. Lancé depuis les sources (comme actuellement), le logiciel ne demande jamais d'activation.\n\n💡 Ce verrou n'est pas encore actif sur les exécutables actuellement en circulation — il pourra l'être sur une future version, sans rien changer pour les postes déjà activés."
   },
   {
     "level": 1,
