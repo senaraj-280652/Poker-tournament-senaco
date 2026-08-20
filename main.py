@@ -996,10 +996,17 @@ class RosterManagerDialog(ttk.Frame):
         add_frame = ttk.Frame(self)
         add_frame.pack(fill="x", padx=12, pady=(0, 8))
         self.new_name_var = tk.StringVar()
-        entry = ttk.Entry(add_frame, textvariable=self.new_name_var)
-        entry.pack(side="left", fill="x", expand=True)
+        # width=8 : environ le quart des ~32 caractères qu'occupait ce
+        # champ auparavant (fill="x", expand=True — il s'étirait sur
+        # toute la largeur disponible dans add_frame).
+        entry = ttk.Entry(add_frame, textvariable=self.new_name_var, width=8)
+        entry.pack(side="left")
         entry.bind("<Return>", lambda e: self._add())
         ttk.Button(add_frame, text="Ajouter", command=self._add).pack(side="left", padx=5)
+        ttk.Button(
+            add_frame, text="Importer les joueurs d'un tournoi existant...",
+            command=self._import_from_tournament,
+        ).pack(side="left", padx=(8, 0))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0, 4))
@@ -1010,16 +1017,6 @@ class RosterManagerDialog(ttk.Frame):
             btns, text="Tout supprimer", command=self._delete_all, style="Danger.TButton",
         ).pack(side="left", padx=3)
 
-        # Largeur réduite au minimum (naturelle, pas fill="x") pour ces 4
-        # boutons : le texte suffit à les rendre lisibles, inutile de les
-        # étirer sur toute la largeur de l'onglet.
-        btns2 = ttk.Frame(self)
-        btns2.pack(fill="x", padx=12, pady=(0, 8))
-        ttk.Button(
-            btns2, text="Importer les joueurs d'un tournoi existant...",
-            command=self._import_from_tournament,
-        ).pack(anchor="w")
-
         btns_csv = ttk.Frame(self)
         btns_csv.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Button(
@@ -1028,13 +1025,10 @@ class RosterManagerDialog(ttk.Frame):
         ttk.Button(
             btns_csv, text="Exporter (CSV)...", command=self._export_csv,
         ).pack(side="left", padx=(6, 0))
-
-        btns3 = ttk.Frame(self)
-        btns3.pack(fill="x", padx=12, pady=(0, 8))
         reactivate_btn = ttk.Button(
-            btns3, text="Tout réactiver...", command=self._reactivate_all,
+            btns_csv, text="Tout réactiver...", command=self._reactivate_all,
         )
-        reactivate_btn.pack(anchor="w")
+        reactivate_btn.pack(side="left", padx=(6, 0))
         Tooltip(
             reactivate_btn,
             "Cherche, dans un dossier au choix, TOUS les tournois où des\n"
