@@ -65,11 +65,11 @@ app = BUNDLE(
     name="PokerTournament.app",
     icon=None,
     bundle_identifier="com.pokertournament.gestionnaire",
-    version="1.0.0",
+    version="1.2.16",
     info_plist={
         "CFBundleName": "Gestionnaire de Tournoi de Poker",
         "CFBundleDisplayName": "Gestionnaire de Tournoi de Poker",
-        "CFBundleShortVersionString": "1.0.0",
+        "CFBundleShortVersionString": "1.2.16",
         "NSHumanReadableCopyright": "Raj Juganaikloo",
         "NSHighResolutionCapable": True,
         "NSCameraUsageDescription": "Utilisée pour prendre une photo de joueur depuis l'application.",
