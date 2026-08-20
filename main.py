@@ -991,39 +991,37 @@ class RosterManagerDialog(ttk.Frame):
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
         self.roster_sort = {"column": "name", "ascending": True}
 
-        # Rangée du tout haut de l'onglet : le titre à gauche, le petit
-        # tableau de synthèse "Club / Nombre" à droite — complètement en
-        # haut (rien au-dessus), plutôt que dans la colonne de droite
-        # (aperçu/prise de photo) plus bas, où il grossissait la largeur
-        # de toute cette colonne en même temps que sa hauteur.
-        top_row = ttk.Frame(self)
-        top_row.pack(fill="x", padx=12, pady=(12, 6))
-        # anchor="nw" (pas juste "w") : sans ça, ce titre — bien plus
-        # court en hauteur que le tableau "Joueurs par club" à côté —
-        # se retrouvait centré verticalement contre lui, avec un grand
-        # vide au-dessus qui donnait l'impression d'un décalage.
+        # Titre en flux normal (pack), compact — plus dans une rangée
+        # partagée avec le tableau "Joueurs par club" : les deux forçaient
+        # sinon la rangée entière à la hauteur du plus grand des deux
+        # (le tableau), laissant un vide sous ce titre bien plus court.
         ttk.Label(
-            top_row, text="Joueurs habituels (proposés à la création d'un tournoi)",
+            self, text="Joueurs habituels (proposés à la création d'un tournoi)",
             font=("Helvetica", 10, "bold"),
-        ).pack(side="left", anchor="nw")
+        ).pack(anchor="w", padx=12, pady=(12, 6))
 
-        # "Sans" regroupe les joueurs sans club, toujours affiché en
-        # premier ; recalculé à chaque _refresh() (donc à chaque ajout/
-        # modification/suppression d'un joueur).
+        # Tableau "Joueurs par club" : posé par-dessus (place(), pas pack())
+        # en haut à droite de l'onglet, plutôt qu'inséré dans le flux
+        # normal des widgets empilés verticalement — c'est justement pour
+        # ne pas influencer la hauteur du titre ci-dessus (ni celle
+        # d'aucune autre rangée) que ce widget est sorti du flux. "Sans"
+        # regroupe les joueurs sans club, toujours affiché en premier ;
+        # recalculé à chaque _refresh() (donc à chaque ajout/modification/
+        # suppression d'un joueur).
         #
-        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT), avec ascenseur : le nombre
+        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT) avec ascenseur : le nombre
         # de clubs distincts n'est pas borné (variantes/fautes de frappe
         # incluses, ex. "CPC" et "CPC&") et grossirait ce tableau sans
         # limite — même principe (Canvas + Scrollbar) que les tableaux
-        # Jetons/Blindes de l'onglet Blindes. Largeur NON étirée
-        # (contrairement à un premier essai) : le canvas est calé sur la
-        # largeur réelle du contenu (voir le bind <Configure> plus bas),
-        # pas sur celle, plus grande, de toute la colonne de droite.
+        # Jetons/Blindes de l'onglet Blindes. Largeur calée sur celle du
+        # cadre de prise de photo (ROSTER_PREVIEW_SIZE), pour un alignement
+        # visuel cohérent avec lui.
         CLUB_SUMMARY_HEIGHT = 130
-        summary_box = ttk.LabelFrame(top_row, text="Joueurs par club")
-        summary_box.pack(side="right")
+        summary_box = ttk.LabelFrame(self, text="Joueurs par club")
+        summary_box.place(relx=1.0, x=-15, y=12, anchor="ne")
         summary_canvas = tk.Canvas(
-            summary_box, bg=FELT, highlightthickness=0, height=CLUB_SUMMARY_HEIGHT,
+            summary_box, bg=FELT, highlightthickness=0,
+            width=ROSTER_PREVIEW_SIZE, height=CLUB_SUMMARY_HEIGHT,
         )
         summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
         summary_canvas.configure(yscrollcommand=summary_vscroll.set)
@@ -1037,13 +1035,7 @@ class RosterManagerDialog(ttk.Frame):
         summary_canvas.create_window((0, 0), window=self.club_summary_frame, anchor="nw")
         self.club_summary_frame.bind(
             "<Configure>",
-            lambda e: (
-                summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
-                # Largeur du canvas calée sur celle de son contenu, pas
-                # étirée sur le reste de la rangée (voir commentaire
-                # ci-dessus) — même technique que chips_rows_frame.
-                summary_canvas.configure(width=self.club_summary_frame.winfo_reqwidth()),
-            ),
+            lambda e: summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
         )
 
         def _on_summary_mousewheel(event):
