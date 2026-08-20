@@ -1019,6 +1019,17 @@ class RosterManagerDialog(ttk.Frame):
         btns.pack(fill="x", padx=12, pady=(0, 4))
         ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
         ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
+        fill_missing_btn = ttk.Button(
+            btns, text="Modifier clubs pour tous...", command=self._apply_default_club_to_missing,
+        )
+        fill_missing_btn.pack(side="left", padx=3)
+        Tooltip(
+            fill_missing_btn,
+            "Attribue le club par défaut (« Nom du Club », réglé dans\n"
+            "Paramètres) à tous les joueurs du répertoire qui n'ont\n"
+            "encore aucun club — ne touche jamais à un club déjà\n"
+            "renseigné.",
+        )
         ttk.Button(btns, text="Supprimer", command=self._delete).pack(side="left", padx=3)
         ttk.Button(
             btns, text="Tout supprimer", command=self._delete_all, style="Danger.TButton",
@@ -1172,6 +1183,40 @@ class RosterManagerDialog(ttk.Frame):
         if club is not None:
             roster.set_club(name, club)
             self._refresh()
+
+    def _apply_default_club_to_missing(self):
+        """Attribue le 'Nom du Club' réglé dans Paramètres à tous les
+        joueurs du répertoire sans club — n'écrase jamais un club déjà
+        renseigné (voir la même logique côté ajout, _add/_add_new_name)."""
+        default_club = export_prefs.load_value("club_name", "").strip()
+        if not default_club:
+            messagebox.showinfo(
+                "Info",
+                "Aucun club par défaut réglé pour l'instant — renseignez "
+                "d'abord « Nom du Club » dans Paramètres.",
+                parent=self,
+            )
+            return
+        entries = roster.load_roster_entries()
+        missing = [e["name"] for e in entries if not e["club"]]
+        if not missing:
+            messagebox.showinfo(
+                "Info", "Tous les joueurs du répertoire ont déjà un club.", parent=self,
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirmer",
+            f"Attribuer le club « {default_club} » aux {len(missing)} joueur(s) "
+            "du répertoire qui n'ont encore aucun club ?",
+            parent=self,
+        ):
+            return
+        for name in missing:
+            roster.set_club(name, default_club)
+        self._refresh()
+        messagebox.showinfo(
+            "Terminé", f"{len(missing)} joueur(s) mis à jour.", parent=self,
+        )
 
     def _delete(self):
         name = self._selected_name()
