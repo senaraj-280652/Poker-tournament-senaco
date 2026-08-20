@@ -75,6 +75,7 @@ except ImportError:
 
 PLAYER_THUMB_SIZE = 28  # taille des vignettes dans le tableau des joueurs
 ROSTER_PREVIEW_SIZE = 160  # taille de l'aperçu dans le répertoire
+ROSTER_ROW_THUMB_SIZE = 28  # taille des vignettes dans le tableau du répertoire (colonne Photo)
 
 
 def open_file_with_default_app(path):
@@ -1062,9 +1063,17 @@ class RosterManagerDialog(ttk.Frame):
 
         list_frame = ttk.Frame(body)
         list_frame.pack(side="left", fill="both", expand=True)
+        # show="tree headings" plutôt que "headings" seul : la photo (une
+        # image par ligne) ne peut s'afficher que dans la toute première
+        # colonne d'un Treeview ("#0", la colonne "arbre") — jamais dans
+        # une colonne de données ordinaire comme "club", même en pratique
+        # positionnée après elle. Même contrainte, même solution que la
+        # colonne Photo de l'onglet Joueurs (voir _refresh_players_tab).
         self.roster_tree = ttk.Treeview(
-            list_frame, columns=("name", "club"), show="headings", selectmode="browse",
+            list_frame, columns=("name", "club"), show="tree headings", selectmode="browse",
         )
+        self.roster_tree.heading("#0", text="Photo")
+        self.roster_tree.column("#0", width=ROSTER_ROW_THUMB_SIZE + 16, stretch=False, anchor="center")
         self.roster_tree.heading("name", text="Nom", command=lambda: self._sort_roster_by("name"))
         self.roster_tree.heading("club", text="Club", command=lambda: self._sort_roster_by("club"))
         self.roster_tree.column("name", width=180, anchor="w")
@@ -1077,13 +1086,23 @@ class RosterManagerDialog(ttk.Frame):
 
         photo_frame = ttk.Frame(body)
         photo_frame.pack(side="left", fill="y", padx=(12, 0))
+
+        # Petit tableau de synthèse "Club / Nombre" — au-dessus de
+        # l'aperçu/prise de photo, recalculé à chaque _refresh() (donc à
+        # chaque ajout/modification d'un joueur, comme demandé). "Sans"
+        # regroupe les joueurs sans club, toujours affiché en premier.
+        summary_box = ttk.LabelFrame(photo_frame, text="Joueurs par club")
+        summary_box.pack(fill="x")
+        self.club_summary_frame = ttk.Frame(summary_box)
+        self.club_summary_frame.pack(fill="x", padx=6, pady=6)
+
         preview_container = tk.Frame(
             photo_frame, width=ROSTER_PREVIEW_SIZE, height=ROSTER_PREVIEW_SIZE, bg=CREAM
         )
         preview_container.pack_propagate(False)  # taille fixe en pixels, quel que soit le contenu
-        # pady(top) : laisse un peu d'air au-dessus de la vignette, qui
-        # touchait presque le haut de la fenêtre auparavant.
-        preview_container.pack(pady=(24, 0))
+        # pady(top) : laisse un peu d'air sous le tableau de synthèse
+        # au-dessus (voir summary_box).
+        preview_container.pack(pady=(12, 0))
         self.preview_lbl = tk.Label(
             preview_container, bg=CREAM, text="Aucune photo", fg="#888888",
         )
@@ -1125,11 +1144,54 @@ class RosterManagerDialog(ttk.Frame):
         if not self.roster_sort["ascending"]:
             entries.reverse()
         self._update_roster_sort_headings()
+        self.roster_row_photo_images = {}  # {nom: PhotoImage} — évite le garbage collect
         for e in entries:
-            self.roster_tree.insert("", "end", iid=e["name"], values=(e["name"], e["club"]))
+            photo_path = player_photos.get_photo_path(e["name"])
+            photo = load_thumbnail(photo_path, ROSTER_ROW_THUMB_SIZE) if photo_path else None
+            if photo is not None:
+                self.roster_row_photo_images[e["name"]] = photo
+            self.roster_tree.insert(
+                "", "end", iid=e["name"], image=photo if photo is not None else "",
+                values=(e["name"], e["club"]),
+            )
         if selected and self.roster_tree.exists(selected):
             self.roster_tree.selection_set(selected)
+        self._refresh_club_summary(entries)
         self._refresh_preview()
+
+    def _refresh_club_summary(self, entries):
+        """Reconstruit le petit tableau 'Club / Nombre' au-dessus de
+        l'aperçu photo — appelé par _refresh(), donc à chaque
+        ajout/modification/suppression d'un joueur du répertoire. 'Sans'
+        regroupe les joueurs sans club, toujours affiché en premier ;
+        les vrais clubs suivent par ordre alphabétique."""
+        for w in self.club_summary_frame.winfo_children():
+            w.destroy()
+        counts = {}
+        for e in entries:
+            key = e["club"] or "Sans"
+            counts[key] = counts.get(key, 0) + 1
+        ordered = ([("Sans", counts["Sans"])] if "Sans" in counts else []) + sorted(
+            (item for item in counts.items() if item[0] != "Sans"), key=lambda item: item[0].lower()
+        )
+        ttk.Label(
+            self.club_summary_frame, text="Club", font=("Helvetica", 9, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ttk.Label(
+            self.club_summary_frame, text="Nombre", font=("Helvetica", 9, "bold"),
+        ).grid(row=0, column=1, sticky="e")
+        if not ordered:
+            ttk.Label(
+                self.club_summary_frame, text="(répertoire vide)", foreground=MUTED,
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            return
+        for i, (club, count) in enumerate(ordered, start=1):
+            ttk.Label(self.club_summary_frame, text=club).grid(
+                row=i, column=0, sticky="w", padx=(0, 12), pady=1
+            )
+            ttk.Label(self.club_summary_frame, text=str(count)).grid(
+                row=i, column=1, sticky="e", pady=1
+            )
 
     def _refresh_preview(self):
         name = self._selected_name()
