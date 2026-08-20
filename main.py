@@ -1009,47 +1009,35 @@ class RosterManagerDialog(ttk.Frame):
         # recalculé à chaque _refresh() (donc à chaque ajout/modification/
         # suppression d'un joueur).
         #
-        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT) avec ascenseur : le nombre
-        # de clubs distincts n'est pas borné (variantes/fautes de frappe
-        # incluses, ex. "CPC" et "CPC&") et grossirait ce tableau sans
-        # limite — même principe (Canvas + Scrollbar) que les tableaux
-        # Jetons/Blindes de l'onglet Blindes. Largeur calée sur celle du
-        # cadre de prise de photo (ROSTER_PREVIEW_SIZE), pour un alignement
+        # Hauteur bloquée avec ascenseur : le nombre de clubs distincts
+        # n'est pas borné (variantes/fautes de frappe incluses, ex. "CPC"
+        # et "CPC&") et grossirait ce tableau sans limite. Un Treeview
+        # (plutôt qu'un Canvas + fenêtre intégrée + widgets détruits/
+        # recréés à chaque rafraîchissement, essayé d'abord) : ce dernier
+        # provoquait un affichage tronqué/superposé (artefact de rendu
+        # Tk connu avec ce genre de construction) — un Treeview gère son
+        # défilement nativement, sans ce risque, et height=N lignes suffit
+        # à borner sa hauteur sans le moindre Canvas ni scrollregion à
+        # gérer à la main. Largeur des colonnes calée sur celle du cadre
+        # de prise de photo (ROSTER_PREVIEW_SIZE), pour un alignement
         # visuel cohérent avec lui.
-        CLUB_SUMMARY_HEIGHT = 130
         summary_box = ttk.LabelFrame(self, text="Joueurs par club")
         summary_box.place(relx=1.0, x=-15, y=12, anchor="ne")
-        # Gardé sur self (pas une simple variable locale) : _refresh_club_summary
-        # doit pouvoir recalculer la scrollregion et remettre l'ascenseur
-        # en haut à chaque reconstruction du tableau (voir plus bas).
-        self.summary_canvas = tk.Canvas(
-            summary_box, bg=FELT, highlightthickness=0,
-            width=ROSTER_PREVIEW_SIZE, height=CLUB_SUMMARY_HEIGHT,
+        self.club_summary_tree = ttk.Treeview(
+            summary_box, columns=("club", "count"), show="headings",
+            height=4, selectmode="none",
         )
-        summary_canvas = self.summary_canvas
-        summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
-        summary_canvas.configure(yscrollcommand=summary_vscroll.set)
-        # vscroll empaqueté AVANT canvas : sinon canvas capterait tout
+        self.club_summary_tree.heading("club", text="Club")
+        self.club_summary_tree.heading("count", text="Nombre")
+        self.club_summary_tree.column("club", width=int(ROSTER_PREVIEW_SIZE * 0.62), anchor="w", stretch=False)
+        self.club_summary_tree.column("count", width=int(ROSTER_PREVIEW_SIZE * 0.38), anchor="e", stretch=False)
+        summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=self.club_summary_tree.yview)
+        self.club_summary_tree.configure(yscrollcommand=summary_vscroll.set)
+        # vscroll empaqueté AVANT le tree : sinon le tree capterait tout
         # l'espace restant et la scrollbar n'aurait plus de place (même
         # raison qu'ailleurs dans ce fichier).
         summary_vscroll.pack(side="right", fill="y")
-        summary_canvas.pack(side="left", padx=6, pady=6)
-
-        self.club_summary_frame = ttk.Frame(summary_canvas)
-        summary_canvas.create_window((0, 0), window=self.club_summary_frame, anchor="nw")
-        self.club_summary_frame.bind(
-            "<Configure>",
-            lambda e: summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
-        )
-
-        def _on_summary_mousewheel(event):
-            if self.tk.call("tk", "windowingsystem") == "aqua":
-                summary_canvas.yview_scroll(int(-1 * event.delta), "units")
-            else:
-                summary_canvas.yview_scroll(int(-1 * event.delta / 120), "units")
-
-        summary_canvas.bind("<Enter>", lambda e: summary_canvas.bind_all("<MouseWheel>", _on_summary_mousewheel))
-        summary_canvas.bind("<Leave>", lambda e: summary_canvas.unbind_all("<MouseWheel>"))
+        self.club_summary_tree.pack(side="left", padx=6, pady=6)
 
         # Tous les boutons d'action tout en haut de la fenêtre (avant la
         # zone de liste, extensible) : ils restent ainsi toujours visibles
@@ -1214,8 +1202,8 @@ class RosterManagerDialog(ttk.Frame):
         ajout/modification/suppression d'un joueur du répertoire. 'Sans'
         regroupe les joueurs sans club, toujours affiché en premier ;
         les vrais clubs suivent par ordre alphabétique."""
-        for w in self.club_summary_frame.winfo_children():
-            w.destroy()
+        for row in self.club_summary_tree.get_children():
+            self.club_summary_tree.delete(row)
         counts = {}
         for e in entries:
             key = e["club"] or "Sans"
@@ -1223,37 +1211,8 @@ class RosterManagerDialog(ttk.Frame):
         ordered = ([("Sans", counts["Sans"])] if "Sans" in counts else []) + sorted(
             (item for item in counts.items() if item[0] != "Sans"), key=lambda item: item[0].lower()
         )
-        ttk.Label(
-            self.club_summary_frame, text="Club", font=("Helvetica", 9, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ttk.Label(
-            self.club_summary_frame, text="Nombre", font=("Helvetica", 9, "bold"),
-        ).grid(row=0, column=1, sticky="e")
-        if not ordered:
-            ttk.Label(
-                self.club_summary_frame, text="(répertoire vide)", foreground=MUTED,
-            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
-            self.club_summary_frame.update_idletasks()
-            self.summary_canvas.configure(scrollregion=self.summary_canvas.bbox("all"))
-            self.summary_canvas.yview_moveto(0)
-            return
-        for i, (club, count) in enumerate(ordered, start=1):
-            ttk.Label(self.club_summary_frame, text=club).grid(
-                row=i, column=0, sticky="w", padx=(0, 12), pady=1
-            )
-            ttk.Label(self.club_summary_frame, text=str(count)).grid(
-                row=i, column=1, sticky="e", pady=1
-            )
-        # Force le recalcul de la scrollregion et remet l'ascenseur en
-        # haut MAINTENANT, plutôt que de compter uniquement sur le bind
-        # <Configure> du frame (déclenché un peu plus tard, une fois la
-        # géométrie de Tk réellement à jour) : sans ça, si le tableau
-        # rétrécit d'un coup (moins de clubs qu'avant), l'ancienne
-        # position de défilement pouvait rester au-delà du nouveau
-        # contenu, laissant un affichage tronqué/à moitié à jour.
-        self.club_summary_frame.update_idletasks()
-        self.summary_canvas.configure(scrollregion=self.summary_canvas.bbox("all"))
-        self.summary_canvas.yview_moveto(0)
+        for club, count in ordered:
+            self.club_summary_tree.insert("", "end", values=(club, count))
 
     def _refresh_preview(self):
         name = self._selected_name()
