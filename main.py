@@ -1223,6 +1223,9 @@ class RosterManagerDialog(ttk.Frame):
         )
         for club, count in ordered:
             self.club_summary_tree.insert("", "end", values=(club, count))
+        # Total à droite du titre : somme de tous les joueurs du
+        # répertoire, tous clubs (et "Sans") confondus.
+        self.summary_box.configure(text=f"Joueurs par club  (total={len(entries)})")
         # Remis au premier plan à CHAQUE rafraîchissement (pas seulement
         # à la construction initiale) : voir le commentaire à la création
         # de self.summary_box — un autre widget (re-)construit/repacké
