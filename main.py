@@ -1021,7 +1021,14 @@ class RosterManagerDialog(ttk.Frame):
         # gérer à la main. Largeur des colonnes calée sur celle du cadre
         # de prise de photo (ROSTER_PREVIEW_SIZE), pour un alignement
         # visuel cohérent avec lui.
-        summary_box = ttk.LabelFrame(self, text="Joueurs par club")
+        # Gardé sur self : _refresh() le remet au premier plan à chaque
+        # rafraîchissement (voir plus bas et self.summary_box.lift() en
+        # fin de __init__) — sans ça, les widgets créés APRÈS lui (la
+        # liste du répertoire, le cadre photo...) passent devant dans
+        # l'ordre d'empilement Tk par défaut (le plus récent créé au-
+        # dessus), d'où les "stries" : un mélange visuel des deux.
+        self.summary_box = ttk.LabelFrame(self, text="Joueurs par club")
+        summary_box = self.summary_box
         summary_box.place(relx=1.0, x=-15, y=12, anchor="ne")
 
         # --- TEMPORAIRE (débogage) : poignée pour glisser summary_box à
@@ -1244,6 +1251,11 @@ class RosterManagerDialog(ttk.Frame):
         )
         for club, count in ordered:
             self.club_summary_tree.insert("", "end", values=(club, count))
+        # Remis au premier plan à CHAQUE rafraîchissement (pas seulement
+        # à la construction initiale) : voir le commentaire à la création
+        # de self.summary_box — un autre widget (re-)construit/repacké
+        # entre-temps pourrait sinon repasser devant.
+        self.summary_box.lift()
 
     def _refresh_preview(self):
         name = self._selected_name()
