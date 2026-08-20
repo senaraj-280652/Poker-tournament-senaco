@@ -1019,10 +1019,14 @@ class RosterManagerDialog(ttk.Frame):
         CLUB_SUMMARY_HEIGHT = 130
         summary_box = ttk.LabelFrame(self, text="Joueurs par club")
         summary_box.place(relx=1.0, x=-15, y=12, anchor="ne")
-        summary_canvas = tk.Canvas(
+        # Gardé sur self (pas une simple variable locale) : _refresh_club_summary
+        # doit pouvoir recalculer la scrollregion et remettre l'ascenseur
+        # en haut à chaque reconstruction du tableau (voir plus bas).
+        self.summary_canvas = tk.Canvas(
             summary_box, bg=FELT, highlightthickness=0,
             width=ROSTER_PREVIEW_SIZE, height=CLUB_SUMMARY_HEIGHT,
         )
+        summary_canvas = self.summary_canvas
         summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
         summary_canvas.configure(yscrollcommand=summary_vscroll.set)
         # vscroll empaqueté AVANT canvas : sinon canvas capterait tout
@@ -1229,6 +1233,9 @@ class RosterManagerDialog(ttk.Frame):
             ttk.Label(
                 self.club_summary_frame, text="(répertoire vide)", foreground=MUTED,
             ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            self.club_summary_frame.update_idletasks()
+            self.summary_canvas.configure(scrollregion=self.summary_canvas.bbox("all"))
+            self.summary_canvas.yview_moveto(0)
             return
         for i, (club, count) in enumerate(ordered, start=1):
             ttk.Label(self.club_summary_frame, text=club).grid(
@@ -1237,6 +1244,16 @@ class RosterManagerDialog(ttk.Frame):
             ttk.Label(self.club_summary_frame, text=str(count)).grid(
                 row=i, column=1, sticky="e", pady=1
             )
+        # Force le recalcul de la scrollregion et remet l'ascenseur en
+        # haut MAINTENANT, plutôt que de compter uniquement sur le bind
+        # <Configure> du frame (déclenché un peu plus tard, une fois la
+        # géométrie de Tk réellement à jour) : sans ça, si le tableau
+        # rétrécit d'un coup (moins de clubs qu'avant), l'ancienne
+        # position de défilement pouvait rester au-delà du nouveau
+        # contenu, laissant un affichage tronqué/à moitié à jour.
+        self.club_summary_frame.update_idletasks()
+        self.summary_canvas.configure(scrollregion=self.summary_canvas.bbox("all"))
+        self.summary_canvas.yview_moveto(0)
 
     def _refresh_preview(self):
         name = self._selected_name()
