@@ -3194,17 +3194,20 @@ class App(tk.Tk):
     def _update_window_title(self):
         """Met à jour le titre de la fenêtre et le bandeau avec le nom du
         tournoi en cours (appelé à l'ouverture et après chaque changement
-        de paramètres)."""
+        de paramètres). Format "Tournoi : <nom> <date du jour>" — la date
+        est celle du jour où la fenêtre est affichée (recalculée à chaque
+        appel), pas forcément celle de création du tournoi."""
         name = self.db.get_setting("tournament_name", "Tournoi") if self.db else ""
         if self.db and name in ("", "Nouveau tournoi", "Tournoi"):
             fallback = os.path.splitext(os.path.basename(self.db.path))[0]
             if fallback:
                 name = fallback
-        title = f"{APP_NAME} — {name}" if name else APP_NAME
+        today = datetime.now().strftime("%d/%m/%Y")
+        title = f"Tournoi : {name} {today}" if name else APP_NAME
         self.title(title)
         if hasattr(self, "header_title_lbl"):
             self.header_title_lbl.config(
-                text=f"♠ ♥  {APP_NAME} — {name}  ♦ ♣" if name
+                text=f"♠ ♥  Tournoi : {name} {today}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
             )
 
