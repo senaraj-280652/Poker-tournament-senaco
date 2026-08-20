@@ -1023,6 +1023,37 @@ class RosterManagerDialog(ttk.Frame):
         # visuel cohérent avec lui.
         summary_box = ttk.LabelFrame(self, text="Joueurs par club")
         summary_box.place(relx=1.0, x=-15, y=12, anchor="ne")
+
+        # --- TEMPORAIRE (débogage) : poignée pour glisser summary_box à
+        # la souris — sert à vérifier si le problème d'affichage signalé
+        # suit le widget quand on le déplace (bug du widget lui-même) ou
+        # reste fixe à l'écran (artefact d'un autre élément sous/derrière
+        # lui). À retirer une fois la cause du glitch confirmée.
+        drag_handle = tk.Label(
+            summary_box, text="⣿⣿ (glisser ici pour déplacer — débogage)",
+            bg=FELT, fg=MUTED, cursor="fleur", font=("Helvetica", 8),
+        )
+        drag_handle.pack(fill="x", pady=(0, 2))
+
+        def _start_summary_drag(event):
+            self._summary_drag_offset = (
+                event.x_root - summary_box.winfo_rootx(),
+                event.y_root - summary_box.winfo_rooty(),
+            )
+
+        def _do_summary_drag(event):
+            offset = getattr(self, "_summary_drag_offset", None)
+            if offset is None:
+                return
+            ox, oy = offset
+            new_x = event.x_root - self.winfo_rootx() - ox
+            new_y = event.y_root - self.winfo_rooty() - oy
+            summary_box.place(x=new_x, y=new_y, relx=0, rely=0, anchor="nw")
+
+        drag_handle.bind("<Button-1>", _start_summary_drag)
+        drag_handle.bind("<B1-Motion>", _do_summary_drag)
+        # --- fin du bloc temporaire ---
+
         self.club_summary_tree = ttk.Treeview(
             summary_box, columns=("club", "count"), show="headings",
             height=4, selectmode="none",
