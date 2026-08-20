@@ -24,7 +24,6 @@ from database import (
     export_period_summary_xlsx, export_period_summary_pdf,
     read_player_names_from_file, bounty_unit_value, find_players_active_elsewhere,
     find_stale_active_players, withdraw_stale_active_players,
-    find_finished_tournament_files, archive_tournament_files,
     format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
@@ -1011,28 +1010,31 @@ class RosterManagerDialog(ttk.Frame):
             btns, text="Tout supprimer", command=self._delete_all, style="Danger.TButton",
         ).pack(side="left", padx=3)
 
+        # Largeur réduite au minimum (naturelle, pas fill="x") pour ces 4
+        # boutons : le texte suffit à les rendre lisibles, inutile de les
+        # étirer sur toute la largeur de l'onglet.
         btns2 = ttk.Frame(self)
         btns2.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Button(
             btns2, text="Importer les joueurs d'un tournoi existant...",
             command=self._import_from_tournament,
-        ).pack(fill="x")
+        ).pack(anchor="w")
 
         btns_csv = ttk.Frame(self)
         btns_csv.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Button(
             btns_csv, text="Importer (CSV)...", command=self._import_csv,
-        ).pack(side="left", fill="x", expand=True)
+        ).pack(side="left")
         ttk.Button(
             btns_csv, text="Exporter (CSV)...", command=self._export_csv,
-        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ).pack(side="left", padx=(6, 0))
 
         btns3 = ttk.Frame(self)
         btns3.pack(fill="x", padx=12, pady=(0, 8))
         reactivate_btn = ttk.Button(
             btns3, text="Tout réactiver...", command=self._reactivate_all,
         )
-        reactivate_btn.pack(fill="x")
+        reactivate_btn.pack(anchor="w")
         Tooltip(
             reactivate_btn,
             "Cherche, dans un dossier au choix, TOUS les tournois où des\n"
@@ -1500,48 +1502,11 @@ class LobbyDialog(tk.Toplevel):
                 master, chapter_title="14. Sit & Go et gestion de plusieurs tournois", section_title="Lobby"
             ),
         )
-        # Dossier choisi explicitement pour le Lobby (via "Choisir un
-        # dossier...") en priorité ; sinon, se rabat sur le dernier
-        # dossier utilisé pour créer un tournoi (voir default_tournament_dir)
-        # — et LE SUIT À CHAQUE RAFRAÎCHISSEMENT tant qu'aucun dossier
-        # explicite n'a été choisi (voir _refresh), pour qu'un tournoi/SNG
-        # créé dans un nouveau dossier apparaisse sans avoir à fermer et
-        # rouvrir le Lobby, ni à re-choisir un dossier à la main.
-        self._explicit_folder = bool(export_prefs.load_value("lobby_folder"))
-        self.folder = (
-            export_prefs.load_value("lobby_folder")
-            or export_prefs.load_value("last_tournament_dir")
-            or ""
-        )
         self._after_id = None
         self._paths_by_iid = {}
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
-        choose_folder_btn = ttk.Button(top, text="📂  Choisir un dossier...", command=self._choose_folder)
-        choose_folder_btn.pack(side="left")
-        self.folder_lbl = ttk.Label(
-            top, text=self.folder or "(aucun dossier choisi)", foreground=MUTED,
-        )
-        self.folder_lbl.pack(side="left", padx=10)
-        Tooltip(
-            choose_folder_btn,
-            "Ne sert qu'à \"Archiver les terminés...\" ci-contre : la\n"
-            "liste ci-dessous montre toujours tous les tournois\n"
-            "actuellement ouverts (peu importe leur dossier), jamais\n"
-            "les autres fichiers .tournoi d'un dossier.",
-        )
-        ttk.Button(top, text="🔄  Rafraîchir", command=self._refresh).pack(side="right")
-        archive_btn = ttk.Button(
-            top, text="🗄  Archiver les terminés...", command=self._archive_finished,
-        )
-        archive_btn.pack(side="right", padx=(0, 8))
-        Tooltip(
-            archive_btn,
-            "Déplace chaque tournoi terminé de ce dossier dans un\n"
-            "sous-dossier \"archive\" créé (si besoin) dans son propre\n"
-            "dossier — celui où il a été créé, pas ailleurs.",
-        )
 
         self.hide_finished_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -1580,33 +1545,10 @@ class LobbyDialog(tk.Toplevel):
         ttk.Button(bottom, text="Fermer", command=self._on_close).pack(side="right")
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        if self.folder:
-            self._refresh()
+        self._refresh()
         self._schedule_refresh()
 
-    def _choose_folder(self):
-        folder = filedialog.askdirectory(
-            title="Choisir le dossier des tournois", parent=self,
-        )
-        if not folder:
-            return
-        self.folder = folder
-        self._explicit_folder = True
-        export_prefs.save_value("lobby_folder", folder)
-        self.folder_lbl.config(text=folder)
-        self._refresh()
-
     def _refresh(self):
-        if not self._explicit_folder:
-            # Aucun dossier choisi à la main : reprend le dernier dossier
-            # utilisé pour créer un tournoi à CHAQUE rafraîchissement (pas
-            # seulement à l'ouverture du Lobby), pour qu'un tournoi/SNG
-            # tout juste créé dans un nouveau dossier apparaisse sans
-            # avoir à fermer/rouvrir cette fenêtre.
-            latest = export_prefs.load_value("last_tournament_dir") or ""
-            if latest and latest != self.folder:
-                self.folder = latest
-                self.folder_lbl.config(text=latest)
         selected_path = self._selected_path()
         for row in self.tree.get_children():
             self.tree.delete(row)
@@ -1615,12 +1557,10 @@ class LobbyDialog(tk.Toplevel):
         # UNIQUEMENT les tournois actuellement ouverts (voir
         # open_windows.py), peu importe leur dossier — plus le contenu
         # d'un dossier scanné : un tournoi juste présent sur disque (pas
-        # ouvert dans une fenêtre en ce moment) n'a pas sa place ici,
-        # seul "Archiver les terminés..." ci-dessus continue de
-        # s'appuyer sur le dossier choisi. "Masquer les tournois
-        # terminés" (coché par défaut) filtre encore ensuite : un
-        # tournoi ouvert mais déjà terminé (fenêtre pas encore refermée)
-        # ne doit pas non plus y figurer.
+        # ouvert dans une fenêtre en ce moment) n'a pas sa place ici.
+        # "Masquer les tournois terminés" (coché par défaut) filtre
+        # encore ensuite : un tournoi ouvert mais déjà terminé (fenêtre
+        # pas encore refermée) ne doit pas non plus y figurer.
         paths = []
         seen = set()
         for path in open_windows.list_open_paths():
@@ -1684,31 +1624,6 @@ class LobbyDialog(tk.Toplevel):
         if not sel:
             return None
         return self._paths_by_iid.get(sel[0])
-
-    def _archive_finished(self):
-        if not self.folder or not os.path.isdir(self.folder):
-            messagebox.showinfo("Archiver", "Choisissez d'abord un dossier.", parent=self)
-            return
-        entries = find_finished_tournament_files(self.folder)
-        if not entries:
-            messagebox.showinfo(
-                "Archiver", "Aucun tournoi terminé à archiver dans ce dossier.", parent=self,
-            )
-            return
-        names = "\n".join(
-            f"- {e['name']} ({os.path.basename(e['path'])})" for e in entries
-        )
-        if not messagebox.askyesno(
-            "Archiver les tournois terminés",
-            f"{len(entries)} tournoi(s) terminé(s) va(ont) être déplacé(s) chacun dans un "
-            f"sous-dossier « archive » (créé si besoin, dans son propre dossier) :\n\n"
-            f"{names}\n\nContinuer ?",
-            parent=self,
-        ):
-            return
-        moved = archive_tournament_files([e["path"] for e in entries])
-        self._refresh()
-        messagebox.showinfo("Archiver", f"{moved} tournoi(s) archivé(s).", parent=self)
 
     def _on_tree_right_click(self, event):
         """Clic droit sur une ligne : la sélectionne (si pas déjà) puis
@@ -3245,21 +3160,12 @@ class App(tk.Tk):
         # ouvrait déjà une fenêtre indépendante avec cet écran
         # (_open_new_window, comportement inchangé), il l'affiche donc
         # bien lui aussi, juste dans une nouvelle fenêtre plutôt qu'en
-        # remplaçant celle-ci.
-        lobby_header_btn = ttk.Button(
-            inner, text="📋  Lobby", command=self._open_lobby,
-        )
-        lobby_header_btn.pack(side="left", pady=14)
-        Tooltip(
-            lobby_header_btn,
-            "Vue d'ensemble de tous les tournois/Sit & Go actuellement\n"
-            "ouverts (dans n'importe quelle fenêtre) et pas encore\n"
-            "terminés — double-cliquez pour basculer vers l'un d'eux.",
-        )
+        # remplaçant celle-ci. Ordre affiché : Menu principal puis Lobby
+        # (interverti par rapport à un tout premier essai).
         new_window_btn = ttk.Button(
             inner, text="🏠  Menu principal", command=self._open_new_window,
         )
-        new_window_btn.pack(side="left", padx=(8, 0), pady=14)
+        new_window_btn.pack(side="left", pady=14)
         Tooltip(
             new_window_btn,
             "Ouvre une nouvelle fenêtre indépendante de l'application, sans\n"
@@ -3267,6 +3173,16 @@ class App(tk.Tk):
             "tournois) en même temps, chacun dans sa propre fenêtre. Vous\n"
             "y retrouverez l'écran d'accueil habituel (Nouveau tournoi /\n"
             "Sit & Go rapide / Ouvrir).",
+        )
+        lobby_header_btn = ttk.Button(
+            inner, text="📋  Lobby", command=self._open_lobby,
+        )
+        lobby_header_btn.pack(side="left", padx=(8, 0), pady=14)
+        Tooltip(
+            lobby_header_btn,
+            "Vue d'ensemble de tous les tournois/Sit & Go actuellement\n"
+            "ouverts (dans n'importe quelle fenêtre) et pas encore\n"
+            "terminés — double-cliquez pour basculer vers l'un d'eux.",
         )
         self.header_title_lbl = tk.Label(
             inner, text=f"♠ ♥  {APP_NAME}  ♦ ♣",
@@ -3584,8 +3500,8 @@ class App(tk.Tk):
         # entrées, mêmes nouveaux libellés/rôles — la troisième
         # ("Lobby (plusieurs tournois)...") a disparu, son rôle étant
         # repris par la première.
-        filemenu.add_command(label="📋 Lobby...", command=self._open_lobby)
         filemenu.add_command(label="🏠 Menu principal (nouvelle fenêtre)...", command=self._open_new_window)
+        filemenu.add_command(label="📋 Lobby...", command=self._open_lobby)
         filemenu.add_separator()
         filemenu.add_command(label="Nouveau tournoi...", command=self._new_tournament)
         filemenu.add_command(label="Ouvrir...", command=self._open_tournament)
