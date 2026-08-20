@@ -3234,11 +3234,28 @@ class App(tk.Tk):
         header.pack(fill="x", side="top")
         inner = tk.Frame(header, bg=FELT_DARK)
         inner.pack(fill="x", padx=18)
-        ttk.Button(
-            inner, text="🏠  Menu principal", command=self._back_to_main_menu,
-        ).pack(side="left", pady=14)
+        # Réorganisation : l'ancien "🏠 Menu principal" (fermait le tournoi
+        # en cours pour revenir à l'écran Bienvenue DANS cette même
+        # fenêtre, voir l'ex-_back_to_main_menu) cède sa place à "📋
+        # Lobby" — accès direct plus utile au quotidien. Son rôle
+        # d'origine ("afficher l'écran Bienvenue") est repris par
+        # l'ancien "🚀 Nouveau SitnGO", renommé "🏠 Menu principal" : il
+        # ouvrait déjà une fenêtre indépendante avec cet écran
+        # (_open_new_window, comportement inchangé), il l'affiche donc
+        # bien lui aussi, juste dans une nouvelle fenêtre plutôt qu'en
+        # remplaçant celle-ci.
+        lobby_header_btn = ttk.Button(
+            inner, text="📋  Lobby", command=self._open_lobby,
+        )
+        lobby_header_btn.pack(side="left", pady=14)
+        Tooltip(
+            lobby_header_btn,
+            "Vue d'ensemble de tous les tournois/Sit & Go actuellement\n"
+            "ouverts (dans n'importe quelle fenêtre) et pas encore\n"
+            "terminés — double-cliquez pour basculer vers l'un d'eux.",
+        )
         new_window_btn = ttk.Button(
-            inner, text="🚀  Nouveau SitnGO", command=self._open_new_window,
+            inner, text="🏠  Menu principal", command=self._open_new_window,
         )
         new_window_btn.pack(side="left", padx=(8, 0), pady=14)
         Tooltip(
@@ -3272,15 +3289,6 @@ class App(tk.Tk):
                 text=f"♠ ♥  {APP_NAME} — {name}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
             )
-
-    def _back_to_main_menu(self):
-        if messagebox.askyesno(
-            "Menu principal",
-            "Fermer ce tournoi et revenir au menu principal ?\n\n"
-            "(Rien n'est perdu : toutes les données sont déjà enregistrées "
-            "dans le fichier .tournoi.)",
-        ):
-            self._new_tournament()
 
     def _open_new_window(self):
         """Lance une nouvelle instance indépendante de l'application (autre
@@ -3570,9 +3578,12 @@ class App(tk.Tk):
     def _build_menu(self):
         menubar = tk.Menu(self)
         filemenu = tk.Menu(menubar, tearoff=0)
-        filemenu.add_command(label="🏠 Menu principal", command=self._back_to_main_menu)
-        filemenu.add_command(label="🚀 Nouveau SitnGO (nouvelle fenêtre)...", command=self._open_new_window)
-        filemenu.add_command(label="📋 Lobby (plusieurs tournois)...", command=self._open_lobby)
+        # Voir le commentaire équivalent dans _build_header : mêmes deux
+        # entrées, mêmes nouveaux libellés/rôles — la troisième
+        # ("Lobby (plusieurs tournois)...") a disparu, son rôle étant
+        # repris par la première.
+        filemenu.add_command(label="📋 Lobby...", command=self._open_lobby)
+        filemenu.add_command(label="🏠 Menu principal (nouvelle fenêtre)...", command=self._open_new_window)
         filemenu.add_separator()
         filemenu.add_command(label="Nouveau tournoi...", command=self._new_tournament)
         filemenu.add_command(label="Ouvrir...", command=self._open_tournament)
@@ -4745,7 +4756,7 @@ class App(tk.Tk):
         réglage correspondant est activé (Paramètres). Silencieux si déjà
         démarré. Le port ne peut être occupé que par une seule fenêtre à
         la fois — normal et attendu si plusieurs tournois/Sit & Go tournent
-        en parallèle (voir "Nouveau SitnGO", chapitre 14) : la première
+        en parallèle (voir "Menu principal", chapitre 14) : la première
         fenêtre ouverte garde le contrôle à distance, les suivantes ne
         l'activent pas mais restent sinon parfaitement utilisables.
         `silent=True` (utilisé au lancement automatique d'une fenêtre,
