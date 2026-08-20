@@ -453,7 +453,11 @@ class PlayerSelectionDialog(tk.Toplevel):
         entry.pack(side="left", fill="x", expand=True, padx=(8, 4), pady=8)
         entry.bind("<Return>", lambda e: self._add_new_name())
         ttk.Label(add_frame, text="Club :").pack(side="left", padx=(4, 0))
-        self.new_name_club_var = tk.StringVar()
+        # Préempli avec le "Nom du Club" réglé dans Paramètres (commun à
+        # tous les tournois/Sit & Go, voir _build_settings_tab) plutôt
+        # que vide — la plupart des joueurs ajoutés ici viennent du même
+        # club que celui qui organise le tournoi.
+        self.new_name_club_var = tk.StringVar(value=export_prefs.load_value("club_name", ""))
         self.new_name_club_combo = ttk.Combobox(
             add_frame, textvariable=self.new_name_club_var, width=14,
             values=roster.list_clubs(),
@@ -616,7 +620,9 @@ class PlayerSelectionDialog(tk.Toplevel):
             roster.set_club(name, club)
         self.check_vars.setdefault(name, tk.BooleanVar()).set(True)
         self.new_name_var.set("")
-        self.new_name_club_var.set("")
+        # Revient au club par défaut (Paramètres), pas à vide : la plupart
+        # des ajouts suivants viendront probablement du même club.
+        self.new_name_club_var.set(export_prefs.load_value("club_name", ""))
         self._filter()
 
     def _import_from_previous_tournament(self):
@@ -1140,7 +1146,10 @@ class RosterManagerDialog(ttk.Frame):
     def _add(self):
         name = self.new_name_var.get().strip()
         if name:
-            roster.add_to_roster(name)
+            # Club par défaut = "Nom du Club" réglé dans Paramètres (commun
+            # à tous les tournois/Sit & Go) plutôt que vide — voir le même
+            # principe dans PlayerSelectionDialog._add_new_name.
+            roster.add_to_roster(name, club=export_prefs.load_value("club_name", "") or None)
             self.new_name_var.set("")
             self._refresh()
 
