@@ -963,26 +963,25 @@ def ask_club_dialog(master, title="Club", current_club=""):
     return result["club"]
 
 
-class RosterManagerDialog(tk.Toplevel):
-    """Fenêtre de gestion du répertoire de joueurs habituels, indépendante
-    de tout tournoi en cours."""
+class RosterManagerDialog(ttk.Frame):
+    """Onglet "Répertoire" de la fenêtre principale — gestion du
+    répertoire de joueurs habituels, indépendante de tout tournoi en
+    cours. Anciennement une fenêtre à part (tk.Toplevel) ouverte depuis
+    le menu Répertoire ; devenue un onglet du notebook (voir
+    App._build_tabs), d'où ce ttk.Frame comme classe de base — le
+    contenu (construction des widgets ci-dessous, méthodes d'action)
+    n'a pas changé, seul le contenant a changé de nature. Le F1
+    contextuel est géré globalement (voir TAB_TO_CHAPTER,
+    help_browser.py), plus besoin d'un bind dédié ici."""
 
-    def __init__(self, master):
+    def __init__(self, master, app):
         super().__init__(master)
-        self.app = master
-        self.title("Répertoire de joueurs")
-        self.geometry("640x540")
-        self.transient(master)
-        self.grab_set()
-        # Prend le pas sur le F1 global (voir App._show_context_help) tant
-        # que cette fenêtre a le focus : chapitre dédié plutôt que celui
-        # de l'onglet resté affiché derrière.
-        self.bind(
-            "<F1>",
-            lambda e: HelpBrowser.open_at(
-                master, chapter_title="16. Menu Répertoire — joueurs habituels et photos"
-            ),
-        )
+        # master = le notebook (parent Tk réel du widget, voir
+        # App._build_tabs) ; app = l'instance App elle-même — distincts
+        # depuis que cette fenêtre est devenue un onglet plutôt qu'un
+        # Toplevel ouvert avec App comme master direct (voir la même
+        # distinction dans PeriodSummaryDialog, juste à côté).
+        self.app = app
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
         self.roster_sort = {"column": "name", "ascending": True}
 
@@ -1011,7 +1010,6 @@ class RosterManagerDialog(tk.Toplevel):
         ttk.Button(
             btns, text="Tout supprimer", command=self._delete_all, style="Danger.TButton",
         ).pack(side="left", padx=3)
-        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right", padx=3)
 
         btns2 = ttk.Frame(self)
         btns2.pack(fill="x", padx=12, pady=(0, 8))
@@ -2135,26 +2133,31 @@ class ChipTemplatesDialog(tk.Toplevel):
             self._refresh()
 
 
-class PeriodSummaryDialog(tk.Toplevel):
-    """Synthèse des résultats de tous les tournois (.tournoi) trouvés dans
-    un dossier, pour une période donnée en paramètre (dates de début/fin),
-    en mentionnant les primes (bounty) empochées par chaque joueur."""
+class PeriodSummaryDialog(ttk.Frame):
+    """Onglet "Statistiques" de la fenêtre principale — synthèse des
+    résultats de tous les tournois (.tournoi) trouvés dans un dossier,
+    pour une période donnée (dates de début/fin), en mentionnant les
+    primes (bounty) empochées par chaque joueur. Anciennement une
+    fenêtre à part (tk.Toplevel) ouverte depuis le menu Statistiques ;
+    devenue un onglet du notebook (voir App._build_tabs), d'où ce
+    ttk.Frame comme classe de base — le contenu n'a pas changé. Le F1
+    contextuel est géré globalement (voir TAB_TO_CHAPTER,
+    help_browser.py), plus besoin d'un bind dédié ici."""
 
-    def __init__(self, master):
+    def __init__(self, master, app):
         super().__init__(master)
-        self.title("Synthèse des résultats par période")
-        self.configure(bg=FELT_DARK)
-        self.geometry("920x620")
-        self.transient(master)
-        self.bind(
-            "<F1>",
-            lambda e: HelpBrowser.open_at(master, chapter_title="15. Statistiques — Synthèse par période"),
-        )
+        # master = le notebook (parent Tk réel du widget, voir
+        # App._build_tabs) ; app = l'instance App elle-même, dont ce
+        # tournoi (self.app.db) dépend pour préremplir le dossier par
+        # défaut ci-dessous — distincts depuis que cette fenêtre est
+        # devenue un onglet plutôt qu'un Toplevel ouvert avec App comme
+        # master direct.
+        self.app = app
         self.summary = None
 
         default_folder = ""
-        if getattr(master, "db", None) is not None:
-            default_folder = os.path.dirname(os.path.abspath(master.db.path))
+        if getattr(app, "db", None) is not None:
+            default_folder = os.path.dirname(os.path.abspath(app.db.path))
         self.folder_var = tk.StringVar(value=default_folder)
         self.recursive_var = tk.BooleanVar(value=True)
         today = datetime.now()
@@ -2167,7 +2170,6 @@ class PeriodSummaryDialog(tk.Toplevel):
         btns = ttk.Frame(self)
         btns.pack(side="top", fill="x", padx=14, pady=(14, 6))
         ttk.Button(btns, text="Exporter...", command=self._open_export_dialog).pack(side="left")
-        ttk.Button(btns, text="Fermer", command=self.destroy).pack(side="right")
 
         params = ttk.Frame(self)
         params.pack(fill="x", padx=14, pady=(14, 6))
@@ -3656,10 +3658,16 @@ class App(tk.Tk):
         messagebox.showinfo("À propos", "\n".join(lines), parent=parent or self)
 
     def _open_period_summary(self):
-        PeriodSummaryDialog(self)
+        # Bascule vers l'onglet "Statistiques" (voir App._build_tabs) —
+        # avant cette réorganisation, ouvrait une fenêtre séparée
+        # (PeriodSummaryDialog). Le menu reste, en simple raccourci.
+        self.notebook.select(self.stats_tab)
 
     def _manage_roster(self):
-        RosterManagerDialog(self)
+        # Bascule vers l'onglet "Répertoire" (voir App._build_tabs) —
+        # avant cette réorganisation, ouvrait une fenêtre séparée
+        # (RosterManagerDialog). Le menu reste, en simple raccourci.
+        self.notebook.select(self.roster_tab)
 
     def _new_tournament(self):
         self._cleanup_for_close()
@@ -3699,6 +3707,14 @@ class App(tk.Tk):
         self.clock_tab = ttk.Frame(self.notebook)
         self.blinds_tab = ttk.Frame(self.notebook)
         self.payouts_tab = ttk.Frame(self.notebook)
+        # "Répertoire" et "Statistiques" : anciennement des fenêtres à
+        # part ouvertes depuis les menus Répertoire/Statistiques
+        # (RosterManagerDialog/PeriodSummaryDialog, voir leurs
+        # docstrings) — construisent tout leur contenu dans __init__,
+        # contrairement aux autres onglets ci-dessus (pas de
+        # _build_xxx_tab séparée à appeler juste en dessous).
+        self.roster_tab = RosterManagerDialog(self.notebook, self)
+        self.stats_tab = PeriodSummaryDialog(self.notebook, self)
         self.settings_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.players_tab, text="Joueurs")
@@ -3708,6 +3724,8 @@ class App(tk.Tk):
         self.notebook.add(self.blinds_tab, text="Blindes")
         self.notebook.add(self.clock_tab, text="Chronomètre")
         self.notebook.add(self.payouts_tab, text="Classement")
+        self.notebook.add(self.roster_tab, text="Répertoire")
+        self.notebook.add(self.stats_tab, text="Statistiques")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
         self._build_players_tab()
@@ -7386,6 +7404,12 @@ class App(tk.Tk):
             self._refresh_blinds_tab()
         elif current == "Classement":
             self._refresh_payouts_tab()
+        elif current == "Répertoire":
+            # Le répertoire peut avoir changé depuis un autre onglet
+            # (ex : nouveau joueur ajouté via Joueurs, qui l'enregistre
+            # aussi au répertoire) — sans ce rafraîchissement, revenir
+            # sur cet onglet pouvait afficher une liste périmée.
+            self.roster_tab._refresh()
 
     def _tick(self):
         if not self.winfo_exists():
