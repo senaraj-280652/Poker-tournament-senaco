@@ -991,10 +991,65 @@ class RosterManagerDialog(ttk.Frame):
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
         self.roster_sort = {"column": "name", "ascending": True}
 
+        # Rangée du tout haut de l'onglet : le titre à gauche, le petit
+        # tableau de synthèse "Club / Nombre" à droite — complètement en
+        # haut (rien au-dessus), plutôt que dans la colonne de droite
+        # (aperçu/prise de photo) plus bas, où il grossissait la largeur
+        # de toute cette colonne en même temps que sa hauteur.
+        top_row = ttk.Frame(self)
+        top_row.pack(fill="x", padx=12, pady=(12, 6))
         ttk.Label(
-            self, text="Joueurs habituels (proposés à la création d'un tournoi)",
+            top_row, text="Joueurs habituels (proposés à la création d'un tournoi)",
             font=("Helvetica", 10, "bold"),
-        ).pack(anchor="w", padx=12, pady=(12, 6))
+        ).pack(side="left", anchor="w")
+
+        # "Sans" regroupe les joueurs sans club, toujours affiché en
+        # premier ; recalculé à chaque _refresh() (donc à chaque ajout/
+        # modification/suppression d'un joueur).
+        #
+        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT), avec ascenseur : le nombre
+        # de clubs distincts n'est pas borné (variantes/fautes de frappe
+        # incluses, ex. "CPC" et "CPC&") et grossirait ce tableau sans
+        # limite — même principe (Canvas + Scrollbar) que les tableaux
+        # Jetons/Blindes de l'onglet Blindes. Largeur NON étirée
+        # (contrairement à un premier essai) : le canvas est calé sur la
+        # largeur réelle du contenu (voir le bind <Configure> plus bas),
+        # pas sur celle, plus grande, de toute la colonne de droite.
+        CLUB_SUMMARY_HEIGHT = 130
+        summary_box = ttk.LabelFrame(top_row, text="Joueurs par club")
+        summary_box.pack(side="right")
+        summary_canvas = tk.Canvas(
+            summary_box, bg=FELT, highlightthickness=0, height=CLUB_SUMMARY_HEIGHT,
+        )
+        summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
+        summary_canvas.configure(yscrollcommand=summary_vscroll.set)
+        # vscroll empaqueté AVANT canvas : sinon canvas capterait tout
+        # l'espace restant et la scrollbar n'aurait plus de place (même
+        # raison qu'ailleurs dans ce fichier).
+        summary_vscroll.pack(side="right", fill="y")
+        summary_canvas.pack(side="left", padx=6, pady=6)
+
+        self.club_summary_frame = ttk.Frame(summary_canvas)
+        summary_canvas.create_window((0, 0), window=self.club_summary_frame, anchor="nw")
+        self.club_summary_frame.bind(
+            "<Configure>",
+            lambda e: (
+                summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
+                # Largeur du canvas calée sur celle de son contenu, pas
+                # étirée sur le reste de la rangée (voir commentaire
+                # ci-dessus) — même technique que chips_rows_frame.
+                summary_canvas.configure(width=self.club_summary_frame.winfo_reqwidth()),
+            ),
+        )
+
+        def _on_summary_mousewheel(event):
+            if self.tk.call("tk", "windowingsystem") == "aqua":
+                summary_canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                summary_canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        summary_canvas.bind("<Enter>", lambda e: summary_canvas.bind_all("<MouseWheel>", _on_summary_mousewheel))
+        summary_canvas.bind("<Leave>", lambda e: summary_canvas.unbind_all("<MouseWheel>"))
 
         # Tous les boutons d'action tout en haut de la fenêtre (avant la
         # zone de liste, extensible) : ils restent ainsi toujours visibles
@@ -1087,54 +1142,13 @@ class RosterManagerDialog(ttk.Frame):
         photo_frame = ttk.Frame(body)
         photo_frame.pack(side="left", fill="y", padx=(12, 0))
 
-        # Petit tableau de synthèse "Club / Nombre" — tout en haut, au-dessus
-        # de l'aperçu/prise de photo, recalculé à chaque _refresh() (donc à
-        # chaque ajout/modification d'un joueur, comme demandé). "Sans"
-        # regroupe les joueurs sans club, toujours affiché en premier.
-        #
-        # Hauteur bloquée (CLUB_SUMMARY_HEIGHT), avec ascenseur : le nombre
-        # de clubs distincts n'est pas borné (variantes/fautes de frappe
-        # incluses, ex. "CPC" et "CPC&") et grossirait ce tableau sans
-        # limite, poussant le cadre de prise de photo juste en dessous de
-        # plus en plus bas — même principe (Canvas + Scrollbar) que les
-        # tableaux Jetons/Blindes de l'onglet Blindes.
-        CLUB_SUMMARY_HEIGHT = 130
-        summary_box = ttk.LabelFrame(photo_frame, text="Joueurs par club")
-        summary_box.pack(fill="x")
-        summary_canvas = tk.Canvas(
-            summary_box, bg=FELT, highlightthickness=0, height=CLUB_SUMMARY_HEIGHT,
-        )
-        summary_vscroll = ttk.Scrollbar(summary_box, orient="vertical", command=summary_canvas.yview)
-        summary_canvas.configure(yscrollcommand=summary_vscroll.set)
-        # vscroll empaqueté AVANT canvas (expand=True) : sinon canvas
-        # capterait tout l'espace restant et la scrollbar n'aurait plus
-        # de place (même raison qu'ailleurs dans ce fichier).
-        summary_vscroll.pack(side="right", fill="y")
-        summary_canvas.pack(side="left", fill="x", expand=True, padx=6, pady=6)
-
-        self.club_summary_frame = ttk.Frame(summary_canvas)
-        summary_canvas.create_window((0, 0), window=self.club_summary_frame, anchor="nw")
-        self.club_summary_frame.bind(
-            "<Configure>",
-            lambda e: summary_canvas.configure(scrollregion=summary_canvas.bbox("all")),
-        )
-
-        def _on_summary_mousewheel(event):
-            if self.tk.call("tk", "windowingsystem") == "aqua":
-                summary_canvas.yview_scroll(int(-1 * event.delta), "units")
-            else:
-                summary_canvas.yview_scroll(int(-1 * event.delta / 120), "units")
-
-        summary_canvas.bind("<Enter>", lambda e: summary_canvas.bind_all("<MouseWheel>", _on_summary_mousewheel))
-        summary_canvas.bind("<Leave>", lambda e: summary_canvas.unbind_all("<MouseWheel>"))
-
         preview_container = tk.Frame(
             photo_frame, width=ROSTER_PREVIEW_SIZE, height=ROSTER_PREVIEW_SIZE, bg=CREAM
         )
         preview_container.pack_propagate(False)  # taille fixe en pixels, quel que soit le contenu
-        # pady(top) : laisse un peu d'air sous le tableau de synthèse
-        # au-dessus (voir summary_box).
-        preview_container.pack(pady=(12, 0))
+        # pady(top) : laisse un peu d'air au-dessus de la vignette, qui
+        # touchait presque le haut de la fenêtre auparavant.
+        preview_container.pack(pady=(24, 0))
         self.preview_lbl = tk.Label(
             preview_container, bg=CREAM, text="Aucune photo", fg="#888888",
         )
