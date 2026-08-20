@@ -165,6 +165,7 @@ CREATE TABLE IF NOT EXISTS players (
     bounty INTEGER NOT NULL DEFAULT 0,       -- prime actuellement portée par ce joueur
     bounty_won INTEGER NOT NULL DEFAULT 0,   -- cumul des primes empochées (en cash)
     kills INTEGER NOT NULL DEFAULT 0,        -- nb de joueurs éliminés par ce joueur (prime de bounty en points)
+    club TEXT NOT NULL DEFAULT '',           -- club du joueur POUR CE TOURNOI (copié du répertoire à l'ajout, voir roster.py)
     FOREIGN KEY(table_id) REFERENCES tables_pk(id)
 );
 
@@ -304,6 +305,8 @@ class Database:
             self.conn.execute("ALTER TABLE players ADD COLUMN elim_round INTEGER")
         if "eliminated_by_name" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN eliminated_by_name TEXT")
+        if "club" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN club TEXT NOT NULL DEFAULT ''")
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -466,13 +469,17 @@ class Database:
                 return path
         return None
 
-    def add_player(self, name):
+    def add_player(self, name, club=""):
+        """`club` : copié dans ce tournoi au moment de l'ajout (voir
+        roster.get_club côté appelant) — n'est ensuite plus synchronisé
+        avec le répertoire si celui-ci change, ce tournoi garde la photo
+        du club tel qu'il était à l'inscription."""
         starting_chips = self.get_setting_int("starting_chips", 10000)
         bounty_amount = self.get_setting_int("bounty_amount", 0)
         cur = self.conn.execute(
             "INSERT INTO players(name, buyin_count, rebuy_count, addon_count, "
-            "chips, status, bounty) VALUES (?, 1, 0, 0, ?, 'active', ?)",
-            (name, starting_chips, bounty_amount),
+            "chips, status, bounty, club) VALUES (?, 1, 0, 0, ?, 'active', ?, ?)",
+            (name, starting_chips, bounty_amount, (club or "").strip()),
         )
         player_id = cur.lastrowid
         self.conn.commit()
@@ -505,6 +512,14 @@ class Database:
             return
         self.conn.execute(
             "UPDATE players SET name=? WHERE id=?", (new_name, player_id)
+        )
+        self.conn.commit()
+
+    def set_player_club(self, player_id, club):
+        """Corrige le club (POUR CE TOURNOI, voir add_player) d'un joueur
+        déjà inscrit — ex. club mal renseigné/absent à l'ajout."""
+        self.conn.execute(
+            "UPDATE players SET club=? WHERE id=?", ((club or "").strip(), player_id)
         )
         self.conn.commit()
 

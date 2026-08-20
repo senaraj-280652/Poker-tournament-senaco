@@ -3462,7 +3462,7 @@ class App(tk.Tk):
         self._update_window_title()
         if result.get("is_new") and result.get("selected_players"):
             for name in self._filter_active_conflicts(result["selected_players"]):
-                self.db.add_player(name)
+                self.db.add_player(name, roster.get_club(name))
         if result.get("is_sng"):
             self._apply_sng_defaults(n_players=len(result.get("selected_players") or []))
         return True
@@ -3845,9 +3845,9 @@ class App(tk.Tk):
         # lui-même pour un nouveau tournoi (clock_started y repart à 0).
         self.delete_player_btn_tooltip = Tooltip(self.delete_player_btn, "")
 
-        columns = ("sel", "id", "name", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang",
+        columns = ("sel", "id", "name", "club", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang",
                    "elim_time", "elim_round", "eliminated_by")
-        headers = ["", "ID", "Nom", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang",
+        headers = ["", "ID", "Nom", "Club", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang",
                    "Éliminé le", "Round", "Éliminé par"]
         self.players_columns = columns
         self.players_headers = headers
@@ -3876,6 +3876,7 @@ class App(tk.Tk):
             # s'en apercevoir.
             self.players_tree.column(c, width=90, anchor="center", stretch=False)
         self.players_tree.heading("name", command=lambda: self._sort_players_by("name"))
+        self.players_tree.heading("club", command=lambda: self._sort_players_by("club"))
         self.players_tree.heading("status", command=lambda: self._sort_players_by("status"))
         self.players_tree.heading("table", command=lambda: self._sort_players_by("table"))
         # "Rang" : classement final du joueur (100 pour le 1er éliminé d'un
@@ -3885,6 +3886,7 @@ class App(tk.Tk):
         self.players_tree.heading("eliminated_by", command=lambda: self._sort_players_by("eliminated_by"))
         self.players_tree.column("sel", width=56, anchor="center", stretch=False)
         self.players_tree.column("name", width=180, anchor="w")
+        self.players_tree.column("club", width=110, anchor="w")
         self.players_tree.column("elim_time", width=130, anchor="center")
         TreeHeadingTooltip(self.players_tree, {
             "sel": "Cocher pour inclure ce joueur dans les actions groupées\n(Éliminer, etc.).",
@@ -3948,7 +3950,7 @@ class App(tk.Tk):
 
     def _update_sort_headings(self):
         base_headers = {
-            "name": "Nom", "status": "Statut", "table": "Table", "rang": "Rang",
+            "name": "Nom", "club": "Club", "status": "Statut", "table": "Table", "rang": "Rang",
             "elim_time": "Éliminé le", "eliminated_by": "Éliminé par",
         }
         for col, label in base_headers.items():
@@ -4285,7 +4287,7 @@ class App(tk.Tk):
         if not self._warn_active_conflict(name):
             return
         club = self.new_player_club_var.get().strip()
-        self.db.add_player(name)
+        self.db.add_player(name, club)
         if not self.temp_player_var.get():
             roster.add_to_roster(name, club=club or None)
             # Rafraîchit la liste de clubs proposée dans le menu déroulant
@@ -4311,7 +4313,7 @@ class App(tk.Tk):
         self.wait_window(dialog)
         to_add = self._filter_active_conflicts(dialog.selected_names)
         for name in to_add:
-            self.db.add_player(name)
+            self.db.add_player(name, roster.get_club(name))
         if to_add:
             self._refresh_all()
 
@@ -4929,6 +4931,8 @@ class App(tk.Tk):
         sort_col = self.players_sort["column"]
         if sort_col == "name":
             players.sort(key=lambda p: p["name"].lower())
+        elif sort_col == "club":
+            players.sort(key=lambda p: (p["club"] or "").lower())
         elif sort_col == "status":
             players.sort(key=lambda p: p["status_label"].lower())
         elif sort_col == "table":
@@ -4968,7 +4972,7 @@ class App(tk.Tk):
                 "", "end", iid=str(p["id"]),
                 image=photo if photo is not None else "",
                 values=(
-                    mark, p["id"], p["name"], table_name, p["seat"] or "-",
+                    mark, p["id"], p["name"], p["club"] or "-", table_name, p["seat"] or "-",
                     f"{p['chips']:,}".replace(",", " "),
                     p["buyin_count"], p["rebuy_count"], p["addon_count"],
                     bounty_txt, status, p["rang"] or "-",
