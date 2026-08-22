@@ -1,10 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Projet WiX Toolset (v5) décrivant l'installateur .msi du Gestionnaire de
-  Tournoi de Poker. Suppose que PokerTournament.exe a déjà été généré par
-  PyInstaller (voir windows/poker_tournament.spec) dans le dossier passé
-  via la variable de préprocesseur "Dist" (par défaut windows/dist,
-  positionnée par windows/build.ps1).
+  Tournoi de Poker. Suppose que PyInstaller (voir windows/poker_tournament.spec,
+  mode "onedir") a déjà généré le dossier
+  $(var.Dist)\PokerTournament\ (contenant PokerTournament.exe et un
+  sous-dossier _internal\ avec toutes les DLL/ressources) dans le dossier
+  passé via la variable de préprocesseur "Dist" (par défaut windows/dist,
+  positionnée par windows/build.ps1). C'est tout ce dossier qui est
+  installé (via l'élément <Files> ci-dessous, qui harvest récursivement
+  _internal\ sans avoir besoin de heat.exe) — pas un simple .exe unique :
+  PokerTournament.exe a besoin de son _internal\ à côté pour démarrer.
 
   Construction manuelle (depuis la racine du dépôt) :
     wix build windows\app.wxs -arch x64 -ext WixToolset.UI.wixext ^
@@ -19,7 +24,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.17"
+           Version="1.2.18"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
@@ -49,13 +54,30 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Gestionnaire de Tournoi de Poker">
+        <!-- L'exécutable garde un Id fixe (PokerTournamentEXE) car les
+             raccourcis Bureau/Menu Démarrer ci-dessous le référencent
+             explicitement par cet Id (Target="[#PokerTournamentEXE]") —
+             un <Files> harvesté ne permet pas de fixer l'Id d'un fichier
+             précis à l'intérieur du lot. -->
         <Component Id="MainExecutable" Guid="*">
           <File Id="PokerTournamentEXE"
-                Source="$(var.Dist)\PokerTournament.exe"
+                Source="$(var.Dist)\PokerTournament\PokerTournament.exe"
                 KeyPath="yes" />
         </Component>
       </Directory>
     </StandardDirectory>
+
+    <!-- Tout le reste du dossier onedir (DLL Python/Tkinter/OpenCV/
+         Pillow, help_content.json, splash...) : harvesté récursivement
+         sous INSTALLFOLDER, en conservant la structure de sous-dossiers
+         (notamment _internal\) telle que PyInstaller l'a produite —
+         PokerTournament.exe s'attend à trouver _internal\ juste à côté
+         de lui. L'exe lui-même est exclu du lot (déjà déclaré ci-dessus
+         avec un Id fixe). -->
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(var.Dist)\PokerTournament\**"
+             Exclude="$(var.Dist)\PokerTournament\PokerTournament.exe" />
+    </ComponentGroup>
 
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ApplicationProgramsFolder" Name="Gestionnaire de Tournoi de Poker">
@@ -94,6 +116,7 @@
 
     <Feature Id="MainFeature" Title="Gestionnaire de Tournoi de Poker" Level="1">
       <ComponentRef Id="MainExecutable" />
+      <ComponentGroupRef Id="AppFiles" />
       <ComponentRef Id="ApplicationShortcut" />
       <ComponentRef Id="DesktopShortcut" />
     </Feature>

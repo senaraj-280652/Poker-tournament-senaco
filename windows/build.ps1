@@ -56,8 +56,8 @@ if (Test-Path "_license_secret.py") {
 
 & $venvPython -m PyInstaller windows\poker_tournament.spec --distpath windows\dist --workpath windows\build --noconfirm
 if ($injectedSecret) { Remove-Item -Force "_license_secret.py" }
-if (-not (Test-Path "windows\dist\PokerTournament.exe")) {
-    throw "PyInstaller n'a pas produit windows\dist\PokerTournament.exe — voir le journal ci-dessus."
+if (-not (Test-Path "windows\dist\PokerTournament\PokerTournament.exe")) {
+    throw "PyInstaller n'a pas produit windows\dist\PokerTournament\PokerTournament.exe — voir le journal ci-dessus."
 }
 
 Write-Host "== 4/5 : installation de l'outil WiX (si nécessaire) ==" -ForegroundColor Cyan

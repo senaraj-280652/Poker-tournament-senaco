@@ -38,14 +38,21 @@ Le fichier obtenu est `windows\dist\PokerTournament-16.msi`.
 ## Ce que fait le build
 
 1. **PyInstaller** empaquette `main.py` (+ Tkinter, openpyxl, OpenCV,
-   Pillow) en un exécutable autonome `PokerTournament.exe` — rien à
-   installer sur le poste de l'utilisateur final, tout est inclus. Un
-   écran de démarrage (« Chargement en cours... », `assets/splash.png`)
-   s'affiche dès le lancement de l'`.exe`, le temps que celui-ci
-   s'extraie et que la fenêtre principale soit prête (voir la section
-   `Splash` de `poker_tournament.spec` et l'appel `pyi_splash.close()`
-   dans `main.py`).
-2. **WiX Toolset** enveloppe cet `.exe` dans un vrai programme
+   Pillow) en un dossier autonome `PokerTournament/` (mode **onedir** :
+   `PokerTournament.exe` + un sous-dossier `_internal/` avec toutes les
+   DLL/ressources) — rien à installer sur le poste de l'utilisateur
+   final, tout est inclus. Volontairement PAS en mode "onefile" (un
+   .exe unique) : en onefile, PyInstaller doit ré-extraire tout le
+   bundle dans un dossier temporaire à CHAQUE lancement, ce qui, sous
+   un antivirus scannant chaque fichier écrit, peut rendre le simple
+   clic sur le lanceur très lent — signalé par un utilisateur (voir
+   commit de passage en onedir). En onedir, l'extraction n'a lieu
+   qu'une fois, à l'installation. Un écran de démarrage (« Chargement
+   en cours... », `assets/splash.png`) s'affiche dès le lancement de
+   l'`.exe`, le temps que la fenêtre principale soit prête (voir la
+   section `Splash` de `poker_tournament.spec` et l'appel
+   `pyi_splash.close()` dans `main.py`).
+2. **WiX Toolset** enveloppe ce dossier dans un vrai programme
    d'installation Windows (`PokerTournament-16.msi`) : dossier dans
    *Program Files*, raccourcis dans le menu Démarrer et sur le Bureau,
    entrée dans "Applications et fonctionnalités" pour la désinstallation.
@@ -60,13 +67,13 @@ comme sur macOS.
 
 | Fichier | Rôle |
 |---|---|
-| `poker_tournament.spec` | Configuration PyInstaller (génère l'`.exe`) |
+| `poker_tournament.spec` | Configuration PyInstaller (génère le dossier `PokerTournament/`, mode onedir) |
 | `assets/splash.png` | Image de l'écran de démarrage (« Chargement en cours... ») |
 | `requirements.txt` | Dépendances Python nécessaires au build |
 | `app.wxs` | Description de l'installateur (WiX Toolset) |
 | `License.rtf` | Texte affiché sur l'écran de licence de l'installateur |
 | `build.ps1` | Script tout-en-un (exe → msi) |
-| `dist/` *(généré)* | Contient `PokerTournament.exe` puis `PokerTournament-16.msi` |
+| `dist/` *(généré)* | Contient `PokerTournament/` (exe + `_internal/`) puis `PokerTournament-16.msi` |
 
 ## Changer le numéro de version
 
