@@ -5905,16 +5905,23 @@ class App(tk.Tk):
             export_prefs.save_value(setting_key, "")
             btn.config(text=self._clock_sound_button_text(setting_key, label))
 
-    def _next_break_eta_text(self):
+    def _next_break_eta_text(self, remaining=None, level=None, structure=None):
         """Texte 'Prochaine pause à HH:MM', calculé à partir du temps
         restant du niveau en cours puis des durées des niveaux suivants
         jusqu'à la prochaine pause de la structure. Si le niveau en cours
-        est lui-même une pause, cherche la suivante (pas celle-ci)."""
-        remaining, level, _ = self._remaining_seconds()
+        est lui-même une pause, cherche la suivante (pas celle-ci).
+        `remaining`/`level`/`structure` : à passer si déjà disponibles
+        chez l'appelant (ex. _refresh_clock_tab, qui tourne chaque
+        seconde) pour éviter de refaire les mêmes requêtes DB ; sinon,
+        recalculés ici."""
+        if level is None and remaining is None:
+            remaining, level, _ = self._remaining_seconds()
         if level is None:
             return "Aucune structure définie"
+        if structure is None:
+            structure = self.db.get_blind_structure()
         total_seconds = max(0, remaining)
-        for lvl in self.db.get_blind_structure():
+        for lvl in structure:
             if lvl["level_order"] <= level["level_order"]:
                 continue
             if lvl["is_break"]:
@@ -5936,7 +5943,18 @@ class App(tk.Tk):
         # une ligne à part entière — les deux sont affichés côte à côte
         # (round_display reste inchangé pendant une pause, justement pour
         # montrer qu'il n'avance pas).
-        round_number = self.db.get_round_number(level["level_order"]) if level is not None else None
+        # Un seul SELECT ici (au lieu d'une requête Database.get_round_number
+        # par niveau, N+1 coûteux vu que ce rafraîchissement tourne chaque
+        # seconde tout au long du tournoi) : la structure est chargée une
+        # fois, et les numéros de round sont comptés en Python au passage.
+        structure = self.db.get_blind_structure()
+        round_by_order = {}
+        round_counter = 0
+        for lvl in structure:
+            if not lvl["is_break"]:
+                round_counter += 1
+            round_by_order[lvl["level_order"]] = round_counter
+        round_number = round_by_order.get(level["level_order"]) if level is not None else None
         self.round_display.config(text=f"Round {round_number}" if round_number is not None else "")
         if level is not None and level["is_break"]:
             self.level_display.config(text=level["break_label"] or "Pause")
@@ -5956,23 +5974,46 @@ class App(tk.Tk):
         else:
             self.next_display.config(text="Dernier niveau de la structure")
 
-        selected = self.blinds_tree.selection()
-        for row in self.blinds_tree.get_children():
-            self.blinds_tree.delete(row)
         current_order = level["level_order"] if level is not None else -1
-        for lvl in self.db.get_blind_structure():
-            label = "Oui" if lvl["is_break"] else "Non"
-            tag = "current" if lvl["level_order"] == current_order else ""
-            self.blinds_tree.insert(
-                "", "end", iid=str(lvl["level_order"]),
-                values=(lvl["level_order"], self.db.get_round_number(lvl["level_order"]),
-                        lvl["small_blind"], lvl["big_blind"],
-                        lvl["ante"], lvl["duration_minutes"], label),
-                tags=(tag,),
-            )
-        self.blinds_tree.tag_configure("current", background=GOLD, foreground=TEXT_DARK)
-        if selected and self.blinds_tree.exists(selected[0]):
-            self.blinds_tree.selection_set(selected)
+
+        # Signature légère du contenu affiché : si elle n'a pas changé
+        # depuis le tick précédent (cas normal — la structure de blindes
+        # ne change quasiment jamais en cours de tournoi), on évite de
+        # vider/reconstruire tout le tableau chaque seconde ; seule la
+        # ligne "en cours" (surlignage doré) peut changer d'un tick à
+        # l'autre, et se met à jour sans reconstruction.
+        sig = tuple(
+            (lvl["level_order"], lvl["small_blind"], lvl["big_blind"], lvl["ante"],
+             lvl["duration_minutes"], lvl["is_break"], lvl["break_label"],
+             round_by_order[lvl["level_order"]])
+            for lvl in structure
+        )
+        if sig != getattr(self, "_blinds_tab_sig", None):
+            selected = self.blinds_tree.selection()
+            for row in self.blinds_tree.get_children():
+                self.blinds_tree.delete(row)
+            for lvl in structure:
+                label = "Oui" if lvl["is_break"] else "Non"
+                tag = "current" if lvl["level_order"] == current_order else ""
+                self.blinds_tree.insert(
+                    "", "end", iid=str(lvl["level_order"]),
+                    values=(lvl["level_order"], round_by_order[lvl["level_order"]],
+                            lvl["small_blind"], lvl["big_blind"],
+                            lvl["ante"], lvl["duration_minutes"], label),
+                    tags=(tag,),
+                )
+            self.blinds_tree.tag_configure("current", background=GOLD, foreground=TEXT_DARK)
+            if selected and self.blinds_tree.exists(selected[0]):
+                self.blinds_tree.selection_set(selected)
+            self._blinds_tab_sig = sig
+            self._blinds_tab_current_order = current_order
+        elif current_order != getattr(self, "_blinds_tab_current_order", None):
+            prev_order = getattr(self, "_blinds_tab_current_order", None)
+            if prev_order is not None and self.blinds_tree.exists(str(prev_order)):
+                self.blinds_tree.item(str(prev_order), tags=())
+            if self.blinds_tree.exists(str(current_order)):
+                self.blinds_tree.item(str(current_order), tags=("current",))
+            self._blinds_tab_current_order = current_order
 
         movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
         blink_on = movement_alert and int(time.time()) % 2 == 0
@@ -5991,7 +6032,7 @@ class App(tk.Tk):
             moves = self.db.get_seat_moves() if movement_alert else []
             self.clock_window.refresh(
                 remaining, level, next_level, stats, name, paused,
-                self._next_break_eta_text(), movement_alert,
+                self._next_break_eta_text(remaining, level, structure), movement_alert,
                 self._load_chip_denominations(), moves, round_number,
             )
 
