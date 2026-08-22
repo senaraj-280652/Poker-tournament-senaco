@@ -624,6 +624,15 @@ class PlayerSelectionDialog(tk.Toplevel):
         # Revient au club par défaut (Paramètres), pas à vide : la plupart
         # des ajouts suivants viendront probablement du même club.
         self.new_name_club_var.set(export_prefs.load_value("club_name", ""))
+        # Si un texte de recherche encore actif ne correspond pas au nom
+        # qu'on vient d'ajouter (ex : on avait tapé "Bob" dans Rechercher
+        # pour vérifier qu'il n'existait pas, avant d'ajouter "Chloé
+        # Nouvelle"), le nouveau joueur resterait coché mais invisible
+        # dans la liste ci-dessus, sans confirmation visuelle — on vide
+        # donc la recherche dans ce cas précis pour qu'il apparaisse.
+        term = self.search_var.get().strip().lower()
+        if term and term not in name.lower():
+            self.search_var.set("")
         self._filter()
 
     def _import_from_previous_tournament(self):
