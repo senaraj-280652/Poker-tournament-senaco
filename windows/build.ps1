@@ -77,7 +77,7 @@ Write-Host "== 5/5 : génération de PokerTournament-16.msi (WiX) ==" -Foregroun
 wix build windows\app.wxs `
     -arch x64 `
     -ext WixToolset.UI.wixext `
-    -d Dist=windows\dist `
+    -d Dist=windows/dist `
     -out windows\dist\PokerTournament-16.msi
 
 Write-Host ""

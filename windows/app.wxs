@@ -24,7 +24,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.19"
+           Version="1.2.20"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
@@ -61,7 +61,7 @@
              précis à l'intérieur du lot. -->
         <Component Id="MainExecutable" Guid="*">
           <File Id="PokerTournamentEXE"
-                Source="$(var.Dist)\PokerTournament\PokerTournament.exe"
+                Source="$(var.Dist)/PokerTournament/PokerTournament.exe"
                 KeyPath="yes" />
         </Component>
         <!-- Sous-dossier créé par PyInstaller à côté de l'exe (mode
@@ -79,8 +79,17 @@
          sous-dossiers. Seul ce sous-dossier est harvesté (pas tout
          PokerTournament\, qui contient aussi l'exe déjà déclaré ci-dessus
          avec un Id fixe) — pas besoin d'exclusion. -->
+    <!-- Chemin en slashes ("/") plutôt que backslashes : le moteur de
+         correspondance de motifs de <Files> (contrairement à un simple
+         File/Source, qui tolère les deux) s'est révélé sensible à un
+         mélange des deux séparateurs avec $(var.Dist) — passé en
+         "windows/dist" (slashes) par le workflow GitHub Actions, un
+         "\PokerTournament\_internal\**" ajouté à la suite ne matchait
+         silencieusement AUCUN fichier (succès du build, mais .msi de
+         8 Mo au lieu de ~78 Mo, DLL manquantes — voir la version
+         précédente). -->
     <ComponentGroup Id="AppFiles" Directory="INTERNALDIR">
-      <Files Include="$(var.Dist)\PokerTournament\_internal\**" />
+      <Files Include="$(var.Dist)/PokerTournament/_internal/**" />
     </ComponentGroup>
 
     <StandardDirectory Id="ProgramMenuFolder">
