@@ -6,9 +6,9 @@
   $(var.Dist)\PokerTournament\ (contenant PokerTournament.exe et un
   sous-dossier _internal\ avec toutes les DLL/ressources) dans le dossier
   passé via la variable de préprocesseur "Dist" (par défaut windows/dist,
-  positionnée par windows/build.ps1). C'est tout ce dossier qui est
-  installé (via l'élément <Files> ci-dessous, qui harvest récursivement
-  _internal\ sans avoir besoin de heat.exe) — pas un simple .exe unique :
+  positionnée par windows/build.ps1). L'exe est déclaré explicitement ;
+  le contenu de _internal\ est harvesté récursivement (élément <Files>,
+  sans avoir besoin de heat.exe) — pas un simple .exe unique :
   PokerTournament.exe a besoin de son _internal\ à côté pour démarrer.
 
   Construction manuelle (depuis la racine du dépôt) :
@@ -24,7 +24,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.18"
+           Version="1.2.19"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
@@ -64,19 +64,23 @@
                 Source="$(var.Dist)\PokerTournament\PokerTournament.exe"
                 KeyPath="yes" />
         </Component>
+        <!-- Sous-dossier créé par PyInstaller à côté de l'exe (mode
+             onedir) : toutes ses DLL/dépendances. Déclaré ici comme
+             simple sous-répertoire d'INSTALLFOLDER (même nom, _internal),
+             peuplé ci-dessous par harvesting — voir ComponentGroup
+             "AppFiles". -->
+        <Directory Id="INTERNALDIR" Name="_internal" />
       </Directory>
     </StandardDirectory>
 
-    <!-- Tout le reste du dossier onedir (DLL Python/Tkinter/OpenCV/
-         Pillow, help_content.json, splash...) : harvesté récursivement
-         sous INSTALLFOLDER, en conservant la structure de sous-dossiers
-         (notamment _internal\) telle que PyInstaller l'a produite —
-         PokerTournament.exe s'attend à trouver _internal\ juste à côté
-         de lui. L'exe lui-même est exclu du lot (déjà déclaré ci-dessus
-         avec un Id fixe). -->
-    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
-      <Files Include="$(var.Dist)\PokerTournament\**"
-             Exclude="$(var.Dist)\PokerTournament\PokerTournament.exe" />
+    <!-- Contenu de _internal\ (DLL Python/Tkinter/OpenCV/Pillow,
+         help_content.json, splash...) : harvesté récursivement dans
+         INTERNALDIR, en conservant sa propre arborescence de
+         sous-dossiers. Seul ce sous-dossier est harvesté (pas tout
+         PokerTournament\, qui contient aussi l'exe déjà déclaré ci-dessus
+         avec un Id fixe) — pas besoin d'exclusion. -->
+    <ComponentGroup Id="AppFiles" Directory="INTERNALDIR">
+      <Files Include="$(var.Dist)\PokerTournament\_internal\**" />
     </ComponentGroup>
 
     <StandardDirectory Id="ProgramMenuFolder">
