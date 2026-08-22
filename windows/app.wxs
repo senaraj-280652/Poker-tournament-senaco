@@ -24,7 +24,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.20"
+           Version="1.2.21"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
@@ -78,18 +78,28 @@
          INTERNALDIR, en conservant sa propre arborescence de
          sous-dossiers. Seul ce sous-dossier est harvesté (pas tout
          PokerTournament\, qui contient aussi l'exe déjà déclaré ci-dessus
-         avec un Id fixe) — pas besoin d'exclusion. -->
-    <!-- Chemin en slashes ("/") plutôt que backslashes : le moteur de
-         correspondance de motifs de <Files> (contrairement à un simple
-         File/Source, qui tolère les deux) s'est révélé sensible à un
-         mélange des deux séparateurs avec $(var.Dist) — passé en
-         "windows/dist" (slashes) par le workflow GitHub Actions, un
-         "\PokerTournament\_internal\**" ajouté à la suite ne matchait
-         silencieusement AUCUN fichier (succès du build, mais .msi de
-         8 Mo au lieu de ~78 Mo, DLL manquantes — voir la version
-         précédente). -->
+         avec un Id fixe) — pas besoin d'exclusion.
+
+         ATTENTION, piège WiX confirmé (issue GitHub wixtoolset/issues
+         #8163, classée "notabug" par les mainteneurs — donc un
+         comportement voulu, pas un bug à surveiller pour une future
+         version) : Files/@Include résout un chemin RELATIF par rapport
+         au dossier qui CONTIENT ce fichier .wxs (donc "windows/" ici),
+         PAS par rapport au dossier depuis lequel "wix build" est lancé
+         (la racine du dépôt) — contrairement à File/@Source (utilisé pour
+         l'exe ci-dessus), qui LUI se résout bien par rapport à la racine
+         du dépôt via $(var.Dist)="windows/dist". Utiliser $(var.Dist) ici
+         aurait donc pointé vers "windows/windows/dist/..." (inexistant) :
+         d'où un motif écrit en dur relatif à windows/ (donc sans le
+         préfixe "windows/"), et non $(var.Dist). Deux versions (1.2.19
+         et 1.2.20) ont échoué silencieusement à cause de ce piège : le
+         build "réussissait" (Files match 0 fichier sans la moindre
+         erreur ni le moindre avertissement), mais produisait un .msi de
+         8 Mo au lieu de ~78 Mo, avec un PokerTournament.exe privé de
+         toutes ses DLL — repéré seulement en comparant la taille du
+         .msi obtenu à celle des versions précédentes. -->
     <ComponentGroup Id="AppFiles" Directory="INTERNALDIR">
-      <Files Include="$(var.Dist)/PokerTournament/_internal/**" />
+      <Files Include="dist/PokerTournament/_internal/**" />
     </ComponentGroup>
 
     <StandardDirectory Id="ProgramMenuFolder">
