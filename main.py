@@ -3583,8 +3583,8 @@ class App(tk.Tk):
     def _update_window_title(self):
         """Met à jour le titre de la fenêtre et le bandeau avec le nom du
         tournoi en cours (appelé à l'ouverture et après chaque changement
-        de paramètres). Format "Tournoi : <nom> <date du tournoi>" — la
-        date affichée est celle de CE tournoi (voir Database.
+        de paramètres). Format "Tournoi : <nom> du <date du tournoi>" —
+        la date affichée est celle de CE tournoi (voir Database.
         get_tournament_date : date fixée à sa création, ou date de
         création du fichier .tournoi à défaut pour d'anciens fichiers),
         pas celle du jour où la fenêtre est ouverte/affichée. Pour un
@@ -3597,11 +3597,11 @@ class App(tk.Tk):
             if fallback:
                 name = fallback
         tournament_date = format_date_fr(self.db.get_tournament_date()) if self.db else ""
-        title = f"Tournoi : {name} {tournament_date}" if name else APP_NAME
+        title = f"Tournoi : {name} du {tournament_date}" if name else APP_NAME
         self.title(title)
         if hasattr(self, "header_title_lbl"):
             self.header_title_lbl.config(
-                text=f"♠ ♥  Tournoi : {name} {tournament_date}  ♦ ♣" if name
+                text=f"♠ ♥  Tournoi : {name} du {tournament_date}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
             )
 
