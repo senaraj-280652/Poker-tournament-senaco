@@ -1510,6 +1510,7 @@ class Database:
                 rang = None
             rows.append({
                 "name": p["name"],
+                "club": p["club"] or "",
                 "table": tables.get(p["table_id"], "-") if p["table_id"] else "-",
                 "seat": p["seat"],
                 "chips": p["chips"],
@@ -2080,13 +2081,24 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
         "tournaments": [ {name, date, path, entries, prize_pool, status,
                            winner, bounty_distributed}, ... ],  # triés par date
         "players": [ {name, tournaments_played, wins, best_place,
-                       total_cost, total_gain, total_bounty_won, net}, ... ],
-                                                    # triés par net décroissant
+                       total_cost, total_gain, total_bounty_won,
+                       total_points}, ... ],  # triés par total_points décroissant
       }
 
-    Le "net" par joueur = gains de classement + primes (bounty) empochées
-    - montant investi (buy-in/rebuy/add-on), toutes tournois confondus sur
-    la période."""
+    "total_bounty_won" (par joueur) et "bounty_distributed" (par tournoi)
+    viennent de la MÊME source que l'onglet Primes de chaque tournoi (voir
+    Database.get_primes_summary, colonne "Mon Bounty") : nombre
+    d'éliminations (kills) × valeur d'un bounty (réglage manuel
+    `bounty_amount`, sinon 10×√N points) — PAS l'ancien champ
+    `bounty_won`/`bounty` (mécanisme cash/PKO indépendant, plus utilisé par
+    l'onglet Primes), qui reste à 0 dès que `bounty_amount` vaut 0 (valeur
+    par défaut de ce club, qui ne joue qu'en points).
+
+    "total_points" par joueur = somme, sur toute la période, du TOTAL de
+    l'onglet Primes de chaque tournoi joué (Présence + Assiduité +
+    Classement + Bounty, en points) — pas un calcul en euros ("total_cost"
+    / "total_gain" restent disponibles pour qui en aurait besoin, mais
+    n'entrent plus dans "total_points")."""
     tournaments = []
     players = {}
 
@@ -2109,7 +2121,11 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
             active = [p for p in all_players if p["status"] == "active"]
             finished = len(active) == 1
             winner = active[0]["name"] if finished else "-"
-            bounty_distributed = sum(p["bounty_won"] or 0 for p in all_players)
+            # Même source que l'onglet Primes de ce tournoi (voir
+            # get_primes_summary) : "bo_montant" = bounty en points, "total"
+            # = Présence + Assiduité + Classement + Bounty pour ce tournoi.
+            primes_by_name = {r["name"]: r for r in db.get_primes_summary()}
+            bounty_distributed = sum(r["bo_montant"] for r in primes_by_name.values())
             entries = sum(p["buyin_count"] for p in all_players)
             stats = db.get_stats()
             payouts_by_place = {r["place"]: r["amount"] for r in db.get_payouts_amounts()}
@@ -2144,7 +2160,9 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
                     + p["rebuy_count"] * rebuy_amount
                     + p["addon_count"] * addon_amount
                 )
-                bounty_won = p["bounty_won"] or 0
+                prime_row = primes_by_name.get(p["name"])
+                bounty_won = prime_row["bo_montant"] if prime_row else 0
+                points = prime_row["total"] if prime_row else 0
 
                 agg = players.setdefault(p["name"], {
                     "name": p["name"],
@@ -2154,11 +2172,13 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
                     "total_cost": 0.0,
                     "total_gain": 0.0,
                     "total_bounty_won": 0,
+                    "total_points": 0,
                 })
                 agg["tournaments_played"] += 1
                 agg["total_cost"] += cost
                 agg["total_gain"] += gain
                 agg["total_bounty_won"] += bounty_won
+                agg["total_points"] += points
                 if place == 1:
                     agg["wins"] += 1
                 if place is not None and (agg["best_place"] is None or place < agg["best_place"]):
@@ -2166,11 +2186,8 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
         finally:
             db.close()
 
-    for agg in players.values():
-        agg["net"] = agg["total_gain"] + agg["total_bounty_won"] - agg["total_cost"]
-
     tournaments.sort(key=lambda t: t["date"])
-    players_list = sorted(players.values(), key=lambda a: a["net"], reverse=True)
+    players_list = sorted(players.values(), key=lambda a: a["total_points"], reverse=True)
     return {"tournaments": tournaments, "players": players_list}
 
 
@@ -2197,8 +2214,8 @@ PERIOD_PLAYER_COLUMNS = [
     ("best_place", "Meilleur Rang", lambda a: a["best_place"]),
     ("total_cost", "Total investi (€)", lambda a: round(a["total_cost"], 2)),
     ("total_gain", "Gains classement (€)", lambda a: round(a["total_gain"], 2)),
-    ("total_bounty_won", "Primes gagnées (€)", lambda a: a["total_bounty_won"]),
-    ("net", "Net (€)", lambda a: round(a["net"], 2)),
+    ("total_bounty_won", "Bounty", lambda a: a["total_bounty_won"]),
+    ("total_points", "TOTAL Pts", lambda a: a["total_points"]),
 ]
 
 # Colonnes disponibles pour l'export du classement final nominatif d'UN

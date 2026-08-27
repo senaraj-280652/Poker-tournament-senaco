@@ -162,6 +162,38 @@ def default_tournament_dir():
     return os.path.expanduser("~")
 
 
+def tournament_day_folder_proposal():
+    """Renvoie (dossier_proposé, nom_de_fichier_proposé) pour "Nouveau
+    tournoi" / "Sit & Go rapide", à partir de "Chemin du dossier du
+    tournoi du jour" (voir _build_settings_tab), mémorisé globalement
+    dans tournament_prefs (dernier tournoi en date, retrouvable même
+    avant l'ouverture d'un fichier .tournoi) : sous-dossier
+    Vendredi/Dimanche/Autre selon le jour de la semaine du jour, créé
+    s'il n'existe pas encore, et nom de fichier To/Sn/Op + date du jour
+    (JJMMAA), ex. "To270826" un vendredi.
+    Renvoie (None, None) si aucun dossier n'est configuré (ou dossier
+    non créable) — les repos de secours habituels s'appliquent alors
+    (default_tournament_dir(), "tournoi.tournoi"...)."""
+    base = tournament_prefs.load_last_settings().get("tournament_day_folder", "")
+    base = (base or "").strip()
+    if not base:
+        return None, None
+    weekday = datetime.now().weekday()  # lundi=0 ... dimanche=6
+    if weekday == 4:
+        subfolder, prefix = "Vendredi", "To"
+    elif weekday == 6:
+        subfolder, prefix = "Dimanche", "Sn"
+    else:
+        subfolder, prefix = "Autre", "Op"
+    folder = os.path.join(base, subfolder)
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError:
+        return None, None
+    filename = f"{prefix}{datetime.now().strftime('%d%m%y')}.tournoi"
+    return folder, filename
+
+
 def spawn_app_process(extra_args=None):
     """Lance une nouvelle instance indépendante de l'application (autre
     processus). `extra_args` : arguments supplémentaires passés au
@@ -245,6 +277,82 @@ class Tooltip:
         if self._tip is not None:
             self._tip.destroy()
             self._tip = None
+
+
+CLUB_FILTER_ALL_LABEL = "Tous"  # pseudo-entrée du filtre "Club" (voir get_selected_clubs)
+
+
+def _populate_club_filter_listbox(listbox):
+    """Remplit `listbox` avec une entrée "Tous" (voir get_selected_clubs),
+    suivie des clubs connus du répertoire (roster.py) et de celui réglé
+    comme "Nom du Club" dans Paramètres même s'il n'a encore aucun joueur
+    — puis présélectionne ce dernier ("Tous" à défaut). Utilisé par le
+    filtre "Club" du Classement et de Statistiques (voir
+    build_club_filter_widget)."""
+    default_club = export_prefs.load_value("club_name", "").strip()
+    clubs = set(roster.list_clubs())
+    if default_club:
+        clubs.add(default_club)
+    clubs = sorted(clubs, key=str.lower)
+    items = [CLUB_FILTER_ALL_LABEL] + clubs
+    listbox.delete(0, "end")
+    for c in items:
+        listbox.insert("end", c)
+    if default_club and default_club in clubs:
+        listbox.selection_set(items.index(default_club))
+    else:
+        listbox.selection_set(0)
+    return items
+
+
+def build_club_filter_widget(parent, on_change, padx=(20, 0)):
+    """Construit le filtre "Club" (libellé + liste à sélection multiple)
+    partagé par les onglets Classement et Statistiques : ne garder dans
+    le tableau que les joueurs des clubs cochés (Ctrl/Shift + clic pour
+    en cocher plusieurs). Par défaut, seul le club réglé dans Paramètres
+    ("Nom du Club") est coché. Cocher "Tous" (ou ne rien cocher) désactive
+    le filtre : tous les clubs sont affichés (voir get_selected_clubs).
+    Un simple clic (sans Ctrl) sur "Tous" ou sur un club désélectionne
+    automatiquement le reste (comportement natif du Listbox), ce qui
+    suffit à basculer proprement entre "un club précis" et "tous".
+    `on_change` est appelé (sans argument) à chaque changement de
+    sélection. Empaquette lui-même le widget dans `parent` (côté gauche,
+    `padx` réglable pour l'espacement avec ce qui précède) et renvoie le
+    Listbox (à repasser à get_selected_clubs)."""
+    frame = ttk.Frame(parent)
+    frame.pack(side="left", padx=padx)
+    ttk.Label(frame, text="Club :").pack(side="left", anchor="n", pady=2)
+    list_wrap = ttk.Frame(frame)
+    list_wrap.pack(side="left", padx=(6, 0))
+    listbox = tk.Listbox(
+        list_wrap, selectmode="extended", exportselection=False,
+        height=4, width=20,
+    )
+    scrollbar = ttk.Scrollbar(list_wrap, orient="vertical", command=listbox.yview)
+    listbox.configure(yscrollcommand=scrollbar.set)
+    listbox.pack(side="left")
+    scrollbar.pack(side="left", fill="y")
+    _populate_club_filter_listbox(listbox)
+    listbox.bind("<<ListboxSelect>>", lambda e: on_change())
+    Tooltip(
+        frame,
+        "Sélectionnez un ou plusieurs clubs (Ctrl/Shift + clic) pour ne\n"
+        "garder que leurs joueurs dans le tableau, ou « Tous » pour ne\n"
+        "filtrer sur aucun club. Par défaut : le club réglé dans\n"
+        "Paramètres.",
+    )
+    return listbox
+
+
+def get_selected_clubs(listbox):
+    """Clubs actuellement cochés dans `listbox` (voir
+    build_club_filter_widget) ; liste vide si aucun coché, ou si "Tous"
+    en fait partie (= pas de filtre, quels que soient les autres clubs
+    cochés en même temps)."""
+    selected = [listbox.get(i) for i in listbox.curselection()]
+    if CLUB_FILTER_ALL_LABEL in selected:
+        return []
+    return selected
 
 
 class TreeHeadingTooltip:
@@ -2252,63 +2360,94 @@ class PeriodSummaryDialog(ttk.Frame):
 
         default_folder = ""
         if getattr(app, "db", None) is not None:
-            default_folder = os.path.dirname(os.path.abspath(app.db.path))
+            # "Chemin du dossier du tournoi du jour" (voir
+            # _build_settings_tab), tel que configuré pour CE tournoi,
+            # sinon repli sur le dossier contenant son fichier .tournoi.
+            default_folder = (app.db.get_setting("tournament_day_folder", "") or "").strip()
+            if not default_folder:
+                default_folder = os.path.dirname(os.path.abspath(app.db.path))
         self.folder_var = tk.StringVar(value=default_folder)
         self.recursive_var = tk.BooleanVar(value=True)
         today = datetime.now()
         self.date_from_var = tk.StringVar(value=f"{today.year}-01-01")
         self.date_to_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
 
-        # Barre de boutons tout en haut de la fenêtre (et non en bas) :
-        # ainsi elle reste toujours visible en premier, quelle que soit la
-        # hauteur prise par le reste du contenu sur un écran donné.
-        btns = ttk.Frame(self)
-        btns.pack(side="top", fill="x", padx=14, pady=(14, 6))
-        ttk.Button(btns, text="Exporter...", command=self._open_export_dialog).pack(side="left")
-
         params = ttk.Frame(self)
-        params.pack(fill="x", padx=14, pady=(14, 6))
+        params.pack(fill="x", padx=14, pady=(10, 4))
 
         row1 = ttk.Frame(params)
         row1.pack(fill="x", pady=3)
         ttk.Label(row1, text="Dossier des tournois :").pack(side="left")
-        ttk.Entry(row1, textvariable=self.folder_var, width=55).pack(
-            side="left", padx=6, fill="x", expand=True
+        # Largeur réduite de moitié (55 -> 27) : la case "Inclure les
+        # sous-dossiers" (déplacée ici, à droite de "Parcourir...") a
+        # besoin de la place ainsi libérée sur la même ligne.
+        ttk.Entry(row1, textvariable=self.folder_var, width=27).pack(
+            side="left", padx=6
         )
         ttk.Button(row1, text="Parcourir...", command=self._browse_folder).pack(side="left")
+        ttk.Checkbutton(
+            row1, text="Inclure les sous-dossiers", variable=self.recursive_var,
+        ).pack(side="left", padx=(16, 0))
 
+        # Ligne 2 : filtre Club à gauche (haut sur 4 lignes) ; à droite,
+        # empilées sur sa hauteur, "Période..." puis, juste en dessous,
+        # le compte-rendu et les boutons Générer/Exporter — une colonne à
+        # part (right_col), pas la ligne "row2" elle-même, sinon ces deux
+        # dernières se retrouveraient sous TOUTE la hauteur du filtre Club
+        # (4 lignes) plutôt que juste sous "Période...".
         row2 = ttk.Frame(params)
         row2.pack(fill="x", pady=3)
-        ttk.Checkbutton(
-            row2, text="Inclure les sous-dossiers", variable=self.recursive_var,
-        ).pack(side="left")
+        # Ne re-filtre que l'affichage déjà généré (voir _refresh_display),
+        # pas besoin de reparcourir les fichiers .tournoi à chaque
+        # coche/décoche.
+        self.stats_club_listbox = build_club_filter_widget(row2, on_change=self._refresh_display)
 
-        row3 = ttk.Frame(params)
-        row3.pack(fill="x", pady=3)
-        ttk.Label(row3, text="Période — du (AAAA-MM-JJ) :").pack(side="left")
-        ttk.Entry(row3, textvariable=self.date_from_var, width=12).pack(side="left", padx=(4, 16))
-        ttk.Label(row3, text="au (AAAA-MM-JJ) :").pack(side="left")
-        ttk.Entry(row3, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
+        right_col = ttk.Frame(row2)
+        right_col.pack(side="left", anchor="n", fill="x", expand=True, padx=(20, 0))
+
+        period_frame = ttk.Frame(right_col)
+        period_frame.pack(fill="x", anchor="w")
+        ttk.Label(period_frame, text="Période — du (AAAA-MM-JJ) :").pack(side="left")
+        ttk.Entry(period_frame, textvariable=self.date_from_var, width=12).pack(
+            side="left", padx=(4, 16)
+        )
+        ttk.Label(period_frame, text="au (AAAA-MM-JJ) :").pack(side="left")
+        ttk.Entry(period_frame, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
         ttk.Label(
-            row3, text="(laisser vide = pas de borne)", foreground=MUTED,
+            period_frame, text="(laisser vide = pas de borne)", foreground=MUTED,
         ).pack(side="left", padx=10)
-        ttk.Button(row3, text="Générer la synthèse", command=self._generate).pack(side="right")
 
-        self.info_lbl = ttk.Label(self, text="", font=("Helvetica", 10, "bold"))
-        self.info_lbl.pack(fill="x", padx=14, pady=(0, 6))
+        info_row = ttk.Frame(right_col)
+        info_row.pack(fill="x", pady=(8, 0))
+        self.info_lbl = ttk.Label(info_row, text="", font=("Helvetica", 10, "bold"))
+        self.info_lbl.pack(side="left", fill="x", expand=True)
+        ttk.Button(info_row, text="Exporter...", command=self._open_export_dialog).pack(side="right")
+        ttk.Button(
+            info_row, text="Générer la synthèse", command=self._generate,
+        ).pack(side="right", padx=(0, 6))
 
         panes = ttk.Frame(self)
         panes.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        # grid + poids égaux plutôt que pack(expand=True) sur les deux
+        # LabelFrame ci-dessous : pack ne les répartissait pas forcément à
+        # parts égales (le premier packé pouvait grossir bien plus que le
+        # second) ; grid avec deux lignes de même poids garantit un
+        # partage 50/50 de la hauteur disponible entre les deux tableaux.
+        panes.grid_rowconfigure(0, weight=1)
+        panes.grid_rowconfigure(1, weight=1)
+        panes.grid_columnconfigure(0, weight=1)
 
         top_pane = ttk.LabelFrame(panes, text="Tournois de la période")
-        top_pane.pack(fill="both", expand=True, pady=(0, 6))
+        top_pane.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
         # Pas de colonne "Prize pool (€)" ici : ce club ne distribue pas de
         # gains en argent réel (voir Classement, colonnes Total investi/
         # Gains classement retirées pour la même raison) — la donnée reste
         # calculée normalement (build_period_summary), juste pas affichée.
         cols_t = ("date", "name", "status", "entries", "winner", "bounty")
         headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (€)"]
-        self.tournaments_tree = ttk.Treeview(top_pane, columns=cols_t, show="headings", height=8)
+        # height=13 : même hauteur que "Classement des joueurs" ci-dessous
+        # (voir players_tree), pour que les deux tableaux soient alignés.
+        self.tournaments_tree = ttk.Treeview(top_pane, columns=cols_t, show="headings", height=13)
         for c, h in zip(cols_t, headers_t):
             self.tournaments_tree.heading(c, text=h)
             self.tournaments_tree.column(c, width=120, anchor="center")
@@ -2316,18 +2455,21 @@ class PeriodSummaryDialog(ttk.Frame):
         self.tournaments_tree.pack(fill="both", expand=True, padx=6, pady=6)
 
         bottom_pane = ttk.LabelFrame(panes, text="Classement des joueurs sur la période (primes incluses)")
-        bottom_pane.pack(fill="both", expand=True)
+        bottom_pane.grid(row=1, column=0, sticky="nsew")
         # Pas de "Total investi (€)" ni "Gains classement (€)" : voir la
         # remarque équivalente ci-dessus pour "Tournois de la période".
-        cols_p = ("name", "played", "wins", "best", "bounty", "net")
+        # "club" en première colonne : club actuel du joueur dans le
+        # répertoire (voir _refresh_display), pas de tri dédié dessus.
+        cols_p = ("club", "name", "played", "wins", "best", "bounty", "total_points")
         headers_p = [
-            "Joueur", "Tournois joués", "Victoires", "Meilleur Rang",
-            "Primes gagnées (€)", "Net (€)",
+            "Club", "Joueur", "Tournois joués", "Victoires", "Meilleur Rang",
+            "Bounty", "TOTAL Pts",
         ]
-        self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=10)
+        self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=13)
         for c, h in zip(cols_p, headers_p):
             self.players_tree.heading(c, text=h)
             self.players_tree.column(c, width=115, anchor="center")
+        self.players_tree.column("club", width=110, anchor="w")
         self.players_tree.column("name", width=170, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=6, pady=6)
 
@@ -2386,7 +2528,37 @@ class PeriodSummaryDialog(ttk.Frame):
 
         tournaments = self.summary["tournaments"]
         players = self.summary["players"]
+        # Filtre "Club" (voir build_club_filter_widget) : club actuel du
+        # joueur dans le répertoire (roster.py), pas celui, potentiellement
+        # différent d'un tournoi à l'autre, enregistré au moment de son
+        # inscription à chacun — un joueur ayant changé de club entre-temps
+        # ne doit compter que pour son club actuel. Aucune coche = tous les
+        # clubs (voir get_selected_clubs). Un joueur sans club renseigné
+        # dans le répertoire (le cas le plus courant pour les joueurs du
+        # club organisateur, jamais explicitement tagués) compte pour le
+        # club réglé dans Paramètres, pas pour "aucun club".
+        home_club = export_prefs.load_value("club_name", "").strip()
+        selected_clubs = get_selected_clubs(self.stats_club_listbox)
+        if selected_clubs:
+            players = [
+                a for a in players
+                if (roster.get_club(a["name"]) or home_club) in selected_clubs
+            ]
 
+        # Ligne de total (en gras, voir tag "totalcol" plus bas), tout en
+        # haut du tableau, insérée avant la boucle pour y rester quel que
+        # soit l'ordre d'affichage — même principe que l'onglet Primes
+        # (_refresh_bounty_tab). Reflète les tournois actuellement
+        # affichés (donc déjà filtrés par la période choisie).
+        self.tournaments_tree.insert(
+            "", "end",
+            values=(
+                "", "TOTAL", "", "",
+                "",
+                f"{sum(t['bounty_distributed'] for t in tournaments):,}".replace(",", " "),
+            ),
+            tags=("totalcol",),
+        )
         for idx, t in enumerate(tournaments):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.tournaments_tree.insert(
@@ -2400,20 +2572,39 @@ class PeriodSummaryDialog(ttk.Frame):
             )
         self.tournaments_tree.tag_configure("evenrow", background=CREAM)
         self.tournaments_tree.tag_configure("oddrow", background=CREAM_ALT)
+        self.tournaments_tree.tag_configure(
+            "totalcol", font=("Helvetica", 9, "bold"), background=GOLD, foreground=TEXT_DARK,
+        )
 
+        # Ligne de total (voir la même chose ci-dessus pour "Tournois de la
+        # période") : reflète les joueurs actuellement affichés (donc déjà
+        # filtrés par club le cas échéant, voir selected_clubs plus haut).
+        self.players_tree.insert(
+            "", "end",
+            values=(
+                "", "TOTAL", "", "", "",
+                f"{sum(a['total_bounty_won'] for a in players):,}".replace(",", " "),
+                f"{sum(a['total_points'] for a in players):,}".replace(",", " "),
+            ),
+            tags=("totalcol",),
+        )
         for idx, a in enumerate(players):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.players_tree.insert(
                 "", "end",
                 values=(
+                    roster.get_club(a["name"]) or home_club or "-",
                     a["name"], a["tournaments_played"], a["wins"], a["best_place"] or "-",
                     f"{a['total_bounty_won']:,}".replace(",", " ") if a["total_bounty_won"] else "-",
-                    f"{a['net']:.2f}",
+                    f"{a['total_points']:,}".replace(",", " "),
                 ),
                 tags=(tag,),
             )
         self.players_tree.tag_configure("evenrow", background=CREAM)
         self.players_tree.tag_configure("oddrow", background=CREAM_ALT)
+        self.players_tree.tag_configure(
+            "totalcol", font=("Helvetica", 9, "bold"), background=GOLD, foreground=TEXT_DARK,
+        )
 
         self.info_lbl.config(
             text=f"{len(tournaments)} tournoi(s) trouvé(s) sur la période — {len(players)} joueur(s) distinct(s)."
@@ -3443,12 +3634,13 @@ class App(tk.Tk):
         ).pack(pady=(0, 24))
 
         def new_tournament():
+            day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau tournoi",
                 defaultextension=".tournoi",
                 filetypes=[("Fichier de tournoi", "*.tournoi")],
-                initialfile="tournoi.tournoi",
-                initialdir=default_tournament_dir(),
+                initialfile=day_filename or "tournoi.tournoi",
+                initialdir=day_folder or default_tournament_dir(),
             )
             if not path:
                 return
@@ -3493,12 +3685,13 @@ class App(tk.Tk):
             win.destroy()
 
         def new_sng():
+            day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau Sit & Go",
                 defaultextension=".tournoi",
                 filetypes=[("Fichier de tournoi", "*.tournoi")],
-                initialfile="sitngo.tournoi",
-                initialdir=default_tournament_dir(),
+                initialfile=day_filename or "sitngo.tournoi",
+                initialdir=day_folder or default_tournament_dir(),
             )
             if not path:
                 return
@@ -3539,9 +3732,13 @@ class App(tk.Tk):
             win.destroy()
 
         def open_tournament():
+            day_folder = (
+                tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+            ).strip()
             path = filedialog.askopenfilename(
                 title="Ouvrir un tournoi existant",
                 filetypes=[("Fichier de tournoi", "*.tournoi"), ("Tous les fichiers", "*.*")],
+                initialdir=day_folder if day_folder and os.path.isdir(day_folder) else None,
             )
             if path:
                 result["path"] = path
@@ -5403,7 +5600,9 @@ class App(tk.Tk):
         for c in ("rang", "bo_nombre", "total"):
             self.primes_tree.heading(c, command=lambda col=c: self._sort_primes_by(col))
         self.primes_tree.pack(fill="both", expand=True, padx=6, pady=6)
-        self.primes_tree.tag_configure("totalcol", font=("Helvetica", 9, "bold"))
+        self.primes_tree.tag_configure(
+            "totalcol", font=("Helvetica", 9, "bold"), background=GOLD, foreground=TEXT_DARK,
+        )
         TreeHeadingTooltip(self.primes_tree, {
             "name": "Nom du joueur.",
             "presence": "Prime de présence : points pour avoir participé à ce\ntournoi (réglage Paramètres, 0 = désactivée).",
@@ -5469,6 +5668,24 @@ class App(tk.Tk):
         primes_rows = self.db.get_primes_summary(
             sort_column=self.primes_sort["column"], ascending=self.primes_sort["ascending"]
         )
+
+        # Ligne de total (en gras, voir tag "totalcol" ci-dessous), tout en
+        # haut du tableau — insérée AVANT la boucle des joueurs pour rester
+        # au-dessus quel que soit le tri en cours (celui-ci ne s'applique
+        # qu'à primes_rows, jamais à cette ligne). Seules "Mon Bounty" et
+        # "TOTAL" ont un total demandé ; les autres colonnes restent vides
+        # sur cette ligne (Nb/Val Bounty n'ont pas de somme pertinente,
+        # Rang encore moins).
+        self.primes_tree.insert(
+            "", "end",
+            values=(
+                "TOTAL", "", "", "", "", "", "",
+                f"{sum(r['bo_montant'] for r in primes_rows):,} pts".replace(",", " "),
+                f"{sum(r['total'] for r in primes_rows):,} pts".replace(",", " "),
+            ),
+            tags=("totalcol",),
+        )
+
         for idx, r in enumerate(primes_rows):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
             self.primes_tree.insert(
@@ -6779,6 +6996,9 @@ class App(tk.Tk):
         ttk.Button(
             top, text="Exporter le classement (Excel/CSV)...", command=self._export_classement,
         ).pack(side="left", padx=3)
+        self.classement_club_listbox = build_club_filter_widget(
+            top, on_change=self._refresh_payouts_tab
+        )
 
         self.payout_summary_lbl = ttk.Label(self.payouts_tab, text="", font=("Helvetica", 11, "bold"))
         self.payout_summary_lbl.pack(padx=10, anchor="w")
@@ -6839,8 +7059,24 @@ class App(tk.Tk):
         (voir Database.players_rows) et n'apparaît donc jamais ici — le
         compteur "En cours" du résumé suffit à savoir combien il en
         reste. Par défaut : du plus récemment classé (rang le plus bas)
-        au plus ancien ; cliquer Nom/Rang trie autrement."""
+        au plus ancien ; cliquer Nom/Rang trie autrement. Filtré en plus
+        par le club coché dans le filtre "Club" (voir _build_payouts_tab
+        / get_selected_clubs) — aucune coche = tous les clubs. Le club
+        pris en compte est celui, actuel, du répertoire (roster.py), pas
+        l'éventuel club figé dans ce tournoi au moment de l'inscription
+        (souvent resté vide sur d'anciens tournois, avant que le club du
+        joueur ne soit renseigné dans le répertoire) — comme pour le
+        filtre équivalent de l'onglet Statistiques. Un joueur toujours
+        sans club dans le répertoire compte pour le club réglé dans
+        Paramètres, pas pour "aucun club"."""
         rows = [r for r in self.db.players_rows() if r["rang"] is not None]
+        selected_clubs = get_selected_clubs(self.classement_club_listbox)
+        if selected_clubs:
+            home_club = export_prefs.load_value("club_name", "").strip()
+            rows = [
+                r for r in rows
+                if (roster.get_club(r["name"]) or home_club) in selected_clubs
+            ]
         column = self.classement_sort["column"]
         ascending = self.classement_sort["ascending"]
 
@@ -7125,6 +7361,32 @@ class App(tk.Tk):
                   "pour en garder une sauvegarde."),
             foreground=MUTED,
         ).grid(row=duration_row + 1, column=0, columnspan=2, sticky="w", pady=10)
+
+        folder_row = duration_row + 2
+        folder_lbl = ttk.Label(left, text="Chemin du dossier du tournoi du jour :")
+        folder_lbl.grid(row=folder_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        Tooltip(
+            folder_lbl,
+            "Dossier choisi par vous où se trouve le tournoi du jour.\n"
+            "Cliquez « Parcourir... » pour le choisir — proposé ensuite\n"
+            "automatiquement (avec un sous-dossier Vendredi/Dimanche/\n"
+            "Autre) pour créer un nouveau tournoi, l'ouvrir, ou dans\n"
+            "l'onglet Statistiques.",
+        )
+        day_folder_var = tk.StringVar(value=self.db.get_setting("tournament_day_folder", ""))
+        # Auto-enregistré à la frappe comme au choix (voir _save_day_folder),
+        # à la fois dans CE tournoi et dans les préférences globales
+        # (tournament_prefs) pour être proposé dès l'écran d'accueil, avant
+        # même l'ouverture d'un fichier .tournoi.
+        day_folder_var.trace_add("write", lambda *a: self._save_day_folder())
+        self.settings_vars["tournament_day_folder"] = day_folder_var
+        ttk.Entry(left, textvariable=day_folder_var, width=25).grid(
+            row=folder_row + 1, column=0, sticky="ew", pady=4, padx=(0, 5)
+        )
+        ttk.Button(
+            left, text="📂 Parcourir...",
+            command=lambda: self._choose_day_folder(day_folder_var),
+        ).grid(row=folder_row + 1, column=1, sticky="ew", pady=4, padx=(5, 0))
 
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
@@ -7479,6 +7741,31 @@ class App(tk.Tk):
         if moves:
             self._trigger_movement_alert()
         return values
+
+    def _choose_day_folder(self, day_folder_var):
+        """Ouvre un sélecteur de dossier pour "Chemin du dossier du tournoi
+        du jour" (voir _build_settings_tab). Le choix est enregistré par le
+        trace_add posé sur day_folder_var (voir _save_day_folder), comme
+        une saisie manuelle dans le champ."""
+        path = filedialog.askdirectory(
+            title="Choisir le dossier du tournoi du jour",
+            initialdir=day_folder_var.get() or os.path.expanduser("~"),
+        )
+        if not path:
+            return
+        day_folder_var.set(path)
+
+    def _save_day_folder(self):
+        """Enregistre en continu "Chemin du dossier du tournoi du jour", au
+        fur et à mesure de la saisie ou dès le choix via "Parcourir..."
+        (voir _build_settings_tab) : à la fois pour CE tournoi (comme les
+        autres réglages), et dans les préférences globales
+        (tournament_prefs) pour que l'écran d'accueil puisse le proposer
+        avant même l'ouverture d'un fichier .tournoi (voir
+        tournament_day_folder_proposal)."""
+        path = self.settings_vars["tournament_day_folder"].get()
+        self.db.set_settings({"tournament_day_folder": path})
+        tournament_prefs.save_last_settings({"tournament_day_folder": path})
 
     def _save_club_name(self):
         """Enregistre en continu le "Nom du Club" (préférence partagée,

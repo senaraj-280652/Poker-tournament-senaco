@@ -35,6 +35,7 @@ PERSISTED_KEYS = [
     "bounty_amount",
     "pko_mode",
     "pko_cash_percent",
+    "tournament_day_folder",
 ]
 
 
@@ -67,10 +68,16 @@ def load_last_settings():
 
 def save_last_settings(values):
     """Mémorise le sous-ensemble pertinent de `values` (dict de réglages)
-    pour les proposer par défaut au prochain nouveau tournoi."""
+    pour les proposer par défaut au prochain nouveau tournoi. Fusionné
+    avec ce qui est déjà enregistré (pas un remplacement complet) : un
+    appel avec un sous-ensemble partiel de PERSISTED_KEYS (ex :
+    tournament_day_folder seul, voir _save_day_folder) n'efface donc pas
+    les autres préférences déjà mémorisées."""
     to_save = {k: v for k, v in values.items() if k in PERSISTED_KEYS}
     if not to_save:
         return
+    existing = load_last_settings()
+    existing.update(to_save)
     path = _prefs_path()
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(to_save, f, ensure_ascii=False, indent=2)
+        json.dump(existing, f, ensure_ascii=False, indent=2)
