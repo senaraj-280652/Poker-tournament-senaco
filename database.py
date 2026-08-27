@@ -1165,6 +1165,37 @@ class Database:
             [[fn(r) for _, _, fn in cols] for r in rows],
         )
 
+    def export_settings_pdf(self, path, club_name=None):
+        """Exporte en PDF tous les réglages actuels de ce tournoi (onglet
+        Paramètres, voir SETTINGS_PRINT_FIELDS), sous forme d'un tableau
+        Réglage/Valeur — pour en garder une trace papier ou la partager.
+        Reflète les valeurs déjà enregistrées dans ce fichier .tournoi
+        (l'appelant, App._print_settings_pdf, enregistre d'abord le
+        formulaire pour être sûr qu'elles soient à jour). Booléens
+        (pko_mode) affichés "Oui"/"Non" plutôt que "1"/"0". `club_name` :
+        à passer explicitement par l'appelant (ex : export_prefs.
+        load_value("club_name", "")) — ce réglage, commun à tous les
+        tournois/Sit & Go, n'est justement JAMAIS écrit dans ce fichier
+        .tournoi (voir App._collect_and_save_all_settings), donc
+        self.get_setting("club_name", ...) renverrait toujours vide ici.
+        Nécessite 'fpdf2'."""
+        name = self.get_setting("tournament_name", "Tournoi")
+        rows = []
+        for key, label in SETTINGS_PRINT_FIELDS:
+            if key == "club_name":
+                value = club_name or ""
+            else:
+                value = self.get_setting(key, "")
+                if key == "pko_mode":
+                    value = "Oui" if value in ("1", 1, True) else "Non"
+            rows.append((label, value))
+        return _write_pdf_table(
+            path, f"Paramètres — {name}",
+            [f"Imprimé le {time.strftime('%d/%m/%Y %H:%M')}"],
+            ["Réglage", "Valeur"],
+            rows,
+        )
+
     def export_bounty_history_csv(self, path, columns=None):
         """Exporte l'historique du bounty progressif (mécanisme PKO
         interne, 2e tableau de l'onglet Primes), en CSV. `columns` :
@@ -2191,6 +2222,21 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
     return {"tournaments": tournaments, "players": players_list}
 
 
+def _period_range_label(date_from, date_to):
+    """Texte lisible de la période couverte par une synthèse
+    (build_period_summary), à afficher dans les exports (CSV/Excel/PDF) —
+    sans lui, un fichier exporté ne permet pas de savoir, une fois hors de
+    l'application, sur quelle période (dates du/au choisies dans l'onglet
+    Statistiques) portait son contenu."""
+    if not date_from and not date_to:
+        return "Période : toutes dates confondues"
+    if date_from and date_to:
+        return f"Période : du {format_date_fr(date_from)} au {format_date_fr(date_to)}"
+    if date_from:
+        return f"Période : à partir du {format_date_fr(date_from)}"
+    return f"Période : jusqu'au {format_date_fr(date_to)}"
+
+
 # Colonnes disponibles pour l'export de la synthèse par période, sous la
 # forme (clé, en-tête, fonction d'extraction de la valeur à partir d'une
 # ligne de tournoi/joueur). Définies une seule fois ici et réutilisées à
@@ -2277,6 +2323,42 @@ PRIMES_COLUMNS = [
     ("total", "TOTAL", lambda r: r["total"]),
 ]
 
+# Réglages imprimables de l'onglet Paramètres (bouton "Imprimer
+# Paramètres...", voir App._print_settings_pdf) : (clé, libellé), dans le
+# même ordre que le formulaire (colonne gauche puis colonne droite). Tenu
+# à jour manuellement en phase avec main.py._build_settings_tab — pas de
+# source unique automatique ici, ces libellés n'existent que côté widgets
+# Tk (self.settings_vars), pas dans ce module.
+SETTINGS_PRINT_FIELDS = [
+    ("club_name", "Nom du Club"),
+    ("tournament_name", "Nom du tournoi"),
+    ("buyin_amount", "Montant du buy-in (€)"),
+    ("rebuy_amount", "Montant d'un rebuy (€)"),
+    ("addon_amount", "Montant d'un add-on (€)"),
+    ("starting_chips", "Tapis de départ (chips)"),
+    ("rebuy_chips", "Chips reçues pour un rebuy"),
+    ("addon_chips", "Chips reçues pour un add-on"),
+    ("max_seats_per_table", "Nombre de sièges par table"),
+    ("min_players_per_table", "Nombre minimum de joueurs par table avant rééquilibrage"),
+    ("highlight_duration_minutes", "Durée de surbrillance des derniers joueurs déplacés (minutes)"),
+    ("rake_percent", "Rake / frais d'organisation (%)"),
+    ("movement_signal_duration_ms", "Durée max. du signal de mouvement (ms)"),
+    ("tournament_day_folder", "Chemin du dossier du tournoi du jour"),
+    ("start_small_blind", "Small blind (niveau 1)"),
+    ("start_big_blind", "Big blind (niveau 1)"),
+    ("ante_start_level", "Niveau à partir duquel l'ante commence"),
+    ("start_ante", "Valeur de l'ante de départ"),
+    ("round_duration_minutes", "Durée d'un Round (minutes)"),
+    ("break_duration_minutes", "Durée de la Pause (minutes)"),
+    ("attendance_bonus_points", "Prime de présence (points)"),
+    ("assiduity_bonus_points", "Prime d'assiduité (points)"),
+    ("assiduity_consecutive_days", "Nombre de jours consécutifs (assiduité)"),
+    ("ranking_bonus_points", "Prime de classement (points)"),
+    ("bounty_amount", "Montant du bounty (points)"),
+    ("pko_mode", "Mode PKO (prime progressive)"),
+    ("pko_cash_percent", "Part en Perso immédiat en PKO (%)"),
+]
+
 # Colonnes disponibles pour l'export de la 2e table de l'onglet Primes,
 # l'historique du bounty progressif (mécanisme PKO interne, voir
 # get_bounty_events) — distinct du récapitulatif ci-dessus.
@@ -2299,49 +2381,68 @@ def _selected_period_columns(columns, keys):
     return [c for c in columns if c[0] in keys]
 
 
-def export_period_summary_csv(summary, path, tournament_keys=None, player_keys=None):
+def export_period_summary_csv(
+    summary, path, tournament_keys=None, player_keys=None, date_from=None, date_to=None,
+):
     """Exporte une synthèse (issue de build_period_summary) en CSV : une
     section 'Tournois de la période', puis une section 'Classement des
     joueurs' incluant les primes (bounty) empochées. `tournament_keys` /
     `player_keys` permettent de ne garder qu'un sous-ensemble de colonnes
-    (voir PERIOD_TOURNAMENT_COLUMNS / PERIOD_PLAYER_COLUMNS) ; None = toutes."""
+    (voir PERIOD_TOURNAMENT_COLUMNS / PERIOD_PLAYER_COLUMNS) ; None = toutes.
+    `date_from`/`date_to` (AAAA-MM-JJ ou None) : bornes de la période
+    choisies dans l'onglet Statistiques, affichées en clair sous chaque
+    titre de section (voir _period_range_label)."""
     import csv
 
     t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
     p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
+    period_label = _period_range_label(date_from, date_to)
 
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f, delimiter=";")
         if t_cols:
             writer.writerow(["Tournois de la période"])
+            writer.writerow([period_label])
             writer.writerow([h for _, h, _ in t_cols])
             for t in summary["tournaments"]:
                 writer.writerow([fn(t) for _, _, fn in t_cols])
             writer.writerow([])
         if p_cols:
             writer.writerow(["Classement des joueurs sur la période"])
+            writer.writerow([period_label])
             writer.writerow([h for _, h, _ in p_cols])
             for a in summary["players"]:
                 writer.writerow([fn(a) for _, _, fn in p_cols])
     return path
 
 
-def export_period_summary_xlsx(summary, path, tournament_keys=None, player_keys=None):
+def export_period_summary_xlsx(
+    summary, path, tournament_keys=None, player_keys=None, date_from=None, date_to=None,
+):
     """Exporte une synthèse en Excel (.xlsx) : une feuille 'Tournois', une
     feuille 'Joueurs', avec les mêmes options de sélection de colonnes que
-    export_period_summary_csv. Nécessite le paquet 'openpyxl'."""
+    export_period_summary_csv (voir aussi date_from/date_to là-bas).
+    Nécessite le paquet 'openpyxl'."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
     from openpyxl.utils import get_column_letter
 
     t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
     p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
+    period_label = _period_range_label(date_from, date_to)
     header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
 
     def _write_sheet(ws, cols, rows):
+        # Ligne 1 : période couverte (italique, fusionnée sur toute la
+        # largeur du tableau) ; ligne 2 : en-têtes de colonnes (décalés
+        # d'une ligne par rapport à avant, d'où row=2 ci-dessous).
+        ws.append([period_label])
+        ws.cell(row=1, column=1).font = Font(italic=True, color="555555")
+        if len(cols) > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(cols))
         ws.append([h for _, h, _ in cols])
         for col in range(1, len(cols) + 1):
-            cell = ws.cell(row=1, column=col)
+            cell = ws.cell(row=2, column=col)
             cell.font = Font(bold=True, color="FFFFFF")
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
@@ -2368,15 +2469,19 @@ def export_period_summary_xlsx(summary, path, tournament_keys=None, player_keys=
     return path
 
 
-def export_period_summary_pdf(summary, path, tournament_keys=None, player_keys=None):
+def export_period_summary_pdf(
+    summary, path, tournament_keys=None, player_keys=None, date_from=None, date_to=None,
+):
     """Exporte une synthèse en PDF : une page 'Tournois de la période', une
     page 'Classement des joueurs sur la période' (chacune omise si sa
     sélection de colonnes est vide), avec les mêmes options que
-    export_period_summary_csv. Nécessite le paquet 'fpdf2'."""
+    export_period_summary_csv (voir aussi date_from/date_to là-bas).
+    Nécessite le paquet 'fpdf2'."""
     from fpdf import FPDF
 
     t_cols = _selected_period_columns(PERIOD_TOURNAMENT_COLUMNS, tournament_keys)
     p_cols = _selected_period_columns(PERIOD_PLAYER_COLUMNS, player_keys)
+    period_label = _period_range_label(date_from, date_to)
 
     pdf = FPDF(orientation="L", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -2385,7 +2490,12 @@ def export_period_summary_pdf(summary, path, tournament_keys=None, player_keys=N
         pdf.add_page()
         pdf.set_font("Helvetica", "B", 16)
         pdf.cell(0, 10, _pdf_text(title), border=0)
-        pdf.ln(12)
+        pdf.ln(9)
+        pdf.set_font("Helvetica", "", 11)
+        pdf.set_text_color(85, 85, 85)
+        pdf.cell(0, 7, _pdf_text(period_label), border=0)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(10)
 
         headers = [h for _, h, _ in cols]
         avail_width = pdf.w - pdf.l_margin - pdf.r_margin

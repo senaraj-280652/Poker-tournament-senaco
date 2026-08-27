@@ -2614,16 +2614,25 @@ class PeriodSummaryDialog(ttk.Frame):
         if not self.summary or not (self.summary["tournaments"] or self.summary["players"]):
             messagebox.showinfo("Info", "Générez d'abord une synthèse non vide.")
             return
-        PeriodExportDialog(self, self.summary)
+        # Les bornes de dates saisies (voir _generate) sont repassées telles
+        # quelles à l'export, pour qu'il puisse indiquer la période couverte
+        # en clair (voir _period_range_label côté database.py) — sans ça,
+        # un fichier exporté ne permettait pas de savoir sur quelle période
+        # portait son contenu une fois hors de l'application.
+        _, date_from = self._parse_date(self.date_from_var.get())
+        _, date_to = self._parse_date(self.date_to_var.get())
+        PeriodExportDialog(self, self.summary, date_from=date_from, date_to=date_to)
 
 
 class PeriodExportDialog(tk.Toplevel):
     """Choix du format (CSV / Excel) et des colonnes à exporter pour une
     synthèse par période déjà générée (voir PeriodSummaryDialog)."""
 
-    def __init__(self, master, summary):
+    def __init__(self, master, summary, date_from=None, date_to=None):
         super().__init__(master)
         self.summary = summary
+        self.date_from = date_from
+        self.date_to = date_to
         self.title("Exporter la synthèse")
         self.configure(bg=FELT_DARK)
         self.geometry("480x560")
@@ -2743,11 +2752,20 @@ class PeriodExportDialog(tk.Toplevel):
         p_keys = keys if kind == "player" else []
         try:
             if fmt == "xlsx":
-                export_period_summary_xlsx(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
+                export_period_summary_xlsx(
+                    self.summary, path, tournament_keys=t_keys, player_keys=p_keys,
+                    date_from=self.date_from, date_to=self.date_to,
+                )
             elif fmt == "pdf":
-                export_period_summary_pdf(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
+                export_period_summary_pdf(
+                    self.summary, path, tournament_keys=t_keys, player_keys=p_keys,
+                    date_from=self.date_from, date_to=self.date_to,
+                )
             else:
-                export_period_summary_csv(self.summary, path, tournament_keys=t_keys, player_keys=p_keys)
+                export_period_summary_csv(
+                    self.summary, path, tournament_keys=t_keys, player_keys=p_keys,
+                    date_from=self.date_from, date_to=self.date_to,
+                )
         except ImportError:
             show_missing_export_module(fmt)
             return
@@ -7267,10 +7285,18 @@ class App(tk.Tk):
             ttk.Entry(left, textvariable=var, width=25).grid(row=i, column=1, pady=4, padx=10)
             self.settings_vars[key] = var
 
+        # Les trois actions sur le formulaire, côte à côte plutôt qu'empilées
+        # (Enregistrer / Récupérer / Imprimer) : plus compact, et les
+        # regroupe visuellement comme les trois faces d'une même action
+        # ("que faire de ces réglages ?").
+        settings_btns_row = ttk.Frame(left)
+        settings_btns_row.grid(row=len(fields), column=0, columnspan=2, pady=(15, 15))
+
         save_as_settings_btn = ttk.Button(
-            left, text="💾 Enregistrer Paramètres sous...", command=self._save_settings_as_template,
+            settings_btns_row, text="💾 Enregistrer Paramètres sous...",
+            command=self._save_settings_as_template,
         )
-        save_as_settings_btn.grid(row=len(fields), column=0, columnspan=2, pady=(15, 3))
+        save_as_settings_btn.pack(side="left", padx=3)
         Tooltip(
             save_as_settings_btn,
             "Applique tous les réglages ci-dessus à ce tournoi ET les\n"
@@ -7280,14 +7306,25 @@ class App(tk.Tk):
             "\"Récupérer Blindes\" pour ça séparément).",
         )
         load_settings_btn = ttk.Button(
-            left, text="📂 Récupérer Paramètres...", command=self._open_settings_templates,
+            settings_btns_row, text="📂 Récupérer Paramètres...", command=self._open_settings_templates,
         )
-        load_settings_btn.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(0, 15))
+        load_settings_btn.pack(side="left", padx=3)
         Tooltip(
             load_settings_btn,
             "Ouvre la liste des réglages déjà enregistrés (via\n"
             "\"Enregistrer Paramètres sous...\") pour en appliquer un à\n"
             "ce tournoi.",
+        )
+        print_settings_btn = ttk.Button(
+            settings_btns_row, text="🖨️ Imprimer Paramètres...", command=self._print_settings_pdf,
+        )
+        print_settings_btn.pack(side="left", padx=3)
+        Tooltip(
+            print_settings_btn,
+            "Enregistre tous les réglages ci-dessus (comme \"Enregistrer\n"
+            "Paramètres sous...\", mais sans leur donner de nom\n"
+            "réutilisable) PUIS génère un PDF récapitulatif — pour en\n"
+            "garder une trace papier ou la partager.",
         )
 
         ttk.Separator(left, orient="horizontal").grid(
@@ -7820,6 +7857,32 @@ class App(tk.Tk):
 
     def _open_settings_templates(self):
         SettingsTemplatesDialog(self)
+
+    def _print_settings_pdf(self):
+        """Enregistre tous les réglages du formulaire (comme "Enregistrer
+        Paramètres sous...", mais sans leur donner de nom réutilisable —
+        applique juste tout à ce tournoi) PUIS génère un PDF récapitulatif
+        (voir Database.export_settings_pdf / SETTINGS_PRINT_FIELDS)."""
+        self._collect_and_save_all_settings()
+        name = self.db.get_setting("tournament_name", "parametres") or "parametres"
+        safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip() or "parametres"
+        path = filedialog.asksaveasfilename(
+            title="Imprimer les paramètres",
+            defaultextension=".pdf",
+            filetypes=[("Fichier PDF", "*.pdf")],
+            initialfile=f"parametres_{safe_name}.pdf",
+        )
+        if not path:
+            return
+        try:
+            # club_name : lu directement depuis le champ du formulaire (pas
+            # depuis self.db, où il n'est jamais écrit — voir le docstring
+            # de Database.export_settings_pdf).
+            self.db.export_settings_pdf(path, club_name=self.settings_vars["club_name"].get())
+        except ImportError:
+            show_missing_export_module("pdf")
+            return
+        open_file_with_default_app(path)
 
     # ---------------------------------------------------------------
     # Boucle de rafraîchissement
