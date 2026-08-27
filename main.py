@@ -3565,20 +3565,25 @@ class App(tk.Tk):
     def _update_window_title(self):
         """Met à jour le titre de la fenêtre et le bandeau avec le nom du
         tournoi en cours (appelé à l'ouverture et après chaque changement
-        de paramètres). Format "Tournoi : <nom> <date du jour>" — la date
-        est celle du jour où la fenêtre est affichée (recalculée à chaque
-        appel), pas forcément celle de création du tournoi."""
+        de paramètres). Format "Tournoi : <nom> <date du tournoi>" — la
+        date affichée est celle de CE tournoi (voir Database.
+        get_tournament_date : date fixée à sa création, ou date de
+        création du fichier .tournoi à défaut pour d'anciens fichiers),
+        pas celle du jour où la fenêtre est ouverte/affichée. Pour un
+        tournoi tout juste créé, les deux coïncident (tournament_date est
+        justement fixée à aujourd'hui à ce moment-là) — seule l'ouverture
+        d'un tournoi plus ancien fait une vraie différence."""
         name = self.db.get_setting("tournament_name", "Tournoi") if self.db else ""
         if self.db and name in ("", "Nouveau tournoi", "Tournoi"):
             fallback = os.path.splitext(os.path.basename(self.db.path))[0]
             if fallback:
                 name = fallback
-        today = datetime.now().strftime("%d/%m/%Y")
-        title = f"Tournoi : {name} {today}" if name else APP_NAME
+        tournament_date = format_date_fr(self.db.get_tournament_date()) if self.db else ""
+        title = f"Tournoi : {name} {tournament_date}" if name else APP_NAME
         self.title(title)
         if hasattr(self, "header_title_lbl"):
             self.header_title_lbl.config(
-                text=f"♠ ♥  Tournoi : {name} {today}  ♦ ♣" if name
+                text=f"♠ ♥  Tournoi : {name} {tournament_date}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
             )
 
