@@ -24,7 +24,7 @@
 
   <Package Name="Gestionnaire de Tournoi de Poker"
            Manufacturer="Raj Juganaikloo"
-           Version="1.2.21"
+           Version="1.2.22"
            UpgradeCode="B0D02965-BECE-4162-856C-144E0675F6AE"
            Language="1036"
            Compressed="yes"
