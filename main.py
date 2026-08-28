@@ -480,11 +480,17 @@ class PlayerSelectionDialog(tk.Toplevel):
         # ET daté du même jour (ex : un autre Sit & Go ce soir) : grisés et
         # non cochables ci-dessous — voir find_players_active_elsewhere
         # (database.py). conflict_folder est None pour un usage sans
-        # contexte de dossier connu (aucun grisage dans ce cas).
-        self.active_elsewhere = find_players_active_elsewhere(
-            conflict_folder, self.roster_names,
-            exclude_path=conflict_exclude_path, date=conflict_date,
-        )
+        # contexte de dossier connu (aucun grisage dans ce cas). Idem si
+        # "Éviter qu'un joueur joue à deux tables à la fois" est décoché
+        # dans Paramètres (préférence partagée, voir _build_settings_tab) :
+        # personne n'est grisé.
+        if export_prefs.load_value("check_multi_table_conflict", True):
+            self.active_elsewhere = find_players_active_elsewhere(
+                conflict_folder, self.roster_names,
+                exclude_path=conflict_exclude_path, date=conflict_date,
+            )
+        else:
+            self.active_elsewhere = set()
 
         ttk.Label(
             self, text="Cochez les joueurs concernés :",
@@ -3375,6 +3381,7 @@ class App(tk.Tk):
         self.voice_awaiting_resume = False
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
+        self._remote_control_tournament_name = "Tournoi"
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -4652,7 +4659,11 @@ class App(tk.Tk):
         """Si `name` est déjà actif dans un autre tournoi .tournoi du même
         dossier (ex : un autre Sit & Go en cours), prévient et demande
         confirmation avant de l'ajouter quand même. Renvoie True s'il faut
-        continuer l'ajout (pas de conflit, ou confirmé malgré tout)."""
+        continuer l'ajout (pas de conflit, ou confirmé malgré tout).
+        Ne vérifie rien du tout si "Éviter qu'un joueur joue à deux tables
+        à la fois" est décoché dans Paramètres (voir _build_settings_tab)."""
+        if not export_prefs.load_value("check_multi_table_conflict", True):
+            return True
         conflict = self.db.find_active_conflict(name)
         if not conflict:
             return True
@@ -4705,7 +4716,11 @@ class App(tk.Tk):
         """Pour une liste de noms à ajouter en une fois : sépare ceux déjà
         actifs dans un autre tournoi du même dossier, prévient en un seul
         message groupé et demande confirmation pour eux uniquement. Renvoie
-        la liste finale des noms à ajouter (sans conflit + confirmés)."""
+        la liste finale des noms à ajouter (sans conflit + confirmés).
+        Ne vérifie rien du tout si "Éviter qu'un joueur joue à deux tables
+        à la fois" est décoché dans Paramètres (voir _build_settings_tab)."""
+        if not export_prefs.load_value("check_multi_table_conflict", True):
+            return list(names)
         no_conflict, conflicts = [], []
         for name in names:
             other = self.db.find_active_conflict(name)
@@ -5107,9 +5122,21 @@ class App(tk.Tk):
             return
         if self.remote_control_server is not None and self.remote_control_server.is_running:
             return
+        # get_tournament_name est appelé depuis le thread du serveur web
+        # (ThreadingHTTPServer démarre un thread par requête) : lire
+        # self.db directement depuis là plante (sqlite3 refuse qu'une
+        # connexion soit utilisée hors du thread qui l'a ouverte —
+        # ProgrammingError, silencieusement avalée par http.server, d'où
+        # une réponse vide côté téléphone/navigateur). On lit donc plutôt
+        # self._remote_control_tournament_name, un simple attribut tenu à
+        # jour depuis le thread principal (voir _tick), jamais écrit ni lu
+        # ailleurs que par une lecture atomique (le GIL suffit ici).
+        self._remote_control_tournament_name = (
+            self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi"
+        )
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
-            get_tournament_name=lambda: self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi",
+            get_tournament_name=lambda: self._remote_control_tournament_name,
         )
         try:
             server.start()
@@ -7430,6 +7457,34 @@ class App(tk.Tk):
             command=lambda: self._choose_day_folder(day_folder_var),
         ).grid(row=folder_row + 1, column=1, sticky="ew", pady=4, padx=(5, 0))
 
+        # Préférence partagée (comme Nom du Club ci-dessus), pas propre à ce
+        # tournoi : désactive dans toute l'appli les vérifications "joueur
+        # déjà actif dans un autre tournoi du même dossier" (fenêtre
+        # "Joueurs participants" à la création, "Inscrire un joueur" et
+        # "Ajouter depuis le répertoire" en cours de tournoi — voir
+        # _warn_active_conflict / _filter_active_conflicts / PlayerSelectionDialog).
+        # Coché par défaut (comportement historique inchangé) ; en pratique
+        # ce conflit reste rare.
+        multi_table_var = tk.BooleanVar(
+            value=export_prefs.load_value("check_multi_table_conflict", True)
+        )
+        multi_table_check = ttk.Checkbutton(
+            left, text="Éviter qu'un joueur joue à deux tables à la fois",
+            variable=multi_table_var,
+            command=lambda: export_prefs.save_value(
+                "check_multi_table_conflict", multi_table_var.get()
+            ),
+        )
+        multi_table_check.grid(
+            row=folder_row + 2, column=0, columnspan=2, sticky="w", pady=(10, 0)
+        )
+        Tooltip(
+            multi_table_check,
+            "Si décoché, le logiciel ne vérifie plus qu'un joueur est déjà\n"
+            "actif dans un autre tournoi/Sit & Go du même dossier avant de\n"
+            "l'ajouter ici — en pratique, ce cas reste rare.",
+        )
+
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
             right, text="Structure de blindes — niveau 1 et antes",
@@ -7607,10 +7662,10 @@ class App(tk.Tk):
 
         ttk.Label(
             right,
-            text=("Le bounty s'applique aux nouvelles inscriptions/rebuys après\n"
-                  "avoir enregistré. En mode classique, l'éliminateur empoche toute\n"
+            text=("Le bounty s'applique aux nouvelles inscriptions/rebuys après "
+                  "avoir enregistré. En mode classique, l'éliminateur empoche toute "
                   "la prime en Perso ; en PKO, une partie s'ajoute à sa propre prime."),
-            foreground=MUTED,
+            foreground=MUTED, wraplength=340, justify="left",
         ).grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
         # -- Raccourcis clavier "Élimination"/"Terminé"/"Chronomètre" :
@@ -7918,6 +7973,11 @@ class App(tk.Tk):
             self._refresh_clock_tab()
         elif current == "Mouvements":
             self._refresh_moves_tab()
+        # Tenu à jour ici (thread principal) plutôt que lu directement
+        # depuis le thread du serveur de contrôle à distance — voir
+        # _start_remote_control_if_enabled.
+        if self.remote_control_server is not None and self.db is not None:
+            self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
         self._tick_after_id = self.after(1000, self._tick)
 
     def _cancel_tick(self):
