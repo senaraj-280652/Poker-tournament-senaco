@@ -4256,8 +4256,14 @@ class App(tk.Tk):
         self.hidden_player_columns = {
             c for c in columns if c not in visible_saved and c not in ("sel", "name")
         }
+        # Conteneur + ascenseur vertical : un tournoi Open peut avoir
+        # beaucoup plus de joueurs que ce qui tient à l'écran (contrairement
+        # à un Sit & Go), sans ça les derniers de la liste n'étaient
+        # atteignables qu'à la molette, sans repère de position.
+        players_tree_frame = ttk.Frame(self.players_tab)
+        players_tree_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         self.players_tree = ttk.Treeview(
-            self.players_tab, columns=columns, show="tree headings", height=20,
+            players_tree_frame, columns=columns, show="tree headings", height=20,
             style="Players.Treeview",
         )
         self.players_tree.heading("#0", text="Photo")
@@ -4295,7 +4301,18 @@ class App(tk.Tk):
             "elim_round": "Round de la structure de blindes (onglet Blindes) où ce\njoueur a été éliminé.",
             "eliminated_by": "Nom du joueur qui l'a éliminé, triable.",
         })
-        self.players_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        players_scrollbar = ttk.Scrollbar(
+            players_tree_frame, orient="vertical", command=self.players_tree.yview
+        )
+        self.players_tree.configure(yscrollcommand=players_scrollbar.set)
+        self.players_tree.pack(side="left", fill="both", expand=True)
+        players_scrollbar.pack(side="right", fill="y")
+        # Molette de souris, en complément de l'ascenseur (même formule que
+        # payouts_tree/moves_tree, cohérent d'un onglet à l'autre).
+        self.players_tree.bind(
+            "<MouseWheel>",
+            lambda e: self.players_tree.yview_scroll(int(-e.delta / 120 * 3) or (-3 if e.delta > 0 else 3), "units"),
+        )
         self.players_tree.bind("<Button-1>", self._on_players_tree_click)
         # Après tout relâchement de clic dans l'en-tête (typiquement la fin
         # d'un redimensionnement de colonne à la souris), masque
@@ -4903,15 +4920,25 @@ class App(tk.Tk):
     def _ask_eliminator(self, exclude_id):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
         compter ses bounties (kills, onglet Primes) et, si un bounty fixe
-        en € est configuré (mécanisme PKO), à le lui attribuer. Renvoie
-        l'id du joueur choisi, ou None si ignoré/annulé."""
+        en € est configuré (mécanisme PKO), à le lui attribuer. Ne
+        propose que les joueurs de la MÊME TABLE que l'éliminé : au
+        poker, on ne peut éliminer que quelqu'un assis à sa propre table.
+        Renvoie l'id du joueur choisi, ou None si ignoré/annulé."""
+        eliminated = self.db.get_player(exclude_id)
         # list_players() trie par table/siège (pratique pour l'affichage du
         # tableau Joueurs, pas pour retrouver un nom ici) — trié par nom
         # pour ce menu, plus facile à parcourir.
-        candidates = sorted(
-            (p for p in self.db.list_players(status="active") if p["id"] != exclude_id),
-            key=lambda p: p["name"].lower(),
-        )
+        same_table = [
+            p for p in self.db.list_players(status="active")
+            if p["id"] != exclude_id and p["table_id"] == eliminated["table_id"]
+        ]
+        # Filet de sécurité si l'éliminé n'a plus de table (ne devrait pas
+        # arriver pour un joueur encore actif) : autant proposer tout le
+        # monde que de bloquer la désignation d'un éliminateur.
+        pool = same_table if eliminated["table_id"] else [
+            p for p in self.db.list_players(status="active") if p["id"] != exclude_id
+        ]
+        candidates = sorted(pool, key=lambda p: p["name"].lower())
         if not candidates:
             return None
 
@@ -4922,8 +4949,6 @@ class App(tk.Tk):
         win.transient(self)
         win.grab_set()
         result = {"id": None}
-
-        eliminated = self.db.get_player(exclude_id)
         header_text = f"Qui a éliminé {eliminated['name']} ?"
         if eliminated["bounty"] > 0:
             header_text = (
@@ -5127,16 +5152,21 @@ class App(tk.Tk):
     def _start_remote_control_if_enabled(self, silent=False):
         """Démarre le petit serveur web de contrôle à distance si le
         réglage correspondant est activé (Paramètres). Silencieux si déjà
-        démarré. Le port ne peut être occupé que par une seule fenêtre à
-        la fois — normal et attendu si plusieurs tournois/Sit & Go tournent
-        en parallèle (voir "Menu principal", chapitre 14) : la première
-        fenêtre ouverte garde le contrôle à distance, les suivantes ne
-        l'activent pas mais restent sinon parfaitement utilisables.
-        `silent=True` (utilisé au lancement automatique d'une fenêtre,
-        justement pour ce cas courant) n'affiche alors aucune fenêtre
-        d'erreur — seulement un message dans la console ; `silent=False`
-        (case à cocher cliquée explicitement dans Paramètres) affiche
-        l'erreur normalement, l'utilisateur a alors besoin du retour."""
+        démarré. Si plusieurs tournois/Sit & Go tournent en parallèle
+        (voir "Menu principal", chapitre 14), seul le premier obtient le
+        port habituel (8765, voir remote_control.DEFAULT_PORT) — les
+        suivants démarrent quand même, chacun sur un port libre
+        quelconque (voir RemoteControlServer.start), et restent
+        joignables depuis le téléphone via le bouton "Lobby" de la page
+        du premier (voir open_windows.list_remote_tournaments et
+        update_remote_info juste en dessous) : `server.start()` ne lève
+        donc plus d'OSError pour ce cas précis, seulement pour un échec
+        réellement bloquant (garde défensive conservée ci-dessous).
+        `silent=True` (utilisé au lancement automatique d'une fenêtre)
+        n'affiche alors aucune fenêtre d'erreur — seulement un message
+        dans la console ; `silent=False` (case à cocher cliquée
+        explicitement dans Paramètres) affiche l'erreur normalement,
+        l'utilisateur a alors besoin du retour."""
         if export_prefs.load_value("remote_control_enabled", False) is not True:
             return
         if self.remote_control_server is not None and self.remote_control_server.is_running:
@@ -5179,6 +5209,15 @@ class App(tk.Tk):
                 )
             return
         self.remote_control_server = server
+        # Fait connaître le port RÉEL de ce tournoi (peut différer de
+        # 8765, voir docstring ci-dessus) au registre partagé entre
+        # processus, pour que le Lobby de la page du téléphone (servie
+        # par quel que soit le tournoi qui a eu le port 8765) puisse le
+        # lister et y relayer les requêtes.
+        if self.db:
+            open_windows.update_remote_info(
+                self.db.path, server.port, self._remote_control_tournament_name
+            )
         self._refresh_remote_control_status()
 
     def _stop_remote_control(self):
@@ -5201,14 +5240,25 @@ class App(tk.Tk):
 
     def _refresh_remote_control_status(self):
         """Met à jour le libellé affichant l'adresse à ouvrir sur le
-        téléphone (ou son absence si le serveur n'est pas démarré)."""
+        téléphone (ou son absence si le serveur n'est pas démarré). Si ce
+        tournoi n'a pas eu le port habituel 8765 (un autre tournoi
+        tournait déjà, voir _start_remote_control_if_enabled), indique
+        plutôt de passer par le Lobby de la page du premier tournoi —
+        donner directement l'adresse de ce port-ci ne servirait à rien,
+        le pare-feu Windows du club n'autorise en général que 8765."""
         if not hasattr(self, "remote_control_status_lbl"):
             return
         if self.remote_control_server is not None and self.remote_control_server.is_running:
-            url = self.remote_control_server.url
-            self.remote_control_status_lbl.config(
-                text=f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
-            )
+            if self.remote_control_server.port == remote_control.DEFAULT_PORT:
+                url = self.remote_control_server.url
+                text = f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
+            else:
+                text = (
+                    "📱 Un autre tournoi occupe déjà le port habituel : ouvrez sa "
+                    "page sur votre téléphone puis choisissez celui-ci via le "
+                    "bouton \"Lobby\"."
+                )
+            self.remote_control_status_lbl.config(text=text)
         else:
             self.remote_control_status_lbl.config(text="")
 
@@ -5250,6 +5300,15 @@ class App(tk.Tk):
             return  # dernier joueur actif : rien à faire, voir _eliminate_selected
         if eliminator_id is not None and eliminator_id not in active_ids:
             eliminator_id = None
+        if eliminator_id is not None:
+            # Un joueur ne peut éliminer que quelqu'un de SA PROPRE table
+            # (voir aussi _ask_eliminator, même règle côté onglet
+            # Joueurs) : la page "Gérer les éliminations" du téléphone ne
+            # propose déjà que ça, mais on revalide ici au cas où (état
+            # changé entre-temps, ex. mouvement de table concurrent).
+            table_by_id = {p["id"]: p["table_id"] for p in active}
+            if table_by_id.get(eliminator_id) != table_by_id.get(eliminated_id):
+                eliminator_id = None
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
         # (et pas après, comme on pourrait s'y attendre) : c'est le premier
@@ -5406,6 +5465,29 @@ class App(tk.Tk):
             "(cliquez « Démarrer » dans l'onglet Chronomètre)."
         )
 
+    def _pending_old_seat_by_name(self):
+        """Tant qu'un mouvement de tables est en attente (bandeau
+        "Changement de tables en cours" affiché, avant que le responsable
+        confirme avec "Terminé"), renvoie {nom_joueur: (ancienne_table,
+        ancien_siège)} pour les joueurs concernés — la base contient déjà
+        la nouvelle affectation (calculée par rebalance_tables, utilisée
+        pour dire où installer les joueurs une fois qu'ils se sont
+        levés), mais les onglets Joueurs ET Tables doivent continuer
+        d'afficher l'ancien emplacement le temps de l'alerte, sans quoi
+        on donnerait l'impression que le joueur a déjà changé de place
+        alors qu'il ne s'est pas encore levé. Voir seat_moves (onglet
+        Mouvements), qui garde justement l'ancienne et la nouvelle valeur
+        le temps de l'alerte — _finish_movement_alert ("Terminé") vide
+        seat_moves, ce qui fait alors réapparaître partout la valeur
+        réelle (déjà en base depuis le début, donc rien à changer côté
+        données). Renvoie un dict vide si aucune alerte n'est active."""
+        if self.db.get_setting_int("movement_alert_active", 0) != 1:
+            return {}
+        return {
+            m["player_name"]: (m["old_table_name"], m["old_seat"])
+            for m in self.db.get_seat_moves()
+        }
+
     def _refresh_players_tab(self):
         # Garde la liste déroulante des clubs à jour (un club a pu être
         # ajouté/modifié entre-temps depuis le répertoire de joueurs).
@@ -5416,24 +5498,7 @@ class App(tk.Tk):
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
         present_ids = set()
 
-        # Tant qu'un mouvement de tables est en attente (bandeau "Changement
-        # de tables en cours" affiché, avant que le responsable confirme
-        # avec "Terminé"), l'onglet Joueurs continue d'afficher l'ANCIENNE
-        # table/siège des joueurs concernés — la base, elle, contient déjà
-        # la nouvelle affectation (calculée par rebalance_tables, utilisée
-        # par l'onglet Tables/le contrôle à distance pour dire où installer
-        # les joueurs), mais l'afficher tout de suite ici donnerait
-        # l'impression que le joueur a déjà changé de place alors qu'il ne
-        # s'est pas encore levé — voir seat_moves (onglet Mouvements), qui
-        # garde justement l'ancienne et la nouvelle valeur le temps de
-        # l'alerte. _finish_movement_alert (bouton "Terminé") vide
-        # seat_moves, ce qui fait alors réapparaître ici la valeur réelle
-        # (déjà en base depuis le début, donc rien à changer côté données).
-        movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
-        pending_old_by_name = {}
-        if movement_alert:
-            for m in self.db.get_seat_moves():
-                pending_old_by_name[m["player_name"]] = (m["old_table_name"], m["old_seat"])
+        pending_old_by_name = self._pending_old_seat_by_name()
 
         status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
         players = [dict(p) for p in self.db.list_players()]
@@ -5635,10 +5700,39 @@ class App(tk.Tk):
     def _refresh_tables_tab(self):
         for w in self.tables_inner.winfo_children():
             w.destroy()
-        tables = self.db.list_tables()
+
+        # Comme l'onglet Joueurs (voir _pending_old_seat_by_name) : tant
+        # qu'un mouvement de tables est en attente, un joueur concerné
+        # reste affiché à son ANCIENNE table/siège ici aussi, pas à la
+        # nouvelle déjà enregistrée en base.
+        pending_old_by_name = self._pending_old_seat_by_name()
+        all_tables_by_id = {t["id"]: t for t in self.db.list_tables(active_only=False)}
+        name_to_id = {t["name"]: t["id"] for t in all_tables_by_id.values()}
+        active_ids = {t["id"] for t in self.db.list_tables()}
+
         players_by_table = {}
         for p in self.db.list_players(status="active"):
-            players_by_table.setdefault(p["table_id"], []).append(p)
+            p = dict(p)
+            table_id, seat = p["table_id"], p["seat"]
+            if p["name"] in pending_old_by_name:
+                old_table_name, old_seat = pending_old_by_name[p["name"]]
+                old_table_id = name_to_id.get(old_table_name)
+                if old_table_id is not None:
+                    table_id, seat = old_table_id, old_seat
+            p["_display_seat"] = seat
+            players_by_table.setdefault(table_id, []).append(p)
+
+        # Tables à afficher : les actives, plus — pendant l'alerte
+        # seulement — celles (même déjà fermées par la consolidation qui a
+        # causé ce mouvement) où un joueur reste affiché "gelé" à son
+        # ancienne place ; sans ça, sa table d'avant, si elle vient de
+        # fermer dans ce même rééquilibrage, n'aurait plus de cadre où
+        # l'afficher tant que "Terminé" n'a pas été cliqué.
+        table_ids_to_show = active_ids | set(players_by_table.keys())
+        tables = sorted(
+            (all_tables_by_id[tid] for tid in table_ids_to_show if tid in all_tables_by_id),
+            key=lambda t: t["id"],
+        )
 
         # Tailles/espacements proportionnels au zoom (voir Zoom+/Zoom-
         # ci-dessus) — tk.LabelFrame/tk.Label plutôt que leurs équivalents
@@ -5659,14 +5753,14 @@ class App(tk.Tk):
                 bg=FELT, fg=GOLD, bd=1, relief="groove", highlightbackground=GOLD_DARK,
             )
             frame.grid(row=idx // cols, column=idx % cols, padx=grid_pad, pady=grid_pad, sticky="n")
-            plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["seat"] or 0)
+            plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["_display_seat"] or 0)
             if not plist:
                 tk.Label(frame, text="(vide)", font=row_font, bg=FELT, fg=CREAM).pack(
                     padx=row_padx, pady=row_pady + 4
                 )
             for p in plist:
                 tk.Label(
-                    frame, text=f"Siège {p['seat']} — {p['name']}",
+                    frame, text=f"Siège {p['_display_seat']} — {p['name']}",
                     font=row_font, bg=FELT, fg=CREAM,
                 ).pack(anchor="w", padx=row_padx, pady=row_pady)
 
@@ -7314,6 +7408,16 @@ class App(tk.Tk):
         self.classement_club_listbox = build_club_filter_widget(
             top, on_change=self._refresh_payouts_tab
         )
+        # Réglage global (comme le zoom des tables ou le contrôle à
+        # distance) : mémorisé d'un tournoi/lancement à l'autre, pas
+        # propre à ce fichier .tournoi précis.
+        self.classement_scroll_var = tk.BooleanVar(
+            value=export_prefs.load_value("classement_autoscroll_enabled", True)
+        )
+        ttk.Checkbutton(
+            top, text="Défilement", variable=self.classement_scroll_var,
+            command=self._on_classement_scroll_toggle,
+        ).pack(side="right", padx=8)
 
         self.payout_summary_lbl = ttk.Label(self.payouts_tab, text="", font=("Helvetica", 11, "bold"))
         self.payout_summary_lbl.pack(padx=10, anchor="w")
@@ -7432,7 +7536,11 @@ class App(tk.Tk):
     def _classement_autoscroll_tick(self):
         """Boucle de défilement automatique et lent de l'onglet Classement,
         active seulement quand le nombre de lignes dépasse la capacité
-        d'affichage à l'écran (sinon rien ne défile)."""
+        d'affichage à l'écran (sinon rien ne défile) et que la case
+        "Défilement" est cochée. Boucle indéfiniment : une fois la
+        dernière ligne intégralement visible, pause pour laisser le
+        temps de lire, retour en haut, nouvelle pause, puis ça redéfile
+        (voir _classement_reset_to_top / _classement_resume_autoscroll)."""
         if not self.winfo_exists() or not self.payouts_tree.winfo_exists():
             return
 
@@ -7442,35 +7550,41 @@ class App(tk.Tk):
             self._classement_scroll_after_id = self.after(500, self._classement_autoscroll_tick)
             return
 
-        children = self.payouts_tree.get_children()
-        # bbox() d'une ligne renvoie '' tant qu'elle n'est pas réellement
-        # visible à l'écran : la dernière ligne a un bbox vide si, et
-        # seulement si, le tableau déborde de la zone visible — un
-        # indicateur direct, sans les arrondis de fraction de yview().
-        overflow = bool(children) and not self.payouts_tree.bbox(children[-1])
-
-        if overflow and not self._classement_scroll_paused:
+        if self.classement_scroll_var.get() and not self._classement_scroll_paused:
             top_frac, bottom_frac = self.payouts_tree.yview()
+            # On se fie uniquement à la fraction yview() (fiable, atteint
+            # bien 1.0 une fois tout défilé) — PAS à bbox() de la dernière
+            # ligne : bbox() renvoie déjà une boîte non vide dès qu'UN
+            # SEUL pixel de la ligne est visible (ligne coupée en bas de
+            # l'écran), ce qui arrêtait le défilement trop tôt et
+            # empêchait de jamais voir la dernière ligne entièrement.
             if bottom_frac < 1.0:
                 self.payouts_tree.yview_scroll(1, "units")
-                if not self.payouts_tree.bbox(children[-1]):
-                    # Toujours pas visible : encore à faire défiler.
-                    pass
-                else:
-                    self._classement_scroll_paused = True
-                    self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_resume_autoscroll)
             elif top_frac > 0.0:
-                # Arrivé en bas : pause puis retour en haut.
+                # Dernière ligne désormais intégralement visible (tout
+                # défilé) : pause ici pour laisser le temps de la lire,
+                # puis retour en haut (voir _classement_reset_to_top).
                 self._classement_scroll_paused = True
-                self.payouts_tree.yview_moveto(0.0)
-                self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_resume_autoscroll)
+                self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_reset_to_top)
 
         self._classement_scroll_after_id = self.after(
             self.CLASSEMENT_AUTOSCROLL_INTERVAL_MS, self._classement_autoscroll_tick
         )
 
+    def _classement_reset_to_top(self):
+        """Après la pause en bas (voir _classement_autoscroll_tick) :
+        retour en haut, puis nouvelle pause avant de reboucler à
+        l'infini — tant que la case "Défilement" reste cochée."""
+        if not self.payouts_tree.winfo_exists():
+            return
+        self.payouts_tree.yview_moveto(0.0)
+        self.after(self.CLASSEMENT_AUTOSCROLL_PAUSE_MS, self._classement_resume_autoscroll)
+
     def _classement_resume_autoscroll(self):
         self._classement_scroll_paused = False
+
+    def _on_classement_scroll_toggle(self):
+        export_prefs.save_value("classement_autoscroll_enabled", self.classement_scroll_var.get())
 
     # ---------------------------------------------------------------
     # Onglet Paramètres

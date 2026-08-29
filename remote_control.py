@@ -12,7 +12,21 @@ dépendance en plus de la bibliothèque standard, sert :
   éliminé puis éliminateur, correspond à l'usage en salle de poker) pour
   gérer les éliminations entièrement depuis le téléphone, sans repasser
   par le PC — pensée pour un responsable qui joue aussi à une table et
-  ne peut pas se lever à chaque élimination.
+  ne peut pas se lever à chaque élimination ;
+- un "Lobby" (bouton au-dessus de "Joueurs", visible seulement si plus
+  d'un tournoi tourne en même temps — voir open_windows.py) pour choisir
+  QUEL tournoi gérer depuis le téléphone. Chaque tournoi/Sit & Go est un
+  processus indépendant (voir spawn_app_process dans main.py) qui essaie
+  de démarrer son PROPRE RemoteControlServer sur le port 8765 ; seul le
+  premier y arrive, les suivants retombent automatiquement sur un port
+  libre quelconque (voir RemoteControlServer.start) — invisible pour le
+  téléphone, qui ne parle jamais qu'au port 8765. Le Lobby, servi par ce
+  processus-là, lit le registre partagé (open_windows.list_remote_
+  tournaments) pour lister tous les tournois joignables, et une fois un
+  tournoi choisi (cookie "selected_pid"), RELAIE en interne (127.0.0.1)
+  chaque requête suivante vers le port réel de ce tournoi précis (voir
+  Handler._proxy_target/_proxy) — le téléphone ne voit jamais qu'une
+  seule adresse, tout le raccordement entre processus se fait côté PC.
 
 Rien n'est installé sur le téléphone : juste ouvrir une adresse dans son
 navigateur, sur le wifi du club.
@@ -25,9 +39,14 @@ déclenchées sont les mêmes que celles déjà disponibles au clavier
 touche aux données du tournoi autrement que par une élimination normale.
 """
 import json
+import os
 import socket
 import threading
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import open_windows
 
 DEFAULT_PORT = 8765
 
@@ -58,6 +77,7 @@ _PAGE_TEMPLATE = """<!doctype html>
     -webkit-tap-highlight-color: transparent;
   }}
   button:active {{ transform: scale(0.97); }}
+  #btn-lobby {{ background: #5a3a8c; }}
   #btn-elimination {{ background: #b5442e; }}
   #btn-chronometre {{ background: #1f6b3a; }}
   #btn-terminer {{ background: #8a6d1f; }}
@@ -72,6 +92,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   <h1>🎙 Contrôle à distance</h1>
   <p class="tournoi">{tournament_name}</p>
 
+  {lobby_button}
   <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Joueurs</button>
   <button id="btn-chronometre" onclick="sendAction('chronometre', this)">▶ Chronomètre</button>
   <button id="btn-terminer" onclick="sendAction('terminer', this)">✅ Terminé</button>
@@ -94,6 +115,48 @@ function sendAction(action, btn) {{
     }});
 }}
 </script>
+</body>
+</html>
+"""
+
+# Page "Lobby" : liste des tournois actuellement joignables (registre
+# partagé open_windows.py — voir docstring du module), un bouton par
+# tournoi. Choisir un tournoi POSTe... en fait un simple lien GET vers
+# /select_tournament?pid=N, qui pose un cookie et redirige vers "/" —
+# toutes les requêtes suivantes de CE téléphone sont alors relayées vers
+# le port de ce tournoi précis (voir Handler._proxy_target/_proxy).
+# N'est jamais accédée directement par un lien visible si un seul
+# tournoi est ouvert (voir do_GET, bouton "Lobby" masqué dans ce cas).
+_LOBBY_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Lobby</title>
+<style>
+  body {{
+    margin: 0; padding: 24px 16px 40px;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    text-align: center;
+  }}
+  h1 {{ font-size: 20px; color: #e8c468; margin: 0 0 20px; }}
+  a.back {{ display: block; color: #b9ad8f; text-decoration: none; margin-bottom: 22px; font-size: 15px; }}
+  button {{
+    display: block; width: 100%; max-width: 420px; margin: 0 auto 14px;
+    padding: 22px 10px; font-size: 19px; font-weight: 700;
+    border: none; border-radius: 14px; color: #fff; background: #3a5a8c;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  button:active {{ transform: scale(0.97); }}
+  button.current {{ background: #e8c468; color: #10241a; }}
+  p.empty {{ color: #b9ad8f; font-size: 15px; }}
+</style>
+</head>
+<body>
+  <a class="back" href="/">← Retour</a>
+  <h1>🏛 Choisir un tournoi</h1>
+  {rows}
 </body>
 </html>
 """
@@ -143,6 +206,10 @@ _ELIMINATE_PAGE = """<!doctype html>
   .player-item.dragging {{ opacity: 0.35; }}
   .player-item.drop-hover {{ background: #e8c468; color: #10241a; }}
   .player-item.drop-hover .sub {{ color: #4a3c10; }}
+  /* Pendant un glissement, les joueurs d'une autre table que l'éliminé
+     ne peuvent pas être l'éliminateur (au poker, on n'élimine que
+     quelqu'un de sa propre table) — grisés et non ciblables. */
+  .player-item.not-eligible {{ opacity: 0.25; pointer-events: none; }}
   #empty {{
     text-align: center; color: #b9ad8f; padding: 40px 16px; font-size: 15px;
   }}
@@ -231,6 +298,7 @@ function makeItem(p, isSource) {{
   var div = document.createElement('div');
   div.className = 'player-item';
   div.dataset.id = p.id;
+  div.dataset.table = p.table || '';
   var sub = fmtSub(p);
   div.dataset.name = fmtLabel(p);
   div.dataset.sub = sub;
@@ -241,6 +309,27 @@ function makeItem(p, isSource) {{
     div.dataset.target = 'true';
   }}
   return div;
+}}
+
+// Un joueur ne peut éliminer que quelqu'un de SA PROPRE table (au
+// poker, on n'élimine jamais quelqu'un assis à une autre table) :
+// pendant un glissement engagé, grise/désactive dans la colonne de
+// droite (Éliminateur) tous les joueurs qui ne sont pas à la même table
+// que l'éliminé en cours de glissement, pour ne laisser sélectionnable
+// que les candidats valides.
+function applyTableFilter(tableName) {{
+  var right = document.getElementById('list-right');
+  Array.prototype.forEach.call(right.children, function(item) {{
+    if (item.dataset.table !== tableName) {{
+      item.classList.add('not-eligible');
+    }}
+  }});
+}}
+function clearTableFilter() {{
+  var right = document.getElementById('list-right');
+  Array.prototype.forEach.call(right.children, function(item) {{
+    item.classList.remove('not-eligible');
+  }});
 }}
 
 function moveGhost(x, y) {{
@@ -264,7 +353,8 @@ function onTouchStart(e) {{
   var el = e.currentTarget;
   var t = e.touches[0];
   pending = {{
-    id: el.dataset.id, label: el.dataset.name, sub: el.dataset.sub, el: el,
+    id: el.dataset.id, label: el.dataset.name, sub: el.dataset.sub,
+    table: el.dataset.table, el: el,
     startX: t.clientX, startY: t.clientY, engaged: false,
   }};
   document.addEventListener('touchmove', onTouchMove, {{passive: false}});
@@ -290,6 +380,7 @@ function onTouchMove(e) {{
     }}
     pending.engaged = true;
     pending.el.classList.add('dragging');
+    applyTableFilter(pending.table);
     var ghost = document.getElementById('ghost');
     ghost.textContent = pending.label;
     ghost.style.display = 'block';
@@ -314,6 +405,7 @@ function cancelPending() {{
   document.removeEventListener('touchcancel', onTouchEnd);
   if (pending && pending.el) pending.el.classList.remove('dragging');
   if (hoverTarget) {{ hoverTarget.classList.remove('drop-hover'); hoverTarget = null; }}
+  clearTableFilter();
   document.getElementById('ghost').style.display = 'none';
   pending = null;
 }}
@@ -416,6 +508,30 @@ class RemoteControlServer:
         get_name = self.get_tournament_name
         get_players = self.get_players
         on_eliminate = self.on_eliminate
+        own_pid = os.getpid()
+
+        def resolve_proxy_port(handler):
+            """Port du tournoi actuellement choisi par CE téléphone (cookie
+            "selected_pid", posé par /select_tournament — voir
+            _LOBBY_PAGE), s'il diffère de ce tournoi-ci. None si aucune
+            sélection, sélection = ce tournoi-ci, ou tournoi sélectionné
+            disparu depuis (fenêtre fermée entre-temps) — dans tous ces
+            cas, la requête est traitée localement, sur ce tournoi-ci."""
+            cookie_header = handler.headers.get("Cookie", "")
+            selected_pid = None
+            for part in cookie_header.split(";"):
+                part = part.strip()
+                if part.startswith("selected_pid="):
+                    try:
+                        selected_pid = int(part.split("=", 1)[1])
+                    except ValueError:
+                        selected_pid = None
+            if selected_pid is None or selected_pid == own_pid:
+                return None
+            for t in open_windows.list_remote_tournaments():
+                if t["pid"] == selected_pid:
+                    return t["port"]
+            return None
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, fmt, *args):
@@ -437,10 +553,88 @@ class RemoteControlServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _proxy(self, target_port):
+                """Relaie telle quelle la requête en cours vers le VRAI
+                port du tournoi choisi via le Lobby (127.0.0.1 — toujours
+                la même machine, jamais le réseau externe) et renvoie au
+                téléphone la réponse obtenue, sans qu'il n'ait jamais eu
+                à connaître ce port lui-même."""
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length) if length else None
+                url = f"http://127.0.0.1:{target_port}{self.path}"
+                req = urllib.request.Request(url, data=body, method=self.command)
+                ctype = self.headers.get("Content-Type")
+                if ctype:
+                    req.add_header("Content-Type", ctype)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        data = resp.read()
+                        self.send_response(resp.status)
+                        self.send_header(
+                            "Content-Type", resp.headers.get("Content-Type", "text/html; charset=utf-8")
+                        )
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                except (OSError, urllib.error.URLError):
+                    self.send_error(502, "Ce tournoi n'est momentanément plus joignable")
+
+            def _handle_lobbylist(self):
+                tournaments = open_windows.list_remote_tournaments()
+                if not tournaments:
+                    rows = "<p class=\"empty\">Aucun tournoi joignable pour l'instant.</p>"
+                else:
+                    parts = []
+                    for t in sorted(tournaments, key=lambda x: x["name"].lower()):
+                        is_self = t["pid"] == own_pid
+                        css_class = " class=\"current\"" if is_self else ""
+                        label = _escape_html(t["name"]) + (" (celui-ci)" if is_self else "")
+                        parts.append(
+                            f'<button{css_class} '
+                            f'onclick="window.location.href=\'/select_tournament?pid={t["pid"]}\'">{label}</button>'
+                        )
+                    rows = "\n".join(parts)
+                self._send_html(_LOBBY_PAGE.format(rows=rows))
+
+            def _handle_select_tournament(self):
+                from urllib.parse import parse_qs, urlparse
+                query = parse_qs(urlparse(self.path).query)
+                pid_values = query.get("pid")
+                self.send_response(302)
+                if pid_values:
+                    try:
+                        pid = int(pid_values[0])
+                        self.send_header("Set-Cookie", f"selected_pid={pid}; Path=/")
+                    except ValueError:
+                        pass
+                self.send_header("Location", "/")
+                self.end_headers()
+
             def do_GET(self):
+                # Toujours traitées ICI, jamais relayées vers un autre
+                # tournoi : ce sont les pages qui permettent justement de
+                # choisir/changer de tournoi.
+                if self.path == "/lobbylist":
+                    self._handle_lobbylist()
+                    return
+                if self.path.startswith("/select_tournament"):
+                    self._handle_select_tournament()
+                    return
+
+                target_port = resolve_proxy_port(self)
+                if target_port is not None:
+                    self._proxy(target_port)
+                    return
+
                 if self.path in ("/", "/index.html"):
+                    tournaments = open_windows.list_remote_tournaments()
+                    lobby_button = (
+                        '<button id="btn-lobby" onclick="window.location.href=\'/lobbylist\'">🏛 Lobby</button>'
+                        if len(tournaments) > 1 else ""
+                    )
                     self._send_html(_PAGE_TEMPLATE.format(
-                        tournament_name=_escape_html(get_name())
+                        tournament_name=_escape_html(get_name()),
+                        lobby_button=lobby_button,
                     ))
                 elif self.path in ("/eliminate", "/eliminate.html"):
                     self._send_html(_ELIMINATE_PAGE.format(
@@ -452,6 +646,11 @@ class RemoteControlServer:
                     self.send_error(404)
 
             def do_POST(self):
+                target_port = resolve_proxy_port(self)
+                if target_port is not None:
+                    self._proxy(target_port)
+                    return
+
                 if self.path.startswith("/action/"):
                     action = self.path[len("/action/"):]
                     if action not in _VALID_ACTIONS:
@@ -475,7 +674,18 @@ class RemoteControlServer:
                 else:
                     self.send_error(404)
 
-        self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        try:
+            self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        except OSError:
+            # Port déjà pris par un autre tournoi/processus (voir docstring
+            # de la classe) : on prend un port libre quelconque à la place
+            # plutôt que d'abandonner — ce tournoi reste joignable depuis
+            # le téléphone via le Lobby (voir open_windows.
+            # update_remote_info, appelé par l'appelant juste après ce
+            # start()), même s'il n'est pas celui que le téléphone
+            # contacte directement.
+            self._httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+        self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 

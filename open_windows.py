@@ -95,6 +95,48 @@ def register(path):
     _save(data)
 
 
+def update_remote_info(path, port, name):
+    """Complète l'entrée de ce processus avec les infos nécessaires au
+    Lobby de la page "Contrôle à distance" du téléphone (voir
+    remote_control.py) : le port effectivement utilisé par SON PROPRE
+    serveur de contrôle à distance (peut différer du port par défaut
+    8765 si un autre processus/tournoi l'a pris en premier — voir
+    RemoteControlServer.start) et le nom affiché sur le bouton du
+    Lobby. Appelé à chaque démarrage du contrôle à distance (voir
+    App._start_remote_control_if_enabled). Sans effet si `path` n'est
+    pas (ou plus) enregistré par ce processus."""
+    if not path:
+        return
+    data = _prune(_load())
+    abs_path = os.path.abspath(path)
+    entry = data.get(abs_path)
+    if entry and entry.get("pid") == os.getpid():
+        entry["remote_port"] = port
+        entry["tournament_name"] = name
+        _save(data)
+
+
+def list_remote_tournaments():
+    """Tournois actuellement ouverts (tous processus vivants confondus)
+    dont le contrôle à distance est actif — pour le Lobby de la page
+    "Contrôle à distance" (voir remote_control.py) : ce module n'a
+    besoin de rien d'autre que ce simple registre partagé sur disque
+    pour savoir joindre (en local, sur 127.0.0.1) le serveur de
+    n'importe quel autre tournoi ouvert, même depuis le port d'un
+    tournoi différent. Chaque entrée : {"pid", "port", "name"}."""
+    data = _prune(_load())
+    result = []
+    for entry in data.values():
+        port = entry.get("remote_port")
+        if port:
+            result.append({
+                "pid": entry.get("pid"),
+                "port": port,
+                "name": entry.get("tournament_name") or "Tournoi",
+            })
+    return result
+
+
 def unregister(path):
     """Retire l'entrée de `path` si elle appartient au processus courant
     (par précaution, pour ne jamais effacer par erreur celle d'un autre
