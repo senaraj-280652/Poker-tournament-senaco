@@ -4882,7 +4882,11 @@ class App(tk.Tk):
         for pid in ids:
             moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
         self._clear_checked()
-        self._refresh_all()
+        # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
+        # (voir la même remarque dans _remote_eliminate) : positionne
+        # movement_alert_active avant que l'onglet Joueurs ne se
+        # rafraîchisse, pour qu'il affiche tout de suite l'ancienne
+        # table/siège plutôt que la nouvelle (voir _refresh_players_tab).
         if len(self.db.list_players(status="active")) <= 1:
             # Tournoi terminé (0 ou 1 joueur encore actif) : un éventuel
             # rééquilibrage resté "en attente" (alerte non fermée via
@@ -4894,6 +4898,7 @@ class App(tk.Tk):
                 self._finish_movement_alert()
         elif moved_count:
             self._trigger_movement_alert()
+        self._refresh_all()
 
     def _ask_eliminator(self, exclude_id):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
@@ -5086,23 +5091,26 @@ class App(tk.Tk):
     # n'est traité que s'il a un sens dans l'état courant du tournoi.
     # ---------------------------------------------------------------
     def _bind_voice_command_shortcuts(self):
-        """Raccourcis clavier Ctrl+Maj+E / Ctrl+Maj+C / Ctrl+Maj+T pour les
-        3 actions "Élimination"/"Chronomètre"/"Terminé", TOUJOURS actifs.
-        Ctrl+Alt a été écarté (Ctrl+Maj utilisé à la place) : sur Mac,
-        Option("Alt")+E/C/T compose des caractères spéciaux (é/è, ç, †) au
-        niveau du système avant même que l'application ne voie la touche,
-        rendant Ctrl+Alt peu fiable là-bas — Maj ne compose jamais de
-        caractère spécial, donc fiable sur Windows et Mac. Passent par
-        _on_voice_word, exactement comme le contrôle à distance : mêmes
-        conditions (ex : "Ctrl+Maj+C" ne fait rien tant qu'aucune
-        élimination n'est en attente)."""
+        """Raccourcis clavier Ctrl+Maj+J / Ctrl+Maj+C / Ctrl+Maj+T pour les
+        3 actions "Joueurs"/"Chronomètre"/"Terminé", TOUJOURS actifs (J
+        comme "Joueurs" — anciennement E comme "Élimination", renommé
+        avec le bouton correspondant du contrôle à distance : ce module
+        gère maintenant plus largement les joueurs, pas seulement les
+        éliminations). Ctrl+Alt a été écarté (Ctrl+Maj utilisé à la
+        place) : sur Mac, Option("Alt")+J/C/T compose des caractères
+        spéciaux au niveau du système avant même que l'application ne
+        voie la touche, rendant Ctrl+Alt peu fiable là-bas — Maj ne
+        compose jamais de caractère spécial, donc fiable sur Windows et
+        Mac. Passent par _on_voice_word, exactement comme le contrôle à
+        distance : mêmes conditions (ex : "Ctrl+Maj+C" ne fait rien tant
+        qu'aucune élimination n'est en attente)."""
         # Chaque raccourci est lié en MAJUSCULE et en minuscule : avec
         # Control enfoncé, Tk ne met pas toujours le keysym en majuscule
         # comme il le ferait pour Maj+lettre seule (constaté sous Windows,
-        # où <Control-Shift-E> ne se déclenchait jamais alors que
-        # <Control-Shift-e> fonctionne) — lier les deux couvre tous les
+        # où <Control-Shift-J> ne se déclenchait jamais alors que
+        # <Control-Shift-j> fonctionne) — lier les deux couvre tous les
         # cas sans dépendre de ce détail d'implémentation par plateforme.
-        for key in ("E", "e"):
+        for key in ("J", "j"):
             self.bind_all(f"<Control-Shift-{key}>", lambda e: self._on_voice_word("elimination"))
         for key in ("C", "c"):
             self.bind_all(f"<Control-Shift-{key}>", lambda e: self._on_voice_word("chronometre"))
@@ -5227,7 +5235,7 @@ class App(tk.Tk):
 
     def _remote_eliminate(self, eliminated_id, eliminator_id):
         """Élimination décidée depuis la page "Éliminations" du contrôle
-        à distance (glisser un éliminateur sur un éliminé, voir
+        à distance (glisser un joueur éliminé sur son éliminateur, voir
         remote_control.py) : mêmes garde-fous et suites que
         _eliminate_selected (bounty, rééquilibrage, bandeau de mouvement,
         fin de partie), pour un résultat identique à une élimination faite
@@ -5243,14 +5251,23 @@ class App(tk.Tk):
         if eliminator_id is not None and eliminator_id not in active_ids:
             eliminator_id = None
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
-        self._refresh_all()
-        self._refresh_remote_players_cache()
+        # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
+        # (et pas après, comme on pourrait s'y attendre) : c'est le premier
+        # qui positionne movement_alert_active, dont dépend l'affichage
+        # figé de l'onglet Joueurs pendant qu'un mouvement est en attente
+        # (voir _refresh_players_tab) — dans l'autre ordre, ce premier
+        # rafraîchissement afficherait déjà la nouvelle table/siège avant
+        # même que l'alerte existe, et plus aucun rafraîchissement
+        # ultérieur ne viendrait corriger l'affichage tant que l'onglet
+        # Joueurs n'est pas quitté puis réaffiché.
         if len(self.db.list_players(status="active")) <= 1:
             if (self.db.get_setting_int("movement_alert_active", 0) == 1
                     or self.db.count_seat_moves() > 0):
                 self._finish_movement_alert()
         elif moves:
             self._trigger_movement_alert(from_remote=True)
+        self._refresh_all()
+        self._refresh_remote_players_cache()
         # Contrairement à une élimination faite directement dans l'onglet
         # Joueurs (_eliminate_selected) : pas de self.lift()/focus_force()
         # sur la fenêtre PRINCIPALE ici. Une élimination décidée depuis le
@@ -5399,12 +5416,35 @@ class App(tk.Tk):
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
         present_ids = set()
 
+        # Tant qu'un mouvement de tables est en attente (bandeau "Changement
+        # de tables en cours" affiché, avant que le responsable confirme
+        # avec "Terminé"), l'onglet Joueurs continue d'afficher l'ANCIENNE
+        # table/siège des joueurs concernés — la base, elle, contient déjà
+        # la nouvelle affectation (calculée par rebalance_tables, utilisée
+        # par l'onglet Tables/le contrôle à distance pour dire où installer
+        # les joueurs), mais l'afficher tout de suite ici donnerait
+        # l'impression que le joueur a déjà changé de place alors qu'il ne
+        # s'est pas encore levé — voir seat_moves (onglet Mouvements), qui
+        # garde justement l'ancienne et la nouvelle valeur le temps de
+        # l'alerte. _finish_movement_alert (bouton "Terminé") vide
+        # seat_moves, ce qui fait alors réapparaître ici la valeur réelle
+        # (déjà en base depuis le début, donc rien à changer côté données).
+        movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
+        pending_old_by_name = {}
+        if movement_alert:
+            for m in self.db.get_seat_moves():
+                pending_old_by_name[m["player_name"]] = (m["old_table_name"], m["old_seat"])
+
         status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
         players = [dict(p) for p in self.db.list_players()]
         n_active = sum(1 for p in players if p["status"] == "active")
         for p in players:
             p["status_label"] = status_labels.get(p["status"], p["status"])
             p["table_name"] = tables.get(p["table_id"], "-") if p["table_id"] else "-"
+            if p["name"] in pending_old_by_name:
+                old_table_name, old_seat = pending_old_by_name[p["name"]]
+                p["table_name"] = old_table_name or "-"
+                p["seat"] = old_seat
             # Rang final : celui d'un joueur éliminé (voir eliminate_player),
             # 1 pour le vainqueur (seul joueur encore actif, tournoi
             # terminé), et non déterminé (« - ») pour les autres joueurs
@@ -5584,9 +5624,13 @@ class App(tk.Tk):
 
     def _rebalance(self):
         moves = self.db.rebalance_tables()
-        self._refresh_all()
+        # _trigger_movement_alert avant _refresh_all : voir la remarque
+        # dans _eliminate_selected/_remote_eliminate — sinon l'onglet
+        # Joueurs, si c'est lui l'onglet affiché, montrerait la nouvelle
+        # table/siège avant même que l'alerte n'existe.
         if moves:
             self._trigger_movement_alert()
+        self._refresh_all()
 
     def _refresh_tables_tab(self):
         for w in self.tables_inner.winfo_children():
@@ -5688,6 +5732,30 @@ class App(tk.Tk):
             "À cliquer une fois que tous les joueurs déplacés ont rejoint\n"
             "leur nouvelle table : referme le bandeau \"Changement de tables\n"
             "en cours\" et relance le chronomètre.",
+        )
+        print_filled_btn = ttk.Button(
+            top, text="🖨️ Imprimer", command=self._print_movement_slips_filled,
+        )
+        print_filled_btn.pack(side="right", padx=3)
+        Tooltip(
+            print_filled_btn,
+            "Imprime un coupon par joueur pour les mouvements réellement\n"
+            "affichés ci-dessous (nom du tournoi, nom du joueur, ancienne/\n"
+            "nouvelle table et siège déjà remplis) — à découper et remettre\n"
+            "directement, sans rien écrire à la main. Pratique quand\n"
+            "beaucoup de joueurs sont concernés à la fois.",
+        )
+        print_blank_btn = ttk.Button(
+            top, text="🖨️ Imprimer Vierge", command=self._print_movement_slips,
+        )
+        print_blank_btn.pack(side="right", padx=3)
+        Tooltip(
+            print_blank_btn,
+            "Imprime une feuille de coupons vierges (nom du tournoi, nom\n"
+            "du joueur, ancienne/nouvelle table et siège) à remplir à la\n"
+            "main, découper et remettre directement au joueur concerné —\n"
+            "plus rapide et plus discret que d'annoncer les mouvements à\n"
+            "voix haute.",
         )
 
         cols = ("time", "player", "old_table", "old_seat", "new_table", "new_seat")
@@ -7879,14 +7947,14 @@ class App(tk.Tk):
         shortcuts_title.grid(row=voice_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
         Tooltip(
             shortcuts_title,
-            "Ctrl+Maj+E met le chrono en pause et bascule sur l'onglet\n"
+            "Ctrl+Maj+J met le chrono en pause et bascule sur l'onglet\n"
             "Joueurs ; Ctrl+Maj+C le relance (si aucun mouvement n'a eu\n"
             "lieu) ; Ctrl+Maj+T referme l'alerte de mouvement. Toujours\n"
             "actifs, rien à activer dans les réglages.",
         )
         ttk.Label(
             right,
-            text=("Ctrl+Maj+E Élimination   |   Ctrl+Maj+C Chronomètre   |   Ctrl+Maj+T Terminé"),
+            text=("Ctrl+Maj+J Joueurs   |   Ctrl+Maj+C Chronomètre   |   Ctrl+Maj+T Terminé"),
             foreground=MUTED, wraplength=340, justify="left",
         ).grid(row=voice_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
@@ -8133,6 +8201,60 @@ class App(tk.Tk):
             self.db.export_settings_pdf(path, club_name=self.settings_vars["club_name"].get())
         except ImportError:
             show_missing_export_module("pdf")
+            return
+        open_file_with_default_app(path)
+
+    def _print_movement_slips(self):
+        """Bouton "Imprimer" de l'onglet Mouvements : génère une feuille de
+        coupons vierges à découper (voir Database.export_movement_slips_pdf)
+        — rien n'est préempli automatiquement à partir des mouvements
+        affichés dans le tableau, le responsable écrit chaque coupon à la
+        main au moment où il remet effectivement le joueur en mouvement."""
+        path = filedialog.asksaveasfilename(
+            title="Imprimer les coupons de mouvement de table",
+            defaultextension=".pdf",
+            filetypes=[("Fichier PDF", "*.pdf")],
+            initialfile="coupons_mouvement_table.pdf",
+        )
+        if not path:
+            return
+        try:
+            self.db.export_movement_slips_pdf(path)
+        except ImportError:
+            show_missing_export_module("pdf")
+            return
+        open_file_with_default_app(path)
+
+    def _print_movement_slips_filled(self):
+        """Bouton "Imprimer" de l'onglet Mouvements (à distinguer de
+        "Imprimer Vierge") : imprime un coupon par mouvement réellement
+        affiché dans le tableau, déjà rempli (voir
+        Database.export_movement_slips_filled_pdf) — pratique quand
+        beaucoup de joueurs sont concernés à la fois."""
+        if self.db.count_seat_moves() == 0:
+            messagebox.showinfo(
+                "Aucun mouvement",
+                "Aucun mouvement de table en attente à imprimer pour l'instant.",
+            )
+            return
+        path = filedialog.asksaveasfilename(
+            title="Imprimer les mouvements en cours",
+            defaultextension=".pdf",
+            filetypes=[("Fichier PDF", "*.pdf")],
+            initialfile="coupons_mouvement_table_rempli.pdf",
+        )
+        if not path:
+            return
+        try:
+            self.db.export_movement_slips_filled_pdf(path)
+        except ImportError:
+            show_missing_export_module("pdf")
+            return
+        except ValueError:
+            messagebox.showinfo(
+                "Aucun mouvement",
+                "Aucun mouvement de table en attente à imprimer pour l'instant.",
+            )
             return
         open_file_with_default_app(path)
 

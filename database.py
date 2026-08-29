@@ -3,6 +3,7 @@
 Couche d'accès aux données pour le gestionnaire de tournoi de poker.
 Toutes les données d'un tournoi sont stockées dans un seul fichier SQLite.
 """
+import re
 import sqlite3
 import time
 import math
@@ -397,6 +398,39 @@ class Database:
         self.conn.execute("UPDATE tables_pk SET max_seats=?", (new_max,))
         self.conn.commit()
 
+    def _table_display_number(self, table_row):
+        """Numéro affiché d'une table (ex : 9 pour "Table 9"), utilisé pour
+        décider quelle table fermer en premier lors d'une consolidation
+        (voir rebalance_tables) — à préférer à l'id interne, qui peut
+        diverger du numéro affiché sur un vieux fichier .tournoi (voir
+        commentaire dans rebalance_tables). Retombe sur l'id si le nom ne
+        se termine pas par un nombre (table renommée manuellement)."""
+        m = re.search(r"(\d+)\s*$", table_row["name"] or "")
+        return int(m.group(1)) if m else table_row["id"]
+
+    def _open_or_reopen_table(self):
+        """Fournit une table supplémentaire quand aucune table active n'a
+        de place (voir _seat_player et rebalance_tables) : réactive
+        d'abord la table FERMÉE dont le numéro affiché est le plus bas
+        s'il en existe une, plutôt que d'en créer systématiquement une
+        toute nouvelle avec un numéro plus haut. Sans ça, une phase de
+        consolidation (tables fermées en fin de tournoi) suivie d'un
+        besoin de place retrouvé (joueur réintégré, ou ajouté après coup)
+        rouvrait toujours une table de numéro croissant, laissant des
+        trous dans la numérotation affichée (ex : Table 1, 8, 9 restantes
+        au lieu de Table 1, 2, 3 — un joueur avait fini par signaler cette
+        numérotation en dents de scie comme un bug). Renvoie la ligne de
+        la table (réactivée ou nouvellement créée)."""
+        closed = [t for t in self.list_tables(active_only=False) if t["is_active"] == 0]
+        if closed:
+            closed.sort(key=self._table_display_number)
+            t = closed[0]
+            self.conn.execute("UPDATE tables_pk SET is_active=1 WHERE id=?", (t["id"],))
+            self.conn.commit()
+            return self.conn.execute("SELECT * FROM tables_pk WHERE id=?", (t["id"],)).fetchone()
+        new_id = self.add_table()
+        return self.conn.execute("SELECT * FROM tables_pk WHERE id=?", (new_id,)).fetchone()
+
     def add_table(self, name=None):
         max_seats = self.get_setting_int("max_seats_per_table", 9)
         if name is None:
@@ -665,7 +699,7 @@ class Database:
         """Assoit un joueur à la table la moins remplie, sur le premier siège libre."""
         tables = self.list_tables()
         if not tables:
-            self.add_table()
+            self._open_or_reopen_table()
             tables = self.list_tables()
         best_table = None
         best_count = None
@@ -677,10 +711,7 @@ class Database:
             if occ < t["max_seats"] and (best_count is None or occ < best_count):
                 best_table, best_count = t, occ
         if best_table is None:
-            new_id = self.add_table()
-            best_table = self.conn.execute(
-                "SELECT * FROM tables_pk WHERE id=?", (new_id,)
-            ).fetchone()
+            best_table = self._open_or_reopen_table()
         taken = {
             r["seat"]
             for r in self.conn.execute(
@@ -745,7 +776,7 @@ class Database:
         # cours de tournoi).
         if len(tables) < n_tables_needed:
             for _ in range(n_tables_needed - len(tables)):
-                self.add_table()
+                self._open_or_reopen_table()
             tables = list(self.list_tables())
 
         # Ferme les tables en trop — toujours en partant du numéro le PLUS
@@ -764,7 +795,16 @@ class Database:
             occ_by_table = {}
             for p in active_players:
                 occ_by_table.setdefault(p["table_id"], []).append(p)
-            tables_sorted = sorted(tables, key=lambda t: -t["id"])
+            # Trié par NUMÉRO affiché (extrait du nom "Table N"), pas par id
+            # interne : les deux coïncident normalement (add_table nomme
+            # toujours la nouvelle table d'après le nombre total de tables
+            # jamais créées), mais un fichier .tournoi hérité d'une
+            # version antérieure à la suppression de l'ancienne
+            # renumérotation pouvait avoir des id et des numéros affichés
+            # décorrélés — d'où par exemple "Table 1, Table 8, Table 9"
+            # restantes au lieu de "Table 1, Table 2, Table 3" quand on se
+            # fie à l'id brut plutôt qu'au numéro réellement affiché.
+            tables_sorted = sorted(tables, key=lambda t: -self._table_display_number(t))
             to_close = tables_sorted[: len(tables) - n_tables_needed]
             for t in to_close:
                 players_to_move = occ_by_table.get(t["id"], [])
@@ -833,22 +873,36 @@ class Database:
             )
             self.conn.commit()
 
-        # Recompacte les numéros de sièges de chaque table (1, 2, 3... sans
-        # trou, jamais au-delà du nombre de sièges défini) : nécessaire
-        # notamment après une réduction du nombre de sièges par table en
-        # cours de tournoi, où d'anciens numéros de siège (ex : 7, 8, 9)
-        # pouvaient sinon rester affichés malgré le nouveau maximum.
+        # NE comble PAS les sièges laissés vides par un joueur éliminé (ou
+        # déplacé ailleurs) à une table par ailleurs inchangée : au poker,
+        # les autres joueurs restent physiquement assis là où ils sont,
+        # personne ne se déplace juste pour "combler un trou" — même
+        # l'éliminateur, resté à sa place, se retrouvait pourtant avec un
+        # nouveau numéro de siège à chaque élimination à sa table, sans
+        # aucun mouvement annoncé (le changement de SIÈGE seul, sans
+        # changement de TABLE, n'est jamais compté comme un "mouvement" —
+        # voir plus bas — donc personne n'était prévenu). On ne réassigne
+        # ici que les sièges qui dépassent le nombre de places actuel de la
+        # table (ex : réduction du nombre de sièges par table en cours de
+        # tournoi) : un vrai cas de contrainte violée, pas juste "il y a un
+        # trou".
         for t in self.list_tables():
             occupants = self.conn.execute(
                 "SELECT id, seat FROM players WHERE table_id=? AND status='active' "
                 "ORDER BY seat",
                 (t["id"],),
             ).fetchall()
-            for i, p in enumerate(occupants, start=1):
-                if p["seat"] != i:
-                    self.conn.execute(
-                        "UPDATE players SET seat=? WHERE id=?", (i, p["id"])
-                    )
+            overflow = [p for p in occupants if p["seat"] > t["max_seats"]]
+            if not overflow:
+                continue
+            taken = {p["seat"] for p in occupants if p["seat"] <= t["max_seats"]}
+            seat = 1
+            for p in overflow:
+                while seat in taken:
+                    seat += 1
+                self.conn.execute("UPDATE players SET seat=? WHERE id=?", (seat, p["id"]))
+                taken.add(seat)
+                seat += 1
         self.conn.commit()
 
         # Calcule les déplacements réels (avant -> après) et les archive.
@@ -1149,6 +1203,99 @@ class Database:
             ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
 
         wb.save(path)
+        return path
+
+    def export_movement_slips_pdf(self, path, n_slips=6):
+        """Génère une page de coupons VIERGES (rien de préempli, pas même
+        le nom du tournoi) à découper, un par joueur concerné par un
+        changement de table — bouton "Imprimer" de l'onglet Mouvements.
+        Le responsable écrit chaque coupon à la main au moment du
+        mouvement réel (nom du tournoi, nom du joueur, ancienne table/
+        siège, nouvelle table/siège) et le remet directement au joueur :
+        plus rapide et plus discret que d'annoncer les mouvements à voix
+        haute. `n_slips` : nombre de coupons identiques sur la page (une
+        seule impression sert pour tout un mouvement de plusieurs
+        joueurs à la fois). Nécessite 'fpdf2'."""
+        from fpdf import FPDF
+
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.set_auto_page_break(auto=False)
+        pdf.add_page()
+
+        margin = 12
+        usable_width = pdf.w - 2 * margin
+        slip_height = (pdf.h - 2 * margin) / n_slips
+        line_h = (slip_height - 8) / 4
+        half_width = (usable_width - 6) / 2
+
+        pdf.set_font("Helvetica", "", 11)
+        for i in range(n_slips):
+            top = margin + i * slip_height
+            if i > 0:
+                pdf.dashed_line(margin, top, pdf.w - margin, top, dash_length=2, space_length=1.5)
+            y = top + 5
+
+            def field(label, x, y, w):
+                pdf.set_xy(x, y)
+                pdf.cell(w, line_h, _pdf_text(label), border="B")
+
+            field("Nom du tournoi : ", margin, y, usable_width)
+            field("Nom du joueur : ", margin, y + line_h, usable_width)
+            field("Ancienne table : ", margin, y + 2 * line_h, half_width)
+            field("Ancien siège : ", margin + half_width + 6, y + 2 * line_h, half_width)
+            field("Nouvelle table : ", margin, y + 3 * line_h, half_width)
+            field("Nouveau siège : ", margin + half_width + 6, y + 3 * line_h, half_width)
+
+        pdf.output(path)
+        return path
+
+    def export_movement_slips_filled_pdf(self, path, n_per_page=6):
+        """Comme export_movement_slips_pdf, mais un coupon par mouvement
+        RÉELLEMENT en attente (voir get_seat_moves, même liste que le
+        tableau de l'onglet Mouvements), déjà rempli avec les vraies
+        valeurs — rien à écrire à la main, juste à découper et remettre.
+        Pratique quand beaucoup de joueurs sont concernés à la fois (voir
+        bouton "Imprimer" de l'onglet Mouvements, à distinguer du bouton
+        "Imprimer Vierge" qui imprime des coupons vides). Une page par
+        tranche de `n_per_page` mouvements. Lève ValueError si aucun
+        mouvement n'est en attente. Nécessite 'fpdf2'."""
+        moves = self.get_seat_moves()
+        if not moves:
+            raise ValueError("Aucun mouvement en attente à imprimer.")
+        name = self.get_setting("tournament_name", "Tournoi")
+
+        from fpdf import FPDF
+
+        pdf = FPDF(orientation="P", unit="mm", format="A4")
+        pdf.set_auto_page_break(auto=False)
+
+        margin = 12
+        usable_width = pdf.w - 2 * margin
+        slip_height = (pdf.h - 2 * margin) / n_per_page
+        line_h = (slip_height - 8) / 4
+        half_width = (usable_width - 6) / 2
+
+        def field(label, value, x, y, w):
+            pdf.set_xy(x, y)
+            pdf.cell(w, line_h, _pdf_text(f"{label}{value}"), border="B")
+
+        for i, m in enumerate(moves):
+            pos = i % n_per_page
+            if pos == 0:
+                pdf.add_page()
+                pdf.set_font("Helvetica", "", 11)
+            top = margin + pos * slip_height
+            if pos > 0:
+                pdf.dashed_line(margin, top, pdf.w - margin, top, dash_length=2, space_length=1.5)
+            y = top + 5
+            field("Nom du tournoi : ", name, margin, y, usable_width)
+            field("Nom du joueur : ", m["player_name"], margin, y + line_h, usable_width)
+            field("Ancienne table : ", m["old_table_name"] or "-", margin, y + 2 * line_h, half_width)
+            field("Ancien siège : ", m["old_seat"] or "-", margin + half_width + 6, y + 2 * line_h, half_width)
+            field("Nouvelle table : ", m["new_table_name"] or "-", margin, y + 3 * line_h, half_width)
+            field("Nouveau siège : ", m["new_seat"] or "-", margin + half_width + 6, y + 3 * line_h, half_width)
+
+        pdf.output(path)
         return path
 
     def export_primes_pdf(self, path, columns=None, sort_column=None, ascending=True, title=None):

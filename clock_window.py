@@ -52,7 +52,7 @@ class ClockWindow(tk.Toplevel):
         self.configure(bg="#0b1f14")
         self.geometry("1000x650")
 
-        # Rappel des raccourcis clavier (Ctrl+Maj+E/C/T), en haut à gauche
+        # Rappel des raccourcis clavier (Ctrl+Maj+J/C/T), en haut à gauche
         # — contenu fixe (ne dépend pas du tournoi), affiché en permanence,
         # pas seulement pendant une alerte de mouvement (contrairement au
         # bandeau movement_alert_frame ci-dessous), pour que le responsable
@@ -64,7 +64,7 @@ class ClockWindow(tk.Toplevel):
             bg="#0b1f14", fg="#f4c542", anchor="w", justify="left",
         ).pack(anchor="w")
         for line in (
-            "Ctrl+Maj+E  Élimination",
+            "Ctrl+Maj+J  Joueurs",
             "Ctrl+Maj+C  Chronomètre",
             "Ctrl+Maj+T  Terminé",
         ):

@@ -4,14 +4,15 @@ Contrôle à distance depuis un téléphone (ou toute autre appareil sur le
 même réseau Wifi) : un tout petit serveur web embarqué, sans aucune
 dépendance en plus de la bibliothèque standard, sert :
 
-- une page mobile avec 3 gros boutons — "Élimination", "Chronomètre",
+- une page mobile avec 3 gros boutons — "Joueurs", "Chronomètre",
   "Terminé" — équivalents exacts des raccourcis clavier (voir
   App._on_voice_word dans main.py) ;
-- une page "Éliminations" à deux colonnes (glisser un éliminateur, à
-  gauche, sur un joueur éliminé, à droite, avec confirmation) pour gérer
-  les éliminations entièrement depuis le téléphone, sans repasser par le
-  PC — pensée pour un responsable qui joue aussi à une table et ne peut
-  pas se lever à chaque élimination.
+- une page "Éliminations" à deux colonnes (glisser un joueur éliminé, à
+  gauche, sur son éliminateur, à droite, avec confirmation — cet ordre,
+  éliminé puis éliminateur, correspond à l'usage en salle de poker) pour
+  gérer les éliminations entièrement depuis le téléphone, sans repasser
+  par le PC — pensée pour un responsable qui joue aussi à une table et
+  ne peut pas se lever à chaque élimination.
 
 Rien n'est installé sur le téléphone : juste ouvrir une adresse dans son
 navigateur, sur le wifi du club.
@@ -20,7 +21,7 @@ Volontairement sans mot de passe ni compte : l'accès est limité à qui est
 déjà sur le même réseau Wifi local (comme le reste de l'application, qui
 n'a pas non plus de système d'authentification), et les actions
 déclenchées sont les mêmes que celles déjà disponibles au clavier
-(Ctrl+Maj+E/C/T) ou dans l'onglet Joueurs — rien de destructeur, rien qui
+(Ctrl+Maj+J/C/T) ou dans l'onglet Joueurs — rien de destructeur, rien qui
 touche aux données du tournoi autrement que par une élimination normale.
 """
 import json
@@ -71,7 +72,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   <h1>🎙 Contrôle à distance</h1>
   <p class="tournoi">{tournament_name}</p>
 
-  <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Élimination</button>
+  <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Joueurs</button>
   <button id="btn-chronometre" onclick="sendAction('chronometre', this)">▶ Chronomètre</button>
   <button id="btn-terminer" onclick="sendAction('terminer', this)">✅ Terminé</button>
   <button id="btn-eliminations" onclick="window.location.href='/eliminate'">🎯 Gérer les éliminations</button>
@@ -97,12 +98,14 @@ function sendAction(action, btn) {{
 </html>
 """
 
-# Page "Éliminations" : deux colonnes tactiles (éliminateur à gauche,
-# éliminé à droite), chacune avec son propre ascenseur vertical. Glisser
-# un nom de gauche sur un nom de droite (doigt ou stylet tactile)
-# déclenche une demande de confirmation puis POST /eliminate. Sans
-# bibliothèque externe (glisser-déposer géré à la main via les
-# événements tactiles, pas HTML5 drag-and-drop — peu fiable au toucher).
+# Page "Éliminations" : deux colonnes tactiles (éliminé à gauche,
+# éliminateur à droite — cet ordre correspond à l'usage en salle de
+# poker, où l'on note d'abord le joueur éliminé puis son éliminateur),
+# chacune avec son propre ascenseur vertical. Glisser un nom de gauche
+# sur un nom de droite (doigt ou stylet tactile) déclenche une demande de
+# confirmation puis POST /eliminate. Sans bibliothèque externe
+# (glisser-déposer géré à la main via les événements tactiles, pas
+# HTML5 drag-and-drop — peu fiable au toucher).
 _ELIMINATE_PAGE = """<!doctype html>
 <html lang="fr">
 <head>
@@ -159,11 +162,11 @@ _ELIMINATE_PAGE = """<!doctype html>
   </div>
   <div id="columns">
     <div class="col col-left">
-      <h2>Éliminateur — glisser vers →</h2>
+      <h2>Éliminé — glisser vers →</h2>
       <div class="list" id="list-left"></div>
     </div>
     <div class="col col-right">
-      <h2>← déposer ici — Éliminé</h2>
+      <h2>← déposer ici — Éliminateur</h2>
       <div class="list" id="list-right"></div>
     </div>
   </div>
@@ -219,8 +222,8 @@ function renderLists() {{
     return a.name.localeCompare(b.name, 'fr', {{sensitivity: 'base'}});
   }});
   sorted.forEach(function(p) {{
-    left.appendChild(makeItem(p, true));
-    right.appendChild(makeItem(p, false));
+    left.appendChild(makeItem(p, true));   // gauche = Éliminé (glissable)
+    right.appendChild(makeItem(p, false)); // droite = Éliminateur (cible)
   }});
 }}
 
@@ -322,9 +325,13 @@ function onTouchEnd(e) {{
   cancelPending();
 
   if (wasEngaged && target && target.dataset.id !== drag.id) {{
+    // Colonne de gauche (glissée) = Éliminé, colonne de droite (déposée
+    // dessus) = Éliminateur — voir confirmElimination pour l'ordre inverse
+    // historique (avant l'inversion demandée par un joueur : en salle, on
+    // note d'abord l'éliminé, puis son éliminateur).
     confirmElimination(
-      drag.id, drag.label, drag.sub,
-      target.dataset.id, target.dataset.name, target.dataset.sub
+      target.dataset.id, target.dataset.name, target.dataset.sub,
+      drag.id, drag.label, drag.sub
     );
   }}
 }}
@@ -332,9 +339,10 @@ function onTouchEnd(e) {{
 function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, eliminatedId, eliminatedLabel, eliminatedSub) {{
   var elimText = eliminatedLabel + (eliminatedSub ? ' ' + eliminatedSub : '');
   var elorText = eliminatorLabel + (eliminatorSub ? ' ' + eliminatorSub : '');
-  // Éliminateur d'abord, éliminé ensuite : dans le même ordre que le
-  // geste (on part de la colonne de gauche, l'éliminateur).
-  var msg = elorText + '\\nélimine\\n' + elimText + ' ?';
+  // Éliminé d'abord, éliminateur ensuite : dans le même ordre que le
+  // geste (on part de la colonne de gauche, l'éliminé) et que l'usage en
+  // salle de poker (on note d'abord qui est éliminé, puis par qui).
+  var msg = elimText + '\\nest éliminé par\\n' + elorText + ' ?';
   if (!window.confirm(msg)) return;
   fetch('/eliminate', {{
     method: 'POST',
