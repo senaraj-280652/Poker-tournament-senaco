@@ -3382,6 +3382,11 @@ class App(tk.Tk):
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
+        # Liste des joueurs actifs pour la page "Éliminations" du contrôle
+        # à distance — même principe que _remote_control_tournament_name :
+        # tenue à jour depuis le thread principal (voir _tick), jamais lue
+        # ni écrite depuis le thread du serveur web.
+        self._remote_players_cache = []
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -5013,23 +5018,28 @@ class App(tk.Tk):
         if not sound_signal.play_tone(880, duration):
             self.bell()  # repli si la lecture audio n'a pas pu être lancée
 
-    def _trigger_movement_alert(self):
+    def _trigger_movement_alert(self, from_remote=False):
         """Appelé dès qu'un rééquilibrage a réellement déplacé des joueurs
         (élimination ou bouton "Rééquilibrer les tables") : joue le signal
         sonore, met le chronomètre en pause (comme _clock_pause) s'il
         tournait, et active le bandeau clignotant "Changement de tables en
-        cours" (onglets Chronomètre + écran projecteur). Bascule aussi
+        cours" (onglets Chronomètre + écran projecteur — ce dernier via
+        _refresh_clock_tab, qui pousse l'état à self.clock_window.refresh
+        indépendamment de la fenêtre principale). Bascule aussi
         automatiquement l'onglet Mouvements au premier plan (au-dessus du
-        Chronomètre ou de tout autre onglet affiché) pour que le
-        responsable voie tout de suite qui doit changer de table, avant de
-        dire "Terminé". Le bouton "Terminé" de l'onglet Mouvements
-        (_finish_movement_alert) referme le bandeau et relance le
-        chronomètre — comme le raccourci clavier Ctrl+Maj+T ou le bouton
-        "Terminé" du contrôle à distance (voir _on_voice_word). Annule
-        aussi une éventuelle "élimination en attente" (voir
-        _voice_start_elimination) : si l'élimination qui vient de se
-        produire a justement causé ce rééquilibrage, c'est "Terminé" qui
-        clôt le tout maintenant, plus "Chronomètre"."""
+        Chronomètre ou de tout autre onglet affiché) et ramène la fenêtre
+        principale au premier plan, SAUF si `from_remote=True` (élimination
+        décidée depuis le téléphone, voir _remote_eliminate) : dans ce cas
+        personne n'est devant le PC, et faire remonter la fenêtre
+        principale ne ferait que recouvrir l'écran projecteur (donnant
+        l'impression que le mode projecteur s'arrête). Le bouton "Terminé"
+        de l'onglet Mouvements (_finish_movement_alert) referme le bandeau
+        et relance le chronomètre — comme le raccourci clavier Ctrl+Maj+T
+        ou le bouton "Terminé" du contrôle à distance (voir
+        _on_voice_word). Annule aussi une éventuelle "élimination en
+        attente" (voir _voice_start_elimination) : si l'élimination qui
+        vient de se produire a justement causé ce rééquilibrage, c'est
+        "Terminé" qui clôt le tout maintenant, plus "Chronomètre"."""
         self._play_movement_signal()
         if (self.db.get_setting_int("clock_started", 0) == 1
                 and self.db.get_setting_int("is_paused", 1) == 0):
@@ -5038,15 +5048,16 @@ class App(tk.Tk):
             self.db.set_settings({"is_paused": 1, "paused_accum_seconds": elapsed})
         self.db.set_settings({"movement_alert_active": 1})
         self.voice_awaiting_resume = False
-        self.notebook.select(self.moves_tab)
         self._refresh_moves_tab()
         self._refresh_clock_tab()
-        # Ramène la fenêtre principale au premier plan (devant l'écran
-        # projecteur, potentiellement plein écran) : changer d'onglet ne
-        # suffit pas à rendre le bandeau visible si une autre fenêtre le
-        # recouvre encore (voir aussi _voice_start_elimination).
-        self.lift()
-        self.focus_force()
+        if not from_remote:
+            self.notebook.select(self.moves_tab)
+            # Ramène la fenêtre principale au premier plan (devant l'écran
+            # projecteur, potentiellement plein écran) : changer d'onglet
+            # ne suffit pas à rendre le bandeau visible si une autre
+            # fenêtre le recouvre encore (voir aussi _voice_start_elimination).
+            self.lift()
+            self.focus_force()
 
     def _finish_movement_alert(self):
         """Bouton "Terminé" de l'onglet Mouvements (ou raccourci clavier/
@@ -5134,9 +5145,14 @@ class App(tk.Tk):
         self._remote_control_tournament_name = (
             self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi"
         )
+        self._refresh_remote_players_cache()
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
+            get_players=lambda: self._remote_players_cache,
+            on_eliminate=lambda eliminated_id, eliminator_id: self.voice_command_queue.put(
+                ("eliminate", eliminated_id, eliminator_id)
+            ),
         )
         try:
             server.start()
@@ -5189,27 +5205,78 @@ class App(tk.Tk):
             self.remote_control_status_lbl.config(text="")
 
     def _poll_voice_queue(self):
-        """Relève régulièrement les mots-clés déposés par le contrôle à
-        distance (voir remote_control.py) et les traite ici, sur le thread
-        Tkinter — même principe périodique que _tick. S'arrête
-        silencieusement de se reprogrammer si la fenêtre a été détruite
-        entre-temps (fenêtre secondaire fermée, appli quittée)."""
+        """Relève régulièrement les mots-clés (et éliminations décidées
+        depuis la page "Éliminations" du contrôle à distance) déposés par
+        remote_control.py, et les traite ici, sur le thread Tkinter — même
+        principe périodique que _tick. S'arrête silencieusement de se
+        reprogrammer si la fenêtre a été détruite entre-temps (fenêtre
+        secondaire fermée, appli quittée)."""
         if not self.winfo_exists():
             return
         try:
             while True:
                 item = self.voice_command_queue.get_nowait()
-                self._on_voice_word(item)
+                if isinstance(item, tuple) and item and item[0] == "eliminate":
+                    _, eliminated_id, eliminator_id = item
+                    self._remote_eliminate(eliminated_id, eliminator_id)
+                else:
+                    self._on_voice_word(item)
         except queue.Empty:
             pass
         self.after(150, self._poll_voice_queue)
+
+    def _remote_eliminate(self, eliminated_id, eliminator_id):
+        """Élimination décidée depuis la page "Éliminations" du contrôle
+        à distance (glisser un éliminateur sur un éliminé, voir
+        remote_control.py) : mêmes garde-fous et suites que
+        _eliminate_selected (bounty, rééquilibrage, bandeau de mouvement,
+        fin de partie), pour un résultat identique à une élimination faite
+        directement dans l'onglet Joueurs."""
+        if not self.db:
+            return
+        active = self.db.list_players(status="active")
+        active_ids = {p["id"] for p in active}
+        if eliminated_id not in active_ids or eliminated_id == eliminator_id:
+            return  # état déjà changé entre-temps (ex : élimination concurrente) ou requête absurde
+        if len(active_ids) <= 1:
+            return  # dernier joueur actif : rien à faire, voir _eliminate_selected
+        if eliminator_id is not None and eliminator_id not in active_ids:
+            eliminator_id = None
+        moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
+        self._refresh_all()
+        self._refresh_remote_players_cache()
+        if len(self.db.list_players(status="active")) <= 1:
+            if (self.db.get_setting_int("movement_alert_active", 0) == 1
+                    or self.db.count_seat_moves() > 0):
+                self._finish_movement_alert()
+        elif moves:
+            self._trigger_movement_alert(from_remote=True)
+        # Contrairement à une élimination faite directement dans l'onglet
+        # Joueurs (_eliminate_selected) : pas de self.lift()/focus_force()
+        # sur la fenêtre PRINCIPALE ici. Une élimination décidée depuis le
+        # téléphone veut justement dire que personne n'est devant le PC —
+        # faire remonter la fenêtre principale ne servirait à rien et,
+        # pire, viendrait recouvrir l'écran projecteur (potentiellement
+        # plein écran) juste en dessous.
+        #
+        # On fait l'inverse : si l'écran projecteur est ouvert, on le
+        # relève lui, explicitement, à chaque élimination à distance —
+        # plutôt que de simplement "ne pas toucher à la pile de fenêtres"
+        # (ce qui suppose qu'il était déjà au premier plan, hypothèse
+        # fragile : une seule fenêtre peut avoir le focus à la fois sur un
+        # Mac à un seul écran, et un rafraîchissement de la fenêtre
+        # principale ailleurs entre-temps a pu la faire passer devant sans
+        # qu'aucun code à nous ne le demande explicitement).
+        if self.clock_window is not None and self.clock_window.winfo_exists():
+            self.clock_window.bring_to_front()
 
     def _on_voice_word(self, word):
         """Dispatché pour chaque mot-clé reçu ("elimination"/"terminer"/
         "chronometre", depuis un raccourci clavier ou le contrôle à
         distance) : n'agit que si ce mot a un sens dans l'état courant du
-        tournoi (ex : "chronomètre" ne fait rien tant qu'aucune
-        élimination n'est en attente)."""
+        tournoi (ex : "chronomètre" ne relance pas le chrono tant qu'un
+        mouvement de table est en attente — mais affiche quand même l'écran
+        projecteur, ce n'est pas la même chose)."""
         if not self.db:
             return
         alert_active = self.db.get_setting_int("movement_alert_active", 0) == 1
@@ -5220,16 +5287,24 @@ class App(tk.Tk):
             if not alert_active and not self.voice_awaiting_resume:
                 self._voice_start_elimination()
         elif word == "chronometre":
-            if alert_active:
-                pass
-            elif self.voice_awaiting_resume:
-                self._voice_resume_clock()
+            if self.voice_awaiting_resume:
+                # Reprendre le chrono après une élimination : à éviter tant
+                # qu'un mouvement de table est en attente (le responsable
+                # doit d'abord fermer l'alerte avec "Terminé") — sinon le
+                # chrono repartirait alors que des joueurs n'ont pas encore
+                # changé de table.
+                if not alert_active:
+                    self._voice_resume_clock()
             else:
                 # Hors du contexte "reprendre après une élimination" :
                 # sert simplement à ramener l'écran projecteur au premier
                 # plan (utile s'il a été rapetissé/réduit pour faire autre
-                # chose dans le logiciel entre-temps) — sans quoi Ctrl+Maj+C
-                # ne faisait rien du tout en dehors de ce contexte précis.
+                # chose dans le logiciel entre-temps, ou pour le rouvrir à
+                # distance après une élimination faite depuis le téléphone,
+                # qui ne passe jamais par voice_awaiting_resume). Il n'y a
+                # aucune raison de bloquer ça même si une alerte de
+                # mouvement est active : au contraire, c'est justement là
+                # que le responsable a besoin de voir l'écran projecteur.
                 self._voice_show_clock()
 
     def _voice_start_elimination(self):
@@ -5261,26 +5336,26 @@ class App(tk.Tk):
         distance) : relance le chrono après une élimination (déclenchée
         par "Élimination") qui n'a causé aucun mouvement de table (sinon
         c'est "Terminé" qui s'en charge, voir _finish_movement_alert), et
-        ramène l'onglet Chronomètre + l'écran projecteur au premier plan."""
+        ramène l'onglet Chronomètre + l'écran projecteur au premier plan
+        (l'ouvre s'il n'existait pas encore — voir _open_clock_window)."""
         self.voice_awaiting_resume = False
         self._clock_resume()
         self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
-        if self.clock_window is not None and self.clock_window.winfo_exists():
-            self.clock_window.bring_to_front()
+        self._open_clock_window(fullscreen=True)
 
     def _voice_show_clock(self):
-        """Commande "Chronomètre" (raccourci clavier Ctrl+Maj+C) hors du
-        contexte "reprendre après une élimination" (voir _on_voice_word) :
-        ramène simplement l'onglet Chronomètre et l'écran projecteur au
-        premier plan, en restaurant son plein écran s'il l'était avant
-        d'être rapetissé pour faire autre chose dans le logiciel — sans
-        toucher à l'état pause/lecture du chrono ni à quoi que ce soit
-        d'autre."""
+        """Commande "Chronomètre" (raccourci clavier Ctrl+Maj+C ou contrôle
+        à distance) hors du contexte "reprendre après une élimination"
+        (voir _on_voice_word) : ramène simplement l'onglet Chronomètre et
+        l'écran projecteur au premier plan (l'ouvre s'il n'existait pas
+        encore — voir _open_clock_window), en restaurant son plein écran
+        s'il l'était avant d'être rapetissé pour faire autre chose dans le
+        logiciel — sans toucher à l'état pause/lecture du chrono ni à quoi
+        que ce soit d'autre."""
         self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
-        if self.clock_window is not None and self.clock_window.winfo_exists():
-            self.clock_window.bring_to_front()
+        self._open_clock_window(fullscreen=True)
         self.lift()
 
     def _update_tournament_started_buttons(self):
@@ -5423,7 +5498,18 @@ class App(tk.Tk):
     TABLES_AUTOSCROLL_INTERVAL_MS = 45
     TABLES_AUTOSCROLL_PAUSE_MS = 2500  # pause en haut et en bas avant de reboucler
 
+    # Zoom des cartes de table (taille du texte affiché) : mémorisé comme
+    # préférence partagée (comme Nom du Club), pas propre à un tournoi —
+    # pratique pour ajuster une bonne fois la lisibilité selon l'écran
+    # utilisé (ex : projeté pour les joueurs) sans avoir à recommencer à
+    # chaque tournoi.
+    TABLES_ZOOM_MIN = 0.8
+    TABLES_ZOOM_MAX = 3.0
+    TABLES_ZOOM_STEP = 0.2
+
     def _build_tables_tab(self):
+        self._tables_zoom = export_prefs.load_value("tables_zoom", 1.0)
+
         top = ttk.Frame(self.tables_tab)
         top.pack(fill="x", padx=10, pady=10)
         rebalance_btn = ttk.Button(top, text="Rééquilibrer les tables", command=self._rebalance)
@@ -5434,6 +5520,13 @@ class App(tk.Tk):
             "joueurs par table (utile après des éliminations). Se fait\n"
             "aussi automatiquement à chaque élimination.",
         )
+
+        ttk.Button(
+            top, text="🔍− Zoom", width=9, command=lambda: self._tables_zoom_by(-self.TABLES_ZOOM_STEP),
+        ).pack(side="left", padx=(15, 3))
+        ttk.Button(
+            top, text="🔍+ Zoom", width=9, command=lambda: self._tables_zoom_by(self.TABLES_ZOOM_STEP),
+        ).pack(side="left", padx=3)
 
         scroll_container = ttk.Frame(self.tables_tab)
         scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -5475,6 +5568,14 @@ class App(tk.Tk):
         self._tables_scroll_paused = False
         self._tables_autoscroll_tick()
 
+    def _tables_zoom_by(self, delta):
+        new_zoom = round(min(self.TABLES_ZOOM_MAX, max(self.TABLES_ZOOM_MIN, self._tables_zoom + delta)), 2)
+        if new_zoom == self._tables_zoom:
+            return
+        self._tables_zoom = new_zoom
+        export_prefs.save_value("tables_zoom", new_zoom)
+        self._refresh_tables_tab()
+
     def _on_tables_mousewheel(self, event):
         # event.delta : multiples de 120 sous Windows, valeur brute (~1-3)
         # sous macOS — dans les deux cas, on veut quelques dizaines de
@@ -5495,18 +5596,35 @@ class App(tk.Tk):
         for p in self.db.list_players(status="active"):
             players_by_table.setdefault(p["table_id"], []).append(p)
 
+        # Tailles/espacements proportionnels au zoom (voir Zoom+/Zoom-
+        # ci-dessus) — tk.LabelFrame/tk.Label plutôt que leurs équivalents
+        # ttk : ces derniers ne permettent pas de changer la taille de
+        # police par instance (seulement via un style global partagé par
+        # tous les widgets du thème).
+        zoom = self._tables_zoom
+        title_font = ("Helvetica", round(11 * zoom), "bold")
+        row_font = ("Helvetica", round(11 * zoom))
+        grid_pad = max(4, round(8 * zoom))
+        row_padx = max(6, round(10 * zoom))
+        row_pady = max(1, round(2 * zoom))
+
         cols = 3
         for idx, t in enumerate(tables):
-            frame = ttk.LabelFrame(self.tables_inner, text=t["name"])
-            frame.grid(row=idx // cols, column=idx % cols, padx=8, pady=8, sticky="n")
+            frame = tk.LabelFrame(
+                self.tables_inner, text=t["name"], font=title_font,
+                bg=FELT, fg=GOLD, bd=1, relief="groove", highlightbackground=GOLD_DARK,
+            )
+            frame.grid(row=idx // cols, column=idx % cols, padx=grid_pad, pady=grid_pad, sticky="n")
             plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["seat"] or 0)
             if not plist:
-                ttk.Label(frame, text="(vide)").pack(padx=10, pady=6)
+                tk.Label(frame, text="(vide)", font=row_font, bg=FELT, fg=CREAM).pack(
+                    padx=row_padx, pady=row_pady + 4
+                )
             for p in plist:
-                ttk.Label(
-                    frame,
-                    text=f"Siège {p['seat']} — {p['name']}",
-                ).pack(anchor="w", padx=10, pady=2)
+                tk.Label(
+                    frame, text=f"Siège {p['seat']} — {p['name']}",
+                    font=row_font, bg=FELT, fg=CREAM,
+                ).pack(anchor="w", padx=row_padx, pady=row_pady)
 
         # Repart du haut à chaque rafraîchissement (rééquilibrage,
         # élimination...) plutôt que de rester sur une position de
@@ -5914,6 +6032,17 @@ class App(tk.Tk):
             "Remplace toute la structure actuelle par la structure par\n"
             "défaut (25/50, ante dès le niveau 4, paliers de 15 min).",
         )
+        edit_blinds_btn = ttk.Button(
+            struct_btns, text="Modifier SB/BB/Ante pour un round sélectionné",
+            command=self._edit_selected_level_blinds,
+        )
+        edit_blinds_btn.pack(pady=3, fill="x")
+        Tooltip(
+            edit_blinds_btn,
+            "Sélectionnez d'abord une ligne dans le tableau ci-contre, puis\n"
+            "cliquez ici pour changer juste ses blindes (petite blinde,\n"
+            "grosse blinde, ante) sans toucher au reste de la structure.",
+        )
         ttk.Button(struct_btns, text="Modifier durée (tous niveaux)", command=self._edit_level_duration).pack(pady=3, fill="x")
         ttk.Button(struct_btns, text="Modifier durée de la Pause", command=self._edit_break_duration).pack(pady=3, fill="x")
 
@@ -6033,6 +6162,53 @@ class App(tk.Tk):
             messagebox.showinfo("Info", "Sélectionnez d'abord un niveau dans le tableau.")
             return
         self._go_to_level(int(sel[0]))
+
+    def _edit_selected_level_blinds(self):
+        """Bouton "Modifier SB/BB/Ante pour un round sélectionné" : change
+        juste les blindes de la ligne choisie dans le tableau (contrairement
+        à "Structure standard", qui remplace toute la structure, ou à
+        "Modifier durée", qui s'applique à tous les niveaux)."""
+        sel = self.blinds_tree.selection()
+        if not sel:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un niveau dans le tableau.")
+            return
+        level_order = int(sel[0])
+        row = self.db.conn.execute(
+            "SELECT * FROM blind_levels WHERE level_order=?", (level_order,)
+        ).fetchone()
+        if row is None:
+            return
+        if row["is_break"]:
+            messagebox.showinfo(
+                "Info", "Cette ligne est une pause : elle n'a pas de blindes à modifier."
+            )
+            return
+
+        sb = simpledialog.askinteger(
+            "Petite blinde (SB)", "Nouvelle petite blinde :",
+            initialvalue=row["small_blind"], minvalue=1,
+        )
+        if sb is None:
+            return
+        bb = simpledialog.askinteger(
+            "Grosse blinde (BB)", "Nouvelle grosse blinde :",
+            initialvalue=row["big_blind"], minvalue=1,
+        )
+        if bb is None:
+            return
+        ante = simpledialog.askinteger(
+            "Ante", "Nouvel ante (0 = pas d'ante à ce round) :",
+            initialvalue=row["ante"], minvalue=0,
+        )
+        if ante is None:
+            return
+
+        self.db.conn.execute(
+            "UPDATE blind_levels SET small_blind=?, big_blind=?, ante=? WHERE level_order=?",
+            (sb, bb, ante, level_order),
+        )
+        self.db.conn.commit()
+        self._refresh_clock_tab()
 
     def _clock_next_level(self):
         order = self.db.get_setting_int("current_level_order", 1)
@@ -6271,11 +6447,21 @@ class App(tk.Tk):
             for lvl in structure:
                 label = "Oui" if lvl["is_break"] else "Non"
                 tag = "current" if lvl["level_order"] == current_order else ""
+                # Une pause n'a pas de blindes propres — le "small_blind"/
+                # "big_blind"/"ante" stockés en base pour cette ligne ne
+                # sont que des valeurs de remplissage internes, jamais
+                # utilisées en jeu. Les afficher ("1000 / 2000 / 0", par
+                # exemple) donnait l'illusion d'un round normal éditable —
+                # d'où des joueurs cliquant "Modifier SB/BB/Ante" sur une
+                # pause sans le vouloir et tombant sur le message de refus.
+                # Un tiret rend la distinction visible d'un coup d'œil.
+                sb_txt = "—" if lvl["is_break"] else lvl["small_blind"]
+                bb_txt = "—" if lvl["is_break"] else lvl["big_blind"]
+                ante_txt = "—" if lvl["is_break"] else lvl["ante"]
                 self.blinds_tree.insert(
                     "", "end", iid=str(lvl["level_order"]),
                     values=(lvl["level_order"], round_by_order[lvl["level_order"]],
-                            lvl["small_blind"], lvl["big_blind"],
-                            lvl["ante"], lvl["duration_minutes"], label),
+                            sb_txt, bb_txt, ante_txt, lvl["duration_minutes"], label),
                     tags=(tag,),
                 )
             self.blinds_tree.tag_configure("current", background=GOLD, foreground=TEXT_DARK)
@@ -6312,11 +6498,22 @@ class App(tk.Tk):
                 self._load_chip_denominations(), moves, round_number,
             )
 
-    def _open_clock_window(self):
+    def _open_clock_window(self, fullscreen=False):
+        """Ouvre l'écran projecteur, ou le ramène au premier plan s'il est
+        déjà ouvert. `fullscreen=True` (utilisé par le bouton "Chronomètre"
+        du contrôle à distance, voir _voice_show_clock/_voice_resume_clock)
+        force le plein écran même si la fenêtre vient d'être créée à
+        l'instant — sinon elle s'ouvrirait en petite fenêtre par défaut,
+        ce qui n'a rien de "mode écran projecteur" pour un responsable qui
+        n'est pas physiquement devant le PC pour appuyer sur F11. Sans
+        effet ici si la fenêtre existait déjà (bring_to_front s'en charge
+        déjà, en respectant son état plein écran/fenêtré actuel)."""
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
             return
         self.clock_window = ClockWindow(self, self)
+        if fullscreen:
+            self.clock_window.enter_fullscreen()
 
     # ---------------------------------------------------------------
     # Onglet Blindes
@@ -7978,7 +8175,28 @@ class App(tk.Tk):
         # _start_remote_control_if_enabled.
         if self.remote_control_server is not None and self.db is not None:
             self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
+            self._refresh_remote_players_cache()
         self._tick_after_id = self.after(1000, self._tick)
+
+    def _refresh_remote_players_cache(self):
+        """Reconstruit self._remote_players_cache (liste de joueurs actifs
+        pour la page "Éliminations" du contrôle à distance) depuis le
+        thread principal — jamais depuis le thread du serveur web, voir
+        RemoteControlServer. Appelé chaque seconde tant que le contrôle à
+        distance est actif (_tick), et une fois au démarrage du serveur."""
+        if not self.db:
+            self._remote_players_cache = []
+            return
+        tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
+        self._remote_players_cache = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "table": tables.get(p["table_id"]),
+                "seat": p["seat"],
+            }
+            for p in self.db.list_players(status="active")
+        ]
 
     def _cancel_tick(self):
         after_id = getattr(self, "_tick_after_id", None)

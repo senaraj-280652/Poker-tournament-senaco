@@ -93,7 +93,10 @@ class ClockWindow(tk.Toplevel):
 
         self.blinds_lbl = tk.Label(
             self, text="", font=("Helvetica", 46, "bold"),
-            bg="#0b1f14", fg="#f4c542"
+            # Blanc plutôt que doré : peu visible de loin sur un
+            # vidéoprojecteur (contrairement au chrono et au bandeau
+            # "Round", déjà blancs/dorés à des tailles plus grandes).
+            bg="#0b1f14", fg="#ffffff"
         )
         self.blinds_lbl.pack()
 
@@ -201,6 +204,17 @@ class ClockWindow(tk.Toplevel):
         # en plein écran en croyant que c'est toujours son état voulu.
         self._fullscreen = False
         self.attributes("-fullscreen", False)
+
+    def enter_fullscreen(self):
+        """Force le plein écran (contrairement à _toggle_fullscreen, ne
+        bascule pas : toujours vers l'état plein écran). Utilisé par le
+        bouton "Chronomètre" du contrôle à distance (voir
+        App._voice_show_clock / _voice_resume_clock) : quand ce bouton crée
+        la fenêtre projecteur à distance, personne n'est physiquement là
+        pour appuyer sur F11 — elle doit donc s'afficher directement "en
+        mode écran projecteur" (plein écran), pas en petite fenêtre."""
+        self._fullscreen = True
+        self.attributes("-fullscreen", True)
 
     def bring_to_front(self):
         """Ramène cette fenêtre au premier plan, quitte son état réduit/
