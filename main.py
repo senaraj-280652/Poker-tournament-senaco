@@ -5279,10 +5279,16 @@ class App(tk.Tk):
                 else:
                     text = f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
             else:
+                # Même si ce n'est pas CE tournoi-ci qui répond sur le port
+                # habituel, l'adresse à taper sur le téléphone reste
+                # prévisible (même machine, même port 8765) : autant la
+                # donner directement plutôt que de laisser deviner "la
+                # page de l'autre tournoi" sans dire laquelle.
+                primary_url = f"http://{remote_control.local_ip()}:{remote_control.DEFAULT_PORT}"
                 text = (
-                    "📱 Un autre tournoi occupe déjà le port habituel : ouvrez sa "
-                    "page sur votre téléphone puis choisissez celui-ci via le "
-                    "bouton \"Lobby\"."
+                    f"📱 Un autre tournoi occupe déjà le port habituel — ouvrez "
+                    f"plutôt :\n{primary_url}\nsur votre téléphone, puis "
+                    f"choisissez celui-ci via le bouton \"Lobby\"."
                 )
             self.remote_control_status_lbl.config(text=text)
         else:
@@ -8157,7 +8163,9 @@ class App(tk.Tk):
         )
         remote_check.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
-        self.remote_control_status_lbl = ttk.Label(right, foreground=MUTED, justify="left")
+        self.remote_control_status_lbl = ttk.Label(
+            right, foreground=MUTED, justify="left", wraplength=340,
+        )
         self.remote_control_status_lbl.grid(
             row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
