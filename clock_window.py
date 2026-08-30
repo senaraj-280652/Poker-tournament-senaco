@@ -237,12 +237,16 @@ class ClockWindow(tk.Toplevel):
         qui suffit pour un écran projecteur, qu'on veut juste voir, pas
         y taper au clavier."""
         self.deiconify()
-        if self._fullscreen:
-            self.attributes("-fullscreen", True)
         self.attributes("-topmost", True)
         self.attributes("-topmost", False)
         self.lift()
         self.focus_force()
+        if self._fullscreen:
+            # Réappliqué EN DERNIER (pas avant le lift/focus_force
+            # ci-dessus, comme précédemment) : sur macOS, réaffirmer le
+            # plein écran natif après avoir repris la main semble plus
+            # fiable pour vraiment repasser devant que de le faire avant.
+            self.attributes("-fullscreen", True)
 
     def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
                 is_paused, next_break_text="", movement_alert=False, chip_denominations=None,
@@ -314,22 +318,26 @@ class ClockWindow(tk.Toplevel):
         elif movement_alert:
             # Affiché fixe (ne clignote plus — ça perturbait la lecture du
             # tableau des joueurs concernés), tant que le mouvement est en
-            # cours. En bas de l'écran (pas au milieu, contrairement à
-            # "Partie terminée" ci-dessus) : le chronomètre continue de
-            # tourner pendant un mouvement de tables (ne se met plus en
-            # pause, voir App._trigger_movement_alert), il doit donc
-            # rester bien visible plutôt que d'être recouvert par ce
-            # bandeau.
+            # cours. Juste sous le chrono/les blindes (pas au milieu de
+            # l'écran, contrairement à "Partie terminée" ci-dessus, et pas
+            # tout en bas de la fenêtre non plus — ça poussait le tableau
+            # des joueurs concernés hors de la zone visible sur une
+            # fenêtre pas assez haute, le rendant tout simplement
+            # invisible) : le chronomètre continue de tourner pendant un
+            # mouvement de tables (ne se met plus en pause, voir
+            # App._trigger_movement_alert), il doit donc rester visible
+            # au-dessus de ce bandeau, qui peut en repousser/recouvrir le
+            # contenu en dessous (Prochain niveau/pause).
             self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
             self._update_movement_moves_table(moves or [])
-            # Décalage fixe en pixels (pas une simple fraction de la
-            # hauteur de fenêtre) pour ne pas recouvrir la ligne "Joueurs
-            # restants / Tapis moyen / Durée", elle-même collée tout en
-            # bas (voir "bottom" dans __init__) : sa hauteur réelle ne
-            # dépend que de sa police (fixe), pas de la taille de la
-            # fenêtre — une fraction glisserait dessous sur une fenêtre
-            # plus petite.
-            self.movement_alert_frame.place(relx=0.5, rely=1.0, y=-55, anchor="s")
+            # Position calculée dynamiquement juste sous les blindes
+            # (elles-mêmes juste sous le chrono) à partir de leur
+            # position réelle à l'écran — robuste à la taille de
+            # fenêtre/plein écran, contrairement à un pourcentage fixe de
+            # la hauteur de fenêtre ou à un décalage fixe depuis le bas.
+            self.update_idletasks()
+            y = self.blinds_lbl.winfo_y() + self.blinds_lbl.winfo_height() + 10
+            self.movement_alert_frame.place(relx=0.5, y=y, anchor="n")
         else:
             self.movement_alert_frame.place_forget()
 
@@ -338,23 +346,48 @@ class ClockWindow(tk.Toplevel):
 
     def _ensure_fits_content(self):
         """Agrandit la fenêtre en hauteur si le contenu (par exemple un
-        tableau de jetons avec beaucoup de valeurs différentes) dépasse la
-        taille actuelle, pour ne jamais couper de texte en bas de l'écran —
-        sans quoi le responsable doit agrandir la fenêtre à la main pour
-        tout voir. Ne rétrécit jamais tout seul (pas de scintillement si le
-        contenu redevient plus court), et ne dépasse jamais la hauteur de
-        l'écran. Pas d'effet en plein écran (F11)."""
+        tableau de jetons avec beaucoup de valeurs différentes, ou le
+        tableau des joueurs concernés par un mouvement de tables) dépasse
+        la taille actuelle, pour ne jamais couper de texte en bas de
+        l'écran — sans quoi le responsable doit agrandir la fenêtre à la
+        main pour tout voir. Ne rétrécit jamais tout seul (pas de
+        scintillement si le contenu redevient plus court), et ne dépasse
+        jamais la hauteur de l'écran. Pas d'effet en plein écran (F11)."""
         if self._fullscreen:
             return
         self.update_idletasks()
         needed_h = self.winfo_reqheight()
+        # movement_alert_frame est positionné par place() (voir refresh),
+        # pas pack()/grid() : sa taille ne compte donc PAS dans
+        # winfo_reqheight() ci-dessus (place() ne participe pas à la
+        # négociation de taille du conteneur) — sans ceci, la fenêtre ne
+        # grandissait jamais pour montrer en entier un tableau de
+        # mouvements un peu long, même une fois repositionné juste sous
+        # le chrono (voir refresh()), le bas du tableau restant coupé.
+        if self.movement_alert_frame.winfo_ismapped():
+            needed_h = max(
+                needed_h,
+                self.movement_alert_frame.winfo_y() + self.movement_alert_frame.winfo_height() + 10,
+            )
         current_h = self.winfo_height()
         if needed_h <= current_h:
             return
+        # Pas de plafond calculé à la main ("hauteur d'écran - marge") :
+        # winfo_screenheight() renvoie la résolution PHYSIQUE de l'écran,
+        # pas la hauteur réellement disponible pour une fenêtre (menu,
+        # dock...), donc un plafond basé dessus pouvait refuser une
+        # croissance en fait possible, ou au contraire s'avérer trop
+        # généreux et se faire quand même rogner en silence par le
+        # système sans qu'on le sache. On demande donc directement la
+        # hauteur voulue (remonte aussi la fenêtre si besoin pour lui
+        # laisser un maximum de place vers le bas) et on laisse le
+        # système d'exploitation, qui connaît la vraie zone visible,
+        # accorder ou plafonner lui-même tout seul — jamais d'erreur ni
+        # de débordement possible de son côté.
+        new_h = needed_h + 10
         screen_h = self.winfo_screenheight()
-        new_h = min(needed_h + 10, screen_h - 60)
-        if new_h > current_h:
-            self.geometry(f"{self.winfo_width()}x{new_h}")
+        new_y = max(0, min(self.winfo_y(), max(0, screen_h - new_h)))
+        self.geometry(f"{self.winfo_width()}x{new_h}+{self.winfo_x()}+{new_y}")
 
     def _update_movement_moves_table(self, moves):
         """Reconstruit le tableau des joueurs concernés par le

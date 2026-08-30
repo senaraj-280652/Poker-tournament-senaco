@@ -5460,11 +5460,18 @@ class App(tk.Tk):
         encore — voir _open_clock_window), en restaurant son plein écran
         s'il l'était avant d'être rapetissé pour faire autre chose dans le
         logiciel — sans toucher à l'état pause/lecture du chrono ni à quoi
-        que ce soit d'autre."""
+        que ce soit d'autre.
+
+        PAS de self.lift() ici sur la fenêtre PRINCIPALE (contrairement à
+        avant) : ça annulait aussitôt le travail de _open_clock_window
+        juste au-dessus en faisant repasser la fenêtre principale devant
+        l'écran projecteur qu'on vient tout juste de ramener au premier
+        plan — d'où le symptôme rapporté "le chrono apparaît une fraction
+        de seconde puis disparaît" en utilisant le bouton "Chronomètre"
+        du contrôle à distance."""
         self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
         self._open_clock_window(fullscreen=True)
-        self.lift()
 
     def _update_tournament_started_buttons(self):
         """Ajuste 'Supprimer' et 'Éliminer' (onglet Joueurs) selon que le
@@ -6672,6 +6679,19 @@ class App(tk.Tk):
             self._blinds_tab_current_order = current_order
 
         movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
+        if movement_alert and self.db.count_seat_moves() == 0:
+            # Bandeau actif mais plus aucun mouvement à afficher : état
+            # incohérent (ex : résidu d'un ancien test resté bloqué,
+            # fichier .tournoi réutilisé de nombreuses fois) — un bandeau
+            # "Changement de tables en cours" vide n'aide personne et
+            # bloque en plus la reprise du chrono après une élimination
+            # (voir _on_voice_word) sans qu'il n'y ait plus rien à
+            # confirmer avec "Terminé". On se contente ici de désactiver
+            # le drapeau (pas besoin de tout le reste de
+            # _finish_movement_alert : pas de mouvement réel en cours,
+            # donc rien à figer ou à débloquer côté chrono).
+            self.db.set_settings({"movement_alert_active": 0})
+            movement_alert = False
         blink_on = movement_alert and int(time.time()) % 2 == 0
         if blink_on:
             self.movement_alert_lbl.place(relx=0.5, rely=0.42, anchor="center")
