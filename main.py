@@ -7721,15 +7721,36 @@ class App(tk.Tk):
             ttk.Entry(left, textvariable=var, width=25).grid(row=i, column=1, pady=4, padx=10)
             self.settings_vars[key] = var
 
-        # Les trois actions sur le formulaire, côte à côte plutôt qu'empilées
-        # (Enregistrer / Récupérer / Imprimer) : plus compact, et les
-        # regroupe visuellement comme les trois faces d'une même action
-        # ("que faire de ces réglages ?").
+        # Les quatre actions sur le formulaire, en 2 rangées de 2 boutons
+        # superposées (pas les 4 côte à côte sur une seule ligne, trop
+        # large — obligeait à agrandir la fenêtre Paramètres) : rangée du
+        # haut = appliquer/enregistrer les réglages, rangée du bas =
+        # récupérer/imprimer. Repousse les champs suivants vers le bas,
+        # sans incidence (de la place en dessous) ; largeur de la fenêtre
+        # inchangée.
         settings_btns_row = ttk.Frame(left)
         settings_btns_row.grid(row=len(fields), column=0, columnspan=2, pady=(15, 15))
+        settings_btns_row_top = ttk.Frame(settings_btns_row)
+        settings_btns_row_top.pack(side="top")
+        settings_btns_row_bottom = ttk.Frame(settings_btns_row)
+        settings_btns_row_bottom.pack(side="top", pady=(6, 0))
 
+        apply_settings_btn = ttk.Button(
+            settings_btns_row_top, text="✅ Appliquer à ce tournoi",
+            command=self._apply_settings_button,
+        )
+        apply_settings_btn.pack(side="left", padx=3)
+        Tooltip(
+            apply_settings_btn,
+            "Applique tout de suite tous les réglages ci-dessus à CE\n"
+            "tournoi (ex : un nouveau \"Nombre de sièges par table\") —\n"
+            "sans quoi taper une nouvelle valeur dans un champ ne change\n"
+            "rien tant qu'elle n'a pas été appliquée. Ne demande rien\n"
+            "d'autre (contrairement à \"Enregistrer Paramètres sous...\",\n"
+            "à droite, qui sert à en garder un modèle réutilisable).",
+        )
         save_as_settings_btn = ttk.Button(
-            settings_btns_row, text="💾 Enregistrer Paramètres sous...",
+            settings_btns_row_top, text="💾 Enregistrer Paramètres sous...",
             command=self._save_settings_as_template,
         )
         save_as_settings_btn.pack(side="left", padx=3)
@@ -7744,7 +7765,7 @@ class App(tk.Tk):
             "\"Récupérer Blindes\" pour ça séparément).",
         )
         load_settings_btn = ttk.Button(
-            settings_btns_row, text="📂 Récupérer Paramètres...", command=self._open_settings_templates,
+            settings_btns_row_bottom, text="📂 Récupérer Paramètres...", command=self._open_settings_templates,
         )
         load_settings_btn.pack(side="left", padx=3)
         Tooltip(
@@ -7754,7 +7775,7 @@ class App(tk.Tk):
             "ce tournoi.",
         )
         print_settings_btn = ttk.Button(
-            settings_btns_row, text="🖨️ Imprimer Paramètres...", command=self._print_settings_pdf,
+            settings_btns_row_bottom, text="🖨️ Imprimer Paramètres...", command=self._print_settings_pdf,
         )
         print_settings_btn.pack(side="left", padx=3)
         Tooltip(
@@ -8288,6 +8309,22 @@ class App(tk.Tk):
         (rééquilibrage des tables...) non souhaités à chaque frappe."""
         self.db.set_settings({"tournament_name": self.settings_vars["tournament_name"].get()})
         self._update_window_title()
+
+    def _apply_settings_button(self):
+        """Bouton "Appliquer à ce tournoi" : applique tout de suite tous
+        les réglages du formulaire (voir _collect_and_save_all_settings),
+        sans rien demander d'autre — contrairement à "Enregistrer
+        Paramètres sous...", qui applique aussi tout mais force en plus
+        à nommer un modèle réutilisable. Ajouté après qu'un utilisateur
+        ait changé "Nombre de sièges par table" sans jamais cliquer
+        aucun des deux boutons de sauvegarde (juste tapé la nouvelle
+        valeur dans le champ, en pensant que ça suffisait) : le champ
+        seul ne fait rien tant qu'il n'est pas appliqué, ce bouton rend
+        ça évident et immédiat, sans le détour par une fenêtre de nom de
+        modèle."""
+        self._collect_and_save_all_settings()
+        self._refresh_all()
+        messagebox.showinfo("Paramètres appliqués", "Les réglages ont été appliqués à ce tournoi.")
 
     def _save_settings_as_template(self):
         """Applique tous les réglages du formulaire à ce tournoi (comme
