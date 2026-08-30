@@ -162,15 +162,19 @@ def default_tournament_dir():
     return os.path.expanduser("~")
 
 
-def tournament_day_folder_proposal():
+def tournament_day_folder_proposal(is_sng=False):
     """Renvoie (dossier_proposé, nom_de_fichier_proposé) pour "Nouveau
-    tournoi" / "Sit & Go rapide", à partir de "Chemin du dossier du
-    tournoi du jour" (voir _build_settings_tab), mémorisé globalement
-    dans tournament_prefs (dernier tournoi en date, retrouvable même
-    avant l'ouverture d'un fichier .tournoi) : sous-dossier
-    Vendredi/Dimanche/Autre selon le jour de la semaine du jour, créé
-    s'il n'existe pas encore, et nom de fichier To/Sn/Op + date du jour
-    (JJMMAA), ex. "To270826" un vendredi.
+    tournoi" / "Sit & Go rapide", à partir de "Dossier par défaut" (voir
+    _build_settings_tab), mémorisé globalement dans tournament_prefs
+    (dernier tournoi en date, retrouvable même avant l'ouverture d'un
+    fichier .tournoi) : sous-dossier Vendredi/Dimanche/Autre selon le
+    jour de la semaine du jour (purement organisationnel), créé s'il
+    n'existe pas encore, et nom de fichier To/Sn + date du jour (JJMMAA),
+    ex. "To270826". Le préfixe dépend de `is_sng` (donc du bouton
+    effectivement cliqué — "Nouveau tournoi" ou "Sit & Go rapide"), PAS
+    du jour de la semaine : créer un tournoi normal un dimanche doit
+    donner "To...", pas "Sn..." (qui laisserait croire à tort que
+    c'était un Sit & Go).
     Renvoie (None, None) si aucun dossier n'est configuré (ou dossier
     non créable) — les repos de secours habituels s'appliquent alors
     (default_tournament_dir(), "tournoi.tournoi"...)."""
@@ -180,11 +184,12 @@ def tournament_day_folder_proposal():
         return None, None
     weekday = datetime.now().weekday()  # lundi=0 ... dimanche=6
     if weekday == 4:
-        subfolder, prefix = "Vendredi", "To"
+        subfolder = "Vendredi"
     elif weekday == 6:
-        subfolder, prefix = "Dimanche", "Sn"
+        subfolder = "Dimanche"
     else:
-        subfolder, prefix = "Autre", "Op"
+        subfolder = "Autre"
+    prefix = "Sn" if is_sng else "To"
     folder = os.path.join(base, subfolder)
     try:
         os.makedirs(folder, exist_ok=True)
@@ -2366,9 +2371,9 @@ class PeriodSummaryDialog(ttk.Frame):
 
         default_folder = ""
         if getattr(app, "db", None) is not None:
-            # "Chemin du dossier du tournoi du jour" (voir
-            # _build_settings_tab), tel que configuré pour CE tournoi,
-            # sinon repli sur le dossier contenant son fichier .tournoi.
+            # "Dossier par défaut" (voir _build_settings_tab), tel que
+            # configuré pour CE tournoi, sinon repli sur le dossier
+            # contenant son fichier .tournoi.
             default_folder = (app.db.get_setting("tournament_day_folder", "") or "").strip()
             if not default_folder:
                 default_folder = os.path.dirname(os.path.abspath(app.db.path))
@@ -3720,7 +3725,7 @@ class App(tk.Tk):
             win.destroy()
 
         def new_sng():
-            day_folder, day_filename = tournament_day_folder_proposal()
+            day_folder, day_filename = tournament_day_folder_proposal(is_sng=True)
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau Sit & Go",
                 defaultextension=".tournoi",
@@ -5051,11 +5056,17 @@ class App(tk.Tk):
     def _trigger_movement_alert(self, from_remote=False):
         """Appelé dès qu'un rééquilibrage a réellement déplacé des joueurs
         (élimination ou bouton "Rééquilibrer les tables") : joue le signal
-        sonore, met le chronomètre en pause (comme _clock_pause) s'il
-        tournait, et active le bandeau clignotant "Changement de tables en
-        cours" (onglets Chronomètre + écran projecteur — ce dernier via
+        sonore et active le bandeau "Changement de tables en cours"
+        (onglets Chronomètre + écran projecteur — ce dernier via
         _refresh_clock_tab, qui pousse l'état à self.clock_window.refresh
-        indépendamment de la fenêtre principale). Bascule aussi
+        indépendamment de la fenêtre principale). Ne met PLUS le
+        chronomètre en pause depuis qu'un club a jugé, à l'usage, que le
+        temps continue de s'écouler normalement pendant qu'un mouvement
+        de tables est en cours (les joueurs se déplacent pendant que la
+        partie continue ailleurs, comme dans un vrai tournoi) — le
+        responsable ferme juste le bandeau avec "Terminé" une fois tout
+        le monde réinstallé, sans que le chrono n'ait jamais été
+        interrompu. Bascule aussi
         automatiquement l'onglet Mouvements au premier plan (au-dessus du
         Chronomètre ou de tout autre onglet affiché) et ramène la fenêtre
         principale au premier plan, SAUF si `from_remote=True` (élimination
@@ -5071,11 +5082,6 @@ class App(tk.Tk):
         vient de se produire a justement causé ce rééquilibrage, c'est
         "Terminé" qui clôt le tout maintenant, plus "Chronomètre"."""
         self._play_movement_signal()
-        if (self.db.get_setting_int("clock_started", 0) == 1
-                and self.db.get_setting_int("is_paused", 1) == 0):
-            start = self.db.get_setting_int("level_start_epoch", int(time.time()))
-            elapsed = int(time.time()) - start
-            self.db.set_settings({"is_paused": 1, "paused_accum_seconds": elapsed})
         self.db.set_settings({"movement_alert_active": 1})
         self.voice_awaiting_resume = False
         self._refresh_moves_tab()
@@ -5091,15 +5097,20 @@ class App(tk.Tk):
 
     def _finish_movement_alert(self):
         """Bouton "Terminé" de l'onglet Mouvements (ou raccourci clavier/
-        contrôle à distance, voir _on_voice_word) : referme le bandeau d'alerte,
-        relance le chronomètre (comme _clock_resume), vide la liste des
-        mouvements affichée (le prochain rééquilibrage la repeuplera avec
-        son propre lot), rebascule l'onglet Chronomètre au premier plan
-        dans la fenêtre principale (symétrique du passage automatique sur
-        Mouvements fait par _trigger_movement_alert) et ramène aussi la
-        fenêtre séparée "écran projecteur" au premier plan si elle est
-        ouverte — sans ça elle peut rester cachée derrière la fenêtre
-        principale une fois l'alerte terminée."""
+        contrôle à distance, voir _on_voice_word) : referme le bandeau
+        d'alerte, vide la liste des mouvements affichée (le prochain
+        rééquilibrage la repeuplera avec son propre lot), rebascule
+        l'onglet Chronomètre au premier plan dans la fenêtre principale
+        (symétrique du passage automatique sur Mouvements fait par
+        _trigger_movement_alert) et ramène aussi la fenêtre séparée
+        "écran projecteur" au premier plan si elle est ouverte — sans ça
+        elle peut rester cachée derrière la fenêtre principale une fois
+        l'alerte terminée. Appelle aussi _clock_resume() par précaution
+        (relance le chronomètre s'il était encore en pause pour une autre
+        raison, ex : "Élimination" en attente de désignation via
+        Ctrl+Maj+J/le contrôle à distance — voir _voice_start_elimination)
+        : sans effet si le chrono tournait déjà, ce qui est désormais
+        toujours le cas pendant un simple mouvement de tables."""
         self.db.set_settings({"movement_alert_active": 0})
         self.voice_awaiting_resume = False
         self._clock_resume()
@@ -5251,7 +5262,22 @@ class App(tk.Tk):
         if self.remote_control_server is not None and self.remote_control_server.is_running:
             if self.remote_control_server.port == remote_control.DEFAULT_PORT:
                 url = self.remote_control_server.url
-                text = f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
+                if url.startswith("http://127.0.0.1"):
+                    # local_ip() n'a trouvé aucune vraie adresse réseau
+                    # (voir son docstring) : donner cette adresse telle
+                    # quelle serait inutile, 127.0.0.1 désigne le
+                    # téléphone lui-même depuis son propre navigateur,
+                    # jamais ce PC — mieux vaut le dire clairement que
+                    # laisser croire que l'adresse affichée devrait
+                    # marcher.
+                    text = (
+                        "⚠️ Impossible de déterminer l'adresse réseau de ce PC "
+                        "(pas de connexion Wifi/Ethernet active, ou réseau sans "
+                        "aucune passerelle) : vérifiez que ce PC est bien "
+                        "connecté au même réseau que le téléphone."
+                    )
+                else:
+                    text = f"📱 Sur votre téléphone (même wifi que cet ordinateur), ouvrez :\n{url}"
             else:
                 text = (
                     "📱 Un autre tournoi occupe déjà le port habituel : ouvrez sa "
@@ -6667,15 +6693,19 @@ class App(tk.Tk):
         force le plein écran même si la fenêtre vient d'être créée à
         l'instant — sinon elle s'ouvrirait en petite fenêtre par défaut,
         ce qui n'a rien de "mode écran projecteur" pour un responsable qui
-        n'est pas physiquement devant le PC pour appuyer sur F11. Sans
-        effet ici si la fenêtre existait déjà (bring_to_front s'en charge
-        déjà, en respectant son état plein écran/fenêtré actuel)."""
+        n'est pas physiquement devant le PC pour appuyer sur F11.
+        Dans les deux cas (déjà ouverte ou tout juste créée), passe par
+        bring_to_front() : une fenêtre fraîchement créée peut, elle
+        aussi, ne pas obtenir le premier plan sous Windows si ce
+        processus n'a pas déjà la main au moment de l'appel (voir le
+        commentaire de ClockWindow.bring_to_front)."""
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
             return
         self.clock_window = ClockWindow(self, self)
         if fullscreen:
             self.clock_window.enter_fullscreen()
+        self.clock_window.bring_to_front()
 
     # ---------------------------------------------------------------
     # Onglet Blindes
@@ -7705,9 +7735,11 @@ class App(tk.Tk):
         save_as_settings_btn.pack(side="left", padx=3)
         Tooltip(
             save_as_settings_btn,
-            "Applique tous les réglages ci-dessus à ce tournoi ET les\n"
-            "enregistre sous un nom au choix, pour les réutiliser plus\n"
-            "tard sur d'autres tournois/Sit & Go (le nom du tournoi et la\n"
+            "Applique tous les réglages ci-dessus à ce tournoi — dans\n"
+            "tous les cas, même en annulant la fenêtre de nom qui suit.\n"
+            "Cette fenêtre sert seulement, EN PLUS, à enregistrer ces\n"
+            "réglages sous un nom au choix pour les réutiliser plus tard\n"
+            "sur d'autres tournois/Sit & Go (le nom du tournoi et la\n"
             "structure de blindes elle-même ne sont pas inclus — voir\n"
             "\"Récupérer Blindes\" pour ça séparément).",
         )
@@ -7811,7 +7843,7 @@ class App(tk.Tk):
         ).grid(row=duration_row + 1, column=0, columnspan=2, sticky="w", pady=10)
 
         folder_row = duration_row + 2
-        folder_lbl = ttk.Label(left, text="Chemin du dossier du tournoi du jour :")
+        folder_lbl = ttk.Label(left, text="Dossier par défaut :")
         folder_lbl.grid(row=folder_row, column=0, columnspan=2, sticky="w", pady=(0, 4))
         Tooltip(
             folder_lbl,
@@ -8232,7 +8264,7 @@ class App(tk.Tk):
         day_folder_var.set(path)
 
     def _save_day_folder(self):
-        """Enregistre en continu "Chemin du dossier du tournoi du jour", au
+        """Enregistre en continu "Dossier par défaut", au
         fur et à mesure de la saisie ou dès le choix via "Parcourir..."
         (voir _build_settings_tab) : à la fois pour CE tournoi (comme les
         autres réglages), et dans les préférences globales
@@ -8259,10 +8291,24 @@ class App(tk.Tk):
 
     def _save_settings_as_template(self):
         """Applique tous les réglages du formulaire à ce tournoi (comme
-        l'ancien bouton "Enregistrer les paramètres"), ET les enregistre
-        sous un nom choisi par l'utilisateur, pour les réappliquer plus
-        tard à d'autres tournois via "Récupérer Paramètres..." (le nom du
-        tournoi lui-même n'est jamais inclus dans le modèle)."""
+        l'ancien bouton "Enregistrer les paramètres"), PUIS propose EN
+        PLUS de les enregistrer sous un nom choisi par l'utilisateur,
+        pour les réappliquer plus tard à d'autres tournois via
+        "Récupérer Paramètres..." (le nom du tournoi lui-même n'est
+        jamais inclus dans le modèle).
+
+        Ces deux actions sont volontairement indépendantes : appliquer
+        les réglages à CE tournoi (ex : un nouveau "Nombre de sièges par
+        table") ne doit JAMAIS dépendre de la nomination d'un modèle —
+        avant ce correctif, annuler la fenêtre de nom (ce qu'on ferait
+        naturellement en ne voulant pas créer de modèle réutilisable,
+        juste appliquer le réglage à ce tournoi) annulait TOUT, y compris
+        l'application des réglages eux-mêmes : un joueur avait ainsi pu
+        changer "Nombre de sièges par table" sans que ça ne prenne jamais
+        effet, simplement en annulant cette fenêtre."""
+        values = self._collect_and_save_all_settings()
+        self._refresh_all()
+
         dlg = SaveTemplateAsDialog(
             self,
             "Enregistrer Paramètres sous",
@@ -8272,6 +8318,8 @@ class App(tk.Tk):
         )
         name = dlg.result
         if not name:
+            # Réglages déjà appliqués ci-dessus, même sans nommer de
+            # modèle réutilisable — voir le docstring.
             return
         if name in settings_templates.list_templates():
             if not messagebox.askyesno(
@@ -8280,9 +8328,7 @@ class App(tk.Tk):
             ):
                 return
 
-        values = self._collect_and_save_all_settings()
         settings_templates.save_template(name, values)
-        self._refresh_all()
         messagebox.showinfo(
             "Paramètres enregistrés",
             f"Les réglages ont été appliqués à ce tournoi, et enregistrés "

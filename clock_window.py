@@ -221,10 +221,26 @@ class ClockWindow(tk.Toplevel):
         rapetissé le cas échéant (voir Ctrl+Maj+C, App._voice_show_clock) :
         restaure le plein écran si c'était son état avant d'être réduite
         pour faire autre chose dans le logiciel, sinon la ramène juste au
-        premier plan sans changer sa taille actuelle."""
+        premier plan sans changer sa taille actuelle.
+
+        self.lift()/focus_force() SEULS ne suffisent pas de façon fiable
+        sous Windows : ce sont in fine des appels à SetForegroundWindow,
+        que Windows refuse silencieusement (aucune erreur, la fenêtre ne
+        vient juste pas devant) si ce processus n'a pas déjà la main —
+        typiquement quand le responsable fait autre chose sur le PC au
+        moment où le bouton "Chronomètre" est pressé à distance. D'où le
+        comportement "ça marche parfois" observé : ça dépendait de ce que
+        Windows autorisait sur le moment, pas d'un vrai aléa du logiciel.
+        Bascule brève de -topmost (Z-order, jamais soumis à cette
+        protection, contrairement au focus clavier) avant lift/
+        focus_force : place la fenêtre au premier plan à coup sûr — ce
+        qui suffit pour un écran projecteur, qu'on veut juste voir, pas
+        y taper au clavier."""
         self.deiconify()
         if self._fullscreen:
             self.attributes("-fullscreen", True)
+        self.attributes("-topmost", True)
+        self.attributes("-topmost", False)
         self.lift()
         self.focus_force()
 
@@ -298,10 +314,22 @@ class ClockWindow(tk.Toplevel):
         elif movement_alert:
             # Affiché fixe (ne clignote plus — ça perturbait la lecture du
             # tableau des joueurs concernés), tant que le mouvement est en
-            # cours.
+            # cours. En bas de l'écran (pas au milieu, contrairement à
+            # "Partie terminée" ci-dessus) : le chronomètre continue de
+            # tourner pendant un mouvement de tables (ne se met plus en
+            # pause, voir App._trigger_movement_alert), il doit donc
+            # rester bien visible plutôt que d'être recouvert par ce
+            # bandeau.
             self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
             self._update_movement_moves_table(moves or [])
-            self.movement_alert_frame.place(relx=0.5, rely=0.42, anchor="center")
+            # Décalage fixe en pixels (pas une simple fraction de la
+            # hauteur de fenêtre) pour ne pas recouvrir la ligne "Joueurs
+            # restants / Tapis moyen / Durée", elle-même collée tout en
+            # bas (voir "bottom" dans __init__) : sa hauteur réelle ne
+            # dépend que de sa police (fixe), pas de la taille de la
+            # fenêtre — une fraction glisserait dessous sur une fenêtre
+            # plus petite.
+            self.movement_alert_frame.place(relx=0.5, rely=1.0, y=-55, anchor="s")
         else:
             self.movement_alert_frame.place_forget()
 

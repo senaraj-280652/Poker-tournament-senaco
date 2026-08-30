@@ -47,6 +47,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import open_windows
+import version
 
 DEFAULT_PORT = 8765
 
@@ -54,6 +55,18 @@ DEFAULT_PORT = 8765
 # (voir App._bind_voice_command_shortcuts) — un mot en dehors de cette
 # liste est refusé.
 _VALID_ACTIONS = {"elimination", "chronometre", "terminer"}
+
+# Petit bouton 🔄 en haut à droite de chaque page (voir #btn-reload dans
+# chacun des templates ci-dessous) : recharge la page avec un paramètre
+# d'URL différent à chaque fois pour forcer le téléphone à re-télécharger
+# le HTML/JS depuis le PC plutôt que de servir une version mise en cache
+# — pratique en plein test, juste après avoir relancé l'appli avec du
+# code changé côté serveur, sans avoir à fermer/rouvrir Safari.
+_RELOAD_SCRIPT = (
+    "function reloadApp() {\n"
+    "  window.location.href = window.location.pathname + '?_r=' + Date.now();\n"
+    "}"
+)
 
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="fr">
@@ -69,7 +82,8 @@ _PAGE_TEMPLATE = """<!doctype html>
     text-align: center;
   }}
   h1 {{ font-size: 20px; color: #e8c468; margin: 0 0 4px; }}
-  .tournoi {{ color: #b9ad8f; font-size: 14px; margin: 0 0 28px; }}
+  .tournoi {{ color: #b9ad8f; font-size: 14px; margin: 0 0 4px; }}
+  .version {{ color: #6f6656; font-size: 11px; margin: 0 0 24px; }}
   button {{
     display: block; width: 100%; max-width: 420px; margin: 0 auto 18px;
     padding: 26px 10px; font-size: 22px; font-weight: 700;
@@ -86,11 +100,19 @@ _PAGE_TEMPLATE = """<!doctype html>
     max-width: 420px; margin: 20px auto 0; min-height: 22px;
     color: #b9ad8f; font-size: 15px;
   }}
+  #btn-reload {{
+    position: fixed; top: 14px; right: 14px; width: 40px; height: 40px;
+    max-width: 40px; margin: 0; padding: 0; border-radius: 50%;
+    background: #1c3d2c; font-size: 18px; line-height: 40px;
+    box-shadow: 0 2px 6px rgba(0,0,0,.4);
+  }}
 </style>
 </head>
 <body>
+  <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   <h1>🎙 Contrôle à distance</h1>
   <p class="tournoi">{tournament_name}</p>
+  <p class="version">v{app_version}</p>
 
   {lobby_button}
   <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Joueurs</button>
@@ -114,6 +136,7 @@ function sendAction(action, btn) {{
       status.textContent = 'Échec (' + e.message + ') — vérifiez le wifi.';
     }});
 }}
+{reload_script}
 </script>
 </body>
 </html>
@@ -151,12 +174,22 @@ _LOBBY_PAGE = """<!doctype html>
   button:active {{ transform: scale(0.97); }}
   button.current {{ background: #e8c468; color: #10241a; }}
   p.empty {{ color: #b9ad8f; font-size: 15px; }}
+  #btn-reload {{
+    position: fixed; top: 14px; right: 14px; width: 40px; height: 40px;
+    max-width: 40px; margin: 0; padding: 0; border-radius: 50%;
+    background: #1c3d2c; font-size: 18px; line-height: 40px;
+    box-shadow: 0 2px 6px rgba(0,0,0,.4);
+  }}
 </style>
 </head>
 <body>
+  <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   <a class="back" href="/">← Retour</a>
   <h1>🏛 Choisir un tournoi</h1>
   {rows}
+<script>
+{reload_script}
+</script>
 </body>
 </html>
 """
@@ -188,14 +221,26 @@ _ELIMINATE_PAGE = """<!doctype html>
   }}
   #topbar a {{ color: #b9ad8f; text-decoration: none; font-size: 15px; }}
   #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
-  #columns {{ display: flex; height: calc(100% - 46px); }}
-  .col {{ flex: 1; display: flex; flex-direction: column; min-width: 0; }}
+  #btn-reload {{
+    width: 32px; height: 32px; border: none; border-radius: 50%;
+    background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
+    padding: 0; -webkit-tap-highlight-color: transparent;
+  }}
+  #columns {{ display: flex; height: calc(100% - 46px); min-height: 0; }}
+  .col {{ flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }}
   .col-left {{ border-right: 2px solid #294235; }}
   .col h2 {{
     margin: 0; padding: 10px; font-size: 15px; text-align: center;
     background: #0b1c15; color: #e8c468; position: sticky; top: 0;
   }}
-  .col .list {{ flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 8px; }}
+  /* min-height: 0 est essentiel ici : par défaut, un enfant flexible ne
+     peut pas se réduire en dessous de la taille de son propre contenu
+     (min-height: auto implicite), donc cette liste s'étirait pour
+     contenir TOUS les joueurs au lieu de rester dans l'espace visible
+     et défiler en interne — le débordement était alors coupé net par
+     "overflow: hidden" sur <body>, sans le moindre ascenseur, rendant
+     les derniers joueurs d'une table bien remplie inaccessibles. */
+  .col .list {{ flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 8px; }}
   .player-item {{
     padding: 14px 8px; margin-bottom: 8px; border-radius: 10px;
     background: #1c3d2c; font-size: 15px; text-align: center;
@@ -203,13 +248,24 @@ _ELIMINATE_PAGE = """<!doctype html>
     user-select: none; touch-action: pan-y; line-height: 1.3;
   }}
   .player-item .sub {{ display: block; font-size: 12px; color: #9fb8a8; margin-top: 2px; }}
+  /* Retour visuel immédiat dès que le doigt se pose, avant même de
+     savoir si ça va devenir un glissement ou un simple défilement (voir
+     onTouchStart) — sans ça, rien ne montrait qu'un joueur était "pris"
+     tant que le glissement n'était pas déjà engagé. Disparaît si le
+     doigt est relâché sans glisser (voir cancelPending), ou remplacé
+     par .dragging dès que le glissement est réellement engagé. */
+  .player-item.pressed {{ background: #35624a; box-shadow: 0 0 0 2px #e8c468 inset; }}
   .player-item.dragging {{ opacity: 0.35; }}
   .player-item.drop-hover {{ background: #e8c468; color: #10241a; }}
   .player-item.drop-hover .sub {{ color: #4a3c10; }}
   /* Pendant un glissement, les joueurs d'une autre table que l'éliminé
-     ne peuvent pas être l'éliminateur (au poker, on n'élimine que
-     quelqu'un de sa propre table) — grisés et non ciblables. */
-  .player-item.not-eligible {{ opacity: 0.25; pointer-events: none; }}
+     (au poker, on n'élimine que quelqu'un de sa propre table) — ainsi
+     que l'éliminé lui-même, qui ne peut pas être son propre éliminateur
+     — ne peuvent pas être ciblés. Complètement masqués (pas juste
+     grisés) : ça libère de la place dans la colonne de droite pour les
+     candidats valides, plutôt que de la gâcher avec des lignes qu'on ne
+     peut de toute façon pas choisir. */
+  .player-item.not-eligible {{ display: none; }}
   #empty {{
     text-align: center; color: #b9ad8f; padding: 40px 16px; font-size: 15px;
   }}
@@ -225,7 +281,7 @@ _ELIMINATE_PAGE = """<!doctype html>
   <div id="topbar">
     <a href="/">← Retour</a>
     <span class="tournoi">{tournament_name}</span>
-    <span style="width:50px"></span>
+    <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
   <div id="columns">
     <div class="col col-left">
@@ -317,19 +373,38 @@ function makeItem(p, isSource) {{
 // droite (Éliminateur) tous les joueurs qui ne sont pas à la même table
 // que l'éliminé en cours de glissement, pour ne laisser sélectionnable
 // que les candidats valides.
-function applyTableFilter(tableName) {{
+function applyTableFilter(tableName, excludeId) {{
+  // Masque les joueurs non éligibles (autre table, ou l'éliminé
+  // lui-même — voir CSS .not-eligible) ET remonte les éligibles en tête
+  // de liste : sur une table avec beaucoup de joueurs, un candidat
+  // éligible pouvait se retrouver hors écran sans aucun moyen de
+  // défiler jusqu'à lui — on ne peut pas glisser ET faire défiler avec
+  // le même doigt en même temps. Masquer les non-éligibles (plutôt que
+  // les griser en place) libère en plus de la place pour les candidats
+  // valides, ce qui suffit à tous les afficher sans défiler dans le cas
+  // courant (une table a rarement plus de 9-10 sièges).
   var right = document.getElementById('list-right');
-  Array.prototype.forEach.call(right.children, function(item) {{
-    if (item.dataset.table !== tableName) {{
+  var children = Array.prototype.slice.call(right.children);
+  var eligible = [], ineligible = [];
+  children.forEach(function(item) {{
+    if (item.dataset.table === tableName && item.dataset.id !== excludeId) {{
+      eligible.push(item);
+    }} else {{
       item.classList.add('not-eligible');
+      ineligible.push(item);
     }}
   }});
+  eligible.concat(ineligible).forEach(function(item) {{
+    right.appendChild(item);
+  }});
+  right.scrollTop = 0;
 }}
 function clearTableFilter() {{
-  var right = document.getElementById('list-right');
-  Array.prototype.forEach.call(right.children, function(item) {{
-    item.classList.remove('not-eligible');
-  }});
+  // Reconstruit entièrement les deux colonnes (ordre alphabétique
+  // normal) plutôt que de juste retirer la classe "not-eligible" :
+  // remet aussi la colonne de droite dans son ordre habituel après le
+  // remaniement temporaire fait par applyTableFilter ci-dessus.
+  renderLists();
 }}
 
 function moveGhost(x, y) {{
@@ -357,6 +432,9 @@ function onTouchStart(e) {{
     table: el.dataset.table, el: el,
     startX: t.clientX, startY: t.clientY, engaged: false,
   }};
+  // Retour visuel tout de suite, avant même de savoir si ça deviendra
+  // un glissement ou un simple défilement (voir CSS .player-item.pressed).
+  el.classList.add('pressed');
   document.addEventListener('touchmove', onTouchMove, {{passive: false}});
   document.addEventListener('touchend', onTouchEnd);
   document.addEventListener('touchcancel', onTouchEnd);
@@ -379,8 +457,9 @@ function onTouchMove(e) {{
       return;
     }}
     pending.engaged = true;
+    pending.el.classList.remove('pressed');
     pending.el.classList.add('dragging');
-    applyTableFilter(pending.table);
+    applyTableFilter(pending.table, pending.id);
     var ghost = document.getElementById('ghost');
     ghost.textContent = pending.label;
     ghost.style.display = 'block';
@@ -388,6 +467,7 @@ function onTouchMove(e) {{
 
   e.preventDefault();
   moveGhost(t.clientX, t.clientY);
+  autoScrollNearEdge(t.clientY);
   var el = document.elementFromPoint(t.clientX, t.clientY);
   var target = el ? el.closest('[data-target="true"]') : null;
   if (hoverTarget && hoverTarget !== target) {{
@@ -399,13 +479,41 @@ function onTouchMove(e) {{
   hoverTarget = target;
 }}
 
+// Un seul doigt tient le glissement : impossible de faire défiler la
+// colonne de droite EN MEME TEMPS pour atteindre un candidat éligible
+// resté hors écran (table bien remplie, 9-10 joueurs). On fait donc
+// défiler automatiquement la colonne de droite dès que le doigt
+// s'approche de son bord haut ou bas pendant le glissement — le même
+// principe que le réordonnancement/repli des non-éligibles
+// (applyTableFilter) : maximiser les chances de ne jamais avoir besoin
+// de lâcher le glissement pour voir un candidat plus bas (ou plus haut).
+var EDGE_SCROLL_ZONE = 50;   // px depuis le bord haut/bas de la colonne
+var EDGE_SCROLL_STEP = 14;   // px de défilement à chaque évènement tactile proche du bord
+function autoScrollNearEdge(clientY) {{
+  var right = document.getElementById('list-right');
+  var rect = right.getBoundingClientRect();
+  if (clientY < rect.top + EDGE_SCROLL_ZONE) {{
+    right.scrollTop -= EDGE_SCROLL_STEP;
+  }} else if (clientY > rect.bottom - EDGE_SCROLL_ZONE) {{
+    right.scrollTop += EDGE_SCROLL_STEP;
+  }}
+}}
+
 function cancelPending() {{
   document.removeEventListener('touchmove', onTouchMove);
   document.removeEventListener('touchend', onTouchEnd);
   document.removeEventListener('touchcancel', onTouchEnd);
-  if (pending && pending.el) pending.el.classList.remove('dragging');
+  if (pending && pending.el) {{
+    pending.el.classList.remove('dragging');
+    pending.el.classList.remove('pressed');
+  }}
   if (hoverTarget) {{ hoverTarget.classList.remove('drop-hover'); hoverTarget = null; }}
-  clearTableFilter();
+  // Seulement si un glissement avait vraiment été engagé (donc si
+  // applyTableFilter avait été appelé) : évite de reconstruire toute la
+  // liste à chaque simple défilement annulé (le cas le plus fréquent).
+  if (pending && pending.engaged) {{
+    clearTableFilter();
+  }}
   document.getElementById('ghost').style.display = 'none';
   pending = null;
 }}
@@ -451,6 +559,7 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
 
 loadPlayers();
 refreshTimer = setInterval(loadPlayers, 4000);
+{reload_script}
 </script>
 </body>
 </html>
@@ -463,15 +572,35 @@ def local_ip():
     le navigateur du téléphone. N'envoie en fait aucune donnée (le socket
     UDP n'est jamais réellement utilisé pour émettre) : c'est une astuce
     standard pour demander au système quelle interface réseau serait
-    utilisée pour joindre une adresse externe, sans nécessiter internet."""
+    utilisée pour joindre une adresse externe, sans nécessiter internet.
+
+    Repli si ça échoue (OSError — ex : Wifi local sans accès internet du
+    tout, comme un routeur de voyage sans connexion WAN : la tentative de
+    route vers 8.8.8.8 peut alors échouer même si le réseau local
+    lui-même fonctionne très bien entre le PC et le téléphone) : énumère
+    les adresses IPv4 connues de cette machine via son propre nom d'hôte,
+    et prend la première qui n'est ni loopback (127.x) ni lien-local sans
+    DHCP (169.254.x) — un cas réel rencontré en v1.2.29, où la case
+    Paramètres affichait 127.0.0.1 (inutilisable depuis le téléphone,
+    qui désigne alors LUI-MÊME, pas le PC) alors que le Wifi local
+    fonctionnait. Ne renvoie 127.0.0.1 qu'en tout dernier recours, si
+    vraiment aucune adresse réseau n'a pu être trouvée."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
     except OSError:
-        return "127.0.0.1"
+        pass
     finally:
         s.close()
+    try:
+        for family, _, _, _, sockaddr in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = sockaddr[0]
+            if not ip.startswith("127.") and not ip.startswith("169.254."):
+                return ip
+    except OSError:
+        pass
+    return "127.0.0.1"
 
 
 class RemoteControlServer:
@@ -594,7 +723,7 @@ class RemoteControlServer:
                             f'onclick="window.location.href=\'/select_tournament?pid={t["pid"]}\'">{label}</button>'
                         )
                     rows = "\n".join(parts)
-                self._send_html(_LOBBY_PAGE.format(rows=rows))
+                self._send_html(_LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT))
 
             def _handle_select_tournament(self):
                 from urllib.parse import parse_qs, urlparse
@@ -611,13 +740,24 @@ class RemoteControlServer:
                 self.end_headers()
 
             def do_GET(self):
+                # self.path inclut la chaîne de requête ("?...") le cas
+                # échéant (ex : "/?_r=173..." posé par le bouton 🔄 de
+                # rechargement pour forcer le téléphone à ignorer son
+                # cache — voir _RELOAD_SCRIPT) : la comparer telle quelle
+                # à "/" échouait toujours (404), d'où un routage sur le
+                # chemin SEUL, sans sa chaîne de requête, pour toutes les
+                # pages ci-dessous (_proxy/_handle_select_tournament, qui
+                # ont besoin de la chaîne de requête d'origine, continuent
+                # eux d'utiliser self.path tel quel).
+                path = self.path.split("?", 1)[0]
+
                 # Toujours traitées ICI, jamais relayées vers un autre
                 # tournoi : ce sont les pages qui permettent justement de
                 # choisir/changer de tournoi.
-                if self.path == "/lobbylist":
+                if path == "/lobbylist":
                     self._handle_lobbylist()
                     return
-                if self.path.startswith("/select_tournament"):
+                if path == "/select_tournament":
                     self._handle_select_tournament()
                     return
 
@@ -626,7 +766,7 @@ class RemoteControlServer:
                     self._proxy(target_port)
                     return
 
-                if self.path in ("/", "/index.html"):
+                if path in ("/", "/index.html"):
                     tournaments = open_windows.list_remote_tournaments()
                     lobby_button = (
                         '<button id="btn-lobby" onclick="window.location.href=\'/lobbylist\'">🏛 Lobby</button>'
@@ -635,12 +775,15 @@ class RemoteControlServer:
                     self._send_html(_PAGE_TEMPLATE.format(
                         tournament_name=_escape_html(get_name()),
                         lobby_button=lobby_button,
+                        app_version=version.APP_VERSION,
+                        reload_script=_RELOAD_SCRIPT,
                     ))
-                elif self.path in ("/eliminate", "/eliminate.html"):
+                elif path in ("/eliminate", "/eliminate.html"):
                     self._send_html(_ELIMINATE_PAGE.format(
-                        tournament_name=_escape_html(get_name())
+                        tournament_name=_escape_html(get_name()),
+                        reload_script=_RELOAD_SCRIPT,
                     ))
-                elif self.path == "/players":
+                elif path == "/players":
                     self._send_json(get_players())
                 else:
                     self.send_error(404)
@@ -651,14 +794,15 @@ class RemoteControlServer:
                     self._proxy(target_port)
                     return
 
-                if self.path.startswith("/action/"):
-                    action = self.path[len("/action/"):]
+                path = self.path.split("?", 1)[0]
+                if path.startswith("/action/"):
+                    action = path[len("/action/"):]
                     if action not in _VALID_ACTIONS:
                         self.send_error(400, "Action inconnue")
                         return
                     on_word(action)
                     self._send_json({"ok": True})
-                elif self.path == "/eliminate":
+                elif path == "/eliminate":
                     length = int(self.headers.get("Content-Length", 0) or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     try:
