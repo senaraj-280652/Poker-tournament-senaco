@@ -15,6 +15,7 @@ import time
 import json
 import csv
 import shutil
+import tempfile
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
@@ -54,6 +55,42 @@ try:
     import pyi_splash
 except ImportError:
     pyi_splash = None
+
+# Journal de plantage (~/.poker_tournament/crash.log) : jusqu'ici, aucune
+# exception non gérée n'était conservée nulle part — seulement affichée
+# dans le terminal (perdue dès qu'il est fermé, ou jamais vue si l'appli
+# tournait en arrière-plan). Utile pour diagnostiquer un plantage
+# "silencieux" (l'appli disparaît sans qu'on ait pu voir pourquoi) :
+# couvre le thread principal (sys.excepthook), les threads secondaires
+# (threading.excepthook — ex : celui du serveur de contrôle à distance)
+# et les exceptions survenant dans les callbacks Tkinter (clics de
+# bouton, etc. — normalement juste affichées dans le terminal et
+# avalées sans arrêter l'appli, voir App.report_callback_exception).
+def _crash_log_path():
+    d = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "crash.log")
+
+
+def _log_exception(exc_type, exc_value, exc_tb):
+    import traceback
+    try:
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(datetime.now().isoformat(timespec="seconds") + "\n")
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+    except OSError:
+        pass
+    # Conserve aussi l'affichage terminal habituel.
+    traceback.print_exception(exc_type, exc_value, exc_tb, file=sys.stderr)
+
+
+def _install_crash_logging():
+    sys.excepthook = _log_exception
+    if hasattr(threading, "excepthook"):
+        def _thread_hook(args):
+            _log_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        threading.excepthook = _thread_hook
 
 # Photos de joueurs (aperçu + capture caméra) : dépendances optionnelles.
 # La copie/suppression des fichiers photo (player_photos.py) ne nécessite
@@ -3364,6 +3401,15 @@ class ActivationDialog(tk.Toplevel):
 
 
 class App(tk.Tk):
+    def report_callback_exception(self, exc, val, tb):
+        """Tkinter appelle ceci pour toute exception levée dans un callback
+        (clic de bouton, etc.) — par défaut, juste affiché dans le
+        terminal, avalé sans arrêter l'appli. On le consigne en plus dans
+        le journal de plantage (voir _log_exception) pour pouvoir
+        diagnostiquer après coup, notamment quand l'appli tourne sans
+        terminal visible (contrôle à distance, tests)."""
+        _log_exception(exc, val, tb)
+
     def __init__(self, open_path=None):
         super().__init__()
         self.withdraw()
@@ -3392,6 +3438,17 @@ class App(tk.Tk):
         # tenue à jour depuis le thread principal (voir _tick), jamais lue
         # ni écrite depuis le thread du serveur web.
         self._remote_players_cache = []
+        # État pause/lecture du chrono, pour le petit bouton ON/OFF à côté
+        # de "Chronomètre" sur la page du contrôle à distance — même
+        # principe (tenu à jour depuis _tick, jamais lu/écrit depuis le
+        # thread du serveur web).
+        self._remote_clock_paused = True
+        # Positionné (côté thread du serveur web, voir _remote_upload_photo)
+        # dès qu'une photo vient d'être envoyée depuis le téléphone, pour
+        # que _tick rafraîchisse la colonne Photo (Répertoire/Joueurs) sans
+        # attendre un changement d'onglet — même principe que les deux
+        # attributs juste au-dessus.
+        self._remote_photo_uploaded = False
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -5195,13 +5252,17 @@ class App(tk.Tk):
             self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi"
         )
         self._refresh_remote_players_cache()
+        self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1 if self.db else True
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
             get_players=lambda: self._remote_players_cache,
+            get_clock_paused=lambda: self._remote_clock_paused,
             on_eliminate=lambda eliminated_id, eliminator_id: self.voice_command_queue.put(
                 ("eliminate", eliminated_id, eliminator_id)
             ),
+            on_upload_photo=self._remote_upload_photo,
+            get_roster_players=self._remote_get_roster_players,
         )
         try:
             server.start()
@@ -5378,6 +5439,61 @@ class App(tk.Tk):
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
 
+    def _remote_get_roster_players(self):
+        """TOUT le répertoire de joueurs habituels (roster.py), pas
+        seulement les joueurs actifs dans le tournoi en cours — pour la
+        page Photos du contrôle à distance (voir remote_control.py) :
+        contrairement à l'onglet Joueurs, on peut vouloir photographier un
+        joueur du club avant même qu'il ne soit inscrit ce soir-là.
+        roster.py et player_photos.py ne touchent ni à self.db (SQLite) ni
+        à Tkinter (comme _remote_upload_photo juste en dessous) : appelable
+        sans danger directement depuis le thread du serveur web, sans
+        passer par un cache tenu à jour depuis le thread principal."""
+        return [
+            {
+                "name": e["name"],
+                "club": e["club"],
+                "has_photo": player_photos.get_photo_path(e["name"]) is not None,
+            }
+            for e in roster.load_roster_entries()
+        ]
+
+    def _remote_upload_photo(self, player_name, image_bytes):
+        """Photo prise avec l'appareil photo du téléphone (page /photos du
+        contrôle à distance, voir remote_control.py) et associée à un
+        joueur du répertoire, identifié par NOM (le répertoire n'a pas
+        d'id numérique comme les joueurs d'un tournoi — voir
+        _remote_get_roster_players). Contrairement à _remote_eliminate :
+        appelé directement depuis le thread du serveur web, SANS passer
+        par voice_command_queue — sans danger ici, `player_photos` ne
+        touche ni à self.db (SQLite) ni à Tkinter, seulement à de simples
+        fichiers/JSON dans ~/.poker_tournament/photos/ (déjà conçu pour
+        être utilisé indépendamment de l'appli, voir son docstring).
+        Renvoie (succès: bool, message: str)."""
+        name = (player_name or "").strip()
+        if not name:
+            return False, "Nom de joueur manquant."
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                tmp.write(image_bytes)
+                tmp_path = tmp.name
+            player_photos.save_photo_from_file(name, tmp_path)
+        except OSError as e:
+            return False, f"Échec de l'enregistrement : {e}"
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        # Simple écriture d'attribut (thread-safe en pratique, voir
+        # commentaire sur self._remote_clock_paused) : _tick, sur le
+        # thread principal, la consomme pour rafraîchir la colonne Photo
+        # sans attendre un changement d'onglet.
+        self._remote_photo_uploaded = True
+        return True, name
+
     def _on_voice_word(self, word):
         """Dispatché pour chaque mot-clé reçu ("elimination"/"terminer"/
         "chronometre", depuis un raccourci clavier ou le contrôle à
@@ -5414,6 +5530,50 @@ class App(tk.Tk):
                 # mouvement est active : au contraire, c'est justement là
                 # que le responsable a besoin de voir l'écran projecteur.
                 self._voice_show_clock()
+        elif word == "tables":
+            # Contrairement à "chronometre" : ici c'est bien la fenêtre
+            # PRINCIPALE qu'on veut voir (l'onglet Tables n'existe que
+            # là, pas sur l'écran projecteur), donc self.lift() a tout
+            # son sens — pas de conflit avec un écran projecteur à
+            # préserver au premier plan.
+            self.notebook.select(self.tables_tab)
+            self._refresh_tables_tab()
+            self.lift()
+            self.focus_force()
+        elif word == "mouvements":
+            self.notebook.select(self.moves_tab)
+            self._refresh_moves_tab()
+            self.lift()
+            self.focus_force()
+        elif word == "tables_zoom_moins":
+            # Petits boutons Z-/Z+ de part et d'autre de "Plan des
+            # tables" sur le téléphone : ajustent le même réglage de
+            # zoom que les boutons "🔍− Zoom"/"🔍+ Zoom" de l'onglet
+            # Tables (voir _tables_zoom_by) — discret, comme
+            # "toggle_pause"/"niveau_suivant" (ne remonte aucune
+            # fenêtre : on ajuste typiquement après avoir déjà affiché
+            # "Plan des tables").
+            self._tables_zoom_by(-self.TABLES_ZOOM_STEP)
+        elif word == "tables_zoom_plus":
+            self._tables_zoom_by(self.TABLES_ZOOM_STEP)
+        elif word == "toggle_pause":
+            # Petit bouton ON/OFF à côté de "Chronomètre" sur le
+            # téléphone : bascule directement pause/reprise, sans passer
+            # par le contexte "reprendre après une élimination" (qui a sa
+            # propre logique de garde-fous, voir plus haut) — un simple
+            # aller-retour, jamais bloqué par une alerte de mouvement en
+            # cours, ni ne remonte aucune fenêtre (pensé pour rester
+            # discret).
+            if self.db.get_setting_int("is_paused", 1) == 1:
+                self._clock_resume()
+            else:
+                self._clock_pause()
+            self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+        elif word == "niveau_suivant":
+            # Bouton "Niveau Suivant" du téléphone : équivalent exact du
+            # bouton du même nom dans l'onglet Chronomètre — discret,
+            # comme "toggle_pause" (ne remonte aucune fenêtre).
+            self._clock_next_level()
 
     def _voice_start_elimination(self):
         """Commande "Élimination" (raccourci clavier ou contrôle à
@@ -8517,12 +8677,23 @@ class App(tk.Tk):
             self._refresh_clock_tab()
         elif current == "Mouvements":
             self._refresh_moves_tab()
+        if self._remote_photo_uploaded:
+            # Une photo vient d'être envoyée depuis le téléphone (voir
+            # _remote_upload_photo) : rafraîchit la colonne Photo de
+            # l'onglet actuellement affiché, sans attendre que l'utilisateur
+            # change d'onglet et y revienne.
+            self._remote_photo_uploaded = False
+            if current == "Répertoire":
+                self.roster_tab._refresh()
+            elif current == "Joueurs":
+                self._refresh_players_tab()
         # Tenu à jour ici (thread principal) plutôt que lu directement
         # depuis le thread du serveur de contrôle à distance — voir
         # _start_remote_control_if_enabled.
         if self.remote_control_server is not None and self.db is not None:
             self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
             self._refresh_remote_players_cache()
+            self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
         self._tick_after_id = self.after(1000, self._tick)
 
     def _refresh_remote_players_cache(self):
@@ -8541,6 +8712,10 @@ class App(tk.Tk):
                 "name": p["name"],
                 "table": tables.get(p["table_id"]),
                 "seat": p["seat"],
+                # Pour la page "Photos" du contrôle à distance : indique
+                # d'un coup d'œil qui a déjà une photo au répertoire,
+                # sans endpoint séparé (voir player_photos.get_photo_path).
+                "has_photo": player_photos.get_photo_path(p["name"]) is not None,
             }
             for p in self.db.list_players(status="active")
         ]
@@ -8560,6 +8735,11 @@ if __name__ == "__main__":
     # (voir spawn_app_process/App.__init__) — utilisé par le Lobby SNG pour
     # ouvrir un tournoi précis dans une nouvelle fenêtre, sans passer par
     # l'écran d'accueil.
+    _install_crash_logging()
     _open_path = sys.argv[1] if len(sys.argv) > 1 else None
-    app = App(open_path=_open_path)
-    app.mainloop()
+    try:
+        app = App(open_path=_open_path)
+        app.mainloop()
+    except Exception:
+        _log_exception(*sys.exc_info())
+        raise
