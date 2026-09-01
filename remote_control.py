@@ -696,16 +696,20 @@ _PHOTOS_PAGE = """<!doctype html>
     padding: 10px; margin-bottom: 8px; border-radius: 10px;
     background: #1c3d2c;
   }}
+  .player-row .thumb {{
+    flex: none; width: 44px; height: 44px; border-radius: 8px;
+    object-fit: cover; background: #0b1c15;
+  }}
   .player-row .info {{ flex: 1; min-width: 0; text-align: left; }}
   .player-row .info .name {{ font-size: 16px; font-weight: 700; }}
   .player-row .info .sub {{ font-size: 12px; color: #9fb8a8; margin-top: 2px; }}
-  .player-row .has-photo {{ color: #8fd694; }}
   .player-row button {{
     flex: none; border: none; border-radius: 10px; background: #2c4a6e;
     color: #fff; font-size: 22px; padding: 10px 14px;
     -webkit-tap-highlight-color: transparent;
   }}
   .player-row button:active {{ transform: scale(0.95); }}
+  .player-row .btn-delete {{ background: #6e2c2c; font-size: 18px; padding: 10px 12px; }}
   #empty {{ text-align: center; color: #b9ad8f; padding: 40px 16px; font-size: 15px; }}
   #status {{
     max-width: 420px; margin: 14px auto 0; min-height: 22px;
@@ -766,6 +770,7 @@ _PHOTOS_PAGE = """<!doctype html>
 <script>
 var players = [];
 var pendingPlayer = null;
+var lastPlayersJSON = null;
 
 function loadPlayers() {{
   // /roster_players (pas /players, réservé à la page Éliminations) :
@@ -773,6 +778,12 @@ function loadPlayers() {{
   // au tournoi en cours — on peut vouloir prendre en photo un joueur du
   // club avant même qu'il ne soit assis à une table ce soir-là.
   fetch('/roster_players').then(function(r) {{ return r.json(); }}).then(function(data) {{
+    // Ne redessine que si quelque chose a vraiment changé : sinon,
+    // reconstruire la liste (et donc chaque <img> de miniature) toutes
+    // les 4 secondes pour rien faisait clignoter les photos à l'écran.
+    var json = JSON.stringify(data);
+    if (json === lastPlayersJSON) return;
+    lastPlayersJSON = json;
     players = data;
     renderList();
   }}).catch(function() {{ /* réseau momentanément indisponible : on retentera */ }});
@@ -791,13 +802,18 @@ function renderList() {{
   sorted.forEach(function(p) {{
     var row = document.createElement('div');
     row.className = 'player-row';
+    var thumb = p.has_photo
+      ? '<img class="thumb" src="/photo_image?name=' + encodeURIComponent(p.name) + '&_r=' + Date.now() + '">'
+      : '';
     row.innerHTML =
+      thumb +
       '<div class="info">' +
-        '<div class="name">' + p.name + (p.has_photo ? ' <span class="has-photo">✓</span>' : '') + '</div>' +
+        '<div class="name">' + p.name + '</div>' +
         (p.club ? '<div class="sub">' + p.club + '</div>' : '') +
       '</div>' +
-      '<button type="button">📷</button>';
-    row.querySelector('button').addEventListener('click', function() {{
+      '<button type="button" class="btn-camera">📷</button>' +
+      (p.has_photo ? '<button type="button" class="btn-delete">🗑</button>' : '');
+    row.querySelector('.btn-camera').addEventListener('click', function() {{
       pendingPlayer = p;
       // Rien à afficher DURANT la prise de vue elle-même (vue caméra
       // native, hors de portée de cette page) — mais on confirme ici,
@@ -805,6 +821,25 @@ function renderList() {{
       document.getElementById('status').textContent = '📷 Photo pour ' + p.name + '...';
       document.getElementById('camera-input').click();
     }});
+    var delBtn = row.querySelector('.btn-delete');
+    if (delBtn) {{
+      delBtn.addEventListener('click', function() {{
+        if (!confirm('Supprimer la photo de ' + p.name + ' ?')) return;
+        var status = document.getElementById('status');
+        status.textContent = 'Suppression...';
+        fetch('/delete_photo?player_name=' + encodeURIComponent(p.name), {{ method: 'POST' }})
+          .then(function(r) {{ return r.json(); }})
+          .then(function(data) {{
+            if (!data.ok) throw new Error(data.message || 'erreur');
+            status.textContent = 'Photo supprimée pour ' + p.name + '.';
+            setTimeout(function() {{ status.textContent = ''; }}, 3000);
+            loadPlayers();
+          }})
+          .catch(function(e) {{
+            status.textContent = 'Échec (' + e.message + ').';
+          }});
+      }});
+    }}
     list.appendChild(row);
   }});
 }}
@@ -1072,11 +1107,19 @@ class RemoteControlServer:
       autres, peut être appelé du thread du serveur SANS passer par une
       file d'attente thread-safe, s'il ne touche ni self.db (SQLite) ni
       Tkinter (voir App._remote_upload_photo, qui ne touche que de
-      simples fichiers/JSON via player_photos.py)."""
+      simples fichiers/JSON via player_photos.py).
+    - `get_photo_image(player_name)` : renvoie (bytes, mime) pour la
+      miniature affichée à côté du nom sur la page Photos, ou (None,
+      None) si ce joueur n'a pas de photo — même remarque thread-safe que
+      on_upload_photo (simple lecture de fichier).
+    - `on_delete_photo(player_name)` : supprime la photo de ce joueur
+      (bouton 🗑 de la page Photos) — renvoie (succès: bool, message:
+      str), même remarque thread-safe."""
 
     def __init__(self, on_word, get_tournament_name=None, get_players=None,
                  on_eliminate=None, get_clock_paused=None, on_upload_photo=None,
-                 get_roster_players=None, port=DEFAULT_PORT):
+                 get_roster_players=None, get_photo_image=None, on_delete_photo=None,
+                 port=DEFAULT_PORT):
         self.on_word = on_word
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
         self.get_players = get_players or (lambda: [])
@@ -1084,6 +1127,8 @@ class RemoteControlServer:
         self.on_eliminate = on_eliminate or (lambda eliminated_id, eliminator_id: None)
         self.get_clock_paused = get_clock_paused or (lambda: True)
         self.on_upload_photo = on_upload_photo or (lambda player_name, image_bytes: (False, "Non disponible"))
+        self.get_photo_image = get_photo_image or (lambda player_name: (None, None))
+        self.on_delete_photo = on_delete_photo or (lambda player_name: (False, "Non disponible"))
         self.port = port
         self._httpd = None
         self._thread = None
@@ -1098,6 +1143,8 @@ class RemoteControlServer:
         on_eliminate = self.on_eliminate
         get_clock_paused = self.get_clock_paused
         on_upload_photo = self.on_upload_photo
+        get_photo_image = self.get_photo_image
+        on_delete_photo = self.on_delete_photo
         own_pid = os.getpid()
 
         def resolve_proxy_port(handler):
@@ -1253,6 +1300,26 @@ class RemoteControlServer:
                     self._send_json(get_players())
                 elif path == "/roster_players":
                     self._send_json(get_roster_players())
+                elif path == "/photo_image":
+                    # Miniature affichée à côté du nom sur la page Photos
+                    # (voir _PHOTOS_PAGE) : identifié par NOM, comme
+                    # /upload_photo et /delete_photo — le répertoire n'a
+                    # pas d'id numérique.
+                    from urllib.parse import parse_qs, urlparse
+                    query = parse_qs(urlparse(self.path).query)
+                    name_values = query.get("name")
+                    if not name_values or not name_values[0].strip():
+                        self.send_error(404)
+                        return
+                    image_bytes, mime = get_photo_image(name_values[0].strip())
+                    if image_bytes is None:
+                        self.send_error(404)
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type", mime)
+                    self.send_header("Content-Length", str(len(image_bytes)))
+                    self.end_headers()
+                    self.wfile.write(image_bytes)
                 elif path == "/clock_state":
                     self._send_json({"paused": bool(get_clock_paused())})
                 else:
@@ -1304,6 +1371,15 @@ class RemoteControlServer:
                     player_name = player_name_values[0].strip()
                     image_bytes = self.rfile.read(length)
                     ok, message = on_upload_photo(player_name, image_bytes)
+                    self._send_json({"ok": ok, "message": message})
+                elif path == "/delete_photo":
+                    from urllib.parse import parse_qs, urlparse
+                    query = parse_qs(urlparse(self.path).query)
+                    player_name_values = query.get("player_name")
+                    if not player_name_values or not player_name_values[0].strip():
+                        self.send_error(400, "Requête invalide")
+                        return
+                    ok, message = on_delete_photo(player_name_values[0].strip())
                     self._send_json({"ok": ok, "message": message})
                 else:
                     self.send_error(404)

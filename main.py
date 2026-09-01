@@ -199,33 +199,46 @@ def default_tournament_dir():
     return os.path.expanduser("~")
 
 
+# Noms de sous-dossiers "jour de tournoi" (voir tournament_day_folder_proposal) :
+# l'index correspond à datetime.weekday() (lundi=0 ... dimanche=6).
+WEEKDAY_NAMES_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
+
+# Jours cochés par défaut dans "Jours de tournoi / Sit & Go" (voir
+# _build_settings_tab) avant tout réglage explicite du club : usage actuel
+# du CPC (tournois le vendredi, Sit & Go le dimanche) — un point de départ
+# raisonnable, pas une contrainte : un autre club peut cocher n'importe
+# quel autre jour (ex. jeudi).
+DEFAULT_TOURNAMENT_DAYS = "4,6"
+
+
 def tournament_day_folder_proposal(is_sng=False):
     """Renvoie (dossier_proposé, nom_de_fichier_proposé) pour "Nouveau
     tournoi" / "Sit & Go rapide", à partir de "Dossier par défaut" (voir
     _build_settings_tab), mémorisé globalement dans tournament_prefs
     (dernier tournoi en date, retrouvable même avant l'ouverture d'un
-    fichier .tournoi) : sous-dossier Vendredi/Dimanche/Autre selon le
-    jour de la semaine du jour (purement organisationnel), créé s'il
-    n'existe pas encore, et nom de fichier To/Sn + date du jour (JJMMAA),
-    ex. "To270826". Le préfixe dépend de `is_sng` (donc du bouton
-    effectivement cliqué — "Nouveau tournoi" ou "Sit & Go rapide"), PAS
-    du jour de la semaine : créer un tournoi normal un dimanche doit
-    donner "To...", pas "Sn..." (qui laisserait croire à tort que
-    c'était un Sit & Go).
-    Renvoie (None, None) si aucun dossier n'est configuré (ou dossier
-    non créable) — les repos de secours habituels s'appliquent alors
+    fichier .tournoi) : sous-dossier nommé d'après le jour de la semaine
+    du jour (lundi/mardi/.../dimanche — purement organisationnel, voir
+    WEEKDAY_NAMES_FR), créé s'il n'existe pas encore, et nom de fichier
+    To/Sn + date du jour (JJMMAA), ex. "To270826". Le préfixe dépend de
+    `is_sng` (donc du bouton effectivement cliqué — "Nouveau tournoi" ou
+    "Sit & Go rapide"), PAS du jour de la semaine : créer un tournoi
+    normal un dimanche doit donner "To...", pas "Sn..." (qui laisserait
+    croire à tort que c'était un Sit & Go).
+    Si "Dossier par défaut" n'est pas configuré : sous Windows (poste
+    club réel), repli sur C:\\poker\\senaco plutôt que d'abandonner —
+    l'installation standard Senaco ; ailleurs (Mac de développement/test,
+    où ce chemin Windows n'aurait aucun sens), renvoie (None, None) et
+    laisse les repos de secours habituels s'appliquer
     (default_tournament_dir(), "tournoi.tournoi"...)."""
     base = tournament_prefs.load_last_settings().get("tournament_day_folder", "")
     base = (base or "").strip()
     if not base:
-        return None, None
+        if sys.platform.startswith("win"):
+            base = r"C:\poker\senaco"
+        else:
+            return None, None
     weekday = datetime.now().weekday()  # lundi=0 ... dimanche=6
-    if weekday == 4:
-        subfolder = "Vendredi"
-    elif weekday == 6:
-        subfolder = "Dimanche"
-    else:
-        subfolder = "Autre"
+    subfolder = WEEKDAY_NAMES_FR[weekday]
     prefix = "Sn" if is_sng else "To"
     folder = os.path.join(base, subfolder)
     try:
@@ -5263,6 +5276,8 @@ class App(tk.Tk):
             ),
             on_upload_photo=self._remote_upload_photo,
             get_roster_players=self._remote_get_roster_players,
+            get_photo_image=self._remote_get_photo_image,
+            on_delete_photo=self._remote_delete_photo,
         )
         try:
             server.start()
@@ -5491,6 +5506,36 @@ class App(tk.Tk):
         # commentaire sur self._remote_clock_paused) : _tick, sur le
         # thread principal, la consomme pour rafraîchir la colonne Photo
         # sans attendre un changement d'onglet.
+        self._remote_photo_uploaded = True
+        return True, name
+
+    def _remote_get_photo_image(self, player_name):
+        """Miniature affichée à côté du nom sur la page Photos du contrôle
+        à distance (voir remote_control.py) — simple lecture de fichier
+        via player_photos, sans toucher à self.db ni Tkinter : appelable
+        sans danger directement depuis le thread du serveur web, comme
+        _remote_upload_photo. Renvoie (bytes, mime) ou (None, None) si ce
+        joueur n'a pas de photo."""
+        name = (player_name or "").strip()
+        path = player_photos.get_photo_path(name) if name else None
+        if not path:
+            return None, None
+        ext = os.path.splitext(path)[1].lower()
+        mime = "image/png" if ext == ".png" else "image/jpeg"
+        try:
+            with open(path, "rb") as f:
+                return f.read(), mime
+        except OSError:
+            return None, None
+
+    def _remote_delete_photo(self, player_name):
+        """Supprime la photo de ce joueur (bouton 🗑 de la page Photos du
+        contrôle à distance) — même remarque thread-safe que
+        _remote_upload_photo. Renvoie (succès: bool, message: str)."""
+        name = (player_name or "").strip()
+        if not name:
+            return False, "Nom de joueur manquant."
+        player_photos.delete_photo(name)
         self._remote_photo_uploaded = True
         return True, name
 
@@ -8056,9 +8101,9 @@ class App(tk.Tk):
             folder_lbl,
             "Dossier choisi par vous où se trouve le tournoi du jour.\n"
             "Cliquez « Parcourir... » pour le choisir — proposé ensuite\n"
-            "automatiquement (avec un sous-dossier Vendredi/Dimanche/\n"
-            "Autre) pour créer un nouveau tournoi, l'ouvrir, ou dans\n"
-            "l'onglet Statistiques.",
+            "automatiquement (avec un sous-dossier nommé d'après le jour\n"
+            "de la semaine en cours, ex. vendredi) pour créer un nouveau\n"
+            "tournoi, l'ouvrir, ou dans l'onglet Statistiques.",
         )
         day_folder_var = tk.StringVar(value=self.db.get_setting("tournament_day_folder", ""))
         # Auto-enregistré à la frappe comme au choix (voir _save_day_folder),
@@ -8102,6 +8147,44 @@ class App(tk.Tk):
             "actif dans un autre tournoi/Sit & Go du même dossier avant de\n"
             "l'ajouter ici — en pratique, ce cas reste rare.",
         )
+
+        # -- Jours de tournoi / Sit & Go : purement une référence pour le
+        # club (utile si un autre club joue un autre jour, ex. le jeudi),
+        # sans effet sur la création des dossiers — le sous-dossier
+        # automatique (voir "Dossier par défaut" ci-dessus) porte de toute
+        # façon le nom du jour en cours, quel qu'il soit (voir
+        # tournament_day_folder_proposal / WEEKDAY_NAMES_FR). Mémorisé
+        # globalement (tournament_prefs), comme "Dossier par défaut".
+        days_row = folder_row + 3
+        days_lbl = ttk.Label(
+            left, text="Jours de tournoi / Sit & Go",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        days_lbl.grid(row=days_row, column=0, columnspan=2, sticky="w", pady=(14, 4))
+        Tooltip(
+            days_lbl,
+            "Pour référence : les jours de la semaine où votre club\n"
+            "organise des tournois ou des Sit & Go (ex. vendredi pour les\n"
+            "tournois, dimanche pour les Sit & Go). N'affecte pas la\n"
+            "création des dossiers : le sous-dossier automatique (voir\n"
+            "« Dossier par défaut » ci-dessus) porte de toute façon le nom\n"
+            "du jour en cours, quel qu'il soit.",
+        )
+        saved_days_raw = self.db.get_setting("tournament_days_of_week", DEFAULT_TOURNAMENT_DAYS)
+        try:
+            saved_days = {int(x) for x in saved_days_raw.split(",") if x.strip() != ""}
+        except ValueError:
+            saved_days = {4, 6}
+        self.tournament_day_vars = {}
+        days_grid = ttk.Frame(left)
+        days_grid.grid(row=days_row + 1, column=0, columnspan=2, sticky="w")
+        for idx, day_name in enumerate(WEEKDAY_NAMES_FR):
+            var = tk.BooleanVar(value=idx in saved_days)
+            var.trace_add("write", lambda *a: self._save_tournament_days())
+            self.tournament_day_vars[idx] = var
+            ttk.Checkbutton(
+                days_grid, text=day_name.capitalize(), variable=var,
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2)
 
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
@@ -8483,6 +8566,17 @@ class App(tk.Tk):
         path = self.settings_vars["tournament_day_folder"].get()
         self.db.set_settings({"tournament_day_folder": path})
         tournament_prefs.save_last_settings({"tournament_day_folder": path})
+
+    def _save_tournament_days(self):
+        """Enregistre en continu les jours cochés dans "Jours de tournoi /
+        Sit & Go" (voir _build_settings_tab), au fur et à mesure des
+        cases cochées/décochées — même principe que _save_day_folder
+        juste au-dessus (CE tournoi + préférences globales
+        tournament_prefs, pour être proposé dès l'écran d'accueil)."""
+        checked = sorted(idx for idx, var in self.tournament_day_vars.items() if var.get())
+        value = ",".join(str(i) for i in checked)
+        self.db.set_settings({"tournament_days_of_week": value})
+        tournament_prefs.save_last_settings({"tournament_days_of_week": value})
 
     def _save_club_name(self):
         """Enregistre en continu le "Nom du Club" (préférence partagée,

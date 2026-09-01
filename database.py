@@ -263,6 +263,15 @@ def bounty_unit_value(n_players, flat_value=0):
     return round(10 * math.sqrt(n_players))
 
 
+# Convention "table finale" (voir rebalance_tables) : une fois qu'il ne
+# reste plus que ce nombre de joueurs actifs ou moins, ils sont toujours
+# regroupés sur UNE SEULE table, quitte à dépasser ponctuellement le
+# réglage "Nombre de sièges par table" s'il est plus petit (ex. 8) — un
+# vrai tournoi ne scinde jamais les tout derniers joueurs entre deux
+# tables alors qu'ils tiendraient sur une seule table finale.
+FINAL_TABLE_MAX_SEATS = 10
+
+
 class Database:
     def __init__(self, path, read_only=False):
         """`read_only=True` : pour une simple consultation (Lobby SNG,
@@ -771,12 +780,46 @@ class Database:
             ):
                 n_tables_needed -= 1
 
+        # Convention "table finale" (voir FINAL_TABLE_MAX_SEATS) : au
+        # poker, la toute dernière table peut accueillir jusqu'à 10
+        # joueurs même si "Nombre de sièges par table" est réglé plus bas
+        # (ex. 8) — on ne scinde jamais les derniers joueurs entre deux
+        # tables alors qu'ils tiendraient sur une seule table finale.
+        if n_active <= FINAL_TABLE_MAX_SEATS:
+            n_tables_needed = 1
+
         # Ouvre des tables supplémentaires si le nombre de sièges disponibles
         # ne suffit plus (ex : réduction du nombre de sièges par table en
         # cours de tournoi).
         if len(tables) < n_tables_needed:
             for _ in range(n_tables_needed - len(tables)):
                 self._open_or_reopen_table()
+            tables = list(self.list_tables())
+
+        # Si consolider sur une seule table finale dépasse le nombre de
+        # sièges normalement configuré (cas ci-dessus), relève
+        # ponctuellement la capacité de CETTE table pour qu'elle puisse
+        # réellement tous les accueillir — sinon _seat_player refuserait
+        # de la remplir au-delà de son max_seats actuel et rouvrirait une
+        # table à la place, annulant la fusion voulue.
+        if n_tables_needed == 1 and n_active > max_seats:
+            survivor = min(tables, key=self._table_display_number)
+            if survivor["max_seats"] < n_active:
+                self.conn.execute(
+                    "UPDATE tables_pk SET max_seats=? WHERE id=?",
+                    (n_active, survivor["id"]),
+                )
+                self.conn.commit()
+                tables = list(self.list_tables())
+        elif any(t["max_seats"] != max_seats for t in tables):
+            # Repli : plusieurs tables sont de nouveau nécessaires (ex :
+            # d'autres joueurs se sont inscrits depuis une fusion "table
+            # finale" ci-dessus) — sans ça, la table déjà ponctuellement
+            # élargie garderait pour toujours une capacité différente des
+            # autres, sans raison apparente une fois la fusion plus
+            # nécessaire.
+            self.conn.execute("UPDATE tables_pk SET max_seats=?", (max_seats,))
+            self.conn.commit()
             tables = list(self.list_tables())
 
         # Ferme les tables en trop — toujours en partant du numéro le PLUS
