@@ -43,3 +43,16 @@ _license_secret.py
 # supprimés automatiquement à la fermeture du document)
 ~$*.doc
 ~$*.docx
+
+# Fichiers et dossiers personnels ponctuels (non liés au code source) —
+# entrées exactes, pas de règle globale sur *.pdf ou *.docx.
+/Claude - procédure .docx
+/Gestionnaire de Tournoi de Poker.docx
+/MANUEL_PDF_UTILISATEUR_TOURNOI_CPC.pdf
+/MSI Windows/
+/Son poker/
+/Vendredi/
+/dimanche/
+/primes_S_G1.pdf
+/synthese_joueurs.pdf
+/synthese_tournois.pdf
