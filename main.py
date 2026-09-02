@@ -7072,14 +7072,28 @@ class App(tk.Tk):
         else:
             self.movement_alert_lbl.place_forget()
 
+        # stats (dont stats["tournament_finished"]) calculée ici, avant le
+        # bandeau simplifié ci-dessous, plutôt que seulement plus bas dans
+        # le bloc "écran projecteur" : sert désormais aux deux usages (masquer
+        # ce bandeau une fois la partie terminée, ET alimenter l'écran
+        # projecteur), un seul appel à get_stats() par tick au lieu de deux.
+        stats = self.db.get_stats()
+
         # Version simplifiée (texte seul, sans les photos) du bandeau
         # d'élimination pour cet onglet Chronomètre de la fenêtre
         # principale — même état déjà calculé ci-dessus
         # (_elimination_banner_current), pas de deuxième file/logique :
         # seul le rendu diffère de l'écran projecteur (voir
         # ClockWindow.refresh), pas assez de place ici pour les photos.
+        # Masqué une fois la partie terminée (stats["tournament_finished"]),
+        # exactement comme sur l'écran projecteur (qui affiche alors
+        # "Partie terminée" à la place, voir ClockWindow.refresh) — sans
+        # quoi les deux affichages se contredisaient. Ne touche ni
+        # _elimination_banner_current ni _elimination_banner_queue : seul
+        # l'AFFICHAGE de ce label change, l'état reste intact (utile si la
+        # partie devait reprendre, ex. un joueur réintégré).
         banner = self._elimination_banner_current
-        if banner is not None:
+        if banner is not None and not stats.get("tournament_finished"):
             if banner["eliminator_name"]:
                 text = f"{banner['eliminated_name']} est sorti par {banner['eliminator_name']}\nMerci d'avoir participé"
             else:
@@ -7090,7 +7104,6 @@ class App(tk.Tk):
             self.elimination_banner_lbl.place_forget()
 
         if self.clock_window is not None and self.clock_window.winfo_exists():
-            stats = self.db.get_stats()
             name = self.db.get_setting("tournament_name", "Tournoi")
             # La liste des joueurs concernés n'est utile à l'écran
             # projecteur que pendant l'alerte elle-même (voir
