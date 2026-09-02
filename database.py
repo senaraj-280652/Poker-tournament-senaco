@@ -10,6 +10,7 @@ import math
 import os
 import glob
 import shutil
+import random
 
 # =====================================================================
 # Export PDF : petit utilitaire partagé par tous les export_*_pdf
@@ -849,17 +850,39 @@ class Database:
             # fie à l'id brut plutôt qu'au numéro réellement affiché.
             tables_sorted = sorted(tables, key=lambda t: -self._table_display_number(t))
             to_close = tables_sorted[: len(tables) - n_tables_needed]
+            # Regroupe TOUS les joueurs évincés de TOUTES les tables fermées
+            # dans CE MÊME passage (ex : fusion directe vers la table
+            # finale, qui ferme souvent plusieurs tables d'un coup) en une
+            # seule liste, plutôt que de les réasseoir table fermée par
+            # table fermée : sans ça, les joueurs de la première table
+            # fermée occuperaient systématiquement les places les plus
+            # "précoces", un biais détectable même si chaque groupe était
+            # mélangé séparément.
+            players_to_move = []
             for t in to_close:
-                players_to_move = occ_by_table.get(t["id"], [])
+                players_to_move.extend(occ_by_table.get(t["id"], []))
                 self.close_table(t["id"])
-                for p in players_to_move:
-                    self.conn.execute(
-                        "UPDATE players SET table_id=NULL, seat=NULL WHERE id=?",
-                        (p["id"],),
-                    )
-                self.conn.commit()
-                for p in players_to_move:
-                    self._seat_player(p["id"])
+            for p in players_to_move:
+                self.conn.execute(
+                    "UPDATE players SET table_id=NULL, seat=NULL WHERE id=?",
+                    (p["id"],),
+                )
+            self.conn.commit()
+            # Cassage de table (contrairement au simple équilibrage
+            # ci-dessous, laissé inchangé) : répartition ALÉATOIRE des
+            # joueurs évincés sur les places disponibles des tables
+            # restantes. _seat_player() choisit toujours la table la moins
+            # remplie puis le premier siège libre — une séquence de places
+            # entièrement déterminée par l'état d'occupation courant,
+            # jamais par l'identité du joueur passé en argument. Mélanger
+            # l'ORDRE des joueurs avant de les réasseoir un par un dans
+            # cette même séquence de places (déjà équilibrée) équivaut donc
+            # à une bijection aléatoire uniforme joueur -> place, sans
+            # toucher à _seat_player() elle-même (qui doit continuer à
+            # garantir des effectifs équilibrés).
+            random.shuffle(players_to_move)
+            for p in players_to_move:
+                self._seat_player(p["id"])
 
         # Ré-équilibre : déplace un joueur de la table la plus pleine vers la
         # table la moins pleine tant que l'écart est >= 2
