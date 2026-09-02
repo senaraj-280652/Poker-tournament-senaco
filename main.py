@@ -11,6 +11,7 @@ import sys
 import subprocess
 import threading
 import queue
+import collections
 import time
 import json
 import csv
@@ -183,6 +184,7 @@ TEXT_DARK = "#17281f"
 MUTED = "#b9c9bd"  # texte discret, lisible sur fond foncé
 DANGER_RED = "#8a1f1f"
 DANGER_RED_ACTIVE = "#a92c2c"
+ELIMINATION_BLUE = "#1f4e8a"  # bandeau d'élimination (écran projecteur + onglet Chronomètre)
 
 
 def default_tournament_dir():
@@ -3443,6 +3445,17 @@ class App(tk.Tk):
         # mouvement a eu lieu).
         self.voice_command_queue = queue.Queue()
         self.voice_awaiting_resume = False
+        # Bandeau d'élimination (écran projecteur + onglet Chronomètre,
+        # voir _queue_elimination_banner / _advance_elimination_banner) :
+        # file FIFO sans plafond des éliminations en attente d'affichage
+        # (aucune n'est jamais perdue), et bandeau actuellement affiché
+        # (dict avec "until", l'échéance epoch) ou None. Recalculé à
+        # chaque _refresh_clock_tab (comme movement_alert_active), pas
+        # via un self.after() séparé : rien à annuler si le bandeau est
+        # écourté manuellement ("Chronomètre" pendant qu'il est affiché,
+        # voir _on_voice_word).
+        self._elimination_banner_queue = collections.deque()
+        self._elimination_banner_current = None
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
@@ -4973,6 +4986,7 @@ class App(tk.Tk):
         moved_count = 0
         for pid in ids:
             moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
+            self._queue_elimination_banner(pid, eliminator_id)
         self._clear_checked()
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
         # (voir la même remarque dans _remote_eliminate) : positionne
@@ -5190,6 +5204,85 @@ class App(tk.Tk):
         self._refresh_clock_tab()
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
+
+    # ---------------------------------------------------------------
+    # Bandeau d'élimination (écran projecteur + onglet Chronomètre) :
+    # affiche "XXX est sorti par YYY / Merci d'avoir participé" (ou "XXX
+    # est éliminé" sans éliminateur) pendant une durée réglable, pour
+    # CHAQUE élimination réussie (contrairement au bandeau de mouvement,
+    # qui ne se déclenche que si des joueurs changent réellement de
+    # table). Complètement indépendant de movement_alert_active : les
+    # deux peuvent être actifs en même temps (voir ClockWindow.refresh,
+    # qui empile alors les deux sans jamais les superposer).
+    # ---------------------------------------------------------------
+    def _queue_elimination_banner(self, eliminated_id, eliminator_id):
+        """Ajoute une élimination à la file d'affichage (voir
+        _advance_elimination_banner) — appelé juste après un
+        eliminate_player réussi, depuis _eliminate_selected ET
+        _remote_eliminate : seul point d'entrée de la file, pour ne pas
+        dupliquer cette logique entre les deux chemins d'élimination.
+        Sans plafond : aucune élimination n'est jamais perdue, chacune
+        attend son tour. Ne lève jamais d'exception (un souci ici — nom
+        introuvable, etc. — ne doit jamais remettre en cause l'élimination
+        déjà enregistrée en base)."""
+        try:
+            eliminated = self.db.get_player(eliminated_id)
+            eliminator = self.db.get_player(eliminator_id) if eliminator_id else None
+            self._elimination_banner_queue.append({
+                "eliminated_name": eliminated["name"] if eliminated else "?",
+                "eliminator_name": eliminator["name"] if eliminator else None,
+            })
+        except Exception:
+            pass
+
+    def _advance_elimination_banner(self):
+        """Termine le bandeau d'élimination actuellement affiché (s'il y
+        en a un) et, s'il reste un message dans la file, le fait devenir
+        le nouveau bandeau courant avec sa PROPRE échéance complète à
+        partir de MAINTENANT (durée réglée dans Paramètres, voir
+        _build_settings_tab) et joue le son configuré une seule fois.
+        Seul point qui fait avancer la file — appelé (1) depuis
+        _refresh_clock_tab quand l'échéance du bandeau courant est
+        dépassée, (2) depuis _on_voice_word("chronometre") pour
+        l'écourter manuellement à la demande (bouton "Chronomètre" du
+        téléphone ou Ctrl+Maj+C) : cette seconde utilisation ne vide
+        JAMAIS le reste de la file (elle ne retire qu'UN SEUL élément,
+        le bandeau en cours, jamais rappelé ensuite), les messages
+        suivants restent strictement dans leur ordre FIFO. Sans effet
+        (et sans son) s'il n'y a ni bandeau courant ni file en attente."""
+        self._elimination_banner_current = None
+        if self._elimination_banner_queue:
+            job = self._elimination_banner_queue.popleft()
+            seconds = max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
+            job["until"] = time.time() + seconds
+            self._elimination_banner_current = job
+            try:
+                self._play_elimination_sound()
+            except Exception:
+                pass
+
+    def _play_elimination_sound(self):
+        """Petit son d'attention joué une seule fois, exactement au début
+        de l'affichage d'un bandeau d'élimination (voir
+        _advance_elimination_banner) — même mécanisme de lecture que
+        _play_movement_signal/_play_clock_sound (aucune dépendance
+        nouvelle) : fichier .wav choisi par l'utilisateur ("Son sortie
+        d'un joueur", voir _open_clock_sounds_dialog), tronqué à sa
+        "Durée (ms)" s'il est plus long ; à défaut (aucun fichier choisi
+        — y compris sur une installation qui n'a pas encore cette
+        préférence, ou après un retrait par clic droit), un bip généré
+        automatiquement (sound_signal.play_tone, comme le repli du
+        Signal de mouvements) pour que le bandeau ait un son dès
+        l'installation, sans configuration obligatoire. Jamais en boucle
+        (play_tone/play_file ne jouent qu'une fois). Un échec de lecture
+        (périphérique audio absent, fichier corrompu...) est avalé en
+        silence par sound_signal — le bandeau doit s'afficher normalement
+        même sans aucun son."""
+        duration = self._clock_sound_duration_ms("sound_elimination_path") or 250
+        wav_path = export_prefs.load_value("sound_elimination_path", "")
+        if wav_path and sound_signal.play_file(wav_path, max_duration_ms=duration):
+            return
+        sound_signal.play_tone(660, duration)
 
     # ---------------------------------------------------------------
     # Raccourcis clavier "Élimination" / "Terminé" / "Chronomètre" — même
@@ -5418,6 +5511,7 @@ class App(tk.Tk):
             if table_by_id.get(eliminator_id) != table_by_id.get(eliminated_id):
                 eliminator_id = None
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
+        self._queue_elimination_banner(eliminated_id, eliminator_id)
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
         # (et pas après, comme on pourrait s'y attendre) : c'est le premier
         # qui positionne movement_alert_active, dont dépend l'affichage
@@ -5556,6 +5650,20 @@ class App(tk.Tk):
             if not alert_active and not self.voice_awaiting_resume:
                 self._voice_start_elimination()
         elif word == "chronometre":
+            # Écourte un bandeau d'élimination actuellement affiché (voir
+            # _advance_elimination_banner) : ne fait rien de plus si aucun
+            # bandeau n'est affiché et que la file est vide (fonction
+            # normale de "Chronomètre" ci-dessous inchangée dans tous les
+            # cas) ; s'il en reste un dans la file, il devient le nouveau
+            # bandeau courant avec sa propre durée complète et son son —
+            # jamais toute la file d'un coup, un seul message à la fois.
+            # AVANT le if/else ci-dessous (pas après) : ce dernier appelle
+            # dans tous les cas _refresh_clock_tab() en aval
+            # (_voice_resume_clock/_voice_show_clock), qui affichera donc
+            # tout de suite le nouvel état, sans attendre le tick d'1
+            # seconde — le tout depuis le même passage de
+            # _poll_voice_queue (~150 ms), pour une réaction rapide.
+            self._advance_elimination_banner()
             if self.voice_awaiting_resume:
                 # Reprendre le chrono après une élimination : à éviter tant
                 # qu'un mouvement de table est en attente (le responsable
@@ -6316,6 +6424,20 @@ class App(tk.Tk):
             relief="solid", borderwidth=3, padx=24, pady=16,
         )
 
+        # Bandeau d'élimination — version simplifiée (texte seul, sans les
+        # photos : pas assez de place dans cet onglet) de celui de l'écran
+        # projecteur (voir ClockWindow, "elimination_banner_frame") : même
+        # état déjà calculé une seule fois dans _refresh_clock_tab
+        # (self._elimination_banner_current), affiché/masqué ici en plus,
+        # pas une deuxième file/logique. Positionné plus haut (rely=0.3)
+        # que le bandeau de mouvement ci-dessus (rely=0.42) pour ne
+        # jamais se superposer si les deux sont actifs en même temps.
+        self.elimination_banner_lbl = tk.Label(
+            frame, text="", font=("Helvetica", 18, "bold"),
+            bg=ELIMINATION_BLUE, fg="white",
+            relief="solid", borderwidth=3, padx=24, pady=14, justify="center",
+        )
+
         # Conteneur défilable : les 5 boutons + la structure de blindes +
         # les sons peuvent dépasser la hauteur visible sur un petit écran.
         canvas = tk.Canvas(frame, bg=FELT, highlightthickness=0)
@@ -6479,6 +6601,7 @@ class App(tk.Tk):
             ("sound_break_start_path", "Son début Pause"),
             ("sound_break_end_path", "Son Fin Pause"),
             ("sound_round_end_path", "Son fin Round"),
+            ("sound_elimination_path", "Son sortie d'un joueur"),
         ):
             row = ttk.Frame(win)
             row.pack(fill="x", padx=12, pady=4)
@@ -6487,12 +6610,23 @@ class App(tk.Tk):
             btn.config(command=lambda k=key, l=label, b=btn: self._choose_clock_sound(k, l, b))
             btn.bind("<Button-2>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
             btn.bind("<Button-3>", lambda e, k=key, l=label, b=btn: self._clear_clock_sound(k, l, b))
-            Tooltip(
-                btn,
-                f"Fichier .wav joué automatiquement à chaque « {label.lower()} ».\n"
-                "Clic gauche : choisir/remplacer le fichier.\n"
-                "Clic droit : retirer le son configuré.",
-            )
+            if key == "sound_elimination_path":
+                Tooltip(
+                    btn,
+                    "Fichier .wav joué une seule fois au tout début du bandeau\n"
+                    "« XXX est sorti par YYY » sur l'écran projecteur (voir\n"
+                    "onglet Chronomètre). Un bip généré automatiquement est\n"
+                    "joué à défaut, pour que ça fonctionne sans réglage.\n"
+                    "Clic gauche : choisir/remplacer le fichier.\n"
+                    "Clic droit : retirer le fichier (revient au bip par défaut).",
+                )
+            else:
+                Tooltip(
+                    btn,
+                    f"Fichier .wav joué automatiquement à chaque « {label.lower()} ».\n"
+                    "Clic gauche : choisir/remplacer le fichier.\n"
+                    "Clic droit : retirer le son configuré.",
+                )
             self._clock_sound_buttons[key] = btn
 
             # Durée max. (tronque le fichier s'il est plus long, comme pour
@@ -6730,6 +6864,18 @@ class App(tk.Tk):
         export_prefs.save_value(f"{setting_key}_duration_ms", var.get())
 
     def _test_clock_sound(self, setting_key):
+        if setting_key == "sound_elimination_path":
+            # Contrairement aux 3 sons Round/Pause (vraiment rien à jouer
+            # tant qu'aucun fichier n'est choisi, d'où le message
+            # ci-dessous) : celui-ci a toujours quelque chose à jouer, ne
+            # serait-ce que le bip par défaut (voir
+            # _play_elimination_sound) — "Aucun fichier son choisi" y
+            # serait trompeur, puisqu'un son sera bel et bien joué à la
+            # prochaine élimination. Le bouton doit UNIQUEMENT tester le
+            # son (voir _play_elimination_sound : aucune donnée touchée,
+            # aucun bandeau affiché).
+            self._play_elimination_sound()
+            return
         path = export_prefs.load_value(setting_key, "")
         if not path:
             messagebox.showinfo("Test", "Aucun fichier son choisi pour l'instant.")
@@ -6739,7 +6885,16 @@ class App(tk.Tk):
 
     def _clock_sound_button_text(self, setting_key, label):
         path = export_prefs.load_value(setting_key, "")
-        return f"{label} : {os.path.basename(path)}" if path else f"{label} : (aucun)"
+        if path:
+            return f"{label} : {os.path.basename(path)}"
+        if setting_key == "sound_elimination_path":
+            # Contrairement aux 3 sons Round/Pause (vraiment silencieux
+            # tant qu'aucun fichier n'est choisi) : celui-ci a un repli
+            # (bip généré, voir _play_elimination_sound) pour fonctionner
+            # dès l'installation — "(aucun)" laisserait croire à tort
+            # qu'aucun son ne sera joué.
+            return f"{label} : (son par défaut)"
+        return f"{label} : (aucun)"
 
     def _choose_clock_sound(self, setting_key, label, btn):
         initial = export_prefs.load_value("sound_folder") or os.path.expanduser("~")
@@ -6883,6 +7038,20 @@ class App(tk.Tk):
                 self.blinds_tree.item(str(current_order), tags=("current",))
             self._blinds_tab_current_order = current_order
 
+        # Bandeau d'élimination : état recalculé ici à chaque appel (comme
+        # movement_alert juste en dessous), plutôt que via un self.after()
+        # séparé — voir _advance_elimination_banner, seul point qui fait
+        # avancer la file. "until" est une échéance epoch absolue (pas un
+        # décompte), donc robuste même si _refresh_clock_tab n'a pas
+        # tourné pendant un moment (écran projecteur resté fermé) : le
+        # bandeau en retard est simplement avancé/expiré au tick suivant,
+        # jamais perdu ni dupliqué.
+        if (self._elimination_banner_current is not None
+                and time.time() >= self._elimination_banner_current["until"]):
+            self._advance_elimination_banner()
+        elif self._elimination_banner_current is None and self._elimination_banner_queue:
+            self._advance_elimination_banner()
+
         movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
         if movement_alert and self.db.count_seat_moves() == 0:
             # Bandeau actif mais plus aucun mouvement à afficher : état
@@ -6903,6 +7072,23 @@ class App(tk.Tk):
         else:
             self.movement_alert_lbl.place_forget()
 
+        # Version simplifiée (texte seul, sans les photos) du bandeau
+        # d'élimination pour cet onglet Chronomètre de la fenêtre
+        # principale — même état déjà calculé ci-dessus
+        # (_elimination_banner_current), pas de deuxième file/logique :
+        # seul le rendu diffère de l'écran projecteur (voir
+        # ClockWindow.refresh), pas assez de place ici pour les photos.
+        banner = self._elimination_banner_current
+        if banner is not None:
+            if banner["eliminator_name"]:
+                text = f"{banner['eliminated_name']} est sorti par {banner['eliminator_name']}\nMerci d'avoir participé"
+            else:
+                text = f"{banner['eliminated_name']} est éliminé\nMerci d'avoir participé"
+            self.elimination_banner_lbl.config(text=text)
+            self.elimination_banner_lbl.place(relx=0.5, rely=0.3, anchor="center")
+        else:
+            self.elimination_banner_lbl.place_forget()
+
         if self.clock_window is not None and self.clock_window.winfo_exists():
             stats = self.db.get_stats()
             name = self.db.get_setting("tournament_name", "Tournoi")
@@ -6915,6 +7101,7 @@ class App(tk.Tk):
                 remaining, level, next_level, stats, name, paused,
                 self._next_break_eta_text(remaining, level, structure), movement_alert,
                 self._load_chip_denominations(), moves, round_number,
+                self._elimination_banner_current,
             )
 
     def _open_clock_window(self, fullscreen=False):
@@ -8186,6 +8373,43 @@ class App(tk.Tk):
                 days_grid, text=day_name.capitalize(), variable=var,
             ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2)
 
+        # -- Durée du bandeau d'élimination (écran projecteur + onglet
+        # Chronomètre, voir _advance_elimination_banner) : même principe
+        # que "Dossier par défaut"/"Jours de tournoi" ci-dessus — propre à
+        # CE tournoi (self.db) mais repris par défaut pour le prochain
+        # (tournament_prefs). Un ancien fichier .tournoi sans ce réglage
+        # retombe proprement sur 5 (voir get_setting_int ci-dessous et
+        # dans _advance_elimination_banner). Séparée de "Durée (ms)" du
+        # son "Son sortie d'un joueur" (fenêtre "Sons de fin de
+        # Round/Pause...") : deux réglages indépendants, l'un pour la
+        # durée d'AFFICHAGE du bandeau, l'autre pour la durée du SON.
+        elim_row = days_row + 2
+        elim_lbl = ttk.Label(left, text="Durée du message d'élimination (secondes) :")
+        elim_lbl.grid(row=elim_row, column=0, sticky="w", pady=(14, 4))
+        Tooltip(
+            elim_lbl,
+            "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
+            "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
+            "élimination — de 1 à 30 secondes, 5 par défaut. Sans lien\n"
+            "avec la « Durée (ms) » du son (fenêtre « Sons de fin de\n"
+            "Round/Pause... ») : deux réglages indépendants. Pris en\n"
+            "compte dès la prochaine élimination, sans redémarrer.",
+        )
+        elim_seconds_var = tk.IntVar(
+            value=max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
+        )
+        elim_spin = ttk.Spinbox(
+            left, from_=1, to=30, width=5, textvariable=elim_seconds_var,
+            command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),
+        )
+        elim_spin.grid(row=elim_row, column=1, sticky="w", padx=10, pady=(14, 4))
+        elim_spin.bind(
+            "<Return>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+        elim_spin.bind(
+            "<FocusOut>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
             right, text="Structure de blindes — niveau 1 et antes",
@@ -8577,6 +8801,22 @@ class App(tk.Tk):
         value = ",".join(str(i) for i in checked)
         self.db.set_settings({"tournament_days_of_week": value})
         tournament_prefs.save_last_settings({"tournament_days_of_week": value})
+
+    def _save_elimination_banner_seconds(self, var):
+        """Enregistre la durée d'affichage du bandeau d'élimination (voir
+        _build_settings_tab / _advance_elimination_banner), au clic sur
+        les flèches du Spinbox comme à la frappe (Retour/perte de focus)
+        — même principe que _save_tournament_days : CE tournoi +
+        préférences globales (proposé par défaut au prochain tournoi).
+        Une valeur invalide/vide (ex : champ momentanément vidé pendant
+        la frappe) est ignorée sans planter — reste alors le dernier
+        réglage valide déjà enregistré, jamais une valeur cassée."""
+        try:
+            seconds = max(1, min(30, int(var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self.db.set_settings({"elimination_banner_seconds": seconds})
+        tournament_prefs.save_last_settings({"elimination_banner_seconds": seconds})
 
     def _save_club_name(self):
         """Enregistre en continu le "Nom du Club" (préférence partagée,

@@ -37,6 +37,7 @@ PERSISTED_KEYS = [
     "pko_cash_percent",
     "tournament_day_folder",
     "tournament_days_of_week",
+    "elimination_banner_seconds",
 ]
 
 

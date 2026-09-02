@@ -5,6 +5,7 @@ import tkinter as tk
 import time
 
 import chip_images
+import player_photos
 
 # Pillow est optionnel (voir main.py) : sans lui, une dénomination avec
 # une image de jeton retombe simplement sur sa pastille de couleur ici
@@ -16,11 +17,13 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
-def _load_chip_thumbnail(path, size):
+def _load_square_thumbnail(path, size):
     """Vignette carrée (recadrée) de `size` pixels pour une image de
-    jeton, ou None si le fichier est absent ou Pillow indisponible —
-    équivalent local de main.load_thumbnail (clock_window.py ne dépend
-    pas de main.py)."""
+    jeton ou de joueur (voir _update_chips_display / photos du bandeau
+    d'élimination), ou None si le fichier est absent, corrompu ou si
+    Pillow est indisponible — équivalent local de main.load_thumbnail
+    (clock_window.py ne dépend pas de main.py, pour éviter un import
+    circulaire : main.py importe déjà clock_window.py)."""
     if not path or not PIL_AVAILABLE:
         return None
     try:
@@ -189,6 +192,34 @@ class ClockWindow(tk.Toplevel):
         self._moves_scroll_paused = False
         self._moves_autoscroll_tick()
 
+        # Bandeau d'élimination "XXX est sorti par YYY" : overlay affiché
+        # fixe par-dessus le reste de l'écran, comme movement_alert_frame
+        # ci-dessus, mais géré depuis App._advance_elimination_banner
+        # (état en mémoire avec échéance, pas un réglage persistant en
+        # base comme movement_alert_active — ce bandeau n'a pas besoin de
+        # survivre à un redémarrage). Photo éliminé à gauche, texte au
+        # centre, photo éliminateur à droite — chaque photo masquée
+        # (plutôt que vide) si le joueur correspondant n'en a pas.
+        self.elimination_banner_frame = tk.Frame(
+            self, bg="#1f4e8a", relief="solid", borderwidth=5,
+        )
+        elim_inner = tk.Frame(self.elimination_banner_frame, bg="#1f4e8a")
+        elim_inner.pack(padx=50, pady=26)
+        self._elimination_photo_left_lbl = tk.Label(elim_inner, bg="#1f4e8a", borderwidth=0)
+        self._elimination_photo_left_lbl.pack(side="left", padx=(0, 30))
+        self._elimination_text_lbl = tk.Label(
+            elim_inner, text="", font=("Helvetica", 32, "bold"),
+            bg="#1f4e8a", fg="white", justify="center",
+        )
+        self._elimination_text_lbl.pack(side="left")
+        self._elimination_photo_right_lbl = tk.Label(elim_inner, bg="#1f4e8a", borderwidth=0)
+        self._elimination_photo_right_lbl.pack(side="left", padx=(30, 0))
+        # Références gardées explicitement (voir _update_elimination_banner) :
+        # un PhotoImage/ImageTk sans référence Python est jeté à la
+        # prochaine collecte, ce qui viderait silencieusement le label.
+        self._elimination_photo_images = {"left": None, "right": None}
+        self._elimination_signature = None
+
         self.bind("<F11>", self._toggle_fullscreen)
         self.bind("<Escape>", self._exit_fullscreen)
         self._fullscreen = False
@@ -250,7 +281,7 @@ class ClockWindow(tk.Toplevel):
 
     def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
                 is_paused, next_break_text="", movement_alert=False, chip_denominations=None,
-                moves=None, round_number=None):
+                moves=None, round_number=None, elimination_banner=None):
         self.name_lbl.config(text=tournament_name)
 
         mins, secs = divmod(max(0, int(remaining_seconds)), 60)
@@ -307,39 +338,59 @@ class ClockWindow(tk.Toplevel):
 
         if stats.get("tournament_finished"):
             # La partie est terminée (1 seul joueur actif restant) : le
-            # bandeau reste affiché en permanence avec ce message, plus de
+            # bandeau "Partie terminée" prend toute la place, plus de
             # tableau de mouvements à montrer (voir App.eliminate_player /
-            # Database.eliminate_player, qui fige aussi la "Durée" ci-dessus).
+            # Database.eliminate_player, qui fige aussi la "Durée"
+            # ci-dessus) — et plus rien à annoncer non plus côté
+            # élimination : ce dernier joueur restant EST déjà l'annonce.
             self.movement_alert_lbl.config(text="Partie terminée")
             self._moves_canvas.pack_forget()
             self._moves_needs_scroll = False
             self._moves_signature = None
             self.movement_alert_frame.place(relx=0.5, rely=0.42, anchor="center")
-        elif movement_alert:
-            # Affiché fixe (ne clignote plus — ça perturbait la lecture du
-            # tableau des joueurs concernés), tant que le mouvement est en
-            # cours. Juste sous le chrono/les blindes (pas au milieu de
-            # l'écran, contrairement à "Partie terminée" ci-dessus, et pas
-            # tout en bas de la fenêtre non plus — ça poussait le tableau
-            # des joueurs concernés hors de la zone visible sur une
-            # fenêtre pas assez haute, le rendant tout simplement
-            # invisible) : le chronomètre continue de tourner pendant un
-            # mouvement de tables (ne se met plus en pause, voir
-            # App._trigger_movement_alert), il doit donc rester visible
-            # au-dessus de ce bandeau, qui peut en repousser/recouvrir le
-            # contenu en dessous (Prochain niveau/pause).
-            self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
-            self._update_movement_moves_table(moves or [])
-            # Position calculée dynamiquement juste sous les blindes
-            # (elles-mêmes juste sous le chrono) à partir de leur
-            # position réelle à l'écran — robuste à la taille de
-            # fenêtre/plein écran, contrairement à un pourcentage fixe de
-            # la hauteur de fenêtre ou à un décalage fixe depuis le bas.
-            self.update_idletasks()
-            y = self.blinds_lbl.winfo_y() + self.blinds_lbl.winfo_height() + 10
-            self.movement_alert_frame.place(relx=0.5, y=y, anchor="n")
+            self.elimination_banner_frame.place_forget()
         else:
-            self.movement_alert_frame.place_forget()
+            # Bandeau d'élimination : placé EN PREMIER, juste sous les
+            # blindes (comme le bandeau de mouvement auparavant seul à
+            # cet endroit) — voir App._advance_elimination_banner pour la
+            # file/l'échéance, ce module ne fait que l'afficher. Sa
+            # hauteur réelle (une fois placé) sert ensuite de référence
+            # au bandeau de mouvement ci-dessous, pour que les deux ne se
+            # superposent jamais s'ils sont actifs en même temps.
+            self.update_idletasks()
+            base_y = self.blinds_lbl.winfo_y() + self.blinds_lbl.winfo_height() + 10
+            if elimination_banner is not None:
+                self._update_elimination_banner(elimination_banner)
+                self.elimination_banner_frame.place(relx=0.5, y=base_y, anchor="n")
+                self.update_idletasks()
+                movement_y = (
+                    self.elimination_banner_frame.winfo_y()
+                    + self.elimination_banner_frame.winfo_height() + 10
+                )
+            else:
+                self.elimination_banner_frame.place_forget()
+                movement_y = base_y
+
+            if movement_alert:
+                # Affiché fixe (ne clignote plus — ça perturbait la lecture
+                # du tableau des joueurs concernés), tant que le mouvement
+                # est en cours. Sous le bandeau d'élimination s'il est
+                # affiché, sinon directement sous les blindes (pas au
+                # milieu de l'écran, contrairement à "Partie terminée"
+                # ci-dessus, et pas tout en bas de la fenêtre non plus —
+                # ça poussait le tableau des joueurs concernés hors de la
+                # zone visible sur une fenêtre pas assez haute, le rendant
+                # tout simplement invisible) : le chronomètre continue de
+                # tourner pendant un mouvement de tables (ne se met plus
+                # en pause, voir App._trigger_movement_alert), il doit
+                # donc rester visible au-dessus de ce bandeau, qui peut en
+                # repousser/recouvrir le contenu en dessous (Prochain
+                # niveau/pause).
+                self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
+                self._update_movement_moves_table(moves or [])
+                self.movement_alert_frame.place(relx=0.5, y=movement_y, anchor="n")
+            else:
+                self.movement_alert_frame.place_forget()
 
         self._update_chips_display(chip_denominations or [])
         self._ensure_fits_content()
@@ -368,6 +419,15 @@ class ClockWindow(tk.Toplevel):
             needed_h = max(
                 needed_h,
                 self.movement_alert_frame.winfo_y() + self.movement_alert_frame.winfo_height() + 10,
+            )
+        # Même remarque pour elimination_banner_frame (voir refresh()) :
+        # lui aussi positionné par place(), pas pris en compte par
+        # winfo_reqheight() tout seul.
+        if self.elimination_banner_frame.winfo_ismapped():
+            needed_h = max(
+                needed_h,
+                self.elimination_banner_frame.winfo_y()
+                + self.elimination_banner_frame.winfo_height() + 10,
             )
         current_h = self.winfo_height()
         if needed_h <= current_h:
@@ -477,6 +537,53 @@ class ClockWindow(tk.Toplevel):
     def _moves_resume_autoscroll(self):
         self._moves_scroll_paused = False
 
+    ELIMINATION_PHOTO_SIZE = 150
+
+    def _update_elimination_banner(self, banner):
+        """Met à jour le texte et les deux photos du bandeau d'élimination
+        (voir refresh()) — reconstruit seulement si le contenu a changé
+        depuis le dernier appel (comparaison d'une signature), pas à
+        chaque tick pendant tout l'affichage du même bandeau (refresh()
+        est appelé une fois par seconde). `banner` est le dict construit
+        par App._queue_elimination_banner (eliminated_name,
+        eliminator_name) — jamais None ici (voir refresh)."""
+        eliminated_name = banner.get("eliminated_name") or "?"
+        eliminator_name = banner.get("eliminator_name")
+        signature = (eliminated_name, eliminator_name)
+        if signature == self._elimination_signature:
+            return
+        self._elimination_signature = signature
+
+        if eliminator_name:
+            text = f"{eliminated_name} est sorti par {eliminator_name}\nMerci d'avoir participé"
+        else:
+            text = f"{eliminated_name} est éliminé\nMerci d'avoir participé"
+        self._elimination_text_lbl.config(text=text)
+
+        # Chaque photo est chargée indépendamment : l'absence ou la
+        # corruption de l'une ne doit jamais empêcher l'affichage de
+        # l'autre ni du texte (voir _load_square_thumbnail, qui renvoie
+        # toujours None plutôt qu'une exception). Référence explicitement
+        # gardée dans self._elimination_photo_images : un PhotoImage sans
+        # référence Python est jeté à la prochaine collecte, ce qui
+        # viderait silencieusement le Label.
+        for side, name, lbl in (
+            ("left", eliminated_name, self._elimination_photo_left_lbl),
+            ("right", eliminator_name, self._elimination_photo_right_lbl),
+        ):
+            path = player_photos.get_photo_path(name) if name else None
+            photo = _load_square_thumbnail(path, self.ELIMINATION_PHOTO_SIZE) if path else None
+            self._elimination_photo_images[side] = photo
+            if photo is not None:
+                lbl.config(image=photo, width=0, height=0)
+            else:
+                # Pas de photo (ou introuvable/corrompue) : label vide de
+                # taille nulle, plutôt qu'un espace vide de la taille
+                # d'une photo — le texte central reste bien centré entre
+                # les deux (voir _update_chips_display pour le même
+                # principe de repli propre).
+                lbl.config(image="", width=0, height=0)
+
     def _update_chips_display(self, denominations):
         """Reconstruit le tableau des jetons (à hauteur des blindes)
         seulement s'il a changé depuis le dernier refresh() — appelé une
@@ -516,7 +623,7 @@ class ClockWindow(tk.Toplevel):
             )
             swatch.grid(row=i, column=0, padx=(0, 8), pady=1, sticky="w")
             image_path = chip_images.get_chip_image_path(d.get("image")) if d.get("image") else None
-            photo = _load_chip_thumbnail(image_path, 18) if image_path else None
+            photo = _load_square_thumbnail(image_path, 18) if image_path else None
             if photo is not None:
                 swatch.create_image(9, 9, image=photo)
                 self._chip_photo_images.append(photo)
