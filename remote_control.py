@@ -227,6 +227,7 @@ refreshClockState();
 setInterval(refreshClockState, 3000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
 """
@@ -650,6 +651,7 @@ loadPlayers();
 refreshTimer = setInterval(loadPlayers, 4000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
 """
@@ -1033,8 +1035,83 @@ loadPlayers();
 setInterval(loadPlayers, 4000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
+"""
+
+
+# Widget "Équilibrage des tables" (question "quel siège est actuellement
+# grosse blinde ?" — version TEST, voir database.py: rebalance_tables /
+# resolve_pending_rebalance) : inséré tel quel (voir {rebalance_widget})
+# dans les TROIS pages du contrôle à distance (index, Éliminations,
+# Photos), pas seulement celle des Éliminations — un rééquilibrage peut
+# survenir à tout instant, quelle que soit la page ouverte sur le
+# téléphone à ce moment-là. Sondé toutes les 2s via /rebalance_pending ;
+# répondre poste sur /rebalance_answer. Pas d'association téléphone/table
+# ni de mot de passe (comme le reste du contrôle à distance, voir
+# docstring du module) : la PREMIÈRE RÉPONSE VALIDE traitée gagne (voir
+# database.py: resolve_pending_rebalance) — une réponse invalide (siège
+# obsolète, demande déjà remplacée...) ne consomme rien et ne l'emporte
+# jamais sur une réponse valide arrivant ensuite. Les autres appareils
+# voient simplement leur superposition disparaître au sondage suivant
+# (voir pollRebalance), sans jamais afficher d'erreur pour ça.
+_REBALANCE_WIDGET = """
+<div id="rebalance-overlay" style="display:none; position:fixed; inset:0; z-index:900; background:rgba(0,0,0,.72); align-items:center; justify-content:center; padding:20px;">
+  <div style="background:#10241a; border:2px solid #e8c468; border-radius:14px; padding:22px 20px; max-width:360px; width:100%; text-align:center; box-shadow:0 6px 24px rgba(0,0,0,.5);">
+    <h2 style="color:#e8c468; font-size:16px; margin:0 0 10px; letter-spacing:.02em;">ÉQUILIBRAGE DES TABLES</h2>
+    <p id="rebalance-table-msg" style="color:#f5efe0; font-size:15px; font-weight:700; margin:0 0 10px;"></p>
+    <p style="color:#b9ad8f; font-size:14px; margin:0 0 14px;">Quel siège est actuellement grosse blinde ?</p>
+    <div id="rebalance-seats" style="display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-bottom:16px;"></div>
+    <button id="rebalance-skip" type="button" style="width:100%; padding:12px; border:none; border-radius:10px; background:#4a4a4a; color:#fff; font-size:14px; font-weight:700; -webkit-tap-highlight-color:transparent;">Continuer sans indiquer la BB</button>
+  </div>
+</div>
+<script>
+(function() {
+  var shownId = null;
+  function pollRebalance() {
+    fetch('/rebalance_pending').then(function(r) { return r.json(); }).then(function(data) {
+      var overlay = document.getElementById('rebalance-overlay');
+      if (!data) {
+        if (shownId !== null) { overlay.style.display = 'none'; shownId = null; }
+        return;
+      }
+      if (data.request_id === shownId) return;
+      shownId = data.request_id;
+      document.getElementById('rebalance-table-msg').textContent = data.table_name + ' doit donner un joueur';
+      var seatsDiv = document.getElementById('rebalance-seats');
+      seatsDiv.innerHTML = '';
+      data.seats.forEach(function(s) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = '[' + s + ']';
+        b.style.cssText = 'padding:12px 16px; border:none; border-radius:10px; background:#1f6b6b; color:#fff; font-size:16px; font-weight:700; min-width:46px; -webkit-tap-highlight-color:transparent;';
+        b.addEventListener('click', function() { answerRebalance(data.request_id, s); });
+        seatsDiv.appendChild(b);
+      });
+      overlay.style.display = 'flex';
+    }).catch(function() { /* réseau momentanément indisponible : le prochain sondage rattrapera */ });
+  }
+  function answerRebalance(requestId, seat) {
+    // Masquée tout de suite (optimiste), sans attendre la réponse du
+    // serveur : si la requête échoue (wifi), le prochain sondage la
+    // réaffichera automatiquement tant que la demande est toujours en
+    // attente côté PC — inutile de bloquer l'interface pour ça.
+    document.getElementById('rebalance-overlay').style.display = 'none';
+    shownId = null;
+    fetch('/rebalance_answer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({request_id: requestId, seat: seat})
+    }).catch(function() { /* le prochain sondage rattrapera si besoin */ });
+  }
+  document.getElementById('rebalance-skip').addEventListener('click', function() {
+    if (shownId !== null) answerRebalance(shownId, null);
+  });
+  pollRebalance();
+  setInterval(pollRebalance, 2000);
+})();
+</script>
 """
 
 
@@ -1119,6 +1196,7 @@ class RemoteControlServer:
     def __init__(self, on_word, get_tournament_name=None, get_players=None,
                  on_eliminate=None, get_clock_paused=None, on_upload_photo=None,
                  get_roster_players=None, get_photo_image=None, on_delete_photo=None,
+                 get_pending_rebalance=None, on_rebalance_answer=None,
                  port=DEFAULT_PORT):
         self.on_word = on_word
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
@@ -1129,6 +1207,15 @@ class RemoteControlServer:
         self.on_upload_photo = on_upload_photo or (lambda player_name, image_bytes: (False, "Non disponible"))
         self.get_photo_image = get_photo_image or (lambda player_name: (None, None))
         self.on_delete_photo = on_delete_photo or (lambda player_name: (False, "Non disponible"))
+        # Rééquilibrage simple : question "quel siège est grosse blinde ?"
+        # (version TEST, voir database.py: rebalance_tables /
+        # resolve_pending_rebalance). get_pending_rebalance() renvoie
+        # None ou {request_id, table_name, seats} — sondé par TOUS les
+        # téléphones (voir _REBALANCE_WIDGET) ; on_rebalance_answer(
+        # request_id, seat) est appelé quand l'un d'eux répond (seat=None
+        # pour "Continuer sans indiquer la BB").
+        self.get_pending_rebalance = get_pending_rebalance or (lambda: None)
+        self.on_rebalance_answer = on_rebalance_answer or (lambda request_id, seat: None)
         self.port = port
         self._httpd = None
         self._thread = None
@@ -1145,6 +1232,8 @@ class RemoteControlServer:
         on_upload_photo = self.on_upload_photo
         get_photo_image = self.get_photo_image
         on_delete_photo = self.on_delete_photo
+        get_pending_rebalance = self.get_pending_rebalance
+        on_rebalance_answer = self.on_rebalance_answer
         own_pid = os.getpid()
 
         def resolve_proxy_port(handler):
@@ -1285,16 +1374,19 @@ class RemoteControlServer:
                         lobby_button=lobby_button,
                         app_version=version.APP_VERSION,
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
                     ))
                 elif path in ("/eliminate", "/eliminate.html"):
                     self._send_html(_ELIMINATE_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
                     ))
                 elif path in ("/photos", "/photos.html"):
                     self._send_html(_PHOTOS_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
                     ))
                 elif path == "/players":
                     self._send_json(get_players())
@@ -1322,6 +1414,20 @@ class RemoteControlServer:
                     self.wfile.write(image_bytes)
                 elif path == "/clock_state":
                     self._send_json({"paused": bool(get_clock_paused())})
+                elif path == "/rebalance_pending":
+                    # Sondé toutes les 2s par TOUS les téléphones, sur
+                    # toutes les pages (voir _REBALANCE_WIDGET) : renvoie
+                    # null s'il n'y a aucune question "grosse blinde" en
+                    # attente en ce moment.
+                    pending = get_pending_rebalance()
+                    if pending is None:
+                        self._send_json(None)
+                    else:
+                        self._send_json({
+                            "request_id": pending["request_id"],
+                            "table_name": pending["table_name"],
+                            "seats": pending["seats"],
+                        })
                 else:
                     self.send_error(404)
 
@@ -1381,6 +1487,35 @@ class RemoteControlServer:
                         return
                     ok, message = on_delete_photo(player_name_values[0].strip())
                     self._send_json({"ok": ok, "message": message})
+                elif path == "/rebalance_answer":
+                    # Réponse à la question "quel siège est grosse
+                    # blinde ?" — comme /eliminate, ne fait que déposer la
+                    # réponse dans la file d'attente thread-safe côté
+                    # appelant (voir on_rebalance_answer/voice_command_
+                    # queue) : ce thread ne touche JAMAIS self.db ni
+                    # Tkinter directement. `seat` absent/null/vide =
+                    # "Continuer sans indiquer la BB". La PREMIÈRE RÉPONSE
+                    # VALIDE traitée (PC ou téléphone) à une demande donnée
+                    # gagne ; une réponse invalide (siège obsolète, demande
+                    # déjà remplacée...) ne consomme rien, et toute réponse
+                    # supplémentaire à la MÊME demande (même request_id)
+                    # une fois celle-ci résolue est ignorée proprement —
+                    # cette validation/consommation a lieu côté thread
+                    # principal (voir database.py: resolve_pending_
+                    # rebalance) — jamais ici, pour rester sans accès à
+                    # self.db.
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        request_id = str(data["request_id"])
+                        seat_raw = data.get("seat")
+                        seat = int(seat_raw) if seat_raw not in (None, "") else None
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    on_rebalance_answer(request_id, seat)
+                    self._send_json({"ok": True})
                 else:
                     self.send_error(404)
 
