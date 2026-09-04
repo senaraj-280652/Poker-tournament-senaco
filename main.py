@@ -3475,6 +3475,21 @@ class App(tk.Tk):
         # attendre un changement d'onglet — même principe que les deux
         # attributs juste au-dessus.
         self._remote_photo_uploaded = False
+        # Rééquilibrage simple : question "quel siège est actuellement
+        # grosse blinde ?" (version TEST, voir database.py:
+        # rebalance_tables / resolve_pending_rebalance).
+        # _remote_pending_rebalance : même principe que _remote_clock_
+        # paused ci-dessus — copie de self.db.pending_rebalance tenue à
+        # jour depuis le thread principal (_tick / _check_pending_
+        # rebalance), jamais lue ni écrite depuis le thread du serveur de
+        # contrôle à distance. _pending_rebalance_win/_request_id :
+        # petite fenêtre Tkinter affichée côté PC pour cette même demande
+        # (voir _open_pending_rebalance_dialog), et l'id de la demande
+        # qu'elle affiche actuellement (pour ne pas la reconstruire à
+        # chaque tick tant que la demande n'a pas changé).
+        self._remote_pending_rebalance = None
+        self._pending_rebalance_win = None
+        self._pending_rebalance_request_id = None
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -5005,6 +5020,7 @@ class App(tk.Tk):
         elif moved_count:
             self._trigger_movement_alert()
         self._refresh_all()
+        self._check_pending_rebalance()
 
     def _ask_eliminator(self, exclude_id):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
@@ -5206,6 +5222,147 @@ class App(tk.Tk):
             self.clock_window.bring_to_front()
 
     # ---------------------------------------------------------------
+    # Rééquilibrage simple : question "quel siège est grosse blinde ?"
+    # (version TEST, voir database.py: rebalance_tables /
+    # resolve_pending_rebalance). Lors d'un simple rééquilibrage entre
+    # tables (pas un cassage de table, inchangé), le choix du joueur à
+    # déplacer n'est plus automatique : on demande quel siège est
+    # actuellement grosse blinde, au PC (petite fenêtre Tkinter non
+    # bloquante, voir _open_pending_rebalance_dialog) et sur TOUS les
+    # téléphones du contrôle à distance (voir remote_control.py,
+    # _REBALANCE_WIDGET) en même temps — le premier qui répond gagne. Le
+    # chronomètre et le reste de l'appli continuent de tourner normalement
+    # tant qu'aucune réponse n'arrive (jamais de sleep()/wait_window()/
+    # boucle d'attente ici, voir consigne).
+    # ---------------------------------------------------------------
+    def _check_pending_rebalance(self):
+        """Affiche (ou masque) la petite fenêtre "Équilibrage des tables"
+        selon l'état courant de self.db.pending_rebalance, et tient à jour
+        _remote_pending_rebalance (copie lue par le thread du serveur de
+        contrôle à distance, voir _start_remote_control_if_enabled).
+        Appelée juste après chaque action qui peut déclencher un
+        rééquilibrage (élimination locale ou distante, bouton
+        "Rééquilibrer les tables", changement de "Nombre de sièges par
+        table" dans Paramètres) pour une réaction immédiate, et par
+        sécurité à chaque tick (_tick) : une réponse arrivée par une autre
+        voie (téléphone, alors que le PC affichait la fenêtre — ou
+        l'inverse) doit fermer/mettre à jour cet affichage même s'il n'a
+        pas causé la demande suivante, et le tournoi ne doit jamais rester
+        bloqué faute de réponse si cette méthode n'était appelée que sur
+        les points d'entrée directs."""
+        if not self.db:
+            return
+        pending = self.db.pending_rebalance
+        self._remote_pending_rebalance = pending
+        if pending is None:
+            self._close_pending_rebalance_dialog()
+            return
+        if (self._pending_rebalance_win is not None
+                and self._pending_rebalance_win.winfo_exists()
+                and self._pending_rebalance_request_id == pending["request_id"]):
+            return  # déjà affichée pour CETTE demande précise, rien à refaire
+        self._close_pending_rebalance_dialog()
+        self._open_pending_rebalance_dialog(pending)
+
+    def _close_pending_rebalance_dialog(self):
+        if self._pending_rebalance_win is not None:
+            try:
+                if self._pending_rebalance_win.winfo_exists():
+                    self._pending_rebalance_win.destroy()
+            except tk.TclError:
+                pass
+            self._pending_rebalance_win = None
+        self._pending_rebalance_request_id = None
+
+    def _open_pending_rebalance_dialog(self, pending):
+        """Petite fenêtre Tkinter au-dessus de l'application/Chronomètre
+        (attributes -topmost, jamais de grab_set : voir plus bas), NON
+        bloquante — pas de wait_window()/sleep()/boucle d'attente, le
+        chrono (self.after, indépendant de cette fenêtre) et le reste de
+        l'appli continuent de tourner normalement tant qu'elle est
+        affichée. N'affiche que les numéros de sièges OCCUPÉS de la table
+        qui doit donner un joueur (pending["seats"]), plus un bouton
+        "Continuer sans indiquer la BB". Pas de grab_set() : une
+        éventuelle fenêtre séparée "écran projecteur" est un autre
+        Toplevel du même interpréteur Tk — un grab (même local) y
+        bloquerait le clic, alors qu'elle n'a besoin d'aucune interaction
+        pour continuer d'afficher le temps ; -topmost suffit à rester
+        au-dessus sans gêner personne d'autre."""
+        win = tk.Toplevel(self)
+        self._pending_rebalance_win = win
+        self._pending_rebalance_request_id = pending["request_id"]
+        win.title("Équilibrage des tables")
+        win.configure(bg=FELT_DARK)
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        # Pas de croix pour fermer sans répondre : une demande fermée par
+        # erreur resterait quand même en attente côté téléphone (elle
+        # n'est pas annulée pour autant, seulement plus affichée ici) —
+        # autant éviter la confusion. "Continuer sans indiquer la BB" est
+        # le vrai bouton d'échappement.
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        tk.Label(
+            win, bg=FELT_DARK, fg=GOLD, font=("Helvetica", 13, "bold"),
+            text="ÉQUILIBRAGE DES TABLES",
+        ).pack(padx=18, pady=(16, 2))
+        tk.Label(
+            win, bg=FELT_DARK, fg=CREAM, font=("Helvetica", 11, "bold"),
+            text=f"{pending['table_name']} doit donner un joueur",
+        ).pack(padx=18, pady=(0, 8))
+        tk.Label(
+            win, bg=FELT_DARK, fg=CREAM,
+            text="Quel siège est actuellement grosse blinde ?",
+        ).pack(padx=18, pady=(0, 10))
+
+        seats_frame = ttk.Frame(win)
+        seats_frame.pack(padx=18, pady=(0, 10))
+        request_id = pending["request_id"]
+        for seat in pending["seats"]:
+            ttk.Button(
+                seats_frame, text=f"[{seat}]", width=4,
+                command=lambda s=seat: self._resolve_pending_rebalance(request_id, s, from_remote=False),
+            ).pack(side="left", padx=3)
+
+        ttk.Button(
+            win, text="Continuer sans indiquer la BB",
+            command=lambda: self._resolve_pending_rebalance(request_id, None, from_remote=False),
+        ).pack(padx=18, pady=(0, 16))
+
+        win.lift()
+        win.focus_force()
+
+    def _resolve_pending_rebalance(self, request_id, seat, from_remote):
+        """Traite une réponse à la question "quel siège est grosse
+        blinde ?" — reçue soit du PC (bouton de la fenêtre ci-dessus,
+        from_remote=False), soit d'un téléphone (POST /rebalance_answer,
+        relayé ici par _poll_voice_queue, from_remote=True). La mutation
+        réelle passe par database.py:resolve_pending_rebalance, qui
+        revalide tout avant d'agir (request_id encore valide, table
+        source toujours active, siège toujours occupé par un joueur actif
+        — voir sa docstring) : ici, on se contente d'enchaîner les mêmes
+        suites qu'une élimination normale (alerte de mouvement,
+        rafraîchissements) sur le résultat qu'elle renvoie."""
+        if not self.db:
+            return
+        self._close_pending_rebalance_dialog()
+        moves = self.db.resolve_pending_rebalance(request_id, seat)
+        if moves:
+            if len(self.db.list_players(status="active")) <= 1:
+                if (self.db.get_setting_int("movement_alert_active", 0) == 1
+                        or self.db.count_seat_moves() > 0):
+                    self._finish_movement_alert()
+            else:
+                self._trigger_movement_alert(from_remote=from_remote)
+        self._refresh_all()
+        self._refresh_remote_players_cache()
+        # Le rééquilibrage relancé par resolve_pending_rebalance a pu
+        # poser une NOUVELLE question (écart encore présent ailleurs, ou
+        # table suivante à son tour trop pleine) : l'affiche tout de suite
+        # plutôt que d'attendre le prochain tick.
+        self._check_pending_rebalance()
+
+    # ---------------------------------------------------------------
     # Bandeau d'élimination (écran projecteur + onglet Chronomètre) :
     # affiche "XXX est sorti par YYY / Merci d'avoir participé" (ou "XXX
     # est éliminé" sans éliminateur) pendant une durée réglable, pour
@@ -5371,6 +5528,10 @@ class App(tk.Tk):
             get_roster_players=self._remote_get_roster_players,
             get_photo_image=self._remote_get_photo_image,
             on_delete_photo=self._remote_delete_photo,
+            get_pending_rebalance=lambda: self._remote_pending_rebalance,
+            on_rebalance_answer=lambda request_id, seat: self.voice_command_queue.put(
+                ("rebalance_answer", request_id, seat)
+            ),
         )
         try:
             server.start()
@@ -5478,6 +5639,9 @@ class App(tk.Tk):
                 if isinstance(item, tuple) and item and item[0] == "eliminate":
                     _, eliminated_id, eliminator_id = item
                     self._remote_eliminate(eliminated_id, eliminator_id)
+                elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
+                    _, request_id, seat = item
+                    self._resolve_pending_rebalance(request_id, seat, from_remote=True)
                 else:
                     self._on_voice_word(item)
         except queue.Empty:
@@ -5547,6 +5711,7 @@ class App(tk.Tk):
         # qu'aucun code à nous ne le demande explicitement).
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
+        self._check_pending_rebalance()
 
     def _remote_get_roster_players(self):
         """TOUT le répertoire de joueurs habituels (roster.py), pas
@@ -6048,6 +6213,7 @@ class App(tk.Tk):
         if moves:
             self._trigger_movement_alert()
         self._refresh_all()
+        self._check_pending_rebalance()
 
     def _refresh_tables_tab(self):
         for w in self.tables_inner.winfo_children():
@@ -8777,6 +8943,7 @@ class App(tk.Tk):
         self._update_window_title()
         if moves:
             self._trigger_movement_alert()
+        self._check_pending_rebalance()
         return values
 
     def _choose_day_folder(self, day_folder_var):
@@ -9041,6 +9208,11 @@ class App(tk.Tk):
             self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
             self._refresh_remote_players_cache()
             self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+        # Filet de sécurité (voir docstring de _check_pending_rebalance) :
+        # garantit qu'une question "grosse blinde" en attente est toujours
+        # affichée/rafraîchie au moins une fois par seconde, même si
+        # l'action qui l'a créée ne l'a pas déjà fait explicitement.
+        self._check_pending_rebalance()
         self._tick_after_id = self.after(1000, self._tick)
 
     def _refresh_remote_players_cache(self):

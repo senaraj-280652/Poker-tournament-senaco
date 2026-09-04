@@ -11,6 +11,7 @@ import os
 import glob
 import shutil
 import random
+import uuid
 
 # =====================================================================
 # Export PDF : petit utilitaire partagé par tous les export_*_pdf
@@ -290,6 +291,17 @@ class Database:
         disparaissait alors silencieusement de la liste (exception
         avalée par l'appelant) le temps du conflit."""
         self.path = path
+        # Version TEST "grosse blinde" (voir rebalance_tables /
+        # resolve_pending_rebalance plus bas) : demande "quel siège est
+        # actuellement grosse blinde ?" actuellement en attente de réponse,
+        # ou None. État purement en mémoire (PAS en SQLite : ce n'est pas
+        # une donnée du tournoi, seulement un état de session éphémère
+        # côté interface), remis à None à chaque nouvelle instance de
+        # Database — jamais lu ni écrit depuis le thread du serveur de
+        # contrôle à distance (voir App._remote_pending_rebalance /
+        # remote_control.py dans main.py, même principe que
+        # _remote_clock_paused).
+        self.pending_rebalance = None
         if read_only:
             self.conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
             self.conn.row_factory = sqlite3.Row
@@ -884,60 +896,62 @@ class Database:
             for p in players_to_move:
                 self._seat_player(p["id"])
 
-        # Ré-équilibre : déplace un joueur de la table la plus pleine vers la
-        # table la moins pleine tant que l'écart est >= 2
-        for _ in range(200):  # garde-fou anti boucle infinie
-            tables = list(self.list_tables())
-            if len(tables) < 2:
-                break
-            counts = []
-            for t in tables:
-                occ = self.conn.execute(
-                    "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
-                    (t["id"],),
-                ).fetchone()["c"]
-                counts.append((occ, t))
-            counts.sort(key=lambda x: x[0])
-            smallest_count, smallest_table = counts[0]
-            largest_count, largest_table = counts[-1]
-            if largest_count - smallest_count < 2:
-                break
-            if smallest_count >= smallest_table["max_seats"]:
-                break
-            candidates = self.conn.execute(
-                "SELECT id FROM players WHERE table_id=? AND status='active'",
-                (largest_table["id"],),
-            ).fetchall()
-            if not candidates:
-                break
-            # Préfère déplacer un joueur déjà en mouvement ce rééquilibrage
-            # (replacé ici suite à la fermeture d'une autre table, ou par
-            # un tour précédent de cette même boucle) plutôt qu'un joueur
-            # assis à cette table depuis le début : celui-ci compte déjà
-            # comme "déplacé" quoi qu'il arrive, le déranger ne coûte
-            # donc rien de plus — alors que déplacer quelqu'un de stable
-            # sans nécessité crée un mouvement évitable dans l'historique
-            # (voir onglet Mouvements). Ne change rien au résultat final
-            # (nombre de joueurs par table) : seulement LEQUEL bouge.
-            mover = next(
-                (c for c in candidates if before_state.get(c["id"], (None, None))[0] != largest_table["id"]),
-                candidates[0],
+        # Ré-équilibre : si la table la plus pleine et la moins pleine ont
+        # un écart >= 2, un joueur doit passer de l'une à l'autre.
+        #
+        # Version TEST "grosse blinde" (voir pending_rebalance, docstring
+        # de Database.__init__, _detect_simple_rebalance_need et
+        # resolve_pending_rebalance plus bas) : un rééquilibrage SIMPLE
+        # comme celui-ci (PAS un cassage de table, traité plus haut —
+        # random.shuffle des joueurs évincés, INCHANGÉ) ne choisit plus
+        # lui-même qui bouge. Dès qu'un mouvement est nécessaire, on POSE
+        # LA QUESTION ("quel siège est actuellement grosse blinde ?", voir
+        # App._open_pending_rebalance_dialog et remote_control.py côté
+        # téléphone) au lieu d'agir tout de suite, et on s'arrête là pour
+        # CET appel : un seul mouvement simple est décidé par appel — la
+        # suite ne reprendra qu'au prochain appel de rebalance_tables(),
+        # déclenché par resolve_pending_rebalance() une fois la réponse
+        # traitée (ou par tout autre événement entre-temps) — jamais en
+        # rappelant cette méthode elle-même pendant qu'on attend, ce qui
+        # bloquerait le thread principal Tkinter. Une seule question à la
+        # fois : si une question posée par un appel précédent est toujours
+        # sans réponse, on n'en pose pas une seconde — mais on vérifie
+        # d'abord qu'elle concerne toujours une table active (sinon on
+        # l'abandonne silencieusement : un cassage de table, ci-dessus, a
+        # pu fermer cette table entre-temps), pour ne jamais laisser un
+        # téléphone afficher une question qui n'a plus de sens.
+        if self.pending_rebalance is not None:
+            still_valid = any(
+                t["id"] == self.pending_rebalance["table_id"] for t in self.list_tables()
             )
-            taken = {
-                r["seat"]
-                for r in self.conn.execute(
-                    "SELECT seat FROM players WHERE table_id=? AND status='active'",
-                    (smallest_table["id"],),
-                )
-            }
-            seat = 1
-            while seat in taken:
-                seat += 1
-            self.conn.execute(
-                "UPDATE players SET table_id=?, seat=? WHERE id=?",
-                (smallest_table["id"], seat, mover["id"]),
-            )
-            self.conn.commit()
+            if not still_valid:
+                self.pending_rebalance = None
+
+        if self.pending_rebalance is None:
+            need = self._detect_simple_rebalance_need()
+            if need is not None:
+                source_table, occupied_seats = need
+                # La table de DESTINATION n'est volontairement pas
+                # mémorisée ici — elle sera recalculée à l'état courant au
+                # moment de la réponse (resolve_pending_rebalance ->
+                # _move_player_to_least_full_table), sans changer sa
+                # logique de choix actuelle (consigne explicite de cette
+                # version TEST). before_state (qui était où AVANT ce
+                # rééquilibrage-ci) est mémorisé tel quel dans la demande :
+                # c'est la référence historique nécessaire à
+                # _legacy_pick_mover si "Continuer sans indiquer la BB"
+                # est utilisé plus tard pour y répondre (voir
+                # resolve_pending_rebalance) — y compris si cette demande
+                # est ensuite recréée pour une autre table entre-temps.
+                self.pending_rebalance = {
+                    "request_id": uuid.uuid4().hex,
+                    "table_id": source_table["id"],
+                    "table_name": source_table["name"],
+                    "seats": occupied_seats,
+                    "record_moves": record_moves,
+                    "before_state": dict(before_state),
+                    "created_at": time.time(),
+                }
 
         # NE comble PAS les sièges laissés vides par un joueur éliminé (ou
         # déplacé ailleurs) à une table par ailleurs inchangée : au poker,
@@ -1008,6 +1022,320 @@ class Database:
             # On efface les mouvements précédents : l'onglet Mouvements
             # n'affiche que le dernier lot de déplacements en date, pas un
             # historique cumulatif.
+            self.conn.execute("DELETE FROM seat_moves")
+            for move in moves:
+                self.conn.execute(
+                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
+                    "new_table_name, new_seat, moved_at) VALUES (?,?,?,?,?,?)",
+                    (move["player_name"], move["old_table_name"], move["old_seat"],
+                     move["new_table_name"], move["new_seat"], move["moved_at"]),
+                )
+            self.conn.commit()
+        return moves
+
+    # ---------- rééquilibrage simple : question "grosse blinde" (TEST) ----------
+    def _detect_simple_rebalance_need(self):
+        """Détecte si un rééquilibrage SIMPLE (pas un cassage de table,
+        qui reste géré séparément plus haut dans rebalance_tables) est
+        nécessaire à l'état COURANT : renvoie (table, occupied_seats) où
+        `table` est la ligne de la table qui doit donner un joueur (la
+        plus pleine, si l'écart avec la moins pleine est >= 2 ET que
+        celle-ci a encore de la place) et `occupied_seats` la liste triée
+        de ses sièges actuellement occupés ; renvoie None si aucun
+        mouvement de ce type n'est nécessaire.
+
+        Factorise EXACTEMENT la détection utilisée à la fois par
+        rebalance_tables() (pour savoir s'il faut poser une nouvelle
+        question) et par resolve_pending_rebalance() (pour revalider une
+        question existante quand l'état a changé depuis qu'elle a été
+        posée — voir sa docstring) : les deux doivent s'accorder sur la
+        même notion de "toujours nécessaire", sans quoi une réponse
+        pourrait être acceptée ou refusée de façon incohérente selon qui
+        appelle."""
+        tables = list(self.list_tables())
+        if len(tables) < 2:
+            return None
+        counts = []
+        for t in tables:
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            counts.append((occ, t))
+        counts.sort(key=lambda x: x[0])
+        smallest_count, smallest_table = counts[0]
+        largest_count, largest_table = counts[-1]
+        if largest_count - smallest_count < 2:
+            return None
+        if smallest_count >= smallest_table["max_seats"]:
+            return None
+        occupied_seats = sorted(
+            r["seat"] for r in self.conn.execute(
+                "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                (largest_table["id"],),
+            )
+        )
+        if not occupied_seats:
+            return None
+        return largest_table, occupied_seats
+
+    def _legacy_pick_mover(self, table_id, before_state):
+        """Algorithme HISTORIQUE de choix du joueur à déplacer d'une table
+        lors d'un simple rééquilibrage — EXACTEMENT celui qui existait
+        avant la version TEST "grosse blinde" (voir l'historique git de
+        rebalance_tables) : préfère un joueur déjà en mouvement PENDANT LE
+        MÊME rééquilibrage (avant_state différent de table_id — ex : un
+        joueur replacé ici par un cassage de table plus tôt dans le même
+        appel de rebalance_tables) plutôt qu'un joueur assis à cette table
+        depuis le début de ce rééquilibrage ; celui-ci compte déjà comme
+        "déplacé" quoi qu'il arrive, le déranger ne coûte donc rien de
+        plus — alors que déplacer quelqu'un de stable sans nécessité crée
+        un mouvement évitable dans l'historique (onglet Mouvements). Ne
+        change rien au résultat final (nombre de joueurs par table) :
+        seulement LEQUEL bouge. Retombe sur le premier candidat trouvé
+        (ordre naturel de la requête, sans tri) si personne n'est déjà en
+        mouvement.
+
+        `before_state` : dict {player_id: (table_id, seat)} capturé par
+        l'appelant AVANT le début de ce rééquilibrage (voir
+        rebalance_tables et pending_rebalance["before_state"]) ; un dict
+        vide revient à toujours prendre le premier candidat trouvé (aucune
+        préférence possible sans historique). Utilisé UNIQUEMENT par
+        "Continuer sans indiquer la BB" (voir resolve_pending_rebalance) —
+        la réponse "quel siège est BB" utilise une règle différente et
+        volontairement nouvelle (voir _next_active_seat_player).
+        Renvoie None si cette table n'a plus aucun joueur actif."""
+        candidates = self.conn.execute(
+            "SELECT id FROM players WHERE table_id=? AND status='active'",
+            (table_id,),
+        ).fetchall()
+        if not candidates:
+            return None
+        mover = next(
+            (c for c in candidates if before_state.get(c["id"], (None, None))[0] != table_id),
+            candidates[0],
+        )
+        return mover["id"]
+
+    def _next_active_seat_player(self, table_id, bb_seat, occupied_seats=None):
+        """Joueur à déplacer selon la règle "grosse blinde" (voir
+        rebalance_tables / resolve_pending_rebalance) : le PROCHAIN joueur
+        actif dans l'ordre des sièges après `bb_seat`, sièges vides
+        sautés, avec retour circulaire au premier siège occupé après le
+        dernier (ex : sièges actifs 1,2,4,5,8 et bb_seat=8 -> siège 1).
+        Toujours recalculé à l'état COURANT de la table (occupied_seats
+        n'est accepté que pour éviter une requête redondante à l'appelant
+        qui l'a déjà sous la main ; jamais une liste mémorisée au moment
+        de la question, qui peut être obsolète — voir resolve_pending_
+        rebalance). Renvoie None si `bb_seat` ne correspond (plus) à un
+        siège occupé de cette table, ou si elle n'a plus qu'un seul joueur
+        actif (rien à "sauter") : l'appelant retombe alors sur l'ancien
+        mécanisme historique."""
+        if occupied_seats is None:
+            occupied_seats = sorted(
+                r["seat"] for r in self.conn.execute(
+                    "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                    (table_id,),
+                )
+            )
+        if bb_seat not in occupied_seats or len(occupied_seats) < 2:
+            return None
+        idx = occupied_seats.index(bb_seat)
+        next_seat = occupied_seats[(idx + 1) % len(occupied_seats)]
+        row = self.conn.execute(
+            "SELECT id FROM players WHERE table_id=? AND seat=? AND status='active'",
+            (table_id, next_seat),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def _move_player_to_least_full_table(self, player_id, exclude_table_id):
+        """Déplace un joueur déjà désigné vers la table active la moins
+        remplie (hors `exclude_table_id`, sa table actuelle) qui a encore
+        de la place, au premier siège libre — exactement le même choix de
+        destination que la boucle de rééquilibrage de rebalance_tables
+        (INCHANGÉ, consigne de cette version TEST), mais recalculé à
+        l'état courant plutôt que de réutiliser une table de destination
+        évaluée au moment de la question, qui a pu changer entre-temps
+        (voir resolve_pending_rebalance). Ne fait rien si aucune autre
+        table n'a de place libre (ne devrait pas arriver : on vient
+        justement d'en détecter une)."""
+        counts = []
+        for t in self.list_tables():
+            if t["id"] == exclude_table_id:
+                continue
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            if occ < t["max_seats"]:
+                counts.append((occ, t))
+        if not counts:
+            return
+        counts.sort(key=lambda x: x[0])
+        dest_table = counts[0][1]
+        taken = {
+            r["seat"] for r in self.conn.execute(
+                "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                (dest_table["id"],),
+            )
+        }
+        seat = 1
+        while seat in taken:
+            seat += 1
+        self.conn.execute(
+            "UPDATE players SET table_id=?, seat=? WHERE id=?",
+            (dest_table["id"], seat, player_id),
+        )
+        self.conn.commit()
+
+    def resolve_pending_rebalance(self, request_id, seat):
+        """Traite une réponse à la question "quel siège est actuellement
+        grosse blinde ?" (voir rebalance_tables ci-dessus) — à appeler
+        UNIQUEMENT depuis le thread principal Tkinter (voir App._resolve_
+        pending_rebalance dans main.py) ; jamais directement depuis le
+        thread du serveur de contrôle à distance (remote_control.py ne
+        fait que déposer la réponse dans la file d'attente thread-safe
+        existante, voir on_rebalance_answer/voice_command_queue).
+
+        `seat` : numéro de siège répondu, ou None ("Continuer sans
+        indiquer la BB").
+
+        RÈGLE DE CONSOMMATION — "première réponse VALIDE traitée gagne" :
+        pending_rebalance n'est mis à None (consommant définitivement la
+        demande) QUE lorsque cette réponse est jugée VALIDE ET qu'un
+        mouvement est réellement décidé. Une réponse INVALIDE (mauvais/
+        vieux request_id, siège vide/invalide, siège dont l'occupant n'est
+        plus actif, ou état devenu obsolète) NE consomme RIEN : la demande
+        reste ouverte (avec le même request_id si elle concerne toujours
+        la même table) pour qu'une réponse valide arrivant ensuite —
+        d'un autre appareil ou du même — puisse encore déterminer le
+        mouvement. Étapes, dans l'ordre :
+
+        1. request_id ne correspond pas à la demande actuellement en
+           attente (déjà traitée par une réponse VALIDE précédente, déjà
+           remplacée par une nouvelle demande — voir 3 —, ou inconnue) :
+           ignoré, sans aucun effet sur pending_rebalance.
+        2. Le besoin de rééquilibrage est recalculé sur l'état COURANT
+           (voir _detect_simple_rebalance_need), AVANT même de regarder ce
+           que cette réponse précise contient : l'état a pu changer depuis
+           que la question a été posée (élimination, cassage de table...).
+           Si plus aucun mouvement n'est nécessaire : la demande est
+           fermée SANS déplacer personne, quelle qu'ait été la réponse —
+           jamais un déplacement "par défaut" alors qu'il n'y a plus rien
+           à équilibrer.
+        3. Si la table qui doit maintenant donner un joueur diffère de
+           celle de la demande d'origine (la situation a basculé sur une
+           autre table pendant l'attente) : la demande d'origine n'a plus
+           de sens et n'est PAS utilisée pour décider quoi que ce soit —
+           elle est remplacée par une nouvelle demande cohérente avec
+           l'état courant (nouveau request_id ; l'ancien ne peut plus
+           jamais gagner, y compris s'il semblait numériquement valide
+           pour l'ancienne table).
+        4. Toujours la même table : si un siège est indiqué mais ne
+           correspond plus à un joueur actif de cette table (siège vide,
+           invalide, ou son occupant a été éliminé entre la question et la
+           réponse), la réponse est INVALIDE — voir règle de consommation
+           ci-dessus : la demande reste ouverte (sièges réaffichés à jour),
+           rien n'est déplacé, on ne choisit PAS de joueur à sa place.
+        5. "Continuer sans indiquer la BB" (seat=None) est toujours traité
+           comme une réponse VALIDE (choix explicite et délibéré), dès
+           lors que l'étape 2 confirme qu'un mouvement reste nécessaire :
+           utilise alors l'ancien mécanisme HISTORIQUE exact (voir
+           _legacy_pick_mover), y compris sa préférence pour un joueur
+           déjà déplacé pendant CE rééquilibrage (before_state mémorisé
+           dans la demande au moment de sa création, voir
+           rebalance_tables) — jamais une simplification approximative.
+
+        Renvoie la liste des mouvements RÉELLEMENT effectués par cette
+        résolution (le mouvement décidé ici, plus tout mouvement
+        supplémentaire enchaîné par la suite du rééquilibrage), au même
+        format que rebalance_tables() ; les archive dans l'historique
+        (onglet Mouvements) si la demande d'origine le demandait (voir
+        `record_moves` dans rebalance_tables)."""
+        pending = self.pending_rebalance
+        if pending is None or pending["request_id"] != request_id:
+            # Étape 1 : requête inconnue, déjà traitée par une réponse
+            # valide précédente, ou remplacée par une nouvelle demande
+            # (étape 3) — ignorée SANS AUCUN EFFET.
+            return []
+
+        # Étape 2 : revalide D'ABORD le besoin sur l'état courant, avant de
+        # regarder le contenu de cette réponse.
+        need = self._detect_simple_rebalance_need()
+        if need is None:
+            self.pending_rebalance = None
+            return []
+        source_table, occupied_seats = need
+
+        if source_table["id"] != pending["table_id"]:
+            # Étape 3 : la situation a changé de table entre-temps. On ne
+            # consomme PAS la réponse reçue (elle ne concerne plus la
+            # bonne table) — on la remplace par une demande cohérente,
+            # avec un NOUVEL identifiant.
+            self.pending_rebalance = {
+                "request_id": uuid.uuid4().hex,
+                "table_id": source_table["id"],
+                "table_name": source_table["name"],
+                "seats": occupied_seats,
+                "record_moves": pending["record_moves"],
+                "before_state": {
+                    p["id"]: (p["table_id"], p["seat"])
+                    for p in self.list_players(status="active")
+                },
+                "created_at": time.time(),
+            }
+            return []
+
+        # Toujours la même table : détermine le joueur à déplacer.
+        if seat is not None:
+            mover_id = self._next_active_seat_player(source_table["id"], seat, occupied_seats)
+            if mover_id is None:
+                # Étape 4 : réponse INVALIDE — ne consomme PAS la demande,
+                # qui reste ouverte (même request_id) pour une réponse
+                # valide ultérieure. Sièges réaffichés à jour uniquement.
+                self.pending_rebalance["seats"] = occupied_seats
+                return []
+        else:
+            # Étape 5 : "Continuer sans indiquer la BB" — toujours valide
+            # ici (un mouvement est bien nécessaire, voir étape 2).
+            mover_id = self._legacy_pick_mover(source_table["id"], pending.get("before_state", {}))
+
+        # Réponse VALIDE : consommée SEULEMENT MAINTENANT (jamais avant ce
+        # point) — elle gagne définitivement contre toute réponse
+        # ultérieure à cette même demande (son request_id ne correspondra
+        # plus à l'étape 1 dès l'instruction suivante).
+        self.pending_rebalance = None
+
+        my_move = None
+        if mover_id is not None:
+            mover_before = self.get_player(mover_id)
+            old_table_id, old_seat = mover_before["table_id"], mover_before["seat"]
+            self._move_player_to_least_full_table(mover_id, exclude_table_id=source_table["id"])
+            mover_after = self.get_player(mover_id)
+            if mover_after["table_id"] != old_table_id:
+                table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+                my_move = {
+                    "player_name": mover_after["name"],
+                    "old_table_name": table_names.get(old_table_id),
+                    "old_seat": old_seat,
+                    "new_table_name": table_names.get(mover_after["table_id"]),
+                    "new_seat": mover_after["seat"],
+                    "moved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+        # Reprend le rééquilibrage sur l'état courant (peut fermer
+        # d'autres tables devenues inutiles, ou poser une NOUVELLE
+        # question si un écart persiste ailleurs). record_moves=False ici
+        # dans tous les cas : le mouvement décidé ci-dessus (my_move) a
+        # déjà eu lieu et ne serait de toute façon plus visible dans le
+        # diff avant/après de cet appel-là ; c'est ce résolveur-ci qui
+        # archive l'ensemble (my_move + further_moves) plus bas, une seule
+        # fois, selon le `record_moves` demandé par l'appel d'ORIGINE
+        # (celui qui a posé la question).
+        further_moves = self.rebalance_tables(record_moves=False)
+        moves = ([my_move] if my_move else []) + further_moves
+
+        if moves and pending["record_moves"]:
             self.conn.execute("DELETE FROM seat_moves")
             for move in moves:
                 self.conn.execute(
