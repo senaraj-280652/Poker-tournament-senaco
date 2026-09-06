@@ -29,7 +29,7 @@ from database import (
     format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
-    BOUNTY_HISTORY_COLUMNS,
+    BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
@@ -258,13 +258,29 @@ def spawn_app_process(extra_args=None):
     directement, sans passer par l'écran d'accueil (voir
     App.__init__/open_path, et LobbyDialog qui l'utilise pour "Ouvrir"
     un tournoi de la liste dans sa propre fenêtre). Renvoie l'objet
-    Popen. Lève OSError si le lancement échoue (à l'appelant de gérer)."""
+    Popen. Lève OSError si le lancement échoue (à l'appelant de gérer).
+
+    `stdin=subprocess.DEVNULL` : le nouveau process reçoit un stdin neuf
+    et toujours valide, plutôt que d'hériter du descripteur de fichier 0
+    de SON parent — qui peut déjà être invalide après plusieurs
+    fermetures/ouvertures de fenêtres en chaîne (notamment via "Fin de
+    la partie" depuis le téléphone). Sans ça, l'initialisation de CPython
+    lui-même pouvait échouer dès le tout premier démarrage du nouveau
+    process, AVANT tout code Python : "Fatal Python error:
+    init_sys_streams: can't initialize sys standard streams / OSError:
+    [Errno 9] Bad file descriptor" — le process mourait sans jamais rien
+    afficher, symptôme "Menu principal" qui ne "faisait rien" observé
+    après plusieurs tournois fermés depuis le téléphone (diagnostiqué en
+    capturant réellement stdout/stderr du process mort, voir l'historique
+    git de ce fichier)."""
     extra_args = list(extra_args or [])
     if getattr(sys, "frozen", False):
         # Application empaquetée (PyInstaller) : sys.executable est déjà
         # le programme lui-même, pas besoin de lui repasser main.py.
-        return subprocess.Popen([sys.executable, *extra_args])
-    return subprocess.Popen([sys.executable, os.path.abspath(__file__), *extra_args])
+        return subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL)
+    return subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), *extra_args], stdin=subprocess.DEVNULL,
+    )
 
 
 def raise_process_when_ready(widget, pid, attempt=0):
@@ -278,7 +294,22 @@ def raise_process_when_ready(widget, pid, attempt=0):
     et sa fenêtre n'existe pas encore lors des tout premiers essais.
     Échoue silencieusement si l'accès Accessibilité n'est pas accordé
     (macOS) à l'application qui lance ceci (Terminal, IDE...) — la
-    fenêtre reste alors ouverte, juste pas mise en avant automatiquement."""
+    fenêtre reste alors ouverte, juste pas mise en avant automatiquement.
+
+    Si le process a disparu ENTRE deux tentatives (déjà vivant à l'appel
+    précédent, mort depuis — le cas "mort immédiate" est, lui, détecté
+    plus tôt par App._open_new_window), n'appelle plus bring_pid_to_front
+    sur un pid mort et surtout ne reprogramme PAS d'autre tentative :
+    plus jamais "essayer dans le vide puis abandonner sans rien dire"."""
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    except OSError:
+        alive = True  # existe, appartient à un autre utilisateur, etc.
+    if not alive:
+        return
     open_windows.bring_pid_to_front(pid)
     if attempt < 5:
         widget.after(700, lambda: raise_process_when_ready(widget, pid, attempt + 1))
@@ -1855,6 +1886,27 @@ class LobbyDialog(tk.Toplevel):
         )
         self._after_id = None
         self._paths_by_iid = {}
+        # Synchronisation iPhone -> Lobby Mac (voir open_windows.py:
+        # get_phone_selected_pid) : dernier pid déjà appliqué à LA
+        # sélection de CETTE fenêtre, pour ne réagir qu'à un changement
+        # (jamais réimposer la même valeur en boucle à chaque
+        # rafraîchissement — voir _refresh) et ne jamais écraser un choix
+        # manuel du Mac tant que le téléphone n'a pas sélectionné autre
+        # chose.
+        #
+        # Initialisé avec la valeur DÉJÀ mémorisée (et non None) : sans
+        # ça, un phone_selected_pid laissé par un choix téléphone
+        # ANTÉRIEUR (avant même l'ouverture de CETTE fenêtre) est
+        # interprété au tout premier _refresh() comme un nouveau choix
+        # tout juste reçu, et bring_pid_to_front() ramène alors aussitôt
+        # l'ancien tournoi au premier plan — devant ce Lobby qu'on vient
+        # littéralement d'ouvrir (repéré avec AXRaise : le Lobby apparaît
+        # puis disparaît quasi immédiatement, remplacé par le tournoi
+        # déjà ouvert). En partant de la valeur actuelle, ce pid déjà
+        # connu n'est plus vu comme un changement ; un choix téléphone
+        # réellement nouveau (pid différent) continue, lui, à être
+        # détecté et appliqué normalement (voir _refresh).
+        self._last_synced_phone_pid = open_windows.get_phone_selected_pid()
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
@@ -1964,7 +2016,43 @@ class LobbyDialog(tk.Toplevel):
             )
             self._paths_by_iid[iid] = path
 
-        if selected_path:
+        # Synchronisation iPhone -> Lobby Mac : si un téléphone a
+        # sélectionné un tournoi (voir open_windows.set_phone_selected_pid,
+        # appelé par /select_tournament) depuis la dernière fois qu'on l'a
+        # appliqué ICI, aligne la sélection de cette fenêtre dessus —
+        # exactement l'effet d'un clic manuel (tree.selection_set), sans
+        # ouvrir ni fermer quoi que ce soit. Prioritaire sur la ré-
+        # application de l'ancienne sélection ci-dessous. Ne déclenche
+        # jamais de boucle : _last_synced_phone_pid n'est mis à jour que
+        # lorsque ce pid change réellement, donc un choix manuel ultérieur
+        # du Mac n'est jamais écrasé par un rafraîchissement suivant tant
+        # que le téléphone n'a pas sélectionné autre chose. Si le pid ne
+        # correspond plus à aucun tournoi ouvert (déjà fermé entre-temps),
+        # ne sélectionne rien à sa place ni ne ramène rien au premier
+        # plan : la sélection existante ci-dessous reste inchangée.
+        #
+        # Ramène aussi CETTE fenêtre de tournoi au premier plan sur le
+        # Mac (open_windows.bring_pid_to_front — EXACTEMENT la même
+        # fonction, déjà "best-effort"/silencieuse en cas d'échec, que
+        # _open_selected utilise pour "🔀 Basculer vers" un double-clic
+        # manuel) — mais UNE SEULE FOIS au moment où ce nouveau choix est
+        # détecté (même condition que la sélection ci-dessus), jamais à
+        # chaque rafraîchissement (toutes les 4s).
+        applied_from_phone = False
+        phone_pid = open_windows.get_phone_selected_pid()
+        if phone_pid is not None and phone_pid != self._last_synced_phone_pid:
+            self._last_synced_phone_pid = phone_pid
+            target_path = open_windows.find_path_for_pid(phone_pid)
+            if target_path is not None:
+                for iid, p in self._paths_by_iid.items():
+                    if p == target_path:
+                        self.tree.selection_set(iid)
+                        applied_from_phone = True
+                        break
+                if applied_from_phone:
+                    open_windows.bring_pid_to_front(phone_pid)
+
+        if not applied_from_phone and selected_path:
             for iid, p in self._paths_by_iid.items():
                 if p == selected_path:
                     self.tree.selection_set(iid)
@@ -3433,6 +3521,13 @@ class App(tk.Tk):
 
         self.db = None
         self.clock_window = None
+        # "Son prochain changement Blindes" (voir _open_clock_sounds_dialog
+        # / _maybe_play_next_blinds_sound) : level_order du dernier round
+        # pour lequel ce son a déjà été joué, pour ne le jouer qu'une
+        # seule fois par round tant que le compte à rebours reste sous le
+        # délai configuré (comparé à level["level_order"] à chaque appel,
+        # donc redevient pertinent dès que le niveau change).
+        self._next_blinds_sound_played_for_order = None
         # Actions "Élimination"/"Terminé"/"Chronomètre" (raccourcis clavier
         # et contrôle à distance depuis un téléphone, voir
         # _bind_voice_command_shortcuts / remote_control.py) : le thread du
@@ -3469,27 +3564,46 @@ class App(tk.Tk):
         # principe (tenu à jour depuis _tick, jamais lu/écrit depuis le
         # thread du serveur web).
         self._remote_clock_paused = True
+        # True s'il existe au moins un mouvement en attente dans l'onglet
+        # Mouvements (voir _tick : self.db.count_seat_moves() — EXACTEMENT
+        # la même source que _refresh_moves_tab/self.db.get_seat_moves(),
+        # aucune logique parallèle) — fait clignoter "📋 Afficher
+        # Mouvements" sur le téléphone tant que c'est vrai (voir
+        # remote_control.py, sondé via /clock_state comme _remote_clock_
+        # paused ci-dessus, même principe thread-safe).
+        self._remote_has_pending_moves = False
         # Positionné (côté thread du serveur web, voir _remote_upload_photo)
         # dès qu'une photo vient d'être envoyée depuis le téléphone, pour
         # que _tick rafraîchisse la colonne Photo (Répertoire/Joueurs) sans
         # attendre un changement d'onglet — même principe que les deux
         # attributs juste au-dessus.
         self._remote_photo_uploaded = False
+        # Bouton "Fin de la partie" du contrôle à distance (voir
+        # _remote_end_tournament) : True dès que cette fermeture a été
+        # déclenchée une première fois (par ce téléphone ou un autre,
+        # confirmations quasi simultanées comprises) — empêche tout appel
+        # ultérieur à _on_close()/self.destroy() sur une fenêtre déjà
+        # détruite.
+        self._remote_end_tournament_triggered = False
         # Rééquilibrage simple : question "quel siège est actuellement
         # grosse blinde ?" (version TEST, voir database.py:
-        # rebalance_tables / resolve_pending_rebalance).
+        # rebalance_tables / resolve_pending_rebalance) — affichée
+        # uniquement sur les téléphones du contrôle à distance, plus
+        # aucune fenêtre Mac (voir _check_pending_rebalance).
         # _remote_pending_rebalance : même principe que _remote_clock_
         # paused ci-dessus — copie de self.db.pending_rebalance tenue à
         # jour depuis le thread principal (_tick / _check_pending_
         # rebalance), jamais lue ni écrite depuis le thread du serveur de
-        # contrôle à distance. _pending_rebalance_win/_request_id :
-        # petite fenêtre Tkinter affichée côté PC pour cette même demande
-        # (voir _open_pending_rebalance_dialog), et l'id de la demande
-        # qu'elle affiche actuellement (pour ne pas la reconstruire à
-        # chaque tick tant que la demande n'a pas changé).
+        # contrôle à distance.
         self._remote_pending_rebalance = None
-        self._pending_rebalance_win = None
-        self._pending_rebalance_request_id = None
+        # Synchronisation iPhone -> Mac SANS dépendre d'un Lobby ouvert
+        # (voir _check_phone_selected_pid, appelé depuis _tick) : dernier
+        # pid de tournoi déjà traité PAR CETTE fenêtre, même principe et
+        # même nom que LobbyDialog._last_synced_phone_pid (voir son
+        # commentaire) — initialisé avec la valeur déjà mémorisée pour ne
+        # pas se ramener soi-même au premier plan sur un choix téléphone
+        # antérieur au démarrage de cette fenêtre.
+        self._last_synced_phone_pid = open_windows.get_phone_selected_pid()
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -3724,7 +3838,12 @@ class App(tk.Tk):
         """Lance une nouvelle instance indépendante de l'application (autre
         processus, avec son propre écran d'accueil), sans toucher à celle
         déjà ouverte — pour gérer plusieurs tournois/Sit & Go à la fois,
-        chacun dans sa propre fenêtre."""
+        chacun dans sa propre fenêtre. Si ce nouveau process meurt
+        immédiatement (voir spawn_app_process : stdin=subprocess.DEVNULL
+        en corrige la cause la plus courante), le détecte au lieu de
+        continuer vers raise_process_when_ready (qui essaierait de
+        ramener au premier plan un pid déjà mort, puis abandonnerait sans
+        rien dire) — affiche une vraie erreur à la place."""
         try:
             proc = spawn_app_process()
         except OSError as e:
@@ -3732,6 +3851,20 @@ class App(tk.Tk):
                 "Erreur", f"Impossible d'ouvrir une nouvelle fenêtre :\n{e}"
             )
             return
+
+        # Laisse un court instant à un process qui planterait dès son tout
+        # premier démarrage (avant même Tkinter) le temps de réellement
+        # quitter, plutôt que de foncer vers raise_process_when_ready.
+        time.sleep(0.3)
+        returncode = proc.poll()
+        if returncode is not None:
+            messagebox.showerror(
+                "Erreur",
+                "La nouvelle fenêtre n'a pas pu s'ouvrir : le nouveau "
+                f"processus s'est arrêté immédiatement (code {returncode}).",
+            )
+            return
+
         raise_process_when_ready(self, proc.pid)
 
     def _open_lobby(self):
@@ -5227,125 +5360,53 @@ class App(tk.Tk):
     # resolve_pending_rebalance). Lors d'un simple rééquilibrage entre
     # tables (pas un cassage de table, inchangé), le choix du joueur à
     # déplacer n'est plus automatique : on demande quel siège est
-    # actuellement grosse blinde, au PC (petite fenêtre Tkinter non
-    # bloquante, voir _open_pending_rebalance_dialog) et sur TOUS les
-    # téléphones du contrôle à distance (voir remote_control.py,
-    # _REBALANCE_WIDGET) en même temps — le premier qui répond gagne. Le
-    # chronomètre et le reste de l'appli continuent de tourner normalement
-    # tant qu'aucune réponse n'arrive (jamais de sleep()/wait_window()/
-    # boucle d'attente ici, voir consigne).
+    # actuellement grosse blinde — UNIQUEMENT sur les téléphones du
+    # contrôle à distance (voir remote_control.py, _REBALANCE_WIDGET), le
+    # premier qui répond gagne. Affichée sur le Mac jusqu'à v1.2.37 (petite
+    # fenêtre Tkinter non bloquante) : retirée à la demande explicite de
+    # l'utilisateur (trop envahissante sur les écrans du Mac/projecteur),
+    # le calcul et le stockage de la proposition (self.db.pending_
+    # rebalance) restant, eux, entièrement inchangés — voir
+    # _check_pending_rebalance ci-dessous. Le chronomètre et le reste de
+    # l'appli continuent de tourner normalement tant qu'aucune réponse
+    # n'arrive (jamais de sleep()/wait_window()/boucle d'attente ici, voir
+    # consigne).
     # ---------------------------------------------------------------
     def _check_pending_rebalance(self):
-        """Affiche (ou masque) la petite fenêtre "Équilibrage des tables"
-        selon l'état courant de self.db.pending_rebalance, et tient à jour
-        _remote_pending_rebalance (copie lue par le thread du serveur de
-        contrôle à distance, voir _start_remote_control_if_enabled).
-        Appelée juste après chaque action qui peut déclencher un
-        rééquilibrage (élimination locale ou distante, bouton
-        "Rééquilibrer les tables", changement de "Nombre de sièges par
-        table" dans Paramètres) pour une réaction immédiate, et par
-        sécurité à chaque tick (_tick) : une réponse arrivée par une autre
-        voie (téléphone, alors que le PC affichait la fenêtre — ou
-        l'inverse) doit fermer/mettre à jour cet affichage même s'il n'a
-        pas causé la demande suivante, et le tournoi ne doit jamais rester
-        bloqué faute de réponse si cette méthode n'était appelée que sur
-        les points d'entrée directs."""
+        """Tient à jour _remote_pending_rebalance (copie de self.db.
+        pending_rebalance lue par le thread du serveur de contrôle à
+        distance, voir _start_remote_control_if_enabled et
+        remote_control.py: /rebalance_pending) à partir de l'état courant
+        de self.db.pending_rebalance — SEUL affichage restant de cette
+        proposition, sur les téléphones (voir le commentaire ci-dessus :
+        plus aucune fenêtre Mac depuis ce correctif). Appelée juste après
+        chaque action qui peut déclencher un rééquilibrage (élimination
+        locale ou distante, bouton "Rééquilibrer les tables", changement
+        de "Nombre de sièges par table" dans Paramètres) pour une
+        réaction immédiate côté téléphone, et par sécurité à chaque tick
+        (_tick) : une réponse arrivée par une autre voie doit y être
+        reflétée même si elle n'a pas causé la demande suivante."""
         if not self.db:
             return
-        pending = self.db.pending_rebalance
-        self._remote_pending_rebalance = pending
-        if pending is None:
-            self._close_pending_rebalance_dialog()
-            return
-        if (self._pending_rebalance_win is not None
-                and self._pending_rebalance_win.winfo_exists()
-                and self._pending_rebalance_request_id == pending["request_id"]):
-            return  # déjà affichée pour CETTE demande précise, rien à refaire
-        self._close_pending_rebalance_dialog()
-        self._open_pending_rebalance_dialog(pending)
-
-    def _close_pending_rebalance_dialog(self):
-        if self._pending_rebalance_win is not None:
-            try:
-                if self._pending_rebalance_win.winfo_exists():
-                    self._pending_rebalance_win.destroy()
-            except tk.TclError:
-                pass
-            self._pending_rebalance_win = None
-        self._pending_rebalance_request_id = None
-
-    def _open_pending_rebalance_dialog(self, pending):
-        """Petite fenêtre Tkinter au-dessus de l'application/Chronomètre
-        (attributes -topmost, jamais de grab_set : voir plus bas), NON
-        bloquante — pas de wait_window()/sleep()/boucle d'attente, le
-        chrono (self.after, indépendant de cette fenêtre) et le reste de
-        l'appli continuent de tourner normalement tant qu'elle est
-        affichée. N'affiche que les numéros de sièges OCCUPÉS de la table
-        qui doit donner un joueur (pending["seats"]), plus un bouton
-        "Continuer sans indiquer la BB". Pas de grab_set() : une
-        éventuelle fenêtre séparée "écran projecteur" est un autre
-        Toplevel du même interpréteur Tk — un grab (même local) y
-        bloquerait le clic, alors qu'elle n'a besoin d'aucune interaction
-        pour continuer d'afficher le temps ; -topmost suffit à rester
-        au-dessus sans gêner personne d'autre."""
-        win = tk.Toplevel(self)
-        self._pending_rebalance_win = win
-        self._pending_rebalance_request_id = pending["request_id"]
-        win.title("Équilibrage des tables")
-        win.configure(bg=FELT_DARK)
-        win.resizable(False, False)
-        win.attributes("-topmost", True)
-        # Pas de croix pour fermer sans répondre : une demande fermée par
-        # erreur resterait quand même en attente côté téléphone (elle
-        # n'est pas annulée pour autant, seulement plus affichée ici) —
-        # autant éviter la confusion. "Continuer sans indiquer la BB" est
-        # le vrai bouton d'échappement.
-        win.protocol("WM_DELETE_WINDOW", lambda: None)
-
-        tk.Label(
-            win, bg=FELT_DARK, fg=GOLD, font=("Helvetica", 13, "bold"),
-            text="ÉQUILIBRAGE DES TABLES",
-        ).pack(padx=18, pady=(16, 2))
-        tk.Label(
-            win, bg=FELT_DARK, fg=CREAM, font=("Helvetica", 11, "bold"),
-            text=f"{pending['table_name']} doit donner un joueur",
-        ).pack(padx=18, pady=(0, 8))
-        tk.Label(
-            win, bg=FELT_DARK, fg=CREAM,
-            text="Quel siège est actuellement grosse blinde ?",
-        ).pack(padx=18, pady=(0, 10))
-
-        seats_frame = ttk.Frame(win)
-        seats_frame.pack(padx=18, pady=(0, 10))
-        request_id = pending["request_id"]
-        for seat in pending["seats"]:
-            ttk.Button(
-                seats_frame, text=f"[{seat}]", width=4,
-                command=lambda s=seat: self._resolve_pending_rebalance(request_id, s, from_remote=False),
-            ).pack(side="left", padx=3)
-
-        ttk.Button(
-            win, text="Continuer sans indiquer la BB",
-            command=lambda: self._resolve_pending_rebalance(request_id, None, from_remote=False),
-        ).pack(padx=18, pady=(0, 16))
-
-        win.lift()
-        win.focus_force()
+        self._remote_pending_rebalance = self.db.pending_rebalance
 
     def _resolve_pending_rebalance(self, request_id, seat, from_remote):
         """Traite une réponse à la question "quel siège est grosse
-        blinde ?" — reçue soit du PC (bouton de la fenêtre ci-dessus,
-        from_remote=False), soit d'un téléphone (POST /rebalance_answer,
-        relayé ici par _poll_voice_queue, from_remote=True). La mutation
-        réelle passe par database.py:resolve_pending_rebalance, qui
-        revalide tout avant d'agir (request_id encore valide, table
-        source toujours active, siège toujours occupé par un joueur actif
-        — voir sa docstring) : ici, on se contente d'enchaîner les mêmes
-        suites qu'une élimination normale (alerte de mouvement,
-        rafraîchissements) sur le résultat qu'elle renvoie."""
+        blinde ?" — reçue d'un téléphone (POST /rebalance_answer, relayé
+        ici par _poll_voice_queue, from_remote=True), ou déclenchée
+        localement quand la préférence "Équilibrage guidé par la grosse
+        blinde" (Paramètres) est décochée alors qu'une demande est en
+        attente (voir _on_bb_rebalance_prompt_toggle, from_remote=False —
+        aucune fenêtre Mac n'est impliquée dans ce second cas, seulement
+        ce même traitement de réponse). La mutation réelle passe par
+        database.py:resolve_pending_rebalance, qui revalide tout avant
+        d'agir (request_id encore valide, table source toujours active,
+        siège toujours occupé par un joueur actif — voir sa docstring) :
+        ici, on se contente d'enchaîner les mêmes suites qu'une
+        élimination normale (alerte de mouvement, rafraîchissements) sur
+        le résultat qu'elle renvoie."""
         if not self.db:
             return
-        self._close_pending_rebalance_dialog()
         moves = self.db.resolve_pending_rebalance(request_id, seat)
         if moves:
             if len(self.db.list_players(status="active")) <= 1:
@@ -5396,17 +5457,31 @@ class App(tk.Tk):
         """Termine le bandeau d'élimination actuellement affiché (s'il y
         en a un) et, s'il reste un message dans la file, le fait devenir
         le nouveau bandeau courant avec sa PROPRE échéance complète à
-        partir de MAINTENANT (durée réglée dans Paramètres, voir
-        _build_settings_tab) et joue le son configuré une seule fois.
-        Seul point qui fait avancer la file — appelé (1) depuis
-        _refresh_clock_tab quand l'échéance du bandeau courant est
+        partir de MAINTENANT (durée réglée dans Paramètres — "Durée du
+        bandeau d'élimination (secondes)", self.db.get_setting_int
+        "elimination_banner_seconds" — INDÉPENDANTE de la "Durée (ms)" du
+        son "Son sortie d'un joueur", voir _play_elimination_sound : deux
+        réglages séparés, l'un pour l'AFFICHAGE, l'autre pour le SON,
+        même si aucun son n'est configuré) et joue le son configuré une
+        seule fois. Seul point qui fait avancer la file — appelé (1)
+        depuis _refresh_clock_tab quand l'échéance du bandeau courant est
         dépassée, (2) depuis _on_voice_word("chronometre") pour
         l'écourter manuellement à la demande (bouton "Chronomètre" du
         téléphone ou Ctrl+Maj+C) : cette seconde utilisation ne vide
         JAMAIS le reste de la file (elle ne retire qu'UN SEUL élément,
         le bandeau en cours, jamais rappelé ensuite), les messages
         suivants restent strictement dans leur ordre FIFO. Sans effet
-        (et sans son) s'il n'y a ni bandeau courant ni file en attente."""
+        (et sans son) s'il n'y a ni bandeau courant ni file en attente.
+
+        Chaque bandeau mémorise sa PROPRE échéance ("until", calculée ICI
+        une seule fois à sa création) dans son propre dict, plutôt qu'un
+        minuteur global partagé : si le joueur A est éliminé puis B peu
+        après pendant que le bandeau de A est encore affiché, le job de B
+        est simplement ajouté à la file (_queue_elimination_banner) et ne
+        devient "courant" (avec sa propre échéance à partir de CE
+        moment-là) qu'ici, quand celui de A expire — jamais recalculée
+        après coup ni partagée entre deux bandeaux. Aucun risque qu'une
+        échéance déjà expirée (celle de A) n'efface prématurément B."""
         self._elimination_banner_current = None
         if self._elimination_banner_queue:
             job = self._elimination_banner_queue.popleft()
@@ -5516,11 +5591,13 @@ class App(tk.Tk):
         )
         self._refresh_remote_players_cache()
         self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1 if self.db else True
+        self._remote_has_pending_moves = self.db.count_seat_moves() > 0 if self.db else False
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
             get_players=lambda: self._remote_players_cache,
             get_clock_paused=lambda: self._remote_clock_paused,
+            get_has_pending_moves=lambda: self._remote_has_pending_moves,
             on_eliminate=lambda eliminated_id, eliminator_id: self.voice_command_queue.put(
                 ("eliminate", eliminated_id, eliminator_id)
             ),
@@ -5532,6 +5609,7 @@ class App(tk.Tk):
             on_rebalance_answer=lambda request_id, seat: self.voice_command_queue.put(
                 ("rebalance_answer", request_id, seat)
             ),
+            on_end_tournament=lambda: self.voice_command_queue.put(("end_tournament",)),
         )
         try:
             server.start()
@@ -5642,6 +5720,8 @@ class App(tk.Tk):
                 elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
                     _, request_id, seat = item
                     self._resolve_pending_rebalance(request_id, seat, from_remote=True)
+                elif isinstance(item, tuple) and item and item[0] == "end_tournament":
+                    self._remote_end_tournament()
                 else:
                     self._on_voice_word(item)
         except queue.Empty:
@@ -5797,6 +5877,34 @@ class App(tk.Tk):
         player_photos.delete_photo(name)
         self._remote_photo_uploaded = True
         return True, name
+
+    def _remote_end_tournament(self):
+        """Bouton "Fin de la partie" (tout en bas de la page principale du
+        contrôle à distance, voir remote_control.py) : ferme proprement
+        CE tournoi-ci — ce processus n'en gère jamais qu'un seul à la
+        fois — en réutilisant EXACTEMENT le même chemin que fermer la
+        fenêtre ou "Fichier > Quitter" (_on_close : arrête le contrôle à
+        distance, désinscrit ce tournoi du registre open_windows.py,
+        ferme la base, puis détruit la fenêtre — jamais de
+        os._exit()/kill() ni d'autre raccourci brutal). Ne peut jamais
+        fermer un AUTRE tournoi : remote_control.py a déjà vérifié, avant
+        même de déposer cette demande dans la file d'attente, que le pid
+        envoyé par le téléphone correspond à CE processus précis (voir
+        RemoteControlServer.start, route /end_tournament) — ce module-ci
+        n'a donc besoin d'aucune vérification supplémentaire d'identité.
+
+        Idempotent (voir _remote_end_tournament_triggered, initialisé à
+        False dans __init__) : si cette fermeture a déjà été déclenchée
+        — deux téléphones ayant confirmé presque simultanément, ou une
+        confirmation en double du même téléphone, tous deux déjà déposés
+        dans la file avant que le premier ne soit traité — les appels
+        suivants sont ignorés sans effet, pour ne jamais appeler
+        _on_close()/self.destroy() une seconde fois sur une fenêtre déjà
+        détruite (ce qui lèverait une exception Tcl)."""
+        if self._remote_end_tournament_triggered:
+            return
+        self._remote_end_tournament_triggered = True
+        self._on_close()
 
     def _on_voice_word(self, word):
         """Dispatché pour chaque mot-clé reçu ("elimination"/"terminer"/
@@ -6780,6 +6888,7 @@ class App(tk.Tk):
         self._clock_sound_buttons = {}
         for key, label in (
             ("sound_break_start_path", "Son début Pause"),
+            ("sound_next_blinds_path", "Son prochain changement Blindes"),
             ("sound_break_end_path", "Son Fin Pause"),
             ("sound_round_end_path", "Son fin Round"),
             ("sound_elimination_path", "Son sortie d'un joueur"),
@@ -6800,6 +6909,17 @@ class App(tk.Tk):
                     "joué à défaut, pour que ça fonctionne sans réglage.\n"
                     "Clic gauche : choisir/remplacer le fichier.\n"
                     "Clic droit : retirer le fichier (revient au bip par défaut).",
+                )
+            elif key == "sound_next_blinds_path":
+                Tooltip(
+                    btn,
+                    "Fichier .wav joué une seule fois, au délai configuré\n"
+                    "ci-contre AVANT qu'un changement RÉEL de blindes (SB/BB\n"
+                    "différentes) ne survienne. Jamais joué pendant une\n"
+                    "pause, ni si le round suivant est une pause, ni si ses\n"
+                    "blindes sont identiques à celles du round en cours.\n"
+                    "Clic gauche : choisir/remplacer le fichier.\n"
+                    "Clic droit : retirer le son configuré.",
                 )
             else:
                 Tooltip(
@@ -6824,6 +6944,28 @@ class App(tk.Tk):
             dur_var.trace_add(
                 "write", lambda *a, k=key, v=dur_var: self._save_clock_sound_duration(k, v)
             )
+
+            if key == "sound_next_blinds_path":
+                # Propre à ce son (voir _maybe_play_next_blinds_sound) :
+                # combien de secondes avant le changement de blindes il
+                # doit se déclencher — 60 par défaut, réglable ici, sans
+                # équivalent sur les 3 autres sons (tous déclenchés à un
+                # instant fixe, jamais "avant" quoi que ce soit).
+                ttk.Label(row, text="  Délai avant fin (s) :").pack(side="left")
+                lead_var = tk.StringVar(
+                    value=export_prefs.load_value(f"{key}_lead_seconds", "60")
+                )
+                lead_entry = ttk.Entry(row, textvariable=lead_var, width=5)
+                lead_entry.pack(side="left", padx=(4, 4))
+                Tooltip(
+                    lead_entry,
+                    "Nombre de secondes avant le changement de blindes\n"
+                    "auquel jouer ce son (60 par défaut). Entier positif.",
+                )
+                lead_var.trace_add(
+                    "write", lambda *a, k=key, v=lead_var: self._save_clock_sound_lead_seconds(k, v)
+                )
+
             ttk.Button(
                 row, text="Test", width=5, command=lambda k=key: self._test_clock_sound(k),
             ).pack(side="left")
@@ -6993,6 +7135,10 @@ class App(tk.Tk):
             start = self.db.get_setting_int("level_start_epoch", int(time.time()))
             elapsed = int(time.time()) - start
         remaining = duration - elapsed
+        if (remaining > 0 and not level["is_break"]
+                and self.db.get_setting_int("clock_started", 0) == 1
+                and self.db.get_setting_int("is_paused", 1) == 0):
+            self._maybe_play_next_blinds_sound(level, remaining)
         if remaining <= 0 and self.db.get_setting_int("clock_started", 0) == 1 and self.db.get_setting_int("is_paused", 1) == 0:
             # niveau terminé -> passe automatiquement au suivant
             next_row = self.db.get_next_level()
@@ -7008,6 +7154,53 @@ class App(tk.Tk):
                 remaining = 0
         next_level = self.db.get_next_level()
         return remaining, level, next_level
+
+    def _maybe_play_next_blinds_sound(self, level, remaining):
+        """« Son prochain changement Blindes » (voir _open_clock_sounds_
+        dialog) : joué une seule fois par round, au délai configuré (voir
+        _next_blinds_sound_lead_seconds, 60s par défaut) avant la fin de
+        CE round — mais UNIQUEMENT si un changement RÉEL de blindes est
+        imminent, à la demande explicite de l'utilisateur (à la
+        différence de "Son fin Round", qui se joue quel que soit ce qui
+        suit) :
+        - jamais pendant une pause (l'appelant, _remaining_seconds, exclut
+          déjà level["is_break"] avant même d'appeler ceci) ;
+        - jamais si le round suivant est lui-même une pause (les blindes
+          ne changent pas tout de suite) ;
+        - jamais si les blindes (SB/BB) du round suivant sont identiques
+          à celles du round courant (palier répété dans la structure).
+        self._next_blinds_sound_played_for_order (comparé à
+        level["level_order"]) évite de rejouer à chaque tick tant que
+        `remaining` reste sous le délai — redevient naturellement
+        pertinent dès que le niveau change (nouvel ordre)."""
+        next_level = self.db.get_next_level()
+        if next_level is None or next_level["is_break"]:
+            return
+        if (next_level["small_blind"], next_level["big_blind"]) == (
+                level["small_blind"], level["big_blind"]):
+            return
+        lead = self._next_blinds_sound_lead_seconds()
+        if lead <= 0 or remaining > lead:
+            return
+        if self._next_blinds_sound_played_for_order == level["level_order"]:
+            return
+        self._next_blinds_sound_played_for_order = level["level_order"]
+        self._play_clock_sound("sound_next_blinds_path")
+
+    def _next_blinds_sound_lead_seconds(self):
+        """Délai (s) réglé pour "Son prochain changement Blindes" (champ
+        "Délai avant fin (s)" de _open_clock_sounds_dialog) — 60 par
+        défaut, y compris si le champ est vide/invalide ou à 0 (jamais
+        désactivé silencieusement par une saisie incorrecte)."""
+        raw = export_prefs.load_value("sound_next_blinds_path_lead_seconds", "60")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 60
+        return value if value > 0 else 60
+
+    def _save_clock_sound_lead_seconds(self, setting_key, var):
+        export_prefs.save_value(f"{setting_key}_lead_seconds", var.get())
 
     def _play_level_transition_sounds(self, old_level, new_level):
         """Joue les sons configurés (boutons "Son début Pause"/"Son Fin
@@ -7219,19 +7412,13 @@ class App(tk.Tk):
                 self.blinds_tree.item(str(current_order), tags=("current",))
             self._blinds_tab_current_order = current_order
 
-        # Bandeau d'élimination : état recalculé ici à chaque appel (comme
-        # movement_alert juste en dessous), plutôt que via un self.after()
-        # séparé — voir _advance_elimination_banner, seul point qui fait
-        # avancer la file. "until" est une échéance epoch absolue (pas un
-        # décompte), donc robuste même si _refresh_clock_tab n'a pas
-        # tourné pendant un moment (écran projecteur resté fermé) : le
-        # bandeau en retard est simplement avancé/expiré au tick suivant,
-        # jamais perdu ni dupliqué.
-        if (self._elimination_banner_current is not None
-                and time.time() >= self._elimination_banner_current["until"]):
-            self._advance_elimination_banner()
-        elif self._elimination_banner_current is None and self._elimination_banner_queue:
-            self._advance_elimination_banner()
+        # Bandeau d'élimination : l'échéance ("until", epoch absolue) est
+        # désormais vérifiée/avancée dans _tick() (voir plus bas),
+        # INCONDITIONNELLEMENT à chaque seconde — pas ici, puisque cette
+        # méthode-ci ne tourne que si l'onglet Chronomètre est affiché ou
+        # l'écran projecteur est ouvert (voir _tick). self._elimination_
+        # banner_current est donc déjà à jour au moment où on l'affiche
+        # ci-dessous, une seule source de vérité pour l'avancer.
 
         movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
         if movement_alert and self.db.count_seat_moves() == 0:
@@ -7426,6 +7613,15 @@ class App(tk.Tk):
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
+        # Bascule de l'en-tête "Hr de Début" (voir _toggle_blinds_start_
+        # time / _refresh_blinds_tab) : None = colonne affichée depuis
+        # 00:00 (comportement d'origine, purement relatif au début du
+        # tournoi) ; sinon, minutes depuis minuit capturées lors du
+        # dernier clic sur "Hr de Début" en mode "heure réelle" — sert de
+        # base à toute la colonne jusqu'au prochain clic. Volontairement
+        # non persisté (comme blinds_field_width_var l'est, lui) : simple
+        # aperçu de planification, remis à 00:00 à chaque redémarrage.
+        self._blinds_start_now_minutes = None
         self._blind_row_vars = []
         self._refresh_blinds_tab()
 
@@ -7855,6 +8051,20 @@ class App(tk.Tk):
         export_prefs.save_value("blinds_field_width", width)
         self._refresh_blinds_tab()
 
+    def _toggle_blinds_start_time(self):
+        """Clic sur l'en-tête "Hr de Début" (voir _refresh_blinds_tab) :
+        bascule toute la colonne entre l'heure réelle de l'ordinateur (au
+        moment de CE clic, figée jusqu'au prochain clic — pas une horloge
+        qui continue d'avancer) et 00:00. Purement un aperçu de
+        planification : ne touche à rien en base de données, ne modifie
+        aucune donnée du tournoi ni du chronomètre déjà en cours."""
+        if self._blinds_start_now_minutes is None:
+            now = datetime.now()
+            self._blinds_start_now_minutes = now.hour * 60 + now.minute
+        else:
+            self._blinds_start_now_minutes = None
+        self._refresh_blinds_tab()
+
     def _refresh_blinds_tab(self):
         for w in self.blinds_rows_frame.winfo_children():
             w.destroy()
@@ -7863,17 +8073,37 @@ class App(tk.Tk):
         headers = ["Round", "Hr de Début", "Durée (min)", "Petite Blind", "Grosse Blind",
                    "Ante", "Durée Pause (min)", ""]
         for col, h in enumerate(headers):
-            ttk.Label(self.blinds_rows_frame, text=h, font=("Helvetica", 9, "bold"),
-                      foreground=GOLD_DARK).grid(row=0, column=col, padx=6, pady=(0, 6), sticky="w")
+            header_lbl = ttk.Label(self.blinds_rows_frame, text=h, font=("Helvetica", 9, "bold"),
+                                    foreground=GOLD_DARK)
+            header_lbl.grid(row=0, column=col, padx=6, pady=(0, 6), sticky="w")
+            if col == 1:
+                # "Hr de Début" bascule heure réelle <-> 00:00 au clic
+                # (voir _toggle_blinds_start_time) — seul en-tête cliquable
+                # de ce tableau, d'où le curseur main + l'astuce ci-dessous
+                # pour le rendre repérable (rien d'autre ne change dans
+                # cette colonne quand on ne clique pas).
+                header_lbl.configure(cursor="hand2")
+                header_lbl.bind("<Button-1>", lambda e: self._toggle_blinds_start_time())
+                Tooltip(
+                    header_lbl,
+                    "Cliquer pour basculer entre l'heure réelle de\n"
+                    "l'ordinateur (au moment du clic) et 00:00 comme\n"
+                    "point de départ de toute la colonne.",
+                )
 
         rounds = self._blind_rounds_from_db()
         if not rounds:
             rounds = [{"duration": 15, "sb": 25, "bb": 50, "ante": 0, "pause": 0}]
 
-        # Heure de début (temps écoulé depuis le début du tournoi) de chaque
-        # round : 0:00 pour le premier, puis chaque round suivant démarre
-        # à la fin du round précédent + sa pause éventuelle (Durée Pause),
-        # pour refléter le temps réellement écoulé à la table.
+        # Heure de début de chaque round : soit le temps écoulé depuis le
+        # début du tournoi (base 00:00, comportement d'origine), soit
+        # l'heure réelle au moment du dernier clic sur "Hr de Début" +
+        # ce même temps écoulé (voir _blinds_start_now_minutes /
+        # _toggle_blinds_start_time) — dans les deux cas, chaque round
+        # suivant démarre à la fin du round précédent + sa pause
+        # éventuelle (Durée Pause). Modulo 24h : un tournoi qui dépasse
+        # minuit affiche "01:15" plutôt que "25:15".
+        base_minutes = self._blinds_start_now_minutes or 0
         elapsed_minutes = 0
         for i, rnd in enumerate(rounds, start=1):
             row_vars = {
@@ -7885,9 +8115,9 @@ class App(tk.Tk):
             }
             self._blind_row_vars.append(row_vars)
 
-            start_h, start_m = divmod(elapsed_minutes, 60)
+            start_h, start_m = divmod((base_minutes + elapsed_minutes) % (24 * 60), 60)
             ttk.Label(self.blinds_rows_frame, text=str(i)).grid(row=i, column=0, padx=6, pady=2)
-            ttk.Label(self.blinds_rows_frame, text=f"{start_h}:{start_m:02d}").grid(
+            ttk.Label(self.blinds_rows_frame, text=f"{start_h:02d}:{start_m:02d}").grid(
                 row=i, column=1, padx=6, pady=2
             )
             field_width = self.blinds_field_width_var.get()
@@ -8573,21 +8803,23 @@ class App(tk.Tk):
         # CE tournoi (self.db) mais repris par défaut pour le prochain
         # (tournament_prefs). Un ancien fichier .tournoi sans ce réglage
         # retombe proprement sur 5 (voir get_setting_int ci-dessous et
-        # dans _advance_elimination_banner). Séparée de "Durée (ms)" du
-        # son "Son sortie d'un joueur" (fenêtre "Sons de fin de
-        # Round/Pause...") : deux réglages indépendants, l'un pour la
-        # durée d'AFFICHAGE du bandeau, l'autre pour la durée du SON.
+        # dans _advance_elimination_banner). INDÉPENDANTE de la "Durée
+        # (ms)" du son "Son sortie d'un joueur" (fenêtre "Sons de fin de
+        # Round/Pause...") : deux réglages séparés, l'un pour la durée
+        # d'AFFICHAGE du bandeau, l'autre pour la durée du SON — y compris
+        # si aucun son n'est configuré du tout.
         elim_row = days_row + 2
-        elim_lbl = ttk.Label(left, text="Durée du message d'élimination (secondes) :")
+        elim_lbl = ttk.Label(left, text="Durée du bandeau d'élimination (secondes) :")
         elim_lbl.grid(row=elim_row, column=0, sticky="w", pady=(14, 4))
         Tooltip(
             elim_lbl,
             "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
             "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
-            "élimination — de 1 à 30 secondes, 5 par défaut. Sans lien\n"
-            "avec la « Durée (ms) » du son (fenêtre « Sons de fin de\n"
-            "Round/Pause... ») : deux réglages indépendants. Pris en\n"
-            "compte dès la prochaine élimination, sans redémarrer.",
+            "élimination — de 1 à 30 secondes, 5 par défaut. Indépendante\n"
+            "de la « Durée (ms) » du son « Son sortie d'un joueur »\n"
+            "(fenêtre « Sons de fin de Round/Pause... ») : deux réglages\n"
+            "séparés, même si aucun son n'est configuré. Pris en compte\n"
+            "dès la prochaine élimination, sans redémarrer.",
         )
         elim_seconds_var = tk.IntVar(
             value=max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
@@ -8851,6 +9083,71 @@ class App(tk.Tk):
             row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
         self._refresh_remote_control_status()
+
+        # -- Rééquilibrage simple guidé par la grosse blinde (version TEST,
+        # voir database.py: rebalance_tables/_bb_rebalance_prompt_enabled) :
+        # préférence GLOBALE (comme "Activer le contrôle à distance" juste
+        # au-dessus, pas une donnée du tournoi). Fait partie du CONTENU
+        # DÉFILANT de l'onglet, comme le reste des réglages de "right"
+        # (grid, même colonne 0, même sticky="w") : défile avec l'ascenseur
+        # et reste alignée horizontalement avec "Activer le contrôle à
+        # distance" pour la même raison qu'elle — pas de place() ni
+        # d'ancrage indépendant du défilement.
+        #
+        # Libellé/tooltip mis à jour (clé de stockage BB_REBALANCE_PROMPT_
+        # PREF_KEY et comportement INCHANGÉS, pour rester compatible avec
+        # une préférence déjà enregistrée par une version antérieure) :
+        # cette case ne pilote plus l'affichage d'une fenêtre Mac (retirée,
+        # voir _check_pending_rebalance) mais reste le seul interrupteur
+        # entre le mode "guidé" (demande quel siège est BB, affichée sur
+        # les téléphones) et le mode automatique historique
+        # (_legacy_pick_mover, voir database.py: rebalance_tables) — elle
+        # a donc toujours une utilité propre, indépendante de tout
+        # affichage Mac.
+        bb_prompt_row = remote_start_row + 4
+        self.bb_rebalance_prompt_var = tk.BooleanVar(
+            value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
+        )
+        bb_prompt_check = ttk.Checkbutton(
+            right, text="Équilibrage guidé par la grosse blinde (demande sur le téléphone)",
+            variable=self.bb_rebalance_prompt_var, command=self._on_bb_rebalance_prompt_toggle,
+        )
+        bb_prompt_check.grid(row=bb_prompt_row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        Tooltip(
+            bb_prompt_check,
+            "Activée (par défaut) : lors d'un simple rééquilibrage entre\n"
+            "tables (pas un cassage de table), demande quel siège est\n"
+            "actuellement grosse blinde — sur tous les téléphones du\n"
+            "contrôle à distance — pour choisir qui se déplace. Rien ne\n"
+            "s'affiche sur ce Mac, seul le calcul/résultat y est appliqué.\n"
+            "Désactivée : aucune demande, l'ancien mécanisme historique\n"
+            "choisit directement, comme \"Continuer sans indiquer la BB\".",
+        )
+
+    def _on_bb_rebalance_prompt_toggle(self):
+        """Case "Équilibrage guidé par la grosse blinde" (Paramètres) :
+        mémorise le choix (réglage global, comme _on_remote_control_
+        toggle) et prend effet immédiatement, sans redémarrer —
+        database.py relit cette préférence à chaque appel de
+        rebalance_tables() (voir _bb_rebalance_prompt_enabled), donc le
+        PROCHAIN rééquilibrage en tient déjà compte.
+
+        Cas particulier explicitement demandé : si la case est décochée
+        alors qu'une question est actuellement en attente de réponse, on
+        ne l'abandonne pas telle quelle (le mouvement resterait à
+        décider indéfiniment) — on la résout tout de suite avec l'ancien
+        mécanisme historique, exactement comme si "Continuer sans
+        indiquer la BB" avait été cliqué. Passe par
+        _resolve_pending_rebalance (pas un appel direct à la base) :
+        cette demande est ainsi consommée de façon sûre, comme n'importe
+        quelle autre réponse (voir sa docstring et celle de database.py:
+        resolve_pending_rebalance) — aucun risque de double mouvement."""
+        enabled = self.bb_rebalance_prompt_var.get()
+        export_prefs.save_value(BB_REBALANCE_PROMPT_PREF_KEY, enabled)
+        if not enabled and self.db is not None and self.db.pending_rebalance is not None:
+            self._resolve_pending_rebalance(
+                self.db.pending_rebalance["request_id"], None, from_remote=False
+            )
 
     def _test_movement_signal(self):
         try:
@@ -9202,6 +9499,23 @@ class App(tk.Tk):
         if not self.winfo_exists():
             return
         current = self.notebook.tab(self.notebook.select(), "text")
+        # Expiration du bandeau d'élimination : vérifiée ICI,
+        # INCONDITIONNELLEMENT à chaque tick (1x/seconde), plutôt que
+        # seulement dans _refresh_clock_tab() ci-dessous (qui, elle, ne
+        # tourne QUE si l'onglet Chronomètre est affiché ou l'écran
+        # projecteur est ouvert — voir la condition juste en dessous). Un
+        # bandeau doit disparaître à l'heure même si aucun des deux n'est
+        # vrai au moment précis de son échéance (ex : l'écran projecteur
+        # fermé puis rouvert entre-temps) — voir aussi _refresh_clock_tab,
+        # qui n'a plus besoin de repasser dessus (source unique, testé en
+        # conditions réelles : onglet différent, fenêtre projecteur
+        # ouverte plus de 15s, éliminations rapprochées, bouton
+        # "Chronomètre" du téléphone).
+        if (self._elimination_banner_current is not None
+                and time.time() >= self._elimination_banner_current["until"]):
+            self._advance_elimination_banner()
+        elif self._elimination_banner_current is None and self._elimination_banner_queue:
+            self._advance_elimination_banner()
         if current == "Chronomètre" or (self.clock_window is not None and self.clock_window.winfo_exists()):
             self._refresh_clock_tab()
         elif current == "Mouvements":
@@ -9223,12 +9537,76 @@ class App(tk.Tk):
             self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
             self._refresh_remote_players_cache()
             self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+            self._remote_has_pending_moves = self.db.count_seat_moves() > 0
+            self._maybe_reclaim_default_remote_port()
         # Filet de sécurité (voir docstring de _check_pending_rebalance) :
         # garantit qu'une question "grosse blinde" en attente est toujours
         # affichée/rafraîchie au moins une fois par seconde, même si
         # l'action qui l'a créée ne l'a pas déjà fait explicitement.
         self._check_pending_rebalance()
+        self._check_phone_selected_pid()
         self._tick_after_id = self.after(1000, self._tick)
+
+    def _maybe_reclaim_default_remote_port(self):
+        """Corrige la perte de connexion du téléphone après "Fin de la
+        partie" (voir remote_control.py: /end_tournament et JS
+        confirmEndTournament) quand le tournoi fermé tenait le port
+        habituel (8765, remote_control.DEFAULT_PORT) : le téléphone ne
+        parle jamais qu'à ce port précis (pare-feu club), qui disparaît
+        avec le processus qui vient de se fermer — un simple lien "revenir
+        au Lobby" ne servirait donc plus à rien puisque le serveur qui
+        l'aurait servi n'existe plus.
+
+        Appelé depuis _tick sur CHAQUE tournoi encore ouvert (donc sur
+        chacun des éventuels survivants) : si CE tournoi-ci n'est pas déjà
+        sur 8765 et qu'aucun tournoi encore inscrit au registre partagé
+        (voir open_windows.list_remote_tournaments) ne l'occupe non plus,
+        tente de le récupérer (RemoteControlServer.try_reclaim_default_
+        port — sans risque de rester sans port du tout, voir sa
+        docstring). Aucune négociation entre processus : chacun réessaie
+        à son propre tick, le premier qui réussit son bind() l'emporte,
+        les autres réessaieront simplement au tick suivant s'il s'avère
+        que ce n'était pas encore le bon moment. Le téléphone (voir
+        confirmEndTournament, qui retente /lobbylist un court instant
+        après "Fin de la partie") retrouve ainsi ce tournoi tout seul,
+        sans action manuelle."""
+        server = self.remote_control_server
+        if server is None or not server.is_running or server.port == remote_control.DEFAULT_PORT:
+            return
+        if any(t["port"] == remote_control.DEFAULT_PORT for t in open_windows.list_remote_tournaments()):
+            return  # quelqu'un d'autre l'a déjà (ou toujours) — rien à faire ici
+        if server.try_reclaim_default_port() and self.db:
+            open_windows.update_remote_info(
+                self.db.path, server.port, self._remote_control_tournament_name
+            )
+            self._refresh_remote_control_status()
+
+    def _check_phone_selected_pid(self):
+        """Bascule automatiquement CETTE fenêtre au premier plan sur le
+        Mac si un téléphone vient de choisir SON tournoi dans la page
+        "Lobby" du contrôle à distance (voir open_windows.
+        set_phone_selected_pid, appelé par /select_tournament) — appelé
+        depuis _tick (donc actif en continu tant que cette fenêtre de
+        tournoi est ouverte, PAS seulement quand une fenêtre Lobby Mac
+        est ouverte : avant ce correctif, seule LobbyDialog._refresh
+        surveillait phone_selected_pid.json, donc rien ne réagissait au
+        choix du téléphone si aucun Lobby n'était affiché sur le Mac à ce
+        moment-là).
+
+        Même principe et même garde-fou que LobbyDialog._refresh (voir
+        son commentaire) : ne réagit qu'à un CHANGEMENT de pid par
+        rapport au dernier déjà traité ici (_last_synced_phone_pid,
+        jamais ré-appliqué en boucle), et seulement si ce pid est le
+        SIEN — les autres fenêtres de tournoi ouvertes voient le même
+        changement au même moment (chacune sa propre variable
+        _last_synced_phone_pid) mais ne se ramènent pas elles-mêmes au
+        premier plan puisque ce n'est pas leur pid."""
+        phone_pid = open_windows.get_phone_selected_pid()
+        if phone_pid is None or phone_pid == self._last_synced_phone_pid:
+            return
+        self._last_synced_phone_pid = phone_pid
+        if phone_pid == os.getpid():
+            open_windows.bring_pid_to_front(phone_pid)
 
     def _refresh_remote_players_cache(self):
         """Reconstruit self._remote_players_cache (liste de joueurs actifs

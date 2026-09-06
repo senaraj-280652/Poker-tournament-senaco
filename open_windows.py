@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 
 def _registry_path():
@@ -87,11 +88,20 @@ def _prune(data):
 
 def register(path):
     """Enregistre le processus courant comme affichant `path` — appelé
-    une fois le tournoi effectivement ouvert (voir App.__init__)."""
+    une fois le tournoi effectivement ouvert (voir App.__init__).
+
+    `registered_at` (epoch) : horodatage de CETTE ouverture, indépendant
+    de tout ce qui touche au contrôle à distance — sert uniquement à
+    déterminer le tournoi le plus RÉCEMMENT ouvert parmi ceux joignables
+    depuis un téléphone (voir remote_control.py: resolve_current_pid),
+    jamais modifié ensuite par update_remote_info (simple merge, voir sa
+    docstring) : reprendre plus tard le port 8765 (voir App._maybe_
+    reclaim_default_remote_port) ne doit jamais faire passer un tournoi
+    pour "le plus récent" à sa place."""
     if not path:
         return
     data = _prune(_load())
-    data[os.path.abspath(path)] = {"pid": os.getpid()}
+    data[os.path.abspath(path)] = {"pid": os.getpid(), "registered_at": time.time()}
     _save(data)
 
 
@@ -123,7 +133,11 @@ def list_remote_tournaments():
     besoin de rien d'autre que ce simple registre partagé sur disque
     pour savoir joindre (en local, sur 127.0.0.1) le serveur de
     n'importe quel autre tournoi ouvert, même depuis le port d'un
-    tournoi différent. Chaque entrée : {"pid", "port", "name"}."""
+    tournoi différent. Chaque entrée : {"pid", "port", "name",
+    "registered_at"} — ce dernier sert à remote_control.py:
+    resolve_current_pid à déterminer le tournoi le plus récemment
+    ouvert (0 par défaut pour une entrée héritée d'avant ce champ, donc
+    jamais considérée "la plus récente" face à une vraie ouverture)."""
     data = _prune(_load())
     result = []
     for entry in data.values():
@@ -133,6 +147,7 @@ def list_remote_tournaments():
                 "pid": entry.get("pid"),
                 "port": port,
                 "name": entry.get("tournament_name") or "Tournoi",
+                "registered_at": entry.get("registered_at", 0),
             })
     return result
 
@@ -173,14 +188,135 @@ def list_open_paths():
     return list(data.keys())
 
 
+def find_path_for_pid(pid):
+    """Chemin .tournoi actuellement ouvert par ce pid, ou None (pid
+    inconnu ou son processus a disparu) — utilisé par LobbyDialog pour
+    retrouver quel tournoi sélectionner à l'écran à partir d'un pid choisi
+    depuis un téléphone (voir get_phone_selected_pid)."""
+    if not isinstance(pid, int):
+        return None
+    data = _prune(_load())
+    for path, entry in data.items():
+        if entry.get("pid") == pid:
+            return path
+    return None
+
+
+def _phone_selection_path():
+    return os.path.join(os.path.expanduser("~"), ".poker_tournament", "phone_selected_pid.json")
+
+
+def set_phone_selected_pid(pid):
+    """Mémorise le pid du tournoi actuellement choisi par UN téléphone
+    dans la page "Lobby" du contrôle à distance (voir /select_tournament
+    dans remote_control.py) — pour que toute fenêtre "Lobby" Mac
+    (LobbyDialog, main.py) ouverte à ce moment-là, quel que soit le
+    processus qui l'héberge, puisse aligner sa sélection visuelle sur ce
+    même tournoi (voir get_phone_selected_pid / LobbyDialog._refresh).
+
+    Fichier SÉPARÉ du registre principal (open_windows.json) : ce
+    dernier associe à chaque clé (un chemin de fichier .tournoi) un
+    dict {"pid": ...} que _prune() relit systématiquement en boucle — y
+    mélanger une clé spéciale non-chemin casserait cette hypothèse.
+
+    Peut être appelée directement depuis le thread du serveur de
+    contrôle à distance (comme on_upload_photo/get_photo_image dans
+    remote_control.py) : simple écriture de fichier, ne touche ni
+    self.db (SQLite) ni Tkinter."""
+    try:
+        with open(_phone_selection_path(), "w", encoding="utf-8") as f:
+            json.dump({"pid": pid}, f)
+    except OSError:
+        pass
+
+
+def get_phone_selected_pid():
+    """Dernier pid choisi par un téléphone (voir set_phone_selected_pid),
+    ou None si jamais renseigné ou fichier illisible/absent. Ne vérifie
+    PAS que ce pid correspond encore à un processus vivant : l'appelant
+    (LobbyDialog) le fait déjà lui-même via find_path_for_pid, en gardant
+    simplement la sélection existante si ce pid ne correspond plus à
+    rien — jamais de sélection "par défaut" à sa place."""
+    path = _phone_selection_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    pid = data.get("pid") if isinstance(data, dict) else None
+    return pid if isinstance(pid, int) else None
+
+
 def bring_pid_to_front(pid):
     """Ramène au premier plan la fenêtre du processus `pid` (best-effort,
     silencieux en cas d'échec — ex : permission Accessibilité macOS non
-    accordée, ou plateforme non gérée)."""
+    accordée, ou plateforme non gérée).
+
+    Sous macOS, "frontmost of process" ne suffit pas toujours à faire
+    remonter visuellement la fenêtre Tk au-dessus des autres (le
+    processus devient actif mais sa fenêtre peut rester derrière) : on
+    tente en plus un AXRaise (Accessibilité) sur sa fenêtre principale
+    visible, qui remonte explicitement la fenêtre elle-même. L'activation
+    du process reste faite en premier et inconditionnellement, donc si
+    AXRaise échoue (permission Accessibilité absente, élément introuvable,
+    etc. — voir échec initial osascript -1719), le comportement retombe
+    silencieusement sur l'activation seule (comportement actuel).
+
+    La résolution du process cible se fait par une boucle manuelle sur
+    `every process` plutôt que par `first process whose unix id is
+    {pid}` : ce filtre "whose" de System Events s'est avéré peu fiable
+    quand plusieurs process partagent le même nom/bundle (ex. deux
+    fenêtres de CETTE appli, toutes deux "Python"/org.python.python) —
+    vérifié en le voyant renvoyer le mauvais process (celui d'un AUTRE
+    tournoi déjà ouvert) alors qu'une comparaison manuelle de `unix id`
+    élément par élément trouve, elle, systématiquement le bon. C'est ce
+    qui provoquait le "Menu principal" (fenêtre "Bienvenue", nouveau
+    process lancé depuis un tournoi déjà ouvert) ramené derrière
+    l'ancien tournoi presque aussitôt après son apparition : les
+    tentatives successives de raise_process_when_ready ciblaient en
+    réalité, à cause de ce bug, l'ancien tournoi plutôt que la nouvelle
+    fenêtre.
+
+    `try` autour de CHAQUE comparaison `unix id of p` (pas seulement
+    autour du bloc AXRaise plus bas) : juste après qu'un ou plusieurs
+    tournois se soient fermés (notamment via "Fin de la partie" depuis
+    le téléphone — voir remote_control.py), leur process peut rester
+    listé par System Events pendant un court instant sous une forme
+    "fantôme" dont certaines propriétés (dont `unix id`) lèvent une
+    erreur AppleScript à la lecture. Sans ce `try`, cette seule erreur
+    interrompait TOUT le `repeat` (AppleScript ne continue pas après une
+    erreur non rattrapée) avant même d'avoir atteint le vrai process
+    cible plus loin dans la liste — symptôme observé : "Menu principal"
+    lance bien une nouvelle fenêtre "Bienvenue" (le process existe,
+    voir raise_process_when_ready) mais ne parvient plus jamais à la
+    ramener au premier plan, reproductible juste après avoir fermé
+    plusieurs tournois depuis le téléphone. Un process qui lève ainsi
+    est simplement ignoré (ni lui ni personne ne "gagne" cette
+    itération), la recherche continue normalement avec le suivant."""
     if sys.platform == "darwin":
         script = (
-            f'tell application "System Events" to set frontmost of '
-            f'(first process whose unix id is {pid}) to true'
+            'tell application "System Events"\n'
+            '    set targetProc to missing value\n'
+            '    repeat with p in (every process)\n'
+            '        try\n'
+            f'            if unix id of p is {pid} then\n'
+            '                set targetProc to p\n'
+            '                exit repeat\n'
+            '            end if\n'
+            '        end try\n'
+            '    end repeat\n'
+            '    if targetProc is not missing value then\n'
+            '        set frontmost of targetProc to true\n'
+            '        try\n'
+            '            set visibleWindows to (windows of targetProc whose visible is true)\n'
+            '            if (count of visibleWindows) > 0 then\n'
+            '                perform action "AXRaise" of item 1 of visibleWindows\n'
+            '            end if\n'
+            '        end try\n'
+            '    end if\n'
+            'end tell'
         )
         try:
             subprocess.Popen(

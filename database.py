@@ -13,6 +13,8 @@ import shutil
 import random
 import uuid
 
+import export_prefs
+
 # =====================================================================
 # Export PDF : petit utilitaire partagé par tous les export_*_pdf
 # ci-dessous (Joueurs, Primes, Résultats, Gains, Synthèse par période).
@@ -272,6 +274,17 @@ def bounty_unit_value(n_players, flat_value=0):
 # vrai tournoi ne scinde jamais les tout derniers joueurs entre deux
 # tables alors qu'ils tiendraient sur une seule table finale.
 FINAL_TABLE_MAX_SEATS = 10
+
+# Préférence GLOBALE (voir export_prefs.py — même mécanisme que
+# "remote_control_enabled", partagée par tous les tournois/Sit & Go de
+# cette machine, pas une donnée du tournoi) qui active/désactive la
+# question "quel siège est actuellement grosse blinde ?" lors d'un simple
+# rééquilibrage (voir rebalance_tables, _bb_rebalance_prompt_enabled, et
+# App._build_settings_tab / App._on_bb_rebalance_prompt_toggle dans
+# main.py). Un seul et même nom de clé utilisé des deux côtés (importé
+# dans main.py) pour ne jamais risquer une faute de frappe entre les deux.
+# Activée par défaut (voir _bb_rebalance_prompt_enabled).
+BB_REBALANCE_PROMPT_PREF_KEY = "bb_rebalance_prompt_enabled"
 
 
 class Database:
@@ -915,43 +928,121 @@ class Database:
         # rappelant cette méthode elle-même pendant qu'on attend, ce qui
         # bloquerait le thread principal Tkinter. Une seule question à la
         # fois : si une question posée par un appel précédent est toujours
-        # sans réponse, on n'en pose pas une seconde — mais on vérifie
-        # d'abord qu'elle concerne toujours une table active (sinon on
-        # l'abandonne silencieusement : un cassage de table, ci-dessus, a
-        # pu fermer cette table entre-temps), pour ne jamais laisser un
-        # téléphone afficher une question qui n'a plus de sens.
+        # sans réponse, on n'en pose pas une seconde — mais on la
+        # REVALIDE D'ABORD sur l'état COURANT (au lieu de se contenter de
+        # vérifier que sa table existe encore) : rebalance_tables() peut
+        # être rappelée (par une élimination CONCURRENTE sur une AUTRE
+        # table, un ajout de joueur...) pendant qu'une demande est encore
+        # affichée sur le téléphone, sans attendre sa réponse — voir
+        # eliminate_player, qui rappelle toujours rebalance_tables()
+        # inconditionnellement. Sans cette revalidation ICI (au moment du
+        # recalcul, PAS seulement à la réponse — resolve_pending_rebalance
+        # le fait déjà, mais seulement quand l'utilisateur répond, ce qui
+        # peut prendre un moment), une demande devenue obsolète entre-temps
+        # (écart déjà résorbé, ou déplacé sur une autre table par un
+        # cassage de table ci-dessus) restait affichée sur le téléphone
+        # jusqu'à ce que l'utilisateur y réponde pour rien — symptôme
+        # observé : une deuxième question de grosse blinde alors qu'un
+        # seul déplacement était en réalité nécessaire.
         if self.pending_rebalance is not None:
             still_valid = any(
                 t["id"] == self.pending_rebalance["table_id"] for t in self.list_tables()
             )
             if not still_valid:
+                # Cassage de table (ci-dessus) : la table de cette demande
+                # vient d'être fermée. Plus rien à répondre.
                 self.pending_rebalance = None
+            else:
+                need = self._detect_simple_rebalance_need()
+                if need is None:
+                    # Écart déjà résorbé entre-temps (par le déplacement
+                    # d'un autre joueur, une élimination ailleurs...) :
+                    # cette demande n'a plus d'objet, retirée sans
+                    # attendre une réponse qui ne déplacerait plus
+                    # personne de toute façon (voir resolve_pending_
+                    # rebalance, étape 2 — même logique, appliquée ici
+                    # PLUS TÔT, dès ce recalcul plutôt qu'à la réponse).
+                    self.pending_rebalance = None
+                else:
+                    source_table, occupied_seats = need
+                    if source_table["id"] != self.pending_rebalance["table_id"]:
+                        # Le besoin a basculé sur une AUTRE table entre-
+                        # temps : l'ancienne demande ne correspond plus à
+                        # rien de valide — remplacée par une nouvelle
+                        # demande cohérente, avec un NOUVEL identifiant
+                        # (l'ancien ne doit plus jamais pouvoir "gagner",
+                        # même par coïncidence côté téléphone — même
+                        # principe que l'étape 3 de resolve_pending_
+                        # rebalance, appliqué ici au recalcul plutôt qu'à
+                        # la réponse).
+                        self.pending_rebalance = {
+                            "request_id": uuid.uuid4().hex,
+                            "table_id": source_table["id"],
+                            "table_name": source_table["name"],
+                            "seats": occupied_seats,
+                            "record_moves": self.pending_rebalance["record_moves"],
+                            "before_state": dict(before_state),
+                            "created_at": time.time(),
+                        }
+                    else:
+                        # Toujours la même table source : la demande reste
+                        # valide TELLE QUELLE — même request_id, jamais
+                        # recréée inutilement (une nouvelle demande à
+                        # chaque appel casserait la réponse déjà envoyée
+                        # par un téléphone entre-temps, voir la règle de
+                        # consommation de resolve_pending_rebalance). Seuls
+                        # les sièges affichés sont rafraîchis si
+                        # l'occupation de CETTE table a changé (ex : un de
+                        # ses propres joueurs éliminé entre-temps, sans que
+                        # ça ne change QUELLE table doit donner un joueur).
+                        self.pending_rebalance["seats"] = occupied_seats
 
         if self.pending_rebalance is None:
-            need = self._detect_simple_rebalance_need()
-            if need is not None:
-                source_table, occupied_seats = need
-                # La table de DESTINATION n'est volontairement pas
-                # mémorisée ici — elle sera recalculée à l'état courant au
-                # moment de la réponse (resolve_pending_rebalance ->
-                # _move_player_to_least_full_table), sans changer sa
-                # logique de choix actuelle (consigne explicite de cette
-                # version TEST). before_state (qui était où AVANT ce
-                # rééquilibrage-ci) est mémorisé tel quel dans la demande :
-                # c'est la référence historique nécessaire à
-                # _legacy_pick_mover si "Continuer sans indiquer la BB"
-                # est utilisé plus tard pour y répondre (voir
-                # resolve_pending_rebalance) — y compris si cette demande
-                # est ensuite recréée pour une autre table entre-temps.
-                self.pending_rebalance = {
-                    "request_id": uuid.uuid4().hex,
-                    "table_id": source_table["id"],
-                    "table_name": source_table["name"],
-                    "seats": occupied_seats,
-                    "record_moves": record_moves,
-                    "before_state": dict(before_state),
-                    "created_at": time.time(),
-                }
+            if self._bb_rebalance_prompt_enabled():
+                need = self._detect_simple_rebalance_need()
+                if need is not None:
+                    source_table, occupied_seats = need
+                    # La table de DESTINATION n'est volontairement pas
+                    # mémorisée ici — elle sera recalculée à l'état courant
+                    # au moment de la réponse (resolve_pending_rebalance ->
+                    # _move_player_to_least_full_table), sans changer sa
+                    # logique de choix actuelle (consigne explicite de
+                    # cette version TEST). before_state (qui était où AVANT
+                    # ce rééquilibrage-ci) est mémorisé tel quel dans la
+                    # demande : c'est la référence historique nécessaire à
+                    # _legacy_pick_mover si "Continuer sans indiquer la BB"
+                    # est utilisé plus tard pour y répondre (voir
+                    # resolve_pending_rebalance) — y compris si cette
+                    # demande est ensuite recréée pour une autre table
+                    # entre-temps.
+                    self.pending_rebalance = {
+                        "request_id": uuid.uuid4().hex,
+                        "table_id": source_table["id"],
+                        "table_name": source_table["name"],
+                        "seats": occupied_seats,
+                        "record_moves": record_moves,
+                        "before_state": dict(before_state),
+                        "created_at": time.time(),
+                    }
+            else:
+                # Préférence "Afficher la fenêtre d'équilibrage guidé par
+                # la grosse blinde" désactivée (voir Paramètres) : jamais
+                # de question posée, jamais de pending_rebalance créé — le
+                # mécanisme historique choisit directement qui bouge
+                # (_legacy_pick_mover, EXACTEMENT comme "Continuer sans
+                # indiquer la BB"), en boucle tant qu'un écart persiste —
+                # repris ici du mécanisme d'origine (avant cette version
+                # TEST) pour résoudre tous les mouvements nécessaires en un
+                # seul appel, sans dépendre d'un enchaînement de réponses.
+                for _ in range(200):  # garde-fou anti boucle infinie
+                    need = self._detect_simple_rebalance_need()
+                    if need is None:
+                        break
+                    source_table, _occupied_seats = need
+                    mover_id = self._legacy_pick_mover(source_table["id"], before_state)
+                    if mover_id is None:
+                        break
+                    self._move_player_to_least_full_table(mover_id, exclude_table_id=source_table["id"])
 
         # NE comble PAS les sièges laissés vides par un joueur éliminé (ou
         # déplacé ailleurs) à une table par ailleurs inchangée : au poker,
@@ -1034,6 +1125,15 @@ class Database:
         return moves
 
     # ---------- rééquilibrage simple : question "grosse blinde" (TEST) ----------
+    def _bb_rebalance_prompt_enabled(self):
+        """Préférence globale (voir BB_REBALANCE_PROMPT_PREF_KEY) : True
+        par défaut, désactivée seulement si explicitement enregistrée à
+        False (case décochée dans Paramètres). Relue à CHAQUE appel
+        (jamais mise en cache) : un changement de ce réglage prend ainsi
+        effet immédiatement sur le prochain rééquilibrage, sans redémarrer
+        l'application."""
+        return export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
+
     def _detect_simple_rebalance_need(self):
         """Détecte si un rééquilibrage SIMPLE (pas un cassage de table,
         qui reste géré séparément plus haut dans rebalance_tables) est
