@@ -5834,8 +5834,23 @@ class App(tk.Tk):
                 # qu'un mouvement de table est en attente (le responsable
                 # doit d'abord fermer l'alerte avec "Terminé") — sinon le
                 # chrono repartirait alors que des joueurs n'ont pas encore
-                # changé de table.
-                if not alert_active:
+                # changé de table. Même précaution tant qu'une question
+                # "quel siège est grosse blinde ?" est encore SANS RÉPONSE
+                # (voir database.py: pending_rebalance — source de vérité
+                # unique, pas de second booléen redondant) : entre le
+                # moment où l'élimination a révélé un besoin de
+                # rééquilibrage et celui où quelqu'un y répond, le
+                # mouvement lui-même n'a pas encore eu lieu — un mouvement
+                # qui, une fois décidé, redeviendra visible via
+                # movement_alert_active (voir _trigger_movement_alert,
+                # appelé par _resolve_pending_rebalance) et bloquera alors
+                # la reprise par le chemin habituel ci-dessous. Si la
+                # question disparaît sans qu'aucun mouvement n'ait eu lieu
+                # (écart de rééquilibrage résorbé entretemps), plus rien ne
+                # bloque : pending_rebalance redevient None et ce même
+                # raccourci relance normalement, exactement comme avant
+                # l'apparition de cette question.
+                if not alert_active and self.db.pending_rebalance is None:
                     self._voice_resume_clock()
             else:
                 # Hors du contexte "reprendre après une élimination" :
