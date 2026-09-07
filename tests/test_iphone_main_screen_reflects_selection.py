@@ -147,8 +147,12 @@ class MainScreenReflectsSelectedTournamentTest(unittest.TestCase):
 
         # 3) Le nom affiché sur l'écran principal (chargé via le port de
         # A, avec la sélection de B) doit être celui de B, pas de A.
+        # `[^>]*` avant le `>` : tolère un attribut supplémentaire sur
+        # cette balise (ex : id="tournoi-name", voir le correctif de
+        # reconnexion automatique après "Fin de la partie") sans lier ce
+        # test à l'ordre exact des attributs HTML.
         html = _get_text(f"http://127.0.0.1:{port_a}/", cookie=cookie)
-        m = re.search(r'class="tournoi">([^<]+)<', html)
+        m = re.search(r'class="tournoi"[^>]*>([^<]+)<', html)
         self.assertIsNotNone(m, "nom du tournoi introuvable dans la page")
         self.assertEqual(m.group(1), "_scratch_B")
 
@@ -180,7 +184,7 @@ class MainScreenReflectsSelectedTournamentTest(unittest.TestCase):
         # BUG 2) — C ici, ni A (routeur) ni B (dernière sélection
         # explicite, qui ne doit pas "rester collée" sans cookie).
         html_no_cookie = _get_text(f"http://127.0.0.1:{port_a}/")
-        m3 = re.search(r'class="tournoi">([^<]+)<', html_no_cookie)
+        m3 = re.search(r'class="tournoi"[^>]*>([^<]+)<', html_no_cookie)
         self.assertEqual(m3.group(1), "_scratch_C")
 
     def test_bouton_retour_present_dans_lobbylist_et_va_vers_racine(self):

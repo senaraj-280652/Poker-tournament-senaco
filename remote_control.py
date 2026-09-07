@@ -188,7 +188,7 @@ _PAGE_TEMPLATE = """<!doctype html>
 <body>
   <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   <h1>🎙 Contrôle à distance</h1>
-  <p class="tournoi">{tournament_name}</p>
+  <p class="tournoi" id="tournoi-name">{tournament_name}</p>
   <p class="version">v{app_version}</p>
 
   {lobby_button}
@@ -239,49 +239,60 @@ function confirmEndTournament() {{
     // registre est traité comme "aucune sélection", jamais signalé comme
     // une erreur) — mieux vaut repartir sans aucune sélection.
     document.cookie = 'selected_pid=; Max-Age=0; Path=/';
-    if (!data.other_tournaments_remain) {{
-      status.textContent = 'Partie terminée. Aucun autre tournoi ouvert.';
-      return;
-    }}
-    status.textContent = 'Partie terminée. Retour au Lobby...';
-    goToLobbyWhenReady(0);
+    // En-tête immédiatement neutre : ce process va fermer (via la file
+    // d'attente vocale côté Python — voir _poll_voice_queue — donc pas
+    // forcément instantané), plus question d'afficher encore le nom de
+    // ce tournoi pendant l'attente qui suit.
+    document.getElementById('tournoi-name').textContent = 'En attente d\\'un tournoi';
+    status.textContent = data.other_tournaments_remain
+      ? 'Partie terminée. Retour au Lobby...'
+      : 'Partie terminée. En attente d\\'un nouveau tournoi...';
+    waitForDifferentTournamentThenReload(OWN_PID);
   }}).catch(function(e) {{
     status.textContent = 'Échec (' + e.message + ') — vérifiez le wifi.';
   }});
 }}
-// Après "Fin de la partie" (voir ci-dessus) : si CE tournoi tenait le
-// port habituel (8765 — celui-là même que ce navigateur utilise), le
-// serveur qui vient de répondre est en train de s'arrêter avec le reste
-// du processus. /lobbylist ne répondra donc plus tant qu'un AUTRE
-// tournoi encore ouvert n'aura pas repris ce port tout seul (voir
-// App._maybe_reclaim_default_remote_port côté Python, qui réessaie
-// chaque seconde) — d'où ces tentatives espacées plutôt qu'une simple
-// redirection immédiate, qui échouerait sans recours si elle tombe
-// exactement pendant que l'ancien serveur s'arrête. Dès qu'une tentative
-// aboutit (soit tout de suite si ce n'était pas ce tournoi-ci qui tenait
-// le port, soit après la reprise par un survivant), navigation
-// immédiate ; sinon repli propre après quelques secondes plutôt qu'une
-// page qui semble bloquée indéfiniment.
-var LOBBY_RETRY_DELAYS_MS = [300, 600, 1000, 1500, 2000, 2000, 2000];
-function goToLobbyWhenReady(attempt) {{
+// Après "Fin de la partie" : sonde périodiquement le point d'entrée
+// normal (port 8765 — toujours l'origine de CETTE page déjà chargée,
+// jamais un port/pid figé en dur) jusqu'à ce qu'un tournoi VIVANT et
+// DIFFÉRENT de celui qu'on vient de fermer (closedPid) réponde
+// réellement. Ne navigue JAMAIS (ni window.location, ni location.href,
+// ni reload) avant cette confirmation.
+//
+// Pourquoi pas simplement "la requête a réussi" (r.ok) : le tournoi
+// qu'on vient de fermer reste souvent joignable un court instant après
+// avoir répondu à /end_tournament — la fermeture réelle passe par la
+// file d'attente vocale de Tkinter (_poll_voice_queue côté Python,
+// scrutée toutes les 150 ms), pendant laquelle son propre serveur HTTP
+// continue de tourner normalement. Une redirection déclenchée sur la
+// seule foi d'un "r.ok" pouvait donc atterrir en fait sur CE MÊME
+// process en train de mourir, et échouer (le port pouvant se refermer
+// entre cette vérification et la navigation réelle) : c'est exactement
+// ce qui produisait l'écran natif Safari "ERR_CONNECTION_FAILED".
+//
+// /lobbylist expose maintenant l'en-tête X-Own-Pid (voir
+// _handle_lobbylist côté serveur) : le pid de QUI répond VRAIMENT à
+// CETTE requête précise (/lobbylist n'est jamais relayée vers un autre
+// process — voir do_GET, elle est toujours traitée localement). Un
+// tournoi n'est considéré "détecté" que si ce pid diffère de closedPid
+// — jamais sur la seule réussite de la requête. Un échec réseau (port
+// encore libre, personne n'écoute sur 8765 pour l'instant) est
+// silencieux et simplement retenté, comme une réponse dont le pid ne
+// diffère pas encore (le tournoi qu'on ferme lui-même, ou une réponse
+// sans cet en-tête) : dans les deux cas, on continue d'attendre, sans
+// jamais afficher d'erreur ni de popup.
+var RECONNECT_POLL_MS = 1500;
+function waitForDifferentTournamentThenReload(closedPid) {{
   fetch('/lobbylist', {{ cache: 'no-store' }}).then(function(r) {{
-    if (r.ok) {{
+    var responderPid = r.ok ? Number(r.headers.get('X-Own-Pid')) : NaN;
+    if (r.ok && responderPid && responderPid !== closedPid) {{
       window.location.href = '/lobbylist';
-    }} else {{
-      retryGoToLobbyOrGiveUp(attempt);
+      return;
     }}
+    setTimeout(function() {{ waitForDifferentTournamentThenReload(closedPid); }}, RECONNECT_POLL_MS);
   }}).catch(function() {{
-    retryGoToLobbyOrGiveUp(attempt);
+    setTimeout(function() {{ waitForDifferentTournamentThenReload(closedPid); }}, RECONNECT_POLL_MS);
   }});
-}}
-function retryGoToLobbyOrGiveUp(attempt) {{
-  if (attempt >= LOBBY_RETRY_DELAYS_MS.length) {{
-    document.getElementById('status').textContent =
-      'Partie terminée. Impossible de revenir automatiquement au Lobby — ' +
-      'rechargez cette page dans quelques instants.';
-    return;
-  }}
-  setTimeout(function() {{ goToLobbyWhenReady(attempt + 1); }}, LOBBY_RETRY_DELAYS_MS[attempt]);
 }}
 function sendAction(action, btn) {{
   var status = document.getElementById('status');
@@ -809,8 +820,20 @@ _PHOTOS_PAGE = """<!doctype html>
     padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
     position: sticky; top: 0; z-index: 10;
   }}
-  #topbar a {{ color: #b9ad8f; text-decoration: none; font-size: 15px; }}
   #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  /* "← Retour" : un vrai bouton tactile (même principe et même
+     présentation que sur la page Éliminations), pas un simple lien
+     texte discret — mène toujours à "/", résolu à CHAQUE clic par la
+     même logique de routage que le reste (voir resolve_current_pid
+     côté serveur) : jamais un pid figé dans ce bouton, donc toujours
+     valide même après changement de sélection, fermeture d'un
+     tournoi, ou reprise du port 8765 par un autre. */
+  #btn-back {{
+    border: none; border-radius: 8px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 9px 16px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
   #btn-reload {{
     width: 32px; height: 32px; border: none; border-radius: 50%;
     background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
@@ -875,7 +898,7 @@ _PHOTOS_PAGE = """<!doctype html>
 </head>
 <body>
   <div id="topbar">
-    <a href="/">← Retour</a>
+    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
@@ -1465,11 +1488,14 @@ class RemoteControlServer:
             def log_message(self, fmt, *args):
                 pass  # pas de log console à chaque requête (bruyant)
 
-            def _send_html(self, html):
+            def _send_html(self, html, extra_headers=None):
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                if extra_headers:
+                    for name, value in extra_headers.items():
+                        self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -1528,6 +1554,19 @@ class RemoteControlServer:
                     self.send_error(502, "Ce tournoi n'est momentanément plus joignable")
 
             def _handle_lobbylist(self):
+                # X-Own-Pid (voir confirmEndTournament/waitForDifferent
+                # TournamentThenReload côté client, dans _PAGE_TEMPLATE) :
+                # le pid de CE process, celui qui répond VRAIMENT à cette
+                # requête précise — jamais relayée vers un autre process
+                # (voir do_GET, "/lobbylist" est toujours traitée
+                # localement, avant même resolve_proxy_port). Permet au
+                # téléphone de distinguer, après "Fin de la partie", une
+                # réponse venant encore du tournoi en train de fermer
+                # (même pid) d'une réponse venant d'un tournoi VRAIMENT
+                # différent — sans quoi une navigation pouvait être
+                # déclenchée sur la foi d'une dernière réponse du process
+                # mourant, puis échouer si son port se refermait entre
+                # temps (écran natif Safari "ERR_CONNECTION_FAILED").
                 tournaments = open_windows.list_remote_tournaments()
                 if not tournaments:
                     rows = "<p class=\"empty\">Aucun tournoi joignable pour l'instant.</p>"
@@ -1553,7 +1592,10 @@ class RemoteControlServer:
                             f'onclick="window.location.href=\'/select_tournament?pid={t["pid"]}\'">{label}</button>'
                         )
                     rows = "\n".join(parts)
-                self._send_html(_LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT))
+                self._send_html(
+                    _LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT),
+                    extra_headers={"X-Own-Pid": str(own_pid)},
+                )
 
             def _handle_select_tournament(self):
                 from urllib.parse import parse_qs, urlparse

@@ -283,6 +283,99 @@ def spawn_app_process(extra_args=None):
     )
 
 
+SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
+
+
+def _single_tournament_pref_enabled():
+    """Préférence globale "Un seul tournoi à la fois" (onglet Paramètres,
+    juste sous "Équilibrage guidé par la grosse blinde") — cochée par
+    défaut, mémorisée indépendamment de chaque tournoi (voir
+    export_prefs, déjà utilisé pour d'autres préférences globales
+    comparables, ex : le délai de "Son prochain changement Blindes").
+    N'affecte que les DEMANDES de lancement d'un nouveau process (voir
+    _other_tournament_is_open/_block_second_tournament_if_needed) —
+    lire cette valeur ne touche à aucun tournoi déjà ouvert."""
+    return export_prefs.load_value(SINGLE_TOURNAMENT_PREF_KEY, True) is not False
+
+
+def _other_tournament_is_open():
+    """True si au moins un tournoi est actuellement ouvert (n'importe
+    lequel — voir plus bas pourquoi jamais d'exclusion de "soi-même"),
+    d'après le registre partagé (open_windows.list_open_paths(), qui
+    ignore déjà proprement les PID morts via _prune — voir sa
+    docstring).
+
+    AUCUNE exclusion d'un chemin "own_path" ici (une version antérieure
+    en prenait un et excluait le tournoi appelant de la comparaison) :
+    chaque appelant (_open_new_window, LobbyDialog._open_selected,
+    new_tournament/new_sng/open_tournament) s'apprête à ouvrir un
+    tournoi SUPPLÉMENTAIRE — la question à se poser est toujours "en
+    existe-t-il déjà au moins un", jamais "en existe-t-il un AUTRE que
+    moi". Exclure sa propre fenêtre était correct pour une tout autre
+    question (voir find_open_pid : "CE chemin précis est-il déjà
+    ouvert ailleurs", utilisé pour basculer vers un tournoi déjà actif),
+    mais faux ici : depuis le DERNIER tournoi restant après la fermeture
+    d'un autre, "Menu principal" avec cette exclusion ignorait ce
+    tournoi restant lui-même et autorisait à tort d'en ouvrir un
+    second — repéré lors d'un test manuel (option cochée APRÈS avoir
+    ouvert plusieurs tournois, puis fermeture de tous sauf un)."""
+    return bool(open_windows.list_open_paths())
+
+
+def _block_second_tournament_if_needed(parent):
+    """Point de contrôle central de la préférence "Un seul tournoi à la
+    fois" : à appeler AVANT tout spawn_app_process() qui lancerait un
+    NOUVEAU tournoi/Sit&Go (jamais avant de basculer vers un tournoi
+    déjà ouvert, voir LobbyDialog._open_selected — ce cas garde son
+    comportement actuel de premier plan, jamais bloqué), ainsi qu'en
+    filet de sécurité au tout début de new_tournament/new_sng/
+    open_tournament (voir _choose_tournament_file) — au cas où un
+    lancement passerait malgré l'état grisé de ces boutons (voir
+    _refresh_launch_buttons_state), ex. une fenêtre restée ouverte
+    depuis avant que la préférence ne soit activée. Renvoie True (et
+    affiche le message d'explication) si le lancement doit être refusé ;
+    False sinon, sans aucun effet de bord. Ne ferme ni ne modifie jamais
+    le tournoi déjà ouvert : une simple vérification avant de créer un
+    nouveau process, rien de plus."""
+    if not _single_tournament_pref_enabled():
+        return False
+    if not _other_tournament_is_open():
+        return False
+    messagebox.showinfo(
+        "Un seul tournoi à la fois",
+        "Un tournoi est déjà ouvert.\n\n"
+        "Désactivez « Un seul tournoi à la fois » dans Paramètres pour "
+        "autoriser plusieurs tournois simultanés.",
+        parent=parent,
+    )
+    return True
+
+
+def _refresh_launch_buttons_state(win, buttons):
+    """Active/désactive `buttons` (les commandes "Nouveau tournoi"/
+    "Sit & Go rapide"/"Ouvrir un tournoi existant" de _choose_tournament_
+    file — jamais "Lobby", qui doit rester accessible pour basculer vers
+    un tournoi DÉJÀ ouvert) selon "Un seul tournoi à la fois" et l'état
+    RÉEL du registre partagé (_other_tournament_is_open — toujours
+    recalculé ici, jamais mémorisé). Se reprogramme elle-même tant que
+    `win` existe (win.after, 1 seconde — assez réactif sans sonder trop
+    souvent) : détecte donc aussi bien la fermeture du dernier tournoi
+    ailleurs (réactive) que l'ouverture d'un premier tournoi (grise), et
+    un changement de la préférence elle-même pendant que cet écran
+    reste affiché, sans dépendre d'un quelconque tick déjà existant
+    (aucun ici : cette fenêtre s'affiche AVANT que _tick ne soit jamais
+    lancé, voir App.__init__). Ne remplace pas _block_second_tournament_
+    if_needed, déjà présent en filet de sécurité au tout début de chaque
+    commande — une simple couche d'interface en plus."""
+    if not win.winfo_exists():
+        return
+    disabled = _single_tournament_pref_enabled() and _other_tournament_is_open()
+    state = "disabled" if disabled else "normal"
+    for btn in buttons:
+        btn.configure(state=state)
+    win.after(1000, lambda: _refresh_launch_buttons_state(win, buttons))
+
+
 def raise_process_when_ready(widget, pid, attempt=0):
     """Tente de faire passer au premier plan le processus `pid` tout
     juste lancé par spawn_app_process (macOS et Windows, voir
@@ -1907,6 +2000,10 @@ class LobbyDialog(tk.Toplevel):
         # réellement nouveau (pid différent) continue, lui, à être
         # détecté et appliqué normalement (voir _refresh).
         self._last_synced_phone_pid = open_windows.get_phone_selected_pid()
+        # Garde anti-double-ouverture (voir _open_selected) : chemins pour
+        # lesquels un lancement est en cours depuis CETTE fenêtre, ni
+        # encore enregistré (open_windows.register), ni confirmé mort.
+        self._launching_paths = set()
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
@@ -2092,14 +2189,61 @@ class LobbyDialog(tk.Toplevel):
         if existing_pid:
             open_windows.bring_pid_to_front(existing_pid)
             return
+        # "Un seul tournoi à la fois" (Paramètres) : AVANT le lancement
+        # d'un nouveau process, jamais avant le "bring to front" ci-dessus
+        # (qui doit rester possible pour un tournoi déjà ouvert, quel que
+        # soit ce réglage). Compte TOUT tournoi actuellement ouvert, y
+        # compris celui de LA fenêtre qui a ouvert ce Lobby (self.master,
+        # voir App._open_lobby) : on s'apprête ici à en ouvrir un
+        # SUPPLÉMENTAIRE (chemin `path`, pas encore ouvert), donc ce
+        # tournoi-là compte bel et bien déjà comme "un tournoi ouvert" —
+        # voir _other_tournament_is_open.
+        if _block_second_tournament_if_needed(self):
+            return
+        # Deux clics rapprochés sur "🔀 Basculer vers" (ou un double-clic
+        # suivi d'un second) pour un chemin pas encore ouvert : chacun
+        # verrait `existing_pid` à None ci-dessus tant que le process tout
+        # juste lancé par le premier clic n'a pas eu le temps de
+        # s'enregistrer (open_windows.register, voir App.__init__) — sans
+        # garde, le second lancerait SA PROPRE fenêtre sur le même fichier
+        # .tournoi, soit deux process écrivant en même temps dedans (voir
+        # la tooltip de ce bouton). Garde purement logique, pas de délai
+        # arbitraire : tant qu'un lancement pour CE chemin précis est en
+        # cours, les clics suivants sur la même ligne sont ignorés
+        # silencieusement — un "Basculer vers" ultérieur bascule
+        # normalement vers la fenêtre dès qu'elle existe (existing_pid
+        # ci-dessus la retrouve alors).
+        if path in self._launching_paths:
+            return
+        self._launching_paths.add(path)
         try:
             proc = spawn_app_process([path])
         except OSError as e:
+            self._launching_paths.discard(path)
             messagebox.showerror(
                 "Erreur", f"Impossible d'ouvrir ce tournoi :\n{e}", parent=self,
             )
             return
         raise_process_when_ready(self, proc.pid)
+        self._clear_launch_guard_when_resolved(path, proc)
+
+    def _clear_launch_guard_when_resolved(self, path, proc, attempt=0):
+        """Lève la garde posée par _open_selected sur `path` dès que ce
+        lancement est résolu : soit le nouveau process s'est bien
+        enregistré (auquel cas une tentative suivante sur la même ligne
+        le retrouvera normalement via existing_pid), soit il est mort
+        entre-temps (une nouvelle tentative doit alors pouvoir relancer).
+        Mêmes intervalle et nombre d'essais que raise_process_when_ready
+        ci-dessus (700 ms, 5 essais) : le temps qu'un process démarre est
+        le même dans les deux cas. Filet de sécurité au-delà de ces
+        essais (plutôt qu'une attente indéfinie) : ne bloque jamais
+        durablement une ligne, même dans un cas non prévu."""
+        if not self.winfo_exists():
+            return
+        if open_windows.find_open_pid(path) is not None or proc.poll() is not None or attempt >= 5:
+            self._launching_paths.discard(path)
+            return
+        self.after(700, lambda: self._clear_launch_guard_when_resolved(path, proc, attempt + 1))
 
     def _schedule_refresh(self):
         self._after_id = self.after(self.REFRESH_MS, self._auto_refresh)
@@ -3843,7 +3987,19 @@ class App(tk.Tk):
         en corrige la cause la plus courante), le détecte au lieu de
         continuer vers raise_process_when_ready (qui essaierait de
         ramener au premier plan un pid déjà mort, puis abandonnerait sans
-        rien dire) — affiche une vraie erreur à la place."""
+        rien dire) — affiche une vraie erreur à la place.
+
+        TOUJOURS lancée, quelle que soit "Un seul tournoi à la fois"
+        (Paramètres) : "Menu principal" n'est PAS lui-même un second
+        tournoi (juste un écran d'accueil, voir _choose_tournament_file)
+        — la préférence ne doit jamais empêcher de l'afficher, seulement
+        ce qu'on peut y faire ensuite. C'est cet écran "Bienvenue" qui
+        grise ses propres boutons "Nouveau tournoi"/"Sit & Go rapide"/
+        "Ouvrir..." selon ce réglage (voir _refresh_launch_buttons_state)
+        et vérifie le garde backend à leur tout début (_block_second_
+        tournament_if_needed, filet de sécurité si jamais un appel
+        contournait cet état grisé) — c'est LÀ, jamais ici, que la
+        protection doit intervenir."""
         try:
             proc = spawn_app_process()
         except OSError as e:
@@ -3905,6 +4061,12 @@ class App(tk.Tk):
         ).pack(pady=(0, 24))
 
         def new_tournament():
+            # Filet de sécurité (voir _block_second_tournament_if_needed) :
+            # ce bouton est normalement déjà grisé dans ce cas (voir
+            # _refresh_launch_buttons_state), ce garde ne devrait donc
+            # jamais se déclencher en usage normal.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau tournoi",
@@ -3956,6 +4118,9 @@ class App(tk.Tk):
             win.destroy()
 
         def new_sng():
+            # Voir le commentaire équivalent dans new_tournament() ci-dessus.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder, day_filename = tournament_day_folder_proposal(is_sng=True)
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau Sit & Go",
@@ -4003,6 +4168,9 @@ class App(tk.Tk):
             win.destroy()
 
         def open_tournament():
+            # Voir le commentaire équivalent dans new_tournament() ci-dessus.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder = (
                 tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
             ).strip()
@@ -4018,9 +4186,10 @@ class App(tk.Tk):
 
         btn_frame = tk.Frame(win, bg=FELT_DARK)
         btn_frame.pack(pady=4)
-        ttk.Button(
+        new_tournament_btn = ttk.Button(
             btn_frame, text="🆕  Nouveau tournoi", command=new_tournament, width=28,
-        ).pack(pady=6)
+        )
+        new_tournament_btn.pack(pady=6)
         sng_btn = ttk.Button(
             btn_frame, text="🚀  Sit & Go rapide", command=new_sng, width=28,
         )
@@ -4033,9 +4202,10 @@ class App(tk.Tk):
             "joueurs choisis ci-après — à ajuster ensuite si besoin dans\n"
             "Paramètres/Gains, comme pour n'importe quel tournoi normal.",
         )
-        ttk.Button(
+        open_tournament_btn = ttk.Button(
             btn_frame, text="📂  Ouvrir un tournoi existant", command=open_tournament, width=28,
-        ).pack(pady=6)
+        )
+        open_tournament_btn.pack(pady=6)
         lobby_btn = ttk.Button(
             btn_frame, text="📋  Lobby (plusieurs tournois)",
             command=lambda: LobbyDialog(win), width=28,
@@ -4052,6 +4222,11 @@ class App(tk.Tk):
         ttk.Button(
             btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
         ).pack(pady=6)
+
+        # État initial correct dès le premier affichage (pas seulement au
+        # bout d'une seconde) : voir _refresh_launch_buttons_state, qui
+        # se reprogramme ensuite elle-même tant que `win` reste affichée.
+        _refresh_launch_buttons_state(win, [new_tournament_btn, sng_btn, open_tournament_btn])
 
         self.wait_window(win)
         if not result["path"]:
@@ -5722,6 +5897,17 @@ class App(tk.Tk):
                     self._resolve_pending_rebalance(request_id, seat, from_remote=True)
                 elif isinstance(item, tuple) and item and item[0] == "end_tournament":
                     self._remote_end_tournament()
+                    # La fenêtre vient d'être détruite (ou l'a déjà été,
+                    # voir _remote_end_tournament_triggered) : n'importe
+                    # quel élément suivant resterait dans la file, JAMAIS
+                    # traité ici — self.db est fermé mais pas remis à
+                    # None, donc les gardes "if not self.db" des autres
+                    # gestionnaires (_on_voice_word, _remote_eliminate...)
+                    # ne les arrêteraient pas et lèveraient
+                    # sqlite3.ProgrammingError. Ne reprogramme pas non
+                    # plus de nouveau passage : inutile, ce process se
+                    # termine de toute façon.
+                    return
                 else:
                     self._on_voice_word(item)
         except queue.Empty:
@@ -9124,6 +9310,57 @@ class App(tk.Tk):
             "choisit directement, comme \"Continuer sans indiquer la BB\".",
         )
 
+        # -- "Un seul tournoi à la fois" : préférence GLOBALE (comme la
+        # case juste au-dessus), cochée par défaut. N'empêche jamais de
+        # basculer vers un tournoi déjà ouvert (voir LobbyDialog.
+        # _open_selected) ni ne touche à quoi que ce soit de déjà ouvert
+        # — bloque uniquement la CRÉATION/l'OUVERTURE d'un tournoi ou
+        # Sit&Go supplémentaire (voir _block_second_tournament_if_needed,
+        # appelé depuis App._open_new_window et LobbyDialog._open_
+        # selected — les deux seuls endroits de tout le fichier qui
+        # lancent un nouveau process de tournoi, voir spawn_app_process).
+        single_tournament_row = bb_prompt_row + 1
+        self.single_tournament_var = tk.BooleanVar(
+            value=_single_tournament_pref_enabled()
+        )
+        single_tournament_check = ttk.Checkbutton(
+            right, text="Un seul tournoi à la fois",
+            variable=self.single_tournament_var, command=self._on_single_tournament_toggle,
+        )
+        single_tournament_check.grid(
+            row=single_tournament_row, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+        Tooltip(
+            single_tournament_check,
+            "Activée (par défaut) : interdit d'ouvrir un deuxième tournoi\n"
+            "ou Sit&Go tant qu'un tournoi est déjà ouvert (« Menu\n"
+            "principal », Lobby...) — ne ferme ni ne modifie jamais celui\n"
+            "déjà ouvert, ne fait qu'empêcher d'en lancer un second par\n"
+            "erreur. Désactivée : comportement multi-tournoi habituel,\n"
+            "inchangé.",
+        )
+
+    def _on_single_tournament_toggle(self):
+        export_prefs.save_value(SINGLE_TOURNAMENT_PREF_KEY, self.single_tournament_var.get())
+
+    def _sync_single_tournament_pref_checkbox(self):
+        """Préférence GLOBALE (voir SINGLE_TOURNAMENT_PREF_KEY) : une
+        SEULE valeur dans export_prefs.json, partagée par tous les
+        process, mais chacun ne la lit qu'UNE fois pour initialiser
+        self.single_tournament_var (voir _build_settings_tab) — sans ce
+        rappel périodique, un tournoi A déjà ouvert continuait d'afficher
+        l'ancien état de la case après qu'un tournoi B l'ait changée
+        (chacun n'ayant sa propre BooleanVar qu'en mémoire locale,
+        jamais relue depuis le disque après le démarrage). Appelé depuis
+        _tick (1x/seconde, comme _check_phone_selected_pid juste
+        au-dessus) plutôt qu'un nouveau mécanisme séparé : relit
+        _single_tournament_pref_enabled() et ne touche la case que si sa
+        valeur diffère réellement (évite tout scintillement/coup d'oeil
+        inutile sur ce widget à chaque tick)."""
+        current = _single_tournament_pref_enabled()
+        if self.single_tournament_var.get() != current:
+            self.single_tournament_var.set(current)
+
     def _on_bb_rebalance_prompt_toggle(self):
         """Case "Équilibrage guidé par la grosse blinde" (Paramètres) :
         mémorise le choix (réglage global, comme _on_remote_control_
@@ -9545,6 +9782,7 @@ class App(tk.Tk):
         # l'action qui l'a créée ne l'a pas déjà fait explicitement.
         self._check_pending_rebalance()
         self._check_phone_selected_pid()
+        self._sync_single_tournament_pref_checkbox()
         self._tick_after_id = self.after(1000, self._tick)
 
     def _maybe_reclaim_default_remote_port(self):

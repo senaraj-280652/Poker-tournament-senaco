@@ -21,7 +21,47 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+
+
+def _atomic_write_json(path, data):
+    """Écrit `data` (JSON) dans `path` de façon atomique : écrit d'abord
+    dans un fichier temporaire distinct (créé dans LE MÊME dossier que
+    `path`, pour que le remplacement final reste sur le même système de
+    fichiers — un rename entre deux volumes différents échouerait), le
+    referme explicitement AVANT le remplacement (nécessaire sous
+    Windows : un fichier encore ouvert ne peut pas toujours être
+    renommé/remplacé), puis os.replace() — un remplacement atomique
+    aussi bien sous macOS/Linux (rename()) que Windows (MoveFileEx),
+    contrairement à une écriture directe sur `path` : un crash pendant
+    celle-ci pouvait laisser un JSON tronqué/corrompu (voir _load, qui
+    devait alors retomber sur {} — perdant du même coup tout le registre
+    partagé, y compris les entrées d'AUTRES tournois déjà ouverts).
+
+    Nom de fichier temporaire propre à CET appel (tempfile.mkstemp, pid +
+    suffixe aléatoire inclus) : deux processus qui écriraient au même
+    instant n'utilisent jamais le même fichier temporaire, seul le
+    remplacement final de `path` peut se chevaucher — et reste alors
+    "dernier arrivé gagne" de façon propre (jamais un mélange des deux
+    écritures), exactement comme avant, jamais pire.
+
+    Ne masque PAS les erreurs (contrairement aux appelants, qui les
+    avalent volontairement comme avant ce correctif) : nettoie le
+    fichier temporaire si quoi que ce soit échoue avant le remplacement,
+    puis relève, pour laisser l'appelant décider."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _registry_path():
@@ -70,8 +110,7 @@ def _load():
 
 def _save(data):
     try:
-        with open(_registry_path(), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(_registry_path(), data)
     except OSError:
         pass
 
@@ -224,8 +263,7 @@ def set_phone_selected_pid(pid):
     remote_control.py) : simple écriture de fichier, ne touche ni
     self.db (SQLite) ni Tkinter."""
     try:
-        with open(_phone_selection_path(), "w", encoding="utf-8") as f:
-            json.dump({"pid": pid}, f)
+        _atomic_write_json(_phone_selection_path(), {"pid": pid})
     except OSError:
         pass
 
