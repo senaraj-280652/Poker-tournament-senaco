@@ -44,6 +44,7 @@ import player_photos
 import sound_signal
 import remote_control
 import open_windows
+import backup_restore
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
 from version import APP_NAME, APP_VERSION
@@ -3695,6 +3696,13 @@ class App(tk.Tk):
         # voir _on_voice_word).
         self._elimination_banner_queue = collections.deque()
         self._elimination_banner_current = None
+        # "Menu principal" (voir _open_new_window) : Popen du process déjà
+        # lancé DEPUIS CETTE fenêtre par un clic précédent, tant qu'il est
+        # encore vivant — None si aucun n'a jamais été lancé, ou si le
+        # dernier lancé s'est depuis terminé. Sert uniquement à empêcher
+        # d'en accumuler plusieurs par des clics répétés ; ne concerne que
+        # CE process-ci (chaque tournoi garde sa propre référence).
+        self._menu_principal_proc = None
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
@@ -3999,7 +4007,20 @@ class App(tk.Tk):
         et vérifie le garde backend à leur tout début (_block_second_
         tournament_if_needed, filet de sécurité si jamais un appel
         contournait cet état grisé) — c'est LÀ, jamais ici, que la
-        protection doit intervenir."""
+        protection doit intervenir.
+
+        UNICITÉ (self._menu_principal_proc) : n'en relance PAS un second
+        tant que celui déjà lancé depuis CETTE fenêtre est encore vivant
+        — le ramène simplement au premier plan à la place. Sans cette
+        garde, chaque clic répété créait un nouveau process indépendant,
+        aussi longtemps que l'utilisateur cliquait. Pas de vraie modalité
+        possible ici (grab_set/transient de Tkinter ne s'appliquent qu'à
+        l'intérieur d'un même process — "Menu principal" en est un
+        second, voir spawn_app_process) : la fenêtre tournoi reste
+        techniquement cliquable derrière, seule l'unicité est garantie."""
+        if self._menu_principal_proc is not None and self._menu_principal_proc.poll() is None:
+            open_windows.bring_pid_to_front(self._menu_principal_proc.pid)
+            return
         try:
             proc = spawn_app_process()
         except OSError as e:
@@ -4021,6 +4042,7 @@ class App(tk.Tk):
             )
             return
 
+        self._menu_principal_proc = proc
         raise_process_when_ready(self, proc.pid)
 
     def _open_lobby(self):
@@ -4033,7 +4055,15 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        win.geometry("480x460")
+        # 480x570 (480x460 avant l'ajout de la zone "Sauvegarde des
+        # données" ; 620 tant que cette zone comportait un séparateur et
+        # un texte explicatif sous le titre, supprimés le 2026-09-08 au
+        # profit des tooltips des boutons — 49px de moins, mesuré via
+        # winfo_reqheight() sur les mêmes widgets/polices/paddings)
+        # : sans cet ajustement, ces éléments dépasseraient hors de la
+        # fenêtre (toujours non redimensionnable), ou inversement
+        # laisseraient un espace vide en bas.
+        win.geometry("480x570")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -4184,6 +4214,97 @@ class App(tk.Tk):
                 result["is_new"] = False
                 win.destroy()
 
+        def backup_now():
+            """"💾 Sauvegarder sur clé USB" : copie les .tournoi du
+            dossier de tournoi par défaut + tout ~/.poker_tournament
+            vers un sous-dossier horodaté du dossier choisi (voir
+            backup_restore.create_backup — jamais de modification des
+            fichiers d'origine, uniquement des lectures/copies).
+            Disponible même si un tournoi est ouvert ailleurs : ne fait
+            que LIRE ses fichiers, jamais les modifier."""
+            dest = filedialog.askdirectory(
+                title="Choisir la clé USB ou le dossier de destination", parent=win,
+            )
+            if not dest:
+                return
+            try:
+                result_info = backup_restore.create_backup(dest)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Erreur de sauvegarde", str(e), parent=win)
+                return
+            data_note = (
+                "Données de l'application (réglages, joueurs, photos...) incluses."
+                if result_info["poker_tournament_data_included"]
+                else "Aucune donnée d'application (~/.poker_tournament) trouvée à sauvegarder."
+            )
+            messagebox.showinfo(
+                "Sauvegarde terminée avec succès",
+                "Sauvegarde terminée avec succès.\n\n"
+                f"Emplacement : {result_info['backup_dir']}\n"
+                f"Tournois sauvegardés : {result_info['tournament_file_count']}\n"
+                f"{data_note}",
+                parent=win,
+            )
+
+        def restore_now():
+            """"♻️ Restaurer depuis une clé USB" : voir backup_restore.
+            restore_backup — refuse d'abord si un tournoi est ouvert
+            (open_windows.list_open_paths), affiche le contenu du
+            manifeste et exige une confirmation explicite AVANT toute
+            écriture, puis crée automatiquement une sauvegarde de
+            sécurité de l'état actuel avant d'écraser quoi que ce soit."""
+            src = filedialog.askdirectory(
+                title="Sélectionner un dossier de sauvegarde PokerTournament_Backup_...",
+                parent=win,
+            )
+            if not src:
+                return
+            if open_windows.list_open_paths():
+                messagebox.showerror(
+                    "Tournoi(s) actuellement ouvert(s)",
+                    "Au moins un tournoi est actuellement ouvert (ici ou dans "
+                    "une autre fenêtre).\n\nFermez tous les tournois ouverts "
+                    "avant de restaurer une sauvegarde.",
+                    parent=win,
+                )
+                return
+            try:
+                manifest = backup_restore.validate_backup_folder(src)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Sauvegarde invalide", str(e), parent=win)
+                return
+            count = len(manifest.get("tournament_files", []))
+            has_data = manifest.get("poker_tournament_data_included", False)
+            if not messagebox.askyesno(
+                "Confirmer la restauration",
+                f"Sauvegarde du {manifest.get('created_at', '?')}\n"
+                f"Version : {manifest.get('app_version', '?')}\n"
+                f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
+                f"Tournois : {count}\n"
+                "Données de l'application (réglages, joueurs, photos...) : "
+                f"{'oui' if has_data else 'non'}\n\n"
+                "Une sauvegarde de sécurité des données actuelles sera créée "
+                "automatiquement avant toute modification.\n\n"
+                "Confirmer la restauration ?",
+                icon="warning", default="no", parent=win,
+            ):
+                return
+            try:
+                restore_info = backup_restore.restore_backup(src)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Erreur de restauration", str(e), parent=win)
+                return
+            messagebox.showinfo(
+                "Restauration terminée",
+                "Restauration terminée avec succès.\n\n"
+                f"Tournois restaurés : {restore_info['restored_tournament_files']}\n"
+                f"Données de l'application restaurées : "
+                f"{'oui' if restore_info['restored_data'] else 'non'}\n\n"
+                "Sauvegarde de sécurité de l'état précédent :\n"
+                f"{restore_info['safety_backup_dir']}",
+                parent=win,
+            )
+
         btn_frame = tk.Frame(win, bg=FELT_DARK)
         btn_frame.pack(pady=4)
         new_tournament_btn = ttk.Button(
@@ -4219,6 +4340,42 @@ class App(tk.Tk):
             "coup d'œil — double-cliquez pour basculer vers l'un d'eux.\n"
             "N'ouvre ni ne ferme celle-ci.",
         )
+
+        # -- Sauvegarde des données (clé USB) : jamais liée à "Un seul
+        # tournoi à la fois" (aucun rapport avec le lancement d'un
+        # tournoi) — toujours active, jamais grisée. Voir backup_now/
+        # restore_now ci-dessus et backup_restore.py pour la logique.
+        # Packée dans btn_frame (PAS win) : l'ordre d'affichage suit
+        # l'ordre d'empilement des ENFANTS de btn_frame, indépendant de
+        # quand btn_frame lui-même a été empilé dans win — la packer
+        # dans win la ferait apparaître après TOUT btn_frame (donc après
+        # "À propos"), pas entre "Lobby" et les boutons ci-dessous.
+        # Ni séparateur ni texte explicatif sous le titre (demande du
+        # 2026-09-08) : les explications vivent désormais uniquement
+        # dans les tooltips des deux boutons, voir ci-dessous.
+        tk.Label(
+            btn_frame, text="💾 Sauvegarde des données",
+            bg=FELT_DARK, fg=GOLD, font=("Helvetica", 11, "bold"),
+        ).pack(pady=(14, 6))
+        backup_btn = ttk.Button(
+            btn_frame, text="💾  Sauvegarder sur clé USB", command=backup_now, width=28,
+        )
+        backup_btn.pack(pady=6)
+        Tooltip(
+            backup_btn,
+            "Permet de sauvegarder les tournois, joueurs, photos et\n"
+            "réglages sur une clé USB.",
+        )
+        restore_btn = ttk.Button(
+            btn_frame, text="♻️  Restaurer depuis une clé USB", command=restore_now, width=28,
+        )
+        restore_btn.pack(pady=6)
+        Tooltip(
+            restore_btn,
+            "Permet de restaurer les tournois, joueurs, photos et\n"
+            "réglages depuis une clé USB.",
+        )
+
         ttk.Button(
             btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
         ).pack(pady=6)
@@ -5656,17 +5813,28 @@ class App(tk.Tk):
         devient "courant" (avec sa propre échéance à partir de CE
         moment-là) qu'ici, quand celui de A expire — jamais recalculée
         après coup ni partagée entre deux bandeaux. Aucun risque qu'une
-        échéance déjà expirée (celle de A) n'efface prématurément B."""
+        échéance déjà expirée (celle de A) n'efface prématurément B.
+
+        "Durée du bandeau d'élimination" à 0 (voir Paramètres/tooltip) :
+        DÉSACTIVE uniquement l'AFFICHAGE — _elimination_banner_current
+        n'est alors jamais renseigné (seul point lu par _refresh_clock_
+        tab et ClockWindow.refresh pour décider d'afficher quoi que ce
+        soit, voir leurs commentaires), donc aucun bandeau nulle part
+        (onglet Chronomètre ni écran projecteur). Le son (_play_
+        elimination_sound), réglage totalement indépendant, continue lui
+        de jouer normalement à chaque élimination — comportement
+        volontairement inchangé."""
         self._elimination_banner_current = None
         if self._elimination_banner_queue:
             job = self._elimination_banner_queue.popleft()
-            seconds = max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
-            job["until"] = time.time() + seconds
-            self._elimination_banner_current = job
+            seconds = max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
             try:
                 self._play_elimination_sound()
             except Exception:
                 pass
+            if seconds > 0:
+                job["until"] = time.time() + seconds
+                self._elimination_banner_current = job
 
     def _play_elimination_sound(self):
         """Petit son d'attention joué une seule fois, exactement au début
@@ -9001,17 +9169,19 @@ class App(tk.Tk):
             elim_lbl,
             "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
             "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
-            "élimination — de 1 à 30 secondes, 5 par défaut. Indépendante\n"
+            "élimination — de 0 à 30 secondes, 5 par défaut. Indépendante\n"
             "de la « Durée (ms) » du son « Son sortie d'un joueur »\n"
             "(fenêtre « Sons de fin de Round/Pause... ») : deux réglages\n"
             "séparés, même si aucun son n'est configuré. Pris en compte\n"
-            "dès la prochaine élimination, sans redémarrer.",
+            "dès la prochaine élimination, sans redémarrer.\n"
+            "Mettre 0 seconde pour désactiver l'affichage du bandeau\n"
+            "d'élimination (le son, réglage séparé, continue de jouer).",
         )
         elim_seconds_var = tk.IntVar(
-            value=max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
+            value=max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
         )
         elim_spin = ttk.Spinbox(
-            left, from_=1, to=30, width=5, textvariable=elim_seconds_var,
+            left, from_=0, to=30, width=5, textvariable=elim_seconds_var,
             command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),
         )
         elim_spin.grid(row=elim_row, column=1, sticky="w", padx=10, pady=(14, 4))
@@ -9539,9 +9709,11 @@ class App(tk.Tk):
         préférences globales (proposé par défaut au prochain tournoi).
         Une valeur invalide/vide (ex : champ momentanément vidé pendant
         la frappe) est ignorée sans planter — reste alors le dernier
-        réglage valide déjà enregistré, jamais une valeur cassée."""
+        réglage valide déjà enregistré, jamais une valeur cassée. 0 est
+        une valeur valide (désactive l'affichage du bandeau, voir
+        _advance_elimination_banner) — jamais remonté à 1."""
         try:
-            seconds = max(1, min(30, int(var.get())))
+            seconds = max(0, min(30, int(var.get())))
         except (tk.TclError, ValueError):
             return
         self.db.set_settings({"elimination_banner_seconds": seconds})

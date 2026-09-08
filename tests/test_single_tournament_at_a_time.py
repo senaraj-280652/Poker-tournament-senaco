@@ -79,6 +79,10 @@ class _FakeApp:
         self.db = _FakeDb(db_path) if db_path else None
         self.single_tournament_var = _FakeVar(True)
         self.messagebox_calls = []
+        # Unicité de "Menu principal" (voir tests/test_menu_principal_
+        # single_instance.py pour son comportement propre) : ici, aucun
+        # Menu principal jamais lancé depuis cette doublure.
+        self._menu_principal_proc = None
 
     def winfo_exists(self):
         return True
