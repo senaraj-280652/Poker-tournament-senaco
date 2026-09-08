@@ -4070,15 +4070,16 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        # 480x570 (480x460 avant l'ajout de la zone "Sauvegarde des
-        # données" ; 620 tant que cette zone comportait un séparateur et
-        # un texte explicatif sous le titre, supprimés le 2026-09-08 au
-        # profit des tooltips des boutons — 49px de moins, mesuré via
-        # winfo_reqheight() sur les mêmes widgets/polices/paddings)
+        # 480x527 (480x460 avant l'ajout de la zone "Sauvegarde des
+        # données" ; 620 avec séparateur + texte explicatif sous le
+        # titre ; 570 avec seulement le titre, sans séparateur/texte ;
+        # le titre lui-même a été retiré le 2026-09-08 (plus que les 2
+        # boutons, qui remontent naturellement) — 43px de moins, mesuré
+        # via winfo_reqheight() sur les mêmes widgets/polices/paddings)
         # : sans cet ajustement, ces éléments dépasseraient hors de la
         # fenêtre (toujours non redimensionnable), ou inversement
         # laisseraient un espace vide en bas.
-        win.geometry("480x570")
+        win.geometry("480x527")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -4365,13 +4366,10 @@ class App(tk.Tk):
         # quand btn_frame lui-même a été empilé dans win — la packer
         # dans win la ferait apparaître après TOUT btn_frame (donc après
         # "À propos"), pas entre "Lobby" et les boutons ci-dessous.
-        # Ni séparateur ni texte explicatif sous le titre (demande du
-        # 2026-09-08) : les explications vivent désormais uniquement
-        # dans les tooltips des deux boutons, voir ci-dessous.
-        tk.Label(
-            btn_frame, text="💾 Sauvegarde des données",
-            bg=FELT_DARK, fg=GOLD, font=("Helvetica", 11, "bold"),
-        ).pack(pady=(14, 6))
+        # Ni séparateur, ni texte explicatif, ni titre (demandes du
+        # 2026-09-08) : uniquement les 2 boutons, avec leurs explications
+        # dans les tooltips ci-dessous — aucun espace réservé à la place
+        # d'un titre, les boutons remontent juste après le bouton Lobby.
         backup_btn = ttk.Button(
             btn_frame, text="💾  Sauvegarder sur clé USB", command=backup_now, width=28,
         )
@@ -9327,6 +9325,17 @@ class App(tk.Tk):
         )
         elim_spin.bind(
             "<FocusOut>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+        # Tooltip propre à la Spinbox elle-même (demande du 2026-09-08) :
+        # jusqu'ici seul le libellé à sa gauche (elim_lbl ci-dessus) avait
+        # un tooltip — un survol direct de la Spinbox (zone de saisie ou
+        # flèches haut/bas, un seul widget ttk.Spinbox donc une seule
+        # zone de survol pour Tkinter) n'affichait rien. Texte volontai-
+        # rement plus court que celui du libellé, qui reste inchangé.
+        Tooltip(
+            elim_spin,
+            "Durée d'affichage du bandeau d'élimination, en secondes. "
+            "Si 0, le bandeau n'est pas affiché.",
         )
 
         # -- Colonne droite : structure de blindes + primes --

@@ -178,5 +178,55 @@ class TooltipTest(unittest.TestCase):
         self.assertIn('left, from_=0, to=30, width=5, textvariable=elim_seconds_var', source)
 
 
+class SpinboxTooltipTest(unittest.TestCase):
+    """Demande du 2026-09-08 : la Spinbox elle-même (elim_spin), pas
+    seulement son libellé (elim_lbl, déjà couvert par TooltipTest
+    ci-dessus), doit avoir son propre tooltip — jusqu'ici un survol
+    direct de la Spinbox n'affichait rien."""
+
+    def _spinbox_block(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        start = source.index("elim_spin = ttk.Spinbox(")
+        end = source.index("# -- Colonne droite", start)
+        return source[start:end]
+
+    def test_tooltip_ajoute_sur_la_spinbox_avec_le_texte_demande(self):
+        """Texte exact demandé le 2026-09-08 (révisé le même jour pour
+        mentionner explicitement le cas 0 seconde) — les deux littéraux
+        adjacents du code source sont vérifiés séparément, Python les
+        concatène sans rien ajouter entre eux (pas de séparateur de
+        ligne dans la chaîne finale)."""
+        block = self._spinbox_block()
+        idx = block.index("Tooltip(\n            elim_spin,")
+        call_block = block[idx:block.index(")", idx) + 1]
+        self.assertIn('"Durée d\'affichage du bandeau d\'élimination, en secondes. "', call_block)
+        self.assertIn('"Si 0, le bandeau n\'est pas affiché.",', call_block)
+
+    def test_valeur_et_limites_de_la_spinbox_inchangees(self):
+        """Non-régression explicite : l'ajout du tooltip ne doit pas
+        toucher from_/to/width/textvariable/command ni les bindings
+        Return/FocusOut déjà existants."""
+        block = self._spinbox_block()
+        self.assertIn(
+            "elim_spin = ttk.Spinbox(\n"
+            "            left, from_=0, to=30, width=5, textvariable=elim_seconds_var,\n"
+            "            command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),\n"
+            "        )",
+            block,
+        )
+        self.assertIn('elim_spin.bind(\n            "<Return>"', block)
+        self.assertIn('elim_spin.bind(\n            "<FocusOut>"', block)
+
+    def test_tooltip_de_la_spinbox_distinct_de_celui_du_libelle(self):
+        """Le tooltip du libellé (détaillé, voir TooltipTest) reste
+        inchangé et distinct de celui — volontairement plus court — de
+        la Spinbox elle-même."""
+        block = self._spinbox_block()
+        self.assertNotIn("Indépendante", block)
+        self.assertNotIn("Mettre 0 seconde pour désactiver", block)
+
+
 if __name__ == "__main__":
     unittest.main()

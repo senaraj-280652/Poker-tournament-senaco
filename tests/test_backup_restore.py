@@ -524,22 +524,21 @@ class NoOpOnCancellationTest(unittest.TestCase):
 
 
 class MenuPrincipalPlacementTest(unittest.TestCase):
-    """Vérifie l'ORDRE exact demandé : Lobby, puis la zone "Sauvegarde
-    des données" (titre + 2 boutons, sans séparateur ni texte explicatif
-    depuis le 2026-09-08 — voir SauvegardeZonePresentationTest), puis
-    "À propos" — jamais l'inverse."""
+    """Vérifie l'ORDRE exact demandé : Lobby, puis les 2 boutons de la
+    zone "Sauvegarde des données" (sans titre, sans séparateur, sans
+    texte explicatif depuis le 2026-09-08 — voir
+    SauvegardeZonePresentationTest), puis "À propos" — jamais
+    l'inverse."""
 
     def test_ordre_lobby_puis_sauvegarde_puis_a_propos(self):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
         idx_lobby = source.index('text="📋  Lobby (plusieurs tournois)"')
-        idx_section_title = source.index('text="💾 Sauvegarde des données"')
         idx_backup_btn = source.index('text="💾  Sauvegarder sur clé USB"')
         idx_restore_btn = source.index('text="♻️  Restaurer depuis une clé USB"')
         idx_about = source.index('text="ℹ️  À propos"')
-        self.assertLess(idx_lobby, idx_section_title)
-        self.assertLess(idx_section_title, idx_backup_btn)
+        self.assertLess(idx_lobby, idx_backup_btn)
         self.assertLess(idx_backup_btn, idx_restore_btn)
         self.assertLess(idx_restore_btn, idx_about)
 
@@ -558,32 +557,46 @@ class MenuPrincipalPlacementTest(unittest.TestCase):
 
 
 class SauvegardeZonePresentationTest(unittest.TestCase):
-    """Demande du 2026-09-08 : plus de séparateur ni de texte explicatif
-    sous le titre "💾 Sauvegarde des données" dans cette zone — les
-    explications vivent désormais uniquement dans les tooltips des deux
-    boutons. Le titre lui-même et l'ordre des boutons restent
-    inchangés (voir MenuPrincipalPlacementTest)."""
+    """Demande du 2026-09-08 : plus de séparateur, plus de texte
+    explicatif, et — demande complémentaire du même jour — plus de
+    titre "💾 Sauvegarde des données" du tout dans cette zone : ne
+    restent que les 2 boutons, qui remontent naturellement juste après
+    Lobby. Les explications vivent uniquement dans les tooltips des
+    deux boutons (voir tests dédiés ci-dessous), jamais touchés par ces
+    changements de présentation."""
 
     def _zone_source(self):
+        """Code source entre le bouton Lobby et "À propos" — englobe
+        toute la zone "Sauvegarde des données", quel que soit ce
+        qu'elle contient (titre, séparateur, texte...)."""
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        start = source.index('text="💾 Sauvegarde des données"')
+        start = source.index('text="📋  Lobby (plusieurs tournois)"')
         end = source.index('text="ℹ️  À propos"', start)
         return source[start:end]
 
     def test_aucun_separateur_dans_la_zone(self):
         self.assertNotIn("Separator", self._zone_source())
 
-    def test_aucun_texte_explicatif_sous_le_titre(self):
+    def test_aucun_titre_ni_texte_explicatif_dans_la_zone(self):
+        """Ni l'ancien widget-titre "💾 Sauvegarde des données", ni
+        l'ancien texte explicatif ne doivent plus apparaître dans cette
+        zone (demande du 2026-09-08 : suppression complète du titre,
+        après celle du séparateur/texte explicatif le même jour) — la
+        simple mention "Sauvegarde des données" dans un COMMENTAIRE de
+        code reste, elle, normale et n'est pas ce qui est testé ici."""
         zone = self._zone_source()
+        self.assertNotIn('text="💾 Sauvegarde des données"', zone)
         self.assertNotIn("Permet de sauvegarder ou restaurer", zone)
-        # Le morceau de code ENTRE le titre et le premier bouton (donc
-        # avant toute chance de matcher le texte d'un tooltip) ne doit
-        # contenir aucun bloc tk.Label supplémentaire.
-        idx_title = zone.index('text="💾 Sauvegarde des données"')
+
+    def test_aucun_tk_label_entre_lobby_et_le_premier_bouton(self):
+        """Plus aucun widget (titre ou autre) entre le Tooltip de Lobby
+        et le premier bouton de sauvegarde : celui-ci doit suivre
+        directement, sans espace réservé à un ancien titre."""
+        zone = self._zone_source()
         idx_first_btn = zone.index('text="💾  Sauvegarder sur clé USB"')
-        between = zone[idx_title:idx_first_btn]
+        between = zone[:idx_first_btn]
         self.assertEqual(between.count("tk.Label("), 0)
 
     def test_tooltip_bouton_sauvegarder_a_le_texte_demande(self):
@@ -604,13 +617,23 @@ class SauvegardeZonePresentationTest(unittest.TestCase):
         self.assertIn("Permet de restaurer les tournois, joueurs, photos et", tooltip_block)
         self.assertIn("réglages depuis une clé USB.", tooltip_block)
 
-    def test_titre_de_la_zone_inchange(self):
-        # Non-régression explicite : seuls le séparateur et le texte
-        # explicatif ont été retirés, jamais le titre lui-même.
+    def test_titre_completement_retire_du_fichier(self):
+        """Non-régression explicite (demande du 2026-09-08) : le titre
+        "💾 Sauvegarde des données" ne doit plus exister NULLE PART dans
+        main.py, pas seulement dans cette zone."""
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        self.assertIn('text="💾 Sauvegarde des données"', source)
+        self.assertNotIn('text="💾 Sauvegarde des données"', source)
+
+    def test_les_deux_boutons_restent_bien_presents(self):
+        """Non-régression : seul le titre a été retiré, jamais les
+        boutons eux-mêmes ni leurs tooltips (voir tests dédiés)."""
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn('text="💾  Sauvegarder sur clé USB"', source)
+        self.assertIn('text="♻️  Restaurer depuis une clé USB"', source)
 
 
 if __name__ == "__main__":
