@@ -48,8 +48,8 @@ class _FakeApp:
     def _remote_end_tournament(self):
         self.calls.append(("end_tournament",))
 
-    def _remote_eliminate(self, eliminated_id, eliminator_id):
-        self.calls.append(("eliminate", eliminated_id, eliminator_id))
+    def _remote_eliminate(self, eliminated_id, eliminator_id, request_id=None):
+        self.calls.append(("eliminate", eliminated_id, eliminator_id, request_id))
 
     def _resolve_pending_rebalance(self, request_id, seat, from_remote):
         self.calls.append(("rebalance_answer", request_id, seat, from_remote))
@@ -80,7 +80,7 @@ class PollVoiceQueueStopsAfterEndTournamentTest(unittest.TestCase):
         self.assertEqual(fake.voice_command_queue.get_nowait(), "chronometre")
 
     def test_plusieurs_elements_apres_end_tournament_aucun_nest_traite(self):
-        fake = _FakeApp([("end_tournament",), ("eliminate", 1, 2), "terminer"])
+        fake = _FakeApp([("end_tournament",), ("eliminate", 1, 2, "req-1"), "terminer"])
 
         main.App._poll_voice_queue(fake)
 
@@ -102,7 +102,7 @@ class PollVoiceQueueStopsAfterEndTournamentTest(unittest.TestCase):
         """Non-régression : sans "end_tournament" dans la file, tous les
         éléments restent traités dans l'ordre, et un nouveau passage
         reste programmé — comportement visible normal non modifié."""
-        fake = _FakeApp(["chronometre", ("eliminate", 1, 2), ("rebalance_answer", "r1", 3)])
+        fake = _FakeApp(["chronometre", ("eliminate", 1, 2, "req-1"), ("rebalance_answer", "r1", 3)])
 
         main.App._poll_voice_queue(fake)
 
@@ -110,7 +110,7 @@ class PollVoiceQueueStopsAfterEndTournamentTest(unittest.TestCase):
             fake.calls,
             [
                 ("voice_word", "chronometre"),
-                ("eliminate", 1, 2),
+                ("eliminate", 1, 2, "req-1"),
                 ("rebalance_answer", "r1", 3, True),
             ],
         )

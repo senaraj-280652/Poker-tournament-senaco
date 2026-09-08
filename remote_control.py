@@ -775,6 +775,16 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
     body: JSON.stringify({{eliminated_id: eliminatedId, eliminator_id: eliminatorId}})
   }}).then(function(r) {{
     if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    // data.ok peut être faux même avec une réponse HTTP 200 (demande du
+    // 2026-09-08) : refus explicite (ex. bounty PKO sans éliminateur
+    // désigné), jamais un échec silencieux — data.message est affiché tel
+    // quel, jamais rien n'est modifié côté serveur dans ce cas.
+    if (!data.ok) {{
+      window.alert(data.message || 'Élimination refusée.');
+      return;
+    }}
     lastSignature = null;  // forcer le prochain rendu même si la liste redevient identique entre-temps
     loadPlayers();
   }}).catch(function(e) {{
@@ -1381,7 +1391,13 @@ class RemoteControlServer:
       la page Photos — liste de dicts {name, club, has_photo}, sans id
       numérique (voir on_upload_photo ci-dessous).
     - `on_eliminate(eliminated_id, eliminator_id)` : élimination décidée
-      depuis la page Éliminations (eliminator_id peut être None).
+      depuis la page Éliminations (eliminator_id peut être None). Appelé
+      DIRECTEMENT sur le thread HTTP de la requête (voir ThreadingHTTPServer
+      plus bas) — PAS le thread Tk — et doit renvoyer {"ok": bool,
+      "message": str} : "ok" indique si l'élimination a bien eu lieu,
+      "message" est affiché tel quel sur le téléphone si "ok" est faux
+      (ex. refus PKO sans éliminateur désigné, demande du 2026-09-08) —
+      jamais un échec silencieux.
     - `get_clock_paused()` : True si le chrono est actuellement en pause
       — pour le petit bouton ON/OFF à côté de "Chronomètre".
     - `get_has_pending_moves()` : True s'il existe au moins un mouvement en
@@ -1421,7 +1437,9 @@ class RemoteControlServer:
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
         self.get_players = get_players or (lambda: [])
         self.get_roster_players = get_roster_players or (lambda: [])
-        self.on_eliminate = on_eliminate or (lambda eliminated_id, eliminator_id: None)
+        self.on_eliminate = on_eliminate or (
+            lambda eliminated_id, eliminator_id: {"ok": True, "message": ""}
+        )
         self.get_clock_paused = get_clock_paused or (lambda: True)
         self.get_has_pending_moves = get_has_pending_moves or (lambda: False)
         self.on_upload_photo = on_upload_photo or (lambda player_name, image_bytes: (False, "Non disponible"))
@@ -1779,8 +1797,13 @@ class RemoteControlServer:
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
-                    on_eliminate(eliminated_id, eliminator_id)
-                    self._send_json({"ok": True})
+                    # on_eliminate renvoie {"ok": bool, "message": str}
+                    # (demande du 2026-09-08) : renvoyé tel quel au
+                    # téléphone, qui affiche "message" si "ok" est faux
+                    # (ex. refus PKO sans éliminateur désigné) — jamais un
+                    # échec silencieux, voir sa docstring plus haut.
+                    result = on_eliminate(eliminated_id, eliminator_id)
+                    self._send_json(result)
                 elif path == "/upload_photo":
                     from urllib.parse import parse_qs, urlparse
                     query = parse_qs(urlparse(self.path).query)

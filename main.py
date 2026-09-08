@@ -17,6 +17,7 @@ import json
 import csv
 import shutil
 import tempfile
+import uuid
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
@@ -2740,7 +2741,7 @@ class PeriodSummaryDialog(ttk.Frame):
         # Gains classement retirées pour la même raison) — la donnée reste
         # calculée normalement (build_period_summary), juste pas affichée.
         cols_t = ("date", "name", "status", "entries", "winner", "bounty")
-        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (€)"]
+        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (pts)"]
         # height=13 : même hauteur que "Classement des joueurs" ci-dessous
         # (voir players_tree), pour que les deux tableaux soient alignés.
         self.tournaments_tree = ttk.Treeview(top_pane, columns=cols_t, show="headings", height=13)
@@ -3470,10 +3471,13 @@ class PrimesExportDialog(tk.Toplevel):
             w.destroy()
 
         if self.kind_var.get() == "summary":
-            columns, var_map = PRIMES_COLUMNS, self.col_vars_summary
+            # db.primes_columns() (pas PRIMES_COLUMNS directement) : en-tête
+            # "bo_valeur" adapté au mode classique/PKO de CE tournoi, même
+            # source que l'onglet Primes et les exports (voir sa docstring).
+            columns, var_map = self.db.primes_columns(), self.col_vars_summary
             sort_col = self.sort_state.get("column")
             if sort_col:
-                headers_by_key = {k: h for k, h, _ in PRIMES_COLUMNS}
+                headers_by_key = {k: h for k, h, _ in columns}
                 sort_label = headers_by_key.get(sort_col, sort_col)
                 direction = "croissant" if self.sort_state.get("ascending", True) else "décroissant"
                 self.sort_info_lbl.config(text=f"Tri actuel repris à l'export : {sort_label} ({direction}).")
@@ -3748,6 +3752,17 @@ class App(tk.Tk):
         # rebalance), jamais lue ni écrite depuis le thread du serveur de
         # contrôle à distance.
         self._remote_pending_rebalance = None
+        # Résultat de chaque élimination demandée depuis le téléphone
+        # (demande du 2026-09-08) : {request_id: {"ok": bool, "message":
+        # str}}, écrit par _remote_eliminate (thread Tk, via la file
+        # voice_command_queue comme d'habitude) et lu/consommé par
+        # _remote_eliminate_request (thread HTTP du téléphone concerné,
+        # voir sa docstring) — permet au téléphone d'afficher un message
+        # explicite (ex. refus PKO sans éliminateur) au lieu d'un simple
+        # "ok" silencieux. Dict simple, pas de verrou : lecture/écriture
+        # d'une clé à la fois, déjà sûr sous le GIL (même principe que
+        # _remote_pending_rebalance ci-dessus, jamais verrouillé non plus).
+        self._remote_elimination_results = {}
         # Synchronisation iPhone -> Mac SANS dépendre d'un Lobby ouvert
         # (voir _check_phone_selected_pid, appelé depuis _tick) : dernier
         # pid de tournoi déjà traité PAR CETTE fenêtre, même principe et
@@ -5445,10 +5460,31 @@ class App(tk.Tk):
                 "doit toujours en rester au moins un — c'est le vainqueur.",
             )
             return
+        pko_mode = self.db.get_setting_int("pko_mode", 0) == 1
         if len(ids) == 1:
             p = self.db.get_player(ids[0])
             question = f"Éliminer {p['name']} du tournoi ?"
         else:
+            # Élimination groupée : jamais d'éliminateur désigné (voir
+            # eliminator_id=None plus bas) — en mode PKO, ceci rendrait
+            # orpheline la bounty de tout joueur sélectionné qui en porte
+            # une (interdit, voir Database.eliminate_player) : on bloque
+            # alors l'action groupée entière plutôt que d'échouer à
+            # mi-chemin, ces joueurs devant être éliminés un par un.
+            if pko_mode:
+                with_bounty = [
+                    p["name"] for pid in ids
+                    if (p := self.db.get_player(pid)) and p["status"] == "active" and p["bounty"] > 0
+                ]
+                if with_bounty:
+                    messagebox.showerror(
+                        "Impossible en mode PKO",
+                        "Ces joueurs sélectionnés portent une bounty PKO et "
+                        "doivent être éliminés UN PAR UN pour désigner qui "
+                        "les élimine (sinon leur bounty serait perdue) :\n\n"
+                        + "\n".join(with_bounty),
+                    )
+                    return
             question = (
                 f"Éliminer ces {len(ids)} joueurs du tournoi ?"
                 "\n\n(Élimination groupée : personne ne sera désigné comme "
@@ -5461,11 +5497,22 @@ class App(tk.Tk):
 
         eliminator_id = None
         if len(ids) == 1:
-            eliminator_id = self._ask_eliminator(exclude_id=ids[0])
+            mandatory = pko_mode and p["bounty"] > 0
+            eliminator_id = self._ask_eliminator(exclude_id=ids[0], mandatory=mandatory)
+            if mandatory and eliminator_id is None:
+                return  # élimination abandonnée : la bounty PKO reste intacte, rien n'est modifié
 
         moved_count = 0
         for pid in ids:
-            moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
+            try:
+                moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
+            except ValueError as e:
+                # Filet de sécurité (garde-fou équivalent, plus fort, côté
+                # Database.eliminate_player) : ne devrait normalement plus
+                # se produire grâce aux vérifications ci-dessus, mais ne
+                # doit jamais planter ni laisser un état à moitié traité.
+                messagebox.showerror("Élimination refusée", str(e))
+                break
             self._queue_elimination_banner(pid, eliminator_id)
         self._clear_checked()
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
@@ -5487,13 +5534,22 @@ class App(tk.Tk):
         self._refresh_all()
         self._check_pending_rebalance()
 
-    def _ask_eliminator(self, exclude_id):
+    def _ask_eliminator(self, exclude_id, mandatory=False):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
-        compter ses bounties (kills, onglet Primes) et, si un bounty fixe
-        en € est configuré (mécanisme PKO), à le lui attribuer. Ne
-        propose que les joueurs de la MÊME TABLE que l'éliminé : au
-        poker, on ne peut éliminer que quelqu'un assis à sa propre table.
-        Renvoie l'id du joueur choisi, ou None si ignoré/annulé."""
+        compter ses bounties (kills, onglet Primes) et, si une bounty est
+        configurée, à la lui attribuer. Ne propose que les joueurs de la
+        MÊME TABLE que l'éliminé : au poker, on ne peut éliminer que
+        quelqu'un assis à sa propre table. Renvoie l'id du joueur choisi,
+        ou None si ignoré/annulé.
+
+        `mandatory=True` (demande du 2026-09-08, PKO + bounty > 0) : le
+        bouton "Ignorer (pas de prime)" devient "Annuler l'élimination" —
+        un None renvoyé doit alors être compris par l'APPELANT comme
+        "abandonner l'élimination elle-même" (elle ne doit PAS être
+        exécutée sans éliminateur), jamais comme "l'effectuer quand même
+        sans bounty attribuée", pour ne jamais laisser une bounty PKO
+        orpheline (voir aussi le garde-fou équivalent, plus fort, dans
+        Database.eliminate_player)."""
         eliminated = self.db.get_player(exclude_id)
         # list_players() trie par table/siège (pratique pour l'affichage du
         # tableau Joueurs, pas pour retrouver un nom ici) — trié par nom
@@ -5529,11 +5585,11 @@ class App(tk.Tk):
             win, bg=FELT_DARK, fg=GOLD, font=("Helvetica", 12, "bold"),
             text=header_text,
         ).pack(padx=16, pady=(16, 4))
-        tk.Label(
-            win, bg=FELT_DARK, fg=CREAM,
-            text="Qui l'a éliminé(e) ?" if eliminated["bounty"] > 0 else
-                 "(Compte pour son bounty en points, onglet Primes.)",
-        ).pack(padx=16, pady=(0, 10))
+        subtitle = "Qui l'a éliminé(e) ?" if eliminated["bounty"] > 0 else \
+            "(Compte pour son bounty en points, onglet Primes.)"
+        if mandatory:
+            subtitle += "\nObligatoire en mode PKO : une bounty ne doit jamais rester orpheline."
+        tk.Label(win, bg=FELT_DARK, fg=CREAM, text=subtitle, justify="center").pack(padx=16, pady=(0, 10))
 
         names = [p["name"] for p in candidates]
         name_to_id = {p["name"]: p["id"] for p in candidates}
@@ -5551,7 +5607,8 @@ class App(tk.Tk):
 
         btns = ttk.Frame(win)
         btns.pack(pady=(0, 16))
-        ttk.Button(btns, text="Ignorer (pas de prime)", command=skip).pack(side="left", padx=5)
+        skip_label = "Annuler l'élimination" if mandatory else "Ignorer (pas de prime)"
+        ttk.Button(btns, text=skip_label, command=skip).pack(side="left", padx=5)
         ttk.Button(btns, text="Valider", command=confirm).pack(side="left", padx=5)
 
         self.wait_window(win)
@@ -5941,9 +5998,7 @@ class App(tk.Tk):
             get_players=lambda: self._remote_players_cache,
             get_clock_paused=lambda: self._remote_clock_paused,
             get_has_pending_moves=lambda: self._remote_has_pending_moves,
-            on_eliminate=lambda eliminated_id, eliminator_id: self.voice_command_queue.put(
-                ("eliminate", eliminated_id, eliminator_id)
-            ),
+            on_eliminate=self._remote_eliminate_request,
             on_upload_photo=self._remote_upload_photo,
             get_roster_players=self._remote_get_roster_players,
             get_photo_image=self._remote_get_photo_image,
@@ -6058,8 +6113,8 @@ class App(tk.Tk):
             while True:
                 item = self.voice_command_queue.get_nowait()
                 if isinstance(item, tuple) and item and item[0] == "eliminate":
-                    _, eliminated_id, eliminator_id = item
-                    self._remote_eliminate(eliminated_id, eliminator_id)
+                    _, eliminated_id, eliminator_id, request_id = item
+                    self._remote_eliminate(eliminated_id, eliminator_id, request_id=request_id)
                 elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
                     _, request_id, seat = item
                     self._resolve_pending_rebalance(request_id, seat, from_remote=True)
@@ -6082,21 +6137,57 @@ class App(tk.Tk):
             pass
         self.after(150, self._poll_voice_queue)
 
-    def _remote_eliminate(self, eliminated_id, eliminator_id):
+    def _remote_eliminate_request(self, eliminated_id, eliminator_id):
+        """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
+        contrôle à distance (voir remote_control.py: on_eliminate, passé
+        tel quel au serveur) — PAS depuis le thread Tk. Génère un
+        request_id, dépose la demande dans voice_command_queue (traitée
+        plus tard par _remote_eliminate, sur le thread Tk, comme toujours
+        pour tout accès à self.db) puis ATTEND (sondage borné, ~150 ms de
+        délai habituel de _poll_voice_queue) le résultat écrit dans
+        self._remote_elimination_results par _remote_eliminate, pour le
+        renvoyer tel quel au téléphone (demande du 2026-09-08 : un refus
+        — ex. bounty PKO orpheline — doit être explicite côté téléphone,
+        jamais silencieux). Renvoie toujours {"ok": bool, "message": str}
+        ; un dépassement du délai (Tk anormalement bloqué) renvoie un
+        message d'échec plutôt que de bloquer indéfiniment le thread HTTP
+        (chaque requête téléphone a son propre thread, voir
+        ThreadingHTTPServer : un dépassement ici n'affecte ni l'UI ni les
+        autres téléphones)."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("eliminate", eliminated_id, eliminator_id, request_id))
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            result = self._remote_elimination_results.pop(request_id, None)
+            if result is not None:
+                return result
+            time.sleep(0.03)
+        return {"ok": False, "message": "Délai dépassé, réessayez."}
+
+    def _remote_eliminate(self, eliminated_id, eliminator_id, request_id=None):
         """Élimination décidée depuis la page "Éliminations" du contrôle
         à distance (glisser un joueur éliminé sur son éliminateur, voir
         remote_control.py) : mêmes garde-fous et suites que
         _eliminate_selected (bounty, rééquilibrage, bandeau de mouvement,
         fin de partie), pour un résultat identique à une élimination faite
-        directement dans l'onglet Joueurs."""
+        directement dans l'onglet Joueurs. Appelé sur le thread Tk (voir
+        _poll_voice_queue), jamais directement depuis le thread HTTP —
+        voir _remote_eliminate_request, qui dépose la demande et attend
+        le résultat écrit ici (self._remote_elimination_results) pour le
+        renvoyer au téléphone."""
+        def refuse(message):
+            if request_id is not None:
+                self._remote_elimination_results[request_id] = {"ok": False, "message": message}
+
         if not self.db:
-            return
+            return refuse("Tournoi non disponible.")
         active = self.db.list_players(status="active")
         active_ids = {p["id"] for p in active}
         if eliminated_id not in active_ids or eliminated_id == eliminator_id:
-            return  # état déjà changé entre-temps (ex : élimination concurrente) ou requête absurde
+            # état déjà changé entre-temps (ex : élimination concurrente) ou requête absurde
+            return refuse("Ce joueur n'est plus disponible (état déjà modifié).")
         if len(active_ids) <= 1:
-            return  # dernier joueur actif : rien à faire, voir _eliminate_selected
+            return refuse("Impossible d'éliminer le dernier joueur actif (le vainqueur).")
         if eliminator_id is not None and eliminator_id not in active_ids:
             eliminator_id = None
         if eliminator_id is not None:
@@ -6108,6 +6199,21 @@ class App(tk.Tk):
             table_by_id = {p["id"]: p["table_id"] for p in active}
             if table_by_id.get(eliminator_id) != table_by_id.get(eliminated_id):
                 eliminator_id = None
+        if eliminator_id is None and self.db.get_setting_int("pko_mode", 0) == 1:
+            eliminated = self.db.get_player(eliminated_id)
+            if eliminated and eliminated["bounty"] > 0:
+                # Pas de dialogue possible depuis le téléphone (contrairement
+                # à _eliminate_selected) : on refuse simplement l'élimination
+                # plutôt que de rendre sa bounty PKO orpheline — le joueur
+                # reste actif, rien n'est perdu (aucune donnée PKO modifiée),
+                # à finaliser depuis l'onglet Joueurs (choix de l'éliminateur
+                # y est obligatoire) ou en réessayant un glisser-déposer vers
+                # un éliminateur valide. Message explicite (demande du
+                # 2026-09-08) plutôt qu'un refus silencieux.
+                return refuse(
+                    "Élimination impossible : en mode PKO, vous devez "
+                    "désigner le joueur qui a éliminé ce joueur."
+                )
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
         self._queue_elimination_banner(eliminated_id, eliminator_id)
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
@@ -6127,6 +6233,8 @@ class App(tk.Tk):
             self._trigger_movement_alert(from_remote=True)
         self._refresh_all()
         self._refresh_remote_players_cache()
+        if request_id is not None:
+            self._remote_elimination_results[request_id] = {"ok": True, "message": ""}
         # Contrairement à une élimination faite directement dans l'onglet
         # Joueurs (_eliminate_selected) : pas de self.lift()/focus_force()
         # sur la fenêtre PRINCIPALE ici. Une élimination décidée depuis le
@@ -6928,13 +7036,18 @@ class App(tk.Tk):
         self.primes_tree.tag_configure(
             "totalcol", font=("Helvetica", 9, "bold"), background=GOLD, foreground=TEXT_DARK,
         )
-        TreeHeadingTooltip(self.primes_tree, {
+        # bo_valeur (en-tête ET tooltip) est mutable selon le mode
+        # classique/PKO — voir _refresh_bounty_tab, qui met à jour ces 2
+        # textes dynamiquement à chaque rafraîchissement (self.primes_tree
+        # .heading + self.primes_heading_tooltip.column_texts["bo_valeur"]).
+        # Les valeurs ci-dessous sont celles du mode CLASSIQUE (par défaut).
+        self.primes_heading_tooltip = TreeHeadingTooltip(self.primes_tree, {
             "name": "Nom du joueur.",
             "presence": "Prime de présence : points pour avoir participé à ce\ntournoi (réglage Paramètres, 0 = désactivée).",
             "assiduite": "Prime d'assiduité : points si le joueur était déjà présent\naux N derniers tournois consécutifs (réglages Paramètres).",
             "rang": "Place finale du joueur (1 = vainqueur, un chiffre plus élevé\n= éliminé plus tôt). Vide tant que le joueur est encore en jeu.",
             "cl_montant": "Prime de classement : réglage manuel (Paramètres) s'il est\nnon nul, sinon 100×√N / P (N = nb de joueurs, P = Rang).",
-            "bo_nombre": "Nombre : nombre de joueurs qu'il a éliminés (kills).",
+            "bo_nombre": "Nombre : nombre de joueurs qu'il a éliminés (kills) — jamais\nmodifié par la récupération de sa propre bounty finale (PKO).",
             "bo_valeur": "Valeur : points par bounty — réglage manuel s'il est\nnon nul, sinon 10×√N (N = nombre de joueurs du tournoi).",
             "bo_montant": "Montant = Nombre × Valeur.",
             "total": "Somme de toutes les primes du joueur pour ce tournoi\n(Présence + Assiduité + Classement + Montant Bounty).",
@@ -6987,6 +7100,19 @@ class App(tk.Tk):
                   f"{bounty_val:,} pts".replace(",", " "))
         )
 
+        # bo_valeur : "Val Bounty" (classique, valeur fixe) devient
+        # "Moy Bounty" en PKO (Mon Bounty ÷ Nb Bounty, arrondi — voir
+        # Database.get_bounty_bonuses/primes_columns, même bascule que
+        # dans les exports) — en-tête ET tooltip mis à jour ensemble.
+        self.primes_tree.heading("bo_valeur", text="Moy Bounty" if pko_mode else "Val Bounty")
+        self.primes_heading_tooltip.column_texts["bo_valeur"] = (
+            "Moyenne : Mon Bounty ÷ Nb Bounty, arrondie (mode PKO) —\n"
+            "'-' si Nb Bounty = 0 (rien à diviser)."
+            if pko_mode else
+            "Valeur : points par bounty — réglage manuel s'il est\n"
+            "non nul, sinon 10×√N (N = nombre de joueurs du tournoi)."
+        )
+
         self._update_primes_sort_headings()
         for row in self.primes_tree.get_children():
             self.primes_tree.delete(row)
@@ -7035,10 +7161,21 @@ class App(tk.Tk):
             self.bounty_history_tree.delete(row)
         for idx, e in enumerate(self.db.get_bounty_events()):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            # event_type='victory_collect' (voir Database.
+            # _close_out_winner_bounty) : la récupération de sa propre
+            # bounty finale par le vainqueur, PAS une élimination
+            # supplémentaire — marquée distinctement (🏆) pour ne jamais
+            # être confondue avec une vraie élimination dans cet
+            # historique. eliminator_name reste NULL pour ces lignes,
+            # donc déjà affiché "—" ci-dessous, sans traitement à part.
+            eliminated_display = (
+                f"🏆 {e['eliminated_name']} (bounty finale)"
+                if e["event_type"] == "victory_collect" else e["eliminated_name"]
+            )
             self.bounty_history_tree.insert(
                 "", "end",
                 values=(
-                    format_datetime_fr(e["event_time"]), e["eliminated_name"], e["eliminator_name"] or "—",
+                    format_datetime_fr(e["event_time"]), eliminated_display, e["eliminator_name"] or "—",
                     f"{e['amount_won']:,} pts".replace(",", " "),
                     f"{e['added_to_eliminator_bounty']:,} pts".replace(",", " ")
                     if e["added_to_eliminator_bounty"] else "—",

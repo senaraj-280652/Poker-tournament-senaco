@@ -206,7 +206,12 @@ CREATE TABLE IF NOT EXISTS bounty_events (
     eliminator_name TEXT,
     amount_won INTEGER NOT NULL,
     added_to_eliminator_bounty INTEGER NOT NULL DEFAULT 0,
-    event_time TEXT NOT NULL
+    event_time TEXT NOT NULL,
+    -- 'elimination' (défaut, une élimination normale) ou
+    -- 'victory_collect' (clôture de la bounty finale du vainqueur en fin
+    -- de tournoi PKO, voir Database._close_out_winner_bounty — jamais une
+    -- élimination supplémentaire, eliminator_name reste NULL dans ce cas).
+    event_type TEXT NOT NULL DEFAULT 'elimination'
 );
 """
 
@@ -343,6 +348,11 @@ class Database:
             self.conn.execute("ALTER TABLE players ADD COLUMN eliminated_by_name TEXT")
         if "club" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN club TEXT NOT NULL DEFAULT ''")
+        bounty_events_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(bounty_events)")}
+        if "event_type" not in bounty_events_cols:
+            self.conn.execute(
+                "ALTER TABLE bounty_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'elimination'"
+            )
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -610,13 +620,21 @@ class Database:
     def eliminate_player(self, player_id, eliminated_by_id=None):
         """Élimine un joueur. Si `eliminated_by_id` est fourni, l'éliminateur
         voit son compteur de bounty (kills, prime de bounty en points —
-        voir get_bounty_bonuses) incrémenté de 1, quel que soit l'ancien
-        mécanisme de bounty en €. Si en plus le joueur éliminé portait une
-        prime (bounty €), celle-ci est versée à l'éliminateur : intégralement
-        en mode classique, ou selon le partage PKO (une partie en cash
-        immédiat, le reste ajouté à la prime de l'éliminateur) en mode
+        voir get_bounty_bonuses) incrémenté de 1, quel que soit le mode de
+        bounty. Si en plus le joueur éliminé portait une prime (bounty, en
+        points), celle-ci est versée à l'éliminateur : intégralement en
+        mode classique, ou selon le partage PKO (une partie en points
+        immédiats, le reste ajouté à la prime de l'éliminateur) en mode
         progressif. Enregistre aussi, pour l'onglet Joueurs, le round et le
-        nom de l'éliminateur (indépendamment de tout bounty en €)."""
+        nom de l'éliminateur.
+
+        En mode PKO, un éliminateur est OBLIGATOIRE dès que le joueur
+        éliminé porte une bounty > 0 : lève ValueError sans rien modifier
+        si `eliminated_by_id` est absent ou invalide dans ce cas (demande
+        du 2026-09-08 — une bounty PKO ne doit jamais devenir orpheline).
+        Ne s'applique jamais hors PKO ni si la bounty du joueur est à 0 :
+        toutes les autres possibilités existantes (élimination sans
+        éliminateur) restent inchangées."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
@@ -624,6 +642,14 @@ class Database:
         current_round = self.get_current_round_number()
         eliminator_row = self.get_player(eliminated_by_id) if eliminated_by_id else None
         eliminator_name = eliminator_row["name"] if eliminator_row else None
+
+        pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        if pko_mode and eliminated and eliminated["bounty"] > 0 and eliminator_row is None:
+            raise ValueError(
+                f"{eliminated['name']} porte une prime PKO de "
+                f"{eliminated['bounty']} pts : un éliminateur doit être "
+                "désigné pour ne pas la rendre orpheline."
+            )
 
         self.conn.execute(
             "UPDATE players SET status='eliminated', place=?, elim_time=?, "
@@ -639,7 +665,6 @@ class Database:
         if eliminated_by_id and eliminated and eliminated["bounty"] > 0:
             bounty = eliminated["bounty"]
             eliminator = self.get_player(eliminated_by_id)
-            pko_mode = self.get_setting_int("pko_mode", 0) == 1
             if pko_mode:
                 cash_pct = self.get_setting_int("pko_cash_percent", 50)
                 cash_part = round(bounty * cash_pct / 100)
@@ -655,8 +680,8 @@ class Database:
             self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
             self.conn.execute(
                 "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
-                "amount_won, added_to_eliminator_bounty, event_time) "
-                "VALUES (?,?,?,?,?)",
+                "amount_won, added_to_eliminator_bounty, event_time, event_type) "
+                "VALUES (?,?,?,?,?,'elimination')",
                 (eliminated["name"], eliminator["name"] if eliminator else "?",
                  cash_part, grow_part, now),
             )
@@ -667,10 +692,71 @@ class Database:
         # (le vainqueur) — sert à figer l'affichage "Durée" du chrono
         # projecteur au lieu de continuer à défiler après la fin de la
         # partie, et à y afficher "Partie terminée" (voir get_stats()).
-        if len(self.list_players(status="active")) <= 1:
+        still_active = self.list_players(status="active")
+        if len(still_active) <= 1:
             self.set_setting("tournament_end_epoch", int(time.time()))
+            # Clôture de la bounty finale du vainqueur (mode PKO
+            # uniquement, demande du 2026-09-08) : dès qu'il ne reste
+            # plus qu'un seul joueur actif, sa bounty encore portée lui
+            # est définitivement attribuée — voir _close_out_winner_bounty.
+            if pko_mode and len(still_active) == 1:
+                self._close_out_winner_bounty(still_active[0]["id"], now)
 
         return self.rebalance_tables(record_moves=True)
+
+    def _close_out_winner_bounty(self, winner_id, now=None):
+        """Clôture la bounty finale du VAINQUEUR d'un tournoi PKO (demande
+        du 2026-09-08) : transfère sa bounty encore portée vers son propre
+        bounty_won (elle est "définitivement gagnée", voir
+        get_bounty_bonuses), remet sa bounty portée à 0, et enregistre un
+        événement bounty_events distinct — event_type='victory_collect',
+        eliminator_name=NULL — pour qu'on comprenne sans ambiguïté qu'il
+        s'agit de la récupération de sa propre bounty finale, PAS d'une
+        élimination supplémentaire (ne touche jamais `kills`).
+
+        Idempotent : si la bounty portée est déjà à 0 (déjà clôturée, ou
+        rien à clôturer), ne fait rien — sûr à appeler plusieurs fois.
+        Appelé automatiquement par eliminate_player() dès qu'il ne reste
+        plus qu'un joueur actif. Les tournois déjà terminés AVANT ce
+        correctif ne sont PAS corrigés rétroactivement par cette méthode
+        (aucune nouvelle élimination n'y déclenche plus jamais cet appel)
+        — voir Database._pko_effective_bounty_won pour le filet de
+        sécurité en LECTURE SEULE qui couvre ce cas à l'affichage/export."""
+        winner = self.get_player(winner_id)
+        if not winner or winner["bounty"] <= 0:
+            return
+        amount = winner["bounty"]
+        now = now or time.strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE players SET bounty_won = bounty_won + ?, bounty = 0 WHERE id=?",
+            (amount, winner_id),
+        )
+        self.conn.execute(
+            "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
+            "amount_won, added_to_eliminator_bounty, event_time, event_type) "
+            "VALUES (?,NULL,?,0,?,'victory_collect')",
+            (winner["name"], amount, now),
+        )
+        self.conn.commit()
+
+    def _pko_effective_bounty_won(self, player):
+        """bounty_won réel d'un joueur en mode PKO, EN LECTURE SEULE (ne
+        modifie jamais la base — utilisable même sur une connexion
+        read_only) : inclut la bounty encore portée par le VAINQUEUR si le
+        tournoi est terminé et que cette clôture n'a pas encore été
+        physiquement appliquée en base (voir _close_out_winner_bounty) —
+        filet de sécurité pour les tournois déjà terminés AVANT ce
+        correctif (aucune nouvelle élimination n'y déclenche plus jamais
+        la clôture réelle). Sans effet (renvoie bounty_won tel quel) hors
+        PKO, ou si la clôture a déjà eu lieu (bounty déjà à 0 -> somme
+        inchangée, sans double comptage)."""
+        won = player["bounty_won"]
+        if self.get_setting_int("pko_mode", 0) != 1:
+            return won
+        active = self.list_players(status="active")
+        if len(active) == 1 and active[0]["id"] == player["id"]:
+            won += player["bounty"]
+        return won
 
     def withdraw_player(self, player_id):
         """Retire un joueur de la liste active sans lui attribuer de place
@@ -1577,26 +1663,71 @@ class Database:
 
     def get_bounty_bonuses(self):
         """Calcule la prime de bounty (en points) de chaque joueur du
-        tournoi en cours : Nombre = nombre de joueurs qu'il a éliminés
+        tournoi en cours. Nombre = nombre de joueurs qu'il a éliminés
         (players.kills, incrémenté sur toute élimination avec éliminateur
-        désigné — indépendant de l'ancien mécanisme de bounty en €/PKO),
-        Valeur = réglage manuel `bounty_amount` s'il est non nul, sinon
-        10×√N points par bounty (N = nombre total de joueurs du tournoi),
-        Montant = Nombre × Valeur. Renvoie une liste de dicts
-        {name, nombre, valeur, montant} pour tous les joueurs, triée par
-        montant décroissant."""
-        flat_value = self.get_setting_int("bounty_amount", 0)
-        n_players = self.get_stats()["total_players_ever"]
-        valeur = bounty_unit_value(n_players, flat_value)
-        result = [
-            {
-                "name": p["name"], "nombre": p["kills"],
-                "valeur": valeur, "montant": p["kills"] * valeur,
-            }
-            for p in self.list_players()
-        ]
+        désigné) — JAMAIS incrémenté par la clôture de la bounty finale du
+        vainqueur (voir _close_out_winner_bounty), dans les deux modes.
+
+        Mode CLASSIQUE (pko_mode=0, inchangé) :
+          Valeur = réglage manuel `bounty_amount` s'il est non nul, sinon
+          10×√N points par bounty (N = nombre total de joueurs du
+          tournoi) ; Montant = Nombre × Valeur.
+
+        Mode PKO (demande du 2026-09-08) : Valeur × Nombre ne représente
+          plus les vrais gains (une bounty grandit/se transmet en chaîne,
+          voir eliminate_player) — on utilise donc directement les vrais
+          gains PKO définitivement acquis :
+          Montant = bounty_won réel du joueur (y compris sa propre bounty
+          finale s'il est le vainqueur — voir _pko_effective_bounty_won,
+          qui couvre aussi les tournois déjà terminés avant ce correctif) ;
+          Valeur = Montant ÷ Nombre, arrondi (moyenne par bounty gagnée),
+          0 si Nombre = 0 (aucune division par zéro).
+
+        Renvoie une liste de dicts {name, nombre, valeur, montant} pour
+        tous les joueurs, triée par montant décroissant. Utilisé par
+        get_primes_summary (dont le TOTAL, dans les deux modes) et son
+        export dédié — jamais de double comptage : le calcul classique et
+        le calcul PKO sont mutuellement exclusifs, jamais additionnés."""
+        pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        if not pko_mode:
+            flat_value = self.get_setting_int("bounty_amount", 0)
+            n_players = self.get_stats()["total_players_ever"]
+            valeur = bounty_unit_value(n_players, flat_value)
+            result = [
+                {
+                    "name": p["name"], "nombre": p["kills"],
+                    "valeur": valeur, "montant": p["kills"] * valeur,
+                }
+                for p in self.list_players()
+            ]
+        else:
+            result = []
+            for p in self.list_players():
+                nombre = p["kills"]
+                montant = self._pko_effective_bounty_won(p)
+                valeur = round(montant / nombre) if nombre else 0
+                result.append({
+                    "name": p["name"], "nombre": nombre,
+                    "valeur": valeur, "montant": montant,
+                })
         result.sort(key=lambda r: (-r["montant"], r["name"].casefold()))
         return result
+
+    def primes_columns(self):
+        """PRIMES_COLUMNS pour CE tournoi précis : l'en-tête de la colonne
+        'bo_valeur' s'adapte au mode (demande du 2026-09-08) — "Val
+        Bounty" en classique (valeur fixe par bounty), "Moy Bounty" en PKO
+        (Mon Bounty ÷ Nb Bounty, arrondi — voir get_bounty_bonuses).
+        Source UNIQUE de cette adaptation : utilisée à la fois par
+        l'onglet Primes (main.py) et les exports dédiés
+        (export_primes_csv/xlsx/pdf) pour qu'ils ne divergent jamais."""
+        pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        if not pko_mode:
+            return PRIMES_COLUMNS
+        return [
+            (key, "Moy Bounty", fn) if key == "bo_valeur" else (key, header, fn)
+            for key, header, fn in PRIMES_COLUMNS
+        ]
 
     def get_primes_summary(self, sort_column=None, ascending=True):
         """Construit, pour chaque joueur du tournoi en cours, la ligne
@@ -1646,7 +1777,7 @@ class Database:
         toutes). `sort_column`/`ascending` : voir get_primes_summary."""
         import csv
 
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
             writer.writerow([h for _, h, _ in cols])
@@ -1663,7 +1794,7 @@ class Database:
         from openpyxl.styles import Font, Alignment, PatternFill
         from openpyxl.utils import get_column_letter
 
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
 
         wb = Workbook()
@@ -1796,7 +1927,7 @@ class Database:
         """Exporte le tableau de l'onglet Primes en PDF. `columns`,
         `sort_column`, `ascending` : voir export_primes_csv. `title` : voir
         export_primes_xlsx. Nécessite 'fpdf2'."""
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
         name = title or self.get_setting("tournament_name", "Tournoi")
         return _write_pdf_table(
@@ -2139,7 +2270,11 @@ class Database:
                 "name": p["name"], "status": "En cours" if not finished else "Terminé",
                 "gain": payouts_by_place.get(1) if finished else None,
                 "buyin": p["buyin_count"], "rebuy": p["rebuy_count"], "addon": p["addon_count"],
-                "bounty_won": p["bounty_won"],
+                # _pko_effective_bounty_won (pas p["bounty_won"] brut) :
+                # inclut la bounty finale du vainqueur même sur un tournoi
+                # déjà terminé avant le correctif du 2026-09-08 (filet de
+                # sécurité en lecture seule, voir sa docstring).
+                "bounty_won": self._pko_effective_bounty_won(p),
             })
         for p in eliminated:
             rows.append({
@@ -2759,12 +2894,14 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
 
     "total_bounty_won" (par joueur) et "bounty_distributed" (par tournoi)
     viennent de la MÊME source que l'onglet Primes de chaque tournoi (voir
-    Database.get_primes_summary, colonne "Mon Bounty") : nombre
-    d'éliminations (kills) × valeur d'un bounty (réglage manuel
-    `bounty_amount`, sinon 10×√N points) — PAS l'ancien champ
-    `bounty_won`/`bounty` (mécanisme cash/PKO indépendant, plus utilisé par
-    l'onglet Primes), qui reste à 0 dès que `bounty_amount` vaut 0 (valeur
-    par défaut de ce club, qui ne joue qu'en points).
+    Database.get_primes_summary, colonne "Mon Bounty" -> Database.
+    get_bounty_bonuses) : nombre d'éliminations (kills) × valeur fixe d'un
+    bounty en mode CLASSIQUE, ou les vrais gains PKO définitivement acquis
+    (`bounty_won`, bounty finale du vainqueur incluse) en mode PKO — les
+    deux mécanismes ont été unifiés le 2026-09-08, il n'y a plus de champ
+    "ancien"/"indépendant" ici : cette synthèse reflète toujours exactement
+    ce qu'affiche l'onglet Primes du tournoi correspondant, quel que soit
+    son mode.
 
     "total_points" par joueur = somme, sur toute la période, du TOTAL de
     l'onglet Primes de chaque tournoi joué (Présence + Assiduité +
@@ -2891,7 +3028,7 @@ PERIOD_TOURNAMENT_COLUMNS = [
     ("entries", "Entrées", lambda t: t["entries"]),
     ("prize_pool", "Prize pool (€)", lambda t: round(t["prize_pool"], 2)),
     ("winner", "Vainqueur", lambda t: t["winner"]),
-    ("bounty_distributed", "Primes distribuées (€)", lambda t: t["bounty_distributed"]),
+    ("bounty_distributed", "Primes distribuées (pts)", lambda t: t["bounty_distributed"]),
 ]
 
 PERIOD_PLAYER_COLUMNS = [
@@ -2917,7 +3054,7 @@ RESULT_COLUMNS = [
     ("buyin", "Buy-ins", lambda r: r["buyin"]),
     ("rebuy", "Rebuys", lambda r: r["rebuy"]),
     ("addon", "Add-ons", lambda r: r["addon"]),
-    ("bounty_won", "Prime gagnée (€)", lambda r: r["bounty_won"]),
+    ("bounty_won", "Prime gagnée (pts)", lambda r: r["bounty_won"]),
 ]
 
 # Colonnes disponibles pour l'export de la grille de gains telle
