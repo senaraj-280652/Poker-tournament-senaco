@@ -48,7 +48,24 @@ import open_windows
 import backup_restore
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
-from version import APP_NAME, APP_VERSION
+from version import APP_NAME, APP_VERSION, dev_suffix
+
+
+def _app_title_prefix():
+    """"{APP_NAME} v{APP_VERSION}[complément dev]" — préfixe commun à
+    TOUS les titres de fenêtre de premier niveau (demande du
+    2026-09-09) : Menu principal (voir App.__init__) ET fenêtre de
+    tournoi (voir App._update_window_title), pour identifier
+    immédiatement, PENDANT LE DÉVELOPPEMENT, quel commit (et si des
+    modifications locales non commitées s'y ajoutent, voir version.
+    dev_suffix) une fenêtre déjà ouverte fait réellement tourner — sans
+    jamais avoir à toucher APP_VERSION à la main pour ça. En build
+    officielle (PyInstaller), dev_suffix() est vide : le titre reste
+    strictement "{APP_NAME} v{APP_VERSION}", inchangé par ce correctif.
+    Fonction MODULE-LEVEL (pas une méthode) : réutilisable telle quelle,
+    sans construire de fenêtre, y compris dans les tests."""
+    return f"{APP_NAME} v{APP_VERSION}{dev_suffix()}"
+
 
 # Écran de démarrage ("Chargement en cours...", voir
 # windows/poker_tournament.spec) : le module pyi_splash n'existe que
@@ -3825,7 +3842,16 @@ class App(tk.Tk):
     def __init__(self, open_path=None):
         super().__init__()
         self.withdraw()
-        self.title(f"{APP_NAME}  —  v{APP_VERSION}")
+        # Titre initial (Menu principal, avant tout choix de tournoi —
+        # voir _app_title_prefix, demande du 2026-09-09) : identique au
+        # préfixe utilisé ensuite par _update_window_title pour une
+        # fenêtre de tournoi, pour repérer immédiatement, EN
+        # DÉVELOPPEMENT, quel commit une fenêtre déjà ouverte fait
+        # tourner. Écrasé par _update_window_title dès qu'un tournoi est
+        # choisi (voir _build_header, appelée après _choose_tournament_
+        # file) — ce titre-ci n'est donc visible QUE pendant l'écran
+        # d'accueil "Bienvenue".
+        self.title(_app_title_prefix())
         self.geometry("1200x750")
 
         self.db = None
@@ -4169,12 +4195,22 @@ class App(tk.Tk):
             if fallback:
                 name = fallback
         tournament_date = format_date_fr(self.db.get_tournament_date()) if self.db else ""
-        title = f"Tournoi : {name} du {tournament_date}" if name else APP_NAME
+        # Préfixe "{APP_NAME} v{APP_VERSION}[complément dev]" (demande du
+        # 2026-09-09, voir _app_title_prefix) : identique à celui du
+        # Menu principal (App.__init__), pour repérer immédiatement, EN
+        # DÉVELOPPEMENT, quel commit (et si des modifications locales
+        # non commitées s'y ajoutent) une fenêtre de tournoi déjà ouverte
+        # fait tourner — jamais besoin de toucher APP_VERSION pour ça.
+        # Sans effet en build officielle (dev_suffix() y est vide).
+        app_prefix = _app_title_prefix()
+        title = f"{app_prefix} — Tournoi : {name} du {tournament_date}" if name else app_prefix
         # Mode Test (demande du 2026-09-09) : préfixé bien en évidence,
         # aussi bien dans le titre de la fenêtre (barre de titre/Dock, visible
         # même onglet Paramètres fermé) que dans le bandeau interne
         # (header_title_lbl, coloré différemment pour sauter aux yeux) —
         # pour ne jamais l'oublier activé par erreur avant un vrai tournoi.
+        # Reste le préfixe le PLUS à gauche (donc le plus visible même si
+        # le titre est tronqué), devant même l'identification de version.
         test_mode_on = self.test_mode_var.get() if hasattr(self, "test_mode_var") else False
         if test_mode_on:
             title = f"🧪 MODE TEST — {title}"
