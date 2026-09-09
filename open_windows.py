@@ -401,26 +401,43 @@ def _primes_session_lock_path():
     return os.path.join(os.path.expanduser("~"), ".poker_tournament", "primes_session_started.json")
 
 
-def mark_primes_session_started():
-    """Mémorise que le PREMIER tournoi de la session actuelle vient de
-    démarrer son chronomètre (demande du 2026-09-09, correction du
-    verrouillage de "Calculer les primes" — voir main.py:_clock_resume,
-    appelée à chaque transition clock_started 0->1, y compris pour un
-    tournoi qui ne serait pas le tout premier : écriture idempotente,
-    sans effet si déjà posée).
+def mark_primes_session_started(primes_enabled=True):
+    """Verrouille "Calculer les primes" pour TOUTE la session actuelle,
+    à la valeur `primes_enabled` (bool) — appelée UNE SEULE FOIS pour de
+    bon par session (voir main.py:_clock_resume, appelée à chaque
+    transition clock_started 0->1) : dès que la session est déjà
+    verrouillée (primes_session_started() vrai), un appel ultérieur
+    (ex. un DEUXIÈME tournoi de la session qui démarre à son tour)
+    N'A AUCUN EFFET — la valeur du tout premier tournoi démarré reste
+    l'unique valeur AUTHORITATIVE pour toute la session, jamais
+    réécrite par un second démarrage.
+
+    CORRECTION du 2026-09-09 (4e relecture utilisateur, "ouvrir un
+    tournoi EXISTANT après verrouillage garde à tort son ancienne
+    valeur") : mémorise désormais la valeur elle-même, pas seulement le
+    booléen "un tournoi a démarré" — voir locked_primes_enabled(), qui
+    la restitue. Sans cette valeur explicite et persistée, aligner un
+    tournoi (nouveau ou existant) rejoignant une session déjà verrouillée
+    devait se rabattre sur la valeur "proposée" (export_prefs), qui peut
+    être remise à tort à ON par erreur si le registre passe par un état
+    temporairement vide (ex. App._new_tournament/_open_tournament :
+    fenêtre unique fermée puis immédiatement remplacée par une autre,
+    dans le MÊME process — voir open_windows.register/unregister) —
+    cette valeur-ci, elle, ne peut plus jamais être perdue une fois
+    posée, tant que la session reste active (voir primes_session_
+    started, qui la nettoie exactement au même moment que le drapeau).
 
     Fichier SÉPARÉ du registre principal (open_windows.json) — même
     raison que _phone_selection_path : celui-ci associe à chaque clé (un
     chemin de fichier .tournoi) un dict {"pid": ...} que _prune() relit
     systématiquement en boucle, y mélanger une clé non-chemin le
-    casserait.
-
-    Ne PAS confondre avec un simple booléen "un tournoi a démarré une
-    fois dans le passé" : voir primes_session_started(), qui limite sa
-    portée à la session ACTUELLE (tant qu'il reste au moins un tournoi
-    ouvert)."""
+    casserait."""
+    if primes_session_started():
+        return  # déjà verrouillée : la valeur du tout premier reste seule autoritative
     try:
-        _atomic_write_json(_primes_session_lock_path(), {"started": True})
+        _atomic_write_json(
+            _primes_session_lock_path(), {"started": True, "primes_enabled": bool(primes_enabled)}
+        )
     except OSError:
         pass
 
@@ -430,6 +447,24 @@ def _clear_primes_session_started():
         os.remove(_primes_session_lock_path())
     except OSError:
         pass
+
+
+def _read_primes_session_data():
+    """Lecture brute du fichier de verrouillage — {} si absent/illisible/
+    session terminée (registre vide, voir primes_session_started et
+    locked_primes_enabled, les deux seuls appelants)."""
+    if not list_open_paths():
+        _clear_primes_session_started()
+        return {}
+    path = _primes_session_lock_path()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def primes_session_started():
@@ -453,18 +488,20 @@ def primes_session_started():
     nettoyage : aucune valeur `started=true` périmée ne peut donc
     survivre jusqu'à une session suivante, peu importe qui/quand relit
     ce drapeau en premier."""
-    if not list_open_paths():
-        _clear_primes_session_started()
-        return False
-    path = _primes_session_lock_path()
-    if not os.path.exists(path):
-        return False
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return False
-    return bool(data.get("started")) if isinstance(data, dict) else False
+    return bool(_read_primes_session_data().get("started"))
+
+
+def locked_primes_enabled(default=True):
+    """Valeur de "Calculer les primes" VERROUILLÉE pour la session
+    actuelle (demande du 2026-09-09, 4e relecture) — `default` si la
+    session n'est PAS verrouillée (primes_session_started() faux) : cet
+    appel n'a alors aucun sens, l'appelant doit toujours vérifier
+    primes_session_started() lui-même avant de s'y fier (voir main.py:
+    _align_primes_enabled_on_open, seul appelant prévu)."""
+    data = _read_primes_session_data()
+    if not data.get("started"):
+        return default
+    return bool(data.get("primes_enabled", default))
 
 
 def bring_pid_to_front(pid):

@@ -42,6 +42,18 @@ def _open_new(path):
     db.conn.close()
 
 
+def _open_existing(path):
+    """Reproduit EXACTEMENT le chemin d'ouverture d'un fichier .tournoi
+    DÉJÀ EXISTANT (voir App.__init__, MÊME ORDRE) : Database(path) ->
+    open_windows.register(path) -> _align_primes_enabled_on_open(db) —
+    demande du 2026-09-09 (4e relecture, "ouvrir un tournoi EXISTANT
+    après verrouillage garde à tort son ancienne valeur")."""
+    db = database.Database(path)
+    open_windows.register(path)
+    main._align_primes_enabled_on_open(db)
+    db.conn.close()
+
+
 def _hold_open(path, is_new):
     """Représente UNE fenêtre de tournoi RÉELLEMENT ouverte, pour toute
     la durée où ce process reste vivant — exactement comme un vrai
@@ -60,9 +72,7 @@ def _hold_open(path, is_new):
     if is_new:
         _open_new(path)
     else:
-        db = database.Database(path)
-        db.conn.close()
-        open_windows.register(path)
+        _open_existing(path)
     print("ready", flush=True)
     for line in sys.stdin:
         if line.strip() == "close":
@@ -88,6 +98,13 @@ def main_cli():
         _open_new(args[0])
         print("ok")
 
+    elif action == "open_existing":
+        # Court-vécu (contrairement à "hold_open <path>", sans --new) :
+        # suffisant pour vérifier l'alignement d'un tournoi EXISTANT à
+        # l'ouverture, sans avoir besoin qu'il "reste ouvert" ensuite.
+        _open_existing(args[0])
+        print("ok")
+
     elif action == "toggle_unchecked":
         # Simule un clic sur "Calculer les primes" (décochée) depuis LA
         # fenêtre du tournoi `args[0]` : même effet que App._on_primes_
@@ -104,6 +121,19 @@ def main_cli():
         db = database.Database(path)
         main._set_primes_enabled_proposed(True)
         db.set_setting("primes_enabled", "1")
+        db.conn.close()
+        print("ok")
+
+    elif action == "start_tournament":
+        # Simule App._clock_resume au tout premier démarrage (voir
+        # main.py, MÊME ORDRE) : resynchronisation défensive,
+        # clock_started=1, puis verrouillage de la session à la valeur
+        # de CE tournoi précis.
+        path = args[0]
+        db = database.Database(path)
+        main._sync_primes_enabled_pref(db)
+        db.set_settings({"clock_started": 1})
+        open_windows.mark_primes_session_started(db.get_setting_int("primes_enabled", 1) == 1)
         db.conn.close()
         print("ok")
 

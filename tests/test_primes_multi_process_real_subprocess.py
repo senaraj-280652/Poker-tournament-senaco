@@ -75,7 +75,13 @@ class _HeldWindow:
                     pass
 
 
-class PrimesMultiProcessRealSubprocessTest(unittest.TestCase):
+class _RealSubprocessHelpers:
+    """Mixin (PAS un TestCase — n'hérite pas de unittest.TestCase, pour
+    ne jamais être collecté ni exécuté lui-même) regroupant setUp/
+    tearDown/les petits utilitaires partagés par les classes de test
+    ci-dessous, sans dupliquer leur code ni faire hériter une classe de
+    test d'une autre (ce qui exécuterait deux fois les mêmes tests)."""
+
     def setUp(self):
         self._tmphome_ctx = tempfile.TemporaryDirectory(prefix="poker_primes_subproc_home_")
         self._tmpdata_ctx = tempfile.TemporaryDirectory(prefix="poker_primes_subproc_data_")
@@ -146,6 +152,8 @@ class PrimesMultiProcessRealSubprocessTest(unittest.TestCase):
     def _path(self, name):
         return os.path.join(self.data, f"{name}.tournoi")
 
+
+class PrimesMultiProcessRealSubprocessTest(_RealSubprocessHelpers, unittest.TestCase):
     def test_scenario_deux_vrais_process_puis_nouvelle_session(self):
         path_a = self._path("A")
         path_b = self._path("B")
@@ -245,6 +253,67 @@ class PrimesMultiProcessRealSubprocessTest(unittest.TestCase):
             "même après un plantage (jamais de unregister propre), un "
             "tournoi d'une nouvelle session doit démarrer primes ON",
         )
+
+
+# ---------------------------------------------------------------------
+# 4e relecture du 2026-09-09 : "ouvrir un tournoi EXISTANT après
+# verrouillage garde à tort son ancienne valeur" — version à VRAIS
+# process séparés du scénario déjà couvert (avec de vrais fichiers
+# SQLite mais en mémoire) par tests/test_align_primes_enabled_on_open.py.
+# ---------------------------------------------------------------------
+class ExistingTournamentAlignsOnLockedSessionRealSubprocessTest(_RealSubprocessHelpers, unittest.TestCase):
+    """Utilise le même mixin que PrimesMultiProcessRealSubprocessTest
+    (setUp/tearDown/_run/_hold_open/_path), sans en hériter directement
+    (qui aurait fait exécuter deux fois ses propres tests)."""
+
+    def test_ancien_tournoi_on_rejoint_session_verrouillee_off(self):
+        """LE scénario exact demandé, sens 1, avec de VRAIS process
+        séparés : B (ancien, ON) créé et refermé — session déjà close.
+        Nouvelle session : A créé, décoché, démarré (verrouille OFF).
+        B est ensuite rouvert : doit immédiatement devenir OFF."""
+        path_b = self._path("B")
+        window_b_old = self._hold_open(path_b, is_new=True)  # "ancienne session" : B créé, ON par défaut
+        self.assertEqual(self._run("read_local", path_b), "1")
+        window_b_old.close()  # ancienne session refermée (B était seul)
+        self.assertEqual(self._run("list_open"), "")
+
+        # Nouvelle session : A créé, décoché, démarré.
+        window_a = self._hold_open(self._path("A"), is_new=True)
+        self._run("toggle_unchecked", self._path("A"))
+        self._run("start_tournament", self._path("A"))
+        self.assertEqual(self._run("read_proposed"), "0")
+
+        # B (existant, ancien ON) rouvert PENDANT que la session A reste
+        # verrouillée OFF.
+        self._run("open_existing", path_b)
+        self.assertEqual(
+            self._run("read_local", path_b), "0",
+            "B doit immédiatement adopter OFF (valeur verrouillée de la session en cours)",
+        )
+        window_a.close()
+
+    def test_ancien_tournoi_off_rejoint_session_verrouillee_on(self):
+        """Le test inverse, sens 2, avec de VRAIS process séparés."""
+        path_b = self._path("B2")
+        window_b_old = self._hold_open(path_b, is_new=True)
+        self._run("toggle_unchecked", path_b)
+        self.assertEqual(self._run("read_local", path_b), "0")
+        window_b_old.close()
+        self.assertEqual(self._run("list_open"), "")
+
+        # Nouvelle session : A créé (primes ON par défaut, session neuve), démarré.
+        path_a = self._path("A2")
+        window_a = self._hold_open(path_a, is_new=True)
+        self.assertEqual(self._run("read_local", path_a), "1")
+        self._run("start_tournament", path_a)
+        self.assertEqual(self._run("read_proposed"), "1")
+
+        self._run("open_existing", path_b)
+        self.assertEqual(
+            self._run("read_local", path_b), "1",
+            "B doit immédiatement adopter ON (valeur verrouillée de la session en cours)",
+        )
+        window_a.close()
 
 
 if __name__ == "__main__":

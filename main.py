@@ -494,6 +494,50 @@ def _sync_primes_enabled_pref(db):
         db.set_setting("primes_enabled", wanted)
 
 
+def _align_primes_enabled_on_open(db):
+    """Aligne `db.primes_enabled` sur l'état VERROUILLÉ de la session
+    AVANT que ce tournoi ne puisse être utilisé (demande du 2026-09-09,
+    4e relecture utilisateur) : si la session est DÉJÀ verrouillée
+    (open_windows.primes_session_started), ce tournoi — NOUVEAU ou
+    EXISTANT, peu importe sa propre valeur antérieure — doit
+    immédiatement adopter la valeur verrouillée, authoritative pour
+    TOUS les tournois qui rejoignent la session après ce verrouillage.
+    Seule l'activation/désactivation (ce réglage précis) est concernée :
+    les montants propres à CE tournoi (présence, assiduité, classement,
+    bounty, PKO...) ne sont jamais touchés ici, ni son historique.
+
+    À appeler UNE FOIS, juste après open_windows.register(self.db.path)
+    dans App.__init__ (voir plus bas) — donc AVANT _build_tabs()/
+    _build_settings_tab(), pour que la case et le grisement de la
+    section reflètent le bon état dès la toute première image affichée
+    (jamais l'ancien état qui apparaîtrait puis changerait au tick
+    suivant). Cas d'usage typique découvert le 2026-09-09 : App.
+    _new_tournament/_open_tournament ferme la fenêtre actuelle (donc la
+    désenregistre) puis en ouvre une autre DANS LE MÊME PROCESS — si
+    cette fenêtre était la seule ouverte, le registre passe par un état
+    temporairement vide entre les deux, ce qui pouvait faire lire à tort
+    l'ancienne valeur "proposée" (déjà réinitialisée entre-temps, voir
+    _primes_enabled_proposed) au lieu de la valeur RÉELLEMENT verrouillée
+    de la session en cours — cette fonction s'appuie plutôt sur la
+    valeur verrouillée elle-même (open_windows.locked_primes_enabled),
+    mémorisée une seule fois pour de bon au moment du verrouillage
+    (voir App._clock_resume), jamais perdue tant que la session reste
+    active.
+
+    Ne touche jamais un tournoi déjà démarré (sa valeur lui appartient
+    définitivement, comme _sync_primes_enabled_pref) — cas normalement
+    déjà couvert (un tournoi qu'on rouvre alors qu'il a déjà démarré
+    verrouille de toute façon la session sur SA PROPRE valeur, voir
+    App._clock_resume), simple garde de cohérence supplémentaire ici."""
+    if db.get_setting_int("clock_started", 0) == 1:
+        return
+    if not open_windows.primes_session_started():
+        return
+    wanted = "1" if open_windows.locked_primes_enabled() else "0"
+    if db.get_setting("primes_enabled", "1") != wanted:
+        db.set_setting("primes_enabled", wanted)
+
+
 def raise_process_when_ready(widget, pid, attempt=0):
     """Tente de faire passer au premier plan le processus `pid` tout
     juste lancé par spawn_app_process (macOS et Windows, voir
@@ -3936,6 +3980,13 @@ class App(tk.Tk):
         # déjà ouvert ici et de ramener CETTE fenêtre au premier plan
         # plutôt que d'en ouvrir une deuxième sur le même fichier.
         open_windows.register(self.db.path)
+        # Aligne ce tournoi (nouveau OU existant) sur "Calculer les
+        # primes" VERROUILLÉ de la session, s'il y a lieu (demande du
+        # 2026-09-09, 4e relecture) — AVANT _build_tabs()/_build_
+        # settings_tab() ci-dessous, pour que la case et le grisement de
+        # la section reflètent le bon état dès la toute première image,
+        # jamais l'ancien état affiché puis corrigé au tick suivant.
+        _align_primes_enabled_on_open(self.db)
 
         self.deiconify()
         self._build_header()
@@ -7714,16 +7765,22 @@ class App(tk.Tk):
                 # projecteur (voir Database.get_stats).
                 "tournament_start_epoch": int(time.time()),
             })
-            # Verrouille "Calculer les primes" pour TOUTE la session
-            # (demande du 2026-09-09, voir open_windows.
-            # mark_primes_session_started/primes_session_started et
+            # Verrouille "Calculer les primes" pour TOUTE la session,
+            # À LA VALEUR de CE tournoi précis (demande du 2026-09-09,
+            # voir open_windows.mark_primes_session_started/
+            # primes_session_started/locked_primes_enabled et
             # _primes_session_locked) : posé ici, au moment exact où CE
             # tournoi démarre — que ce soit le tout premier de la session
-            # ou un suivant (écriture idempotente, sans effet si déjà
-            # posée). Reste vrai même après la fermeture de CE tournoi,
-            # tant qu'il reste au moins un autre tournoi de la session
-            # ouvert (voir la docstring de primes_session_started).
-            open_windows.mark_primes_session_started()
+            # ou un suivant (sans effet si la session est déjà
+            # verrouillée : la valeur du tout premier reste seule
+            # autoritative). Reste vrai (et la valeur mémorisée) même
+            # après la fermeture de CE tournoi, tant qu'il reste au moins
+            # un autre tournoi de la session ouvert (voir la docstring de
+            # primes_session_started) — et sert désormais aussi à aligner
+            # tout tournoi (nouveau OU existant) qui rejoindrait la
+            # session après ce verrouillage, voir _align_primes_enabled_
+            # on_open.
+            open_windows.mark_primes_session_started(self.db.get_setting_int("primes_enabled", 1) == 1)
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
             self.db.set_settings({"is_paused": 0, "level_start_epoch": int(time.time()) - self._elapsed_before_pause()})
