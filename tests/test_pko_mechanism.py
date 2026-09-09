@@ -504,13 +504,28 @@ class _FakeApp:
     _remote_eliminate_request lisent ou appellent (même principe que
     tests/test_poll_voice_queue_stops_after_end_tournament.py) — self.db
     est une VRAIE Database sur un fichier .tournoi synthétique, tout le
-    reste (bandeau, rééquilibrage, rafraîchissement) est un no-op."""
+    reste (bandeau, rééquilibrage, rafraîchissement) est un no-op.
 
-    def __init__(self, db):
+    `test_mode` : conservé pour compatibilité avec les appels existants,
+    mais SANS AUCUN EFFET sur _remote_eliminate depuis la correction du
+    2026-09-09 (2e relecture utilisateur) — le Mode Test ne facilite que
+    l'élimination GROUPÉE (_eliminate_selected, onglet Joueurs), un
+    concept qui n'existe pas côté téléphone (toujours une seule
+    élimination à la fois). Voir test_test_mode_est_sans_effet_sur_
+    remote_eliminate ci-dessous, qui vérifie explicitement cette absence
+    d'effet, et tests/test_test_mode_and_mandatory_eliminator.py pour la
+    règle réellement appliquée (mandatory ⟺ primes activées ET bounty >
+    0, indépendant du Mode Test)."""
+
+    def __init__(self, db, test_mode=False):
         self.db = db
         self.voice_command_queue = queue.Queue()
         self._remote_elimination_results = {}
         self.clock_window = None  # écran projecteur : jamais ouvert dans ces tests
+        self.test_mode = test_mode
+
+    def _test_mode_enabled(self):
+        return self.test_mode
 
     def _queue_elimination_banner(self, *a, **k):
         pass
@@ -599,8 +614,16 @@ class RemoteEliminatePkoOrphanTest(unittest.TestCase):
         self.assertEqual(bob["status"], "active")
 
     def test_pas_de_refus_pko_si_bounty_nulle(self):
-        """Non-régression : la règle ne s'applique que si la bounty du
-        joueur éliminé est > 0 (même hors éliminateur désigné)."""
+        """Non-régression : l'obligation d'éliminateur ne s'applique que
+        si la bounty du joueur éliminé est > 0 (même hors éliminateur
+        désigné) — vrai qu'importe le Mode Test, qui n'a plus aucun
+        effet sur _remote_eliminate depuis la CORRECTION du 2026-09-09
+        (2e relecture utilisateur : le Mode Test ne facilite que
+        l'élimination GROUPÉE, un concept qui n'existe pas côté
+        téléphone — voir tests/test_test_mode_and_mandatory_eliminator.py
+        pour la couverture de la règle corrigée, indépendante de
+        test_mode, et tests/test_primes_enabled_toggle.py pour la
+        vérification structurelle que ce couplage a bien disparu)."""
         db2 = _new_db(self._tmp.name, "remote_pko_bounty_nulle", bounty_amount=0, pko_mode=True)
         self.addCleanup(db2.conn.close)
         x = db2.add_player("X")
@@ -608,8 +631,30 @@ class RemoteEliminatePkoOrphanTest(unittest.TestCase):
         db2.add_player("Z")
         fake2 = _FakeApp(db2)
         main.App._remote_eliminate(fake2, y, None, request_id="req-nulle")
-        self.assertTrue(fake2._remote_elimination_results["req-nulle"]["ok"])
+        result = fake2._remote_elimination_results["req-nulle"]
+        self.assertTrue(result["ok"])
         self.assertEqual(db2.get_player(y)["status"], "eliminated")
+
+    def test_test_mode_est_sans_effet_sur_remote_eliminate(self):
+        """Le drapeau `test_mode` de _FakeApp (conservé dans cette classe
+        pour compatibilité, voir sa docstring) ne doit plus influencer le
+        résultat de _remote_eliminate, dans un sens comme dans l'autre —
+        même bounty > 0 en PKO, le refus reste identique."""
+        for test_mode in (False, True):
+            with self.subTest(test_mode=test_mode):
+                db2 = _new_db(
+                    self._tmp.name, f"remote_pko_test_mode_{test_mode}",
+                    bounty_amount=100, pko_mode=True,
+                )
+                self.addCleanup(db2.conn.close)
+                db2.add_player("X")
+                y = db2.add_player("Y")
+                db2.add_player("Z")
+                fake2 = _FakeApp(db2, test_mode=test_mode)
+                main.App._remote_eliminate(fake2, y, None, request_id="req")
+                result = fake2._remote_elimination_results["req"]
+                self.assertFalse(result["ok"], f"test_mode={test_mode} ne doit rien changer")
+                self.assertEqual(db2.get_player(y)["status"], "active")
 
     def test_garde_protegee_au_niveau_database_quel_que_soit_lappelant(self):
         """Vérifie que la protection ne dépend pas de _remote_eliminate :

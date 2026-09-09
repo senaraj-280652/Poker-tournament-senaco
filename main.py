@@ -378,6 +378,114 @@ def _refresh_launch_buttons_state(win, buttons):
     win.after(1000, lambda: _refresh_launch_buttons_state(win, buttons))
 
 
+# --- Interrupteur général "Calculer les primes" (demande du 2026-09-09) ---
+#
+# Objectif : un seul réglage, valable pour TOUTE la session de
+# l'application (tous les tournois déjà ouverts, pas encore démarrés, ou
+# créés plus tard dans la même session), modifiable depuis les Paramètres
+# de N'IMPORTE LEQUEL de ces tournois tant qu'AUCUN d'entre eux n'a
+# encore démarré son chronomètre, puis définitivement figé pour tous dès
+# que le PREMIER démarre (voir _clock_resume) — et qui se déverrouille de
+# nouveau uniquement une fois TOUS fermés (plus aucune entrée dans
+# open_windows.list_open_paths()).
+#
+# Architecture (2 niveaux, cf. discussion avec l'utilisateur) :
+#   1. Une valeur "proposée" globale, dans export_prefs.json (même
+#      mécanisme, mêmes garanties, que SINGLE_TOURNAMENT_PREF_KEY
+#      ci-dessus) : PRIMES_ENABLED_PROPOSED_KEY. Simple reflet de "ce que
+#      l'utilisateur a coché en dernier" avant tout verrouillage.
+#   2. La valeur réellement utilisée par chaque calcul est TOUJOURS la
+#      copie locale en base SQLite de CE tournoi (`primes_enabled`, voir
+#      Database._primes_enabled) — jamais lue directement depuis
+#      export_prefs par database.py, qui n'a connaissance d'aucune notion
+#      de session.
+# Tant que la session n'est pas verrouillée, main.py maintient ces deux
+# valeurs synchronisées activement (voir _sync_primes_enabled_pref,
+# appelée sans condition à chaque tick de CHAQUE fenêtre ouverte, et une
+# dernière fois juste avant que _clock_resume ne démarre le chrono) :
+# ainsi, AUCUNE copie locale figée à la création d'un tournoi ne peut
+# rester en retard sur un changement fait depuis une autre fenêtre — la
+# convergence est garantie en un peu moins d'une seconde, bien avant
+# qu'aucun tournoi n'ait eu la moindre chance de démarrer entre-temps
+# (démarrer un chronomètre est une action utilisateur explicite, jamais
+# automatique). Le verrouillage lui-même n'est JAMAIS un drapeau
+# persisté à part : il est entièrement DÉRIVÉ, à la demande, de l'état
+# réel (clock_started) des tournois actuellement ouverts d'après le
+# registre partagé — voir _primes_session_locked. Ce choix évite tout
+# risque de drapeau de verrouillage resté bloqué après un plantage/une
+# fermeture brutale (même robustesse que _other_tournament_is_open, qui
+# repose déjà sur ce même registre auto-nettoyé).
+
+PRIMES_ENABLED_PROPOSED_KEY = "primes_enabled_session_proposed"
+
+
+def _primes_enabled_proposed():
+    """Valeur globale "proposée" pour "Calculer les primes" (voir
+    bloc de commentaires ci-dessus) — cochée par défaut, comme
+    Database.DEFAULT_SETTINGS["primes_enabled"]="1" pour rester
+    cohérent avec la compatibilité des anciens tournois. Ne représente
+    PAS forcément la valeur en vigueur si la session est verrouillée sur
+    une valeur différente d'une session précédente non nettoyée — c'est
+    toujours la copie SQLite de chaque tournoi qui fait foi pour les
+    calculs, jamais cette valeur directement."""
+    return export_prefs.load_value(PRIMES_ENABLED_PROPOSED_KEY, True) is not False
+
+
+def _set_primes_enabled_proposed(value):
+    """Modifie la valeur "proposée" (case à cocher des Paramètres) — à
+    n'appeler que si `_primes_session_locked()` est faux (voir la case
+    elle-même, désactivée sinon). N'a par elle-même aucun effet sur les
+    tournois déjà ouverts : c'est `_sync_primes_enabled_pref`, rappelée
+    par chaque fenêtre à chaque tick, qui répercute ce changement dans
+    leur copie SQLite locale respective."""
+    export_prefs.save_value(PRIMES_ENABLED_PROPOSED_KEY, bool(value))
+
+
+def _primes_session_locked():
+    """True si le PREMIER tournoi de la session ACTUELLE a déjà démarré
+    son chronomètre, tant qu'il reste au moins un tournoi de cette
+    session encore ouvert — voir open_windows.mark_primes_session_
+    started/primes_session_started, qui portent le drapeau réel.
+
+    CORRECTION du 2026-09-09 (relecture utilisateur) : la version
+    précédente ici re-scannait à chaque appel `clock_started` sur
+    chaque tournoi ACTUELLEMENT ouvert, et considérait la session
+    déverrouillée dès qu'AUCUN d'eux n'avait `clock_started=1` — ce qui
+    déverrouillait à tort dès la fermeture du tournoi qui avait démarré,
+    même si un AUTRE tournoi de la même session (jamais démarré,
+    ex. un Sit & Go créé en attendant) restait ouvert. Voir
+    open_windows.primes_session_started : le drapeau "un tournoi de
+    cette session a démarré" est maintenant mémorisé séparément (posé
+    une fois pour toutes par _clock_resume) et ne redevient faux que
+    lorsque list_open_paths() est complètement VIDE (tous les tournois
+    de la session fermés — PID morts déjà exclus par _prune, donc
+    robuste à un plantage), jamais simplement "plus aucun DÉMARRÉ
+    actuellement ouvert"."""
+    return open_windows.primes_session_started()
+
+
+def _sync_primes_enabled_pref(db):
+    """Fait converger la copie SQLite locale de `db` (CE tournoi) vers la
+    valeur globale proposée (`_primes_enabled_proposed`), UNIQUEMENT si
+    ce tournoi précis n'a pas encore démarré son propre chronomètre —
+    une fois démarré, sa valeur est définitivement la sienne (figée,
+    voir le bloc de commentaires plus haut) et ne doit plus jamais être
+    réécrite, y compris si la session reste "non verrouillée" du point
+    de vue d'un AUTRE tournoi pas encore démarré (cas normal : un
+    tournoi démarré verrouille toute la session, mais tant qu'il reste
+    ouvert son propre réglage ne doit évidemment plus bouger).
+    À appeler sans aucune condition préalable (pas seulement si l'onglet
+    Paramètres est affiché) à chaque tick de chaque fenêtre de tournoi,
+    et une dernière fois juste avant que _clock_resume ne démarre
+    effectivement le chrono (resynchronisation défensive de dernière
+    minute, referme toute fenêtre de course résiduelle)."""
+    if db.get_setting_int("clock_started", 0) == 1:
+        return
+    wanted = "1" if _primes_enabled_proposed() else "0"
+    if db.get_setting("primes_enabled", "1") != wanted:
+        db.set_setting("primes_enabled", wanted)
+
+
 def raise_process_when_ready(widget, pid, attempt=0):
     """Tente de faire passer au premier plan le processus `pid` tout
     juste lancé par spawn_app_process (macOS et Windows, voir
@@ -3707,6 +3815,15 @@ class App(tk.Tk):
         # d'en accumuler plusieurs par des clics répétés ; ne concerne que
         # CE process-ci (chaque tournoi garde sa propre référence).
         self._menu_principal_proc = None
+        # Mode Test (demande du 2026-09-09) : outil de test/développement,
+        # PROPRE À CE PROCESS, jamais mémorisé nulle part (ni export_prefs,
+        # ni réglage de tournoi) — décoché à chaque lancement du logiciel,
+        # voir _build_settings_tab (case "Mode Test") et _test_mode_
+        # enabled. Défini ici, avant même le choix d'un fichier de
+        # tournoi, pour que _update_window_title (appelée dès l'écran
+        # d'accueil) puisse toujours le consulter sans crainte d'un
+        # attribut manquant.
+        self.test_mode_var = tk.BooleanVar(value=False)
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
@@ -3994,11 +4111,24 @@ class App(tk.Tk):
                 name = fallback
         tournament_date = format_date_fr(self.db.get_tournament_date()) if self.db else ""
         title = f"Tournoi : {name} du {tournament_date}" if name else APP_NAME
+        # Mode Test (demande du 2026-09-09) : préfixé bien en évidence,
+        # aussi bien dans le titre de la fenêtre (barre de titre/Dock, visible
+        # même onglet Paramètres fermé) que dans le bandeau interne
+        # (header_title_lbl, coloré différemment pour sauter aux yeux) —
+        # pour ne jamais l'oublier activé par erreur avant un vrai tournoi.
+        test_mode_on = self.test_mode_var.get() if hasattr(self, "test_mode_var") else False
+        if test_mode_on:
+            title = f"🧪 MODE TEST — {title}"
         self.title(title)
         if hasattr(self, "header_title_lbl"):
-            self.header_title_lbl.config(
-                text=f"♠ ♥  Tournoi : {name} du {tournament_date}  ♦ ♣" if name
+            header_text = (
+                f"♠ ♥  Tournoi : {name} du {tournament_date}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
+            )
+            if test_mode_on:
+                header_text = f"🧪 MODE TEST — {header_text}"
+            self.header_title_lbl.config(
+                text=header_text, fg="#ff6b4a" if test_mode_on else GOLD,
             )
 
     def _open_new_window(self):
@@ -4419,6 +4549,21 @@ class App(tk.Tk):
             )
             return False
         if result.get("is_new"):
+            # Interrupteur général "Calculer les primes" (demande du
+            # 2026-09-09) : un tournoi flambant neuf part de la valeur
+            # GLOBALE proposée pour la session en cours (voir
+            # _primes_enabled_proposed), immédiatement — pas seulement
+            # au prochain tick (voir _sync_primes_enabled_pref, qui
+            # prendra ensuite le relais tant que ce tournoi n'a pas
+            # démarré, garantissant qu'il ne puisse jamais rester sur une
+            # valeur devenue périmée entre-temps). Ne fait jamais partie
+            # de `last_settings` ci-dessous (tournament_prefs ne mémorise
+            # que self.settings_vars, qui n'inclut volontairement pas
+            # "primes_enabled" — ce réglage suit une règle de session,
+            # pas la règle habituelle "dernier tournoi utilisé").
+            self.db.set_setting(
+                "primes_enabled", "1" if _primes_enabled_proposed() else "0"
+            )
             last_settings = tournament_prefs.load_last_settings()
             if last_settings:
                 self.db.set_settings(last_settings)
@@ -5458,52 +5603,104 @@ class App(tk.Tk):
                 "doit toujours en rester au moins un — c'est le vainqueur.",
             )
             return
-        pko_mode = self.db.get_setting_int("pko_mode", 0) == 1
+        # Primes désactivées (demande du 2026-09-09, précisée le même
+        # jour après relecture utilisateur) : `primes_matter` conditionne
+        # TOUTES les contraintes d'éliminateur liées aux primes/PKO
+        # ci-dessous (élimination groupée bloquée, éliminateur individuel
+        # obligatoire) — si les primes sont désactivées, aucun mécanisme
+        # bounty/PKO n'existe, donc aucun garde ne doit imposer quoi que
+        # ce soit "pour une raison de prime" : ni la case à cocher
+        # groupée, ni le choix individuel d'un éliminateur (l'information
+        # eliminated_by_name reste saisissable normalement si l'utilisateur
+        # choisit d'indiquer un éliminateur, simplement plus jamais
+        # rendue obligatoire par la logique des primes dans ce cas).
+        primes_matter = self.db.primes_enabled()
+        pko_mode = primes_matter and self.db.get_setting_int("pko_mode", 0) == 1
+        test_mode = self._test_mode_enabled()
         if len(ids) == 1:
             p = self.db.get_player(ids[0])
             question = f"Éliminer {p['name']} du tournoi ?"
         else:
-            # Élimination groupée : jamais d'éliminateur désigné (voir
-            # eliminator_id=None plus bas) — en mode PKO, ceci rendrait
-            # orpheline la bounty de tout joueur sélectionné qui en porte
-            # une (interdit, voir Database.eliminate_player) : on bloque
-            # alors l'action groupée entière plutôt que d'échouer à
-            # mi-chemin, ces joueurs devant être éliminés un par un.
-            if pko_mode:
-                with_bounty = [
-                    p["name"] for pid in ids
-                    if (p := self.db.get_player(pid)) and p["status"] == "active" and p["bounty"] > 0
-                ]
-                if with_bounty:
-                    messagebox.showerror(
-                        "Impossible en mode PKO",
-                        "Ces joueurs sélectionnés portent une bounty PKO et "
-                        "doivent être éliminés UN PAR UN pour désigner qui "
-                        "les élimine (sinon leur bounty serait perdue) :\n\n"
-                        + "\n".join(with_bounty),
-                    )
-                    return
+            # Élimination GROUPÉE : jamais d'éliminateur désigné
+            # individuellement (voir eliminator_id=None plus bas), donc un
+            # moyen de contourner l'attribution d'une bounty — bloquée en
+            # fonctionnement normal SEULEMENT si les primes sont activées
+            # (rien à contourner sinon, voir primes_matter ci-dessus) et
+            # que le Mode Test n'est pas actif (demande du 2026-09-09,
+            # facilité d'essai explicitement demandée) : chaque joueur
+            # doit alors être éliminé un par un, avec un éliminateur
+            # obligatoire (voir plus bas).
+            if primes_matter and not test_mode:
+                messagebox.showerror(
+                    "Élimination groupée indisponible",
+                    "Un éliminateur doit obligatoirement être désigné pour "
+                    "chaque élimination (une prime est en jeu) : éliminez "
+                    "ces joueurs un par un.\n\n"
+                    "(Activez « Mode Test » dans Paramètres pour une "
+                    "élimination groupée sans éliminateur, réservée aux "
+                    "essais — ou décochez « Calculer les primes » si les "
+                    "primes ne doivent plus du tout intervenir.)",
+                )
+                return
+            # Mode Test + PKO (demande du 2026-09-09) : la protection
+            # anti-bounty-orpheline de la base (Database.eliminate_player)
+            # serait normalement bloquante ici puisqu'aucun éliminateur
+            # n'est désigné en groupe — c'est exactement la facilité de
+            # test demandée : éliminer en vrac même des joueurs porteurs
+            # d'une bounty PKO, SANS créer de faux éliminateur ni
+            # transférer leur bounty nulle part (elle reste simplement sur
+            # ces joueurs désormais éliminés, jamais relue ailleurs — voir
+            # orphan_bounty_ok plus bas et sa docstring). Simple note
+            # informative ici, plus un blocage : le contournement est le
+            # but recherché en Mode Test.
+            with_bounty = [
+                p["name"] for pid in ids
+                if (p := self.db.get_player(pid)) and p["status"] == "active" and p["bounty"] > 0
+            ] if pko_mode else []
+            bounty_note = (
+                "\n\n⚠️ Mode Test : " + ", ".join(with_bounty) + " porte(nt) une "
+                "bounty PKO qui sera perdue (non attribuée), aucun "
+                "éliminateur n'étant désigné en élimination groupée."
+            ) if with_bounty else ""
             question = (
                 f"Éliminer ces {len(ids)} joueurs du tournoi ?"
                 "\n\n(Élimination groupée : personne ne sera désigné comme "
                 "éliminateur, donc aucun bounty (points) ne sera attribué "
                 "ici. Éliminez ces joueurs un par un si vous voulez "
-                "enregistrer qui élimine qui.)"
+                "enregistrer qui élimine qui.)" + bounty_note
             )
         if not messagebox.askyesno("Confirmer", question):
             return
 
         eliminator_id = None
         if len(ids) == 1:
-            mandatory = pko_mode and p["bounty"] > 0
+            # Éliminateur obligatoire pour une élimination individuelle
+            # UNIQUEMENT si une attribution de bounty/PKO en dépend
+            # réellement (demande du 2026-09-09, précisée après relecture
+            # utilisateur) : primes activées ET ce joueur précis porte une
+            # bounty > 0 — jamais "toujours obligatoire", et INDÉPENDANT
+            # du Mode Test (qui ne facilite que l'élimination GROUPÉE,
+            # jamais la règle individuelle). Le bouton "Ignorer (pas de
+            # prime)" de _ask_eliminator disparaît de lui-même dès que
+            # mandatory=True (il devient "Annuler l'élimination") ; il
+            # reste disponible normalement si aucune bounty n'est en jeu
+            # (primes désactivées, bounty nulle, ou classique/PKO à 0).
+            mandatory = primes_matter and p["bounty"] > 0
             eliminator_id = self._ask_eliminator(exclude_id=ids[0], mandatory=mandatory)
             if mandatory and eliminator_id is None:
-                return  # élimination abandonnée : la bounty PKO reste intacte, rien n'est modifié
+                return  # élimination abandonnée : rien n'est modifié
 
+        # orphan_bounty_ok=True UNIQUEMENT pour l'élimination groupée
+        # (voir Database.eliminate_player) : ce chemin n'est atteignable
+        # que si primes_matter est faux OU si le Mode Test est actif (déjà
+        # vérifié ci-dessus) — jamais pour une élimination individuelle.
+        orphan_bounty_ok = len(ids) > 1
         moved_count = 0
         for pid in ids:
             try:
-                moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
+                moved_count += len(self.db.eliminate_player(
+                    pid, eliminated_by_id=eliminator_id, orphan_bounty_ok=orphan_bounty_ok
+                ))
             except ValueError as e:
                 # Filet de sécurité (garde-fou équivalent, plus fort, côté
                 # Database.eliminate_player) : ne devrait normalement plus
@@ -6197,21 +6394,36 @@ class App(tk.Tk):
             table_by_id = {p["id"]: p["table_id"] for p in active}
             if table_by_id.get(eliminator_id) != table_by_id.get(eliminated_id):
                 eliminator_id = None
-        if eliminator_id is None and self.db.get_setting_int("pko_mode", 0) == 1:
+        if eliminator_id is None:
+            # Éliminateur obligatoire UNIQUEMENT si une attribution de
+            # bounty/PKO en dépend réellement (demande du 2026-09-09,
+            # précisée après relecture utilisateur : primes activées ET
+            # ce joueur précis porte une bounty > 0) — jamais "toujours
+            # obligatoire", et INDÉPENDANT du Mode Test (qui ne facilite
+            # que l'élimination GROUPÉE depuis l'onglet Joueurs, un
+            # concept qui n'existe pas ici : le téléphone élimine toujours
+            # UN seul joueur à la fois par glisser-déposer). Primes
+            # désactivées (self.db.primes_enabled() coupe cette
+            # contrainte) : aucune bounty n'étant de toute façon jamais
+            # assignée dans ce cas (voir Database.add_player), rien ne
+            # bloque ici. Dans l'usage normal du téléphone (glisser-
+            # déposer, voir remote_control.py: confirmElimination), ce
+            # cas (bounty en jeu mais sans éliminateur) ne se présente
+            # qu'après une invalidation tardive (joueur/table qui ont
+            # changé entre-temps, voir plus haut) : on refuse et on
+            # invite à réessayer, plutôt que de procéder sans éliminateur
+            # et de rendre la bounty orpheline.
             eliminated = self.db.get_player(eliminated_id)
-            if eliminated and eliminated["bounty"] > 0:
-                # Pas de dialogue possible depuis le téléphone (contrairement
-                # à _eliminate_selected) : on refuse simplement l'élimination
-                # plutôt que de rendre sa bounty PKO orpheline — le joueur
-                # reste actif, rien n'est perdu (aucune donnée PKO modifiée),
-                # à finaliser depuis l'onglet Joueurs (choix de l'éliminateur
-                # y est obligatoire) ou en réessayant un glisser-déposer vers
-                # un éliminateur valide. Message explicite (demande du
-                # 2026-09-08) plutôt qu'un refus silencieux.
-                return refuse(
+            if self.db.primes_enabled() and eliminated and eliminated["bounty"] > 0:
+                pko_mode = self.db.get_setting_int("pko_mode", 0) == 1
+                message = (
                     "Élimination impossible : en mode PKO, vous devez "
                     "désigner le joueur qui a éliminé ce joueur."
+                ) if pko_mode else (
+                    "Élimination impossible : ce joueur porte une prime, "
+                    "vous devez désigner qui l'a éliminé pour l'attribuer."
                 )
+                return refuse(message)
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
         self._queue_elimination_banner(eliminated_id, eliminator_id)
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
@@ -7125,15 +7337,27 @@ class App(tk.Tk):
         # "TOTAL" ont un total demandé ; les autres colonnes restent vides
         # sur cette ligne (Nb/Val Bounty n'ont pas de somme pertinente,
         # Rang encore moins).
-        self.primes_tree.insert(
-            "", "end",
-            values=(
-                "TOTAL", "", "", "", "", "", "",
-                f"{sum(r['bo_montant'] for r in primes_rows):,} pts".replace(",", " "),
-                f"{sum(r['total'] for r in primes_rows):,} pts".replace(",", " "),
-            ),
-            tags=("totalcol",),
-        )
+        #
+        # Primes désactivées (demande du 2026-09-09, précisée le même
+        # jour) : le tableau doit être RÉELLEMENT vide, pas seulement
+        # dépourvu de lignes joueurs — cette ligne TOTAL (même à 0 pts)
+        # ne doit donc plus apparaître du tout dans ce cas. primes_rows
+        # est déjà [] ici (voir Database.get_primes_summary), mais on ne
+        # s'appuie pas sur "primes_rows vide" pour décider (un tournoi
+        # sans aucun joueur inscrit, primes activées, aurait aussi
+        # primes_rows == [] et doit, lui, continuer à afficher la ligne
+        # TOTAL à 0 pts comme avant) : c'est bien l'état de la case à
+        # cocher qui décide, jamais une conséquence indirecte.
+        if self.db.primes_enabled():
+            self.primes_tree.insert(
+                "", "end",
+                values=(
+                    "TOTAL", "", "", "", "", "", "",
+                    f"{sum(r['bo_montant'] for r in primes_rows):,} pts".replace(",", " "),
+                    f"{sum(r['total'] for r in primes_rows):,} pts".replace(",", " "),
+                ),
+                tags=("totalcol",),
+            )
 
         for idx, r in enumerate(primes_rows):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
@@ -7463,6 +7687,15 @@ class App(tk.Tk):
 
     def _clock_resume(self):
         if self.db.get_setting_int("clock_started", 0) == 0:
+            # Resynchronisation défensive de dernière minute (demande du
+            # 2026-09-09, voir le grand bloc de commentaires près de
+            # _sync_primes_enabled_pref) : ce tournoi est sur le point de
+            # devenir celui qui verrouille "Calculer les primes" pour
+            # TOUTE la session — on s'assure qu'il porte bien la toute
+            # dernière valeur globale proposée avant que ça n'arrive,
+            # pour fermer toute fenêtre de course résiduelle avec le tick
+            # normal (jusqu'à ~1s de délai autrement).
+            _sync_primes_enabled_pref(self.db)
             self.db.set_settings({
                 "clock_started": 1,
                 "level_start_epoch": int(time.time()),
@@ -7473,6 +7706,16 @@ class App(tk.Tk):
                 # projecteur (voir Database.get_stats).
                 "tournament_start_epoch": int(time.time()),
             })
+            # Verrouille "Calculer les primes" pour TOUTE la session
+            # (demande du 2026-09-09, voir open_windows.
+            # mark_primes_session_started/primes_session_started et
+            # _primes_session_locked) : posé ici, au moment exact où CE
+            # tournoi démarre — que ce soit le tout premier de la session
+            # ou un suivant (écriture idempotente, sans effet si déjà
+            # posée). Reste vrai même après la fermeture de CE tournoi,
+            # tant qu'il reste au moins un autre tournoi de la session
+            # ouvert (voir la docstring de primes_session_started).
+            open_windows.mark_primes_session_started()
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
             self.db.set_settings({"is_paused": 0, "level_start_epoch": int(time.time()) - self._elapsed_before_pause()})
@@ -9220,6 +9463,33 @@ class App(tk.Tk):
             command=lambda: self._choose_day_folder(day_folder_var),
         ).grid(row=folder_row + 1, column=1, sticky="ew", pady=4, padx=(5, 0))
 
+        # -- Mode Test (demande du 2026-09-09) : outil de test/développement,
+        # PAS un paramètre de tournoi ni une préférence permanente — jamais
+        # lu ni écrit via export_prefs/settings_vars, une simple BooleanVar
+        # en mémoire (voir __init__), décochée à CHAQUE lancement, propre à
+        # CE process (pas partagée entre tournois, contrairement à
+        # "Calculer les primes" ci-dessus : "à chaque lancement du
+        # logiciel", pas "à chaque session"). Assouplit UNIQUEMENT les
+        # facilités d'élimination lors des essais (voir _eliminate_selected/
+        # _remote_eliminate/_test_mode_enabled) — ne change RIEN d'autre au
+        # fonctionnement normal du logiciel. Indicateur "MODE TEST" affiché
+        # dans le titre de la fenêtre tant qu'actif (voir
+        # _update_window_title) pour ne jamais l'oublier activé par erreur.
+        test_mode_row = folder_row + 2
+        test_mode_check = ttk.Checkbutton(
+            left, text="Mode Test", variable=self.test_mode_var,
+            command=self._on_test_mode_toggle,
+        )
+        test_mode_check.grid(row=test_mode_row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        Tooltip(
+            test_mode_check,
+            "Outil de test/développement — décoché à chaque lancement,\n"
+            "jamais mémorisé. Assouplit uniquement l'élimination (permet\n"
+            "l'élimination groupée sans désigner d'éliminateur) pour\n"
+            "faciliter les essais ; ne change rien d'autre. « MODE TEST »\n"
+            "s'affiche alors dans le titre de la fenêtre.",
+        )
+
         # Préférence partagée (comme Nom du Club ci-dessus), pas propre à ce
         # tournoi : désactive dans toute l'appli les vérifications "joueur
         # déjà actif dans un autre tournoi du même dossier" (fenêtre
@@ -9239,7 +9509,7 @@ class App(tk.Tk):
             ),
         )
         multi_table_check.grid(
-            row=folder_row + 2, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            row=test_mode_row + 1, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
         Tooltip(
             multi_table_check,
@@ -9255,7 +9525,7 @@ class App(tk.Tk):
         # façon le nom du jour en cours, quel qu'il soit (voir
         # tournament_day_folder_proposal / WEEKDAY_NAMES_FR). Mémorisé
         # globalement (tournament_prefs), comme "Dossier par défaut".
-        days_row = folder_row + 3
+        days_row = test_mode_row + 2
         days_lbl = ttk.Label(
             left, text="Jours de tournoi / Sit & Go",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
@@ -9395,13 +9665,59 @@ class App(tk.Tk):
             right, text="Primes",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
         )
-        primes_title.grid(row=bounty_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        primes_title.grid(row=bounty_start_row + 1, column=0, sticky="w", pady=(0, 8))
         Tooltip(
             primes_title,
             "4 primes en points, cumulées par joueur dans l'onglet Primes :\n"
             "Présence, Assiduité, Classement et Bounty. Leur somme donne\n"
             "le TOTAL de chaque joueur pour ce tournoi.",
         )
+
+        # -- Interrupteur général "Calculer les primes" (demande du
+        # 2026-09-09, voir le grand bloc de commentaires près de
+        # _sync_primes_enabled_pref, module-level, plus haut dans ce
+        # fichier). Cochée par défaut (comportement historique inchangé,
+        # compatibilité des anciens tournois — voir Database.
+        # DEFAULT_SETTINGS["primes_enabled"]). Décochée : plus AUCUN
+        # calcul de prime/bounty/PKO nulle part (voir Database.
+        # _primes_enabled et tous ses appelants), le tableau Primes reste
+        # simplement vide (jamais de message à la place), et le reste de
+        # la section Primes ci-dessous est grisé (valeurs déjà saisies
+        # conservées intactes pour une réactivation future — voir
+        # _update_primes_section_state). Réglage GLOBAL À LA SESSION (pas
+        # propre à ce tournoi, voir _primes_enabled_proposed) : modifiable
+        # depuis N'IMPORTE LEQUEL des tournois de la session tant
+        # qu'AUCUN d'entre eux n'a démarré son chronomètre, puis
+        # définitivement grisée/verrouillée pour tous dès que le premier
+        # démarre (voir _sync_primes_enabled_checkbox, _primes_session_
+        # locked), jusqu'à ce que tous soient refermés.
+        self.primes_enabled_var = tk.BooleanVar(
+            value=self.db.get_setting_int("primes_enabled", 1) == 1
+        )
+        self.primes_enabled_check = ttk.Checkbutton(
+            right, text="Calculer les primes",
+            variable=self.primes_enabled_var, command=self._on_primes_enabled_toggle,
+        )
+        self.primes_enabled_check.grid(row=bounty_start_row + 1, column=1, sticky="w", pady=(0, 8))
+        Tooltip(
+            self.primes_enabled_check,
+            "Cochée (par défaut) : comportement inchangé. Décochée :\n"
+            "désactive complètement le calcul des primes/bounty/PKO pour\n"
+            "TOUS les tournois de la session en cours (déjà ouverts ou\n"
+            "créés plus tard) — le tableau Primes reste vide, rien n'est\n"
+            "calculé ni stampé nulle part ; les montants ci-dessous sont\n"
+            "conservés pour une réactivation ultérieure. Modifiable\n"
+            "uniquement tant qu'aucun tournoi de la session n'a démarré\n"
+            "son chronomètre ; verrouillée ensuite jusqu'à ce que tous\n"
+            "soient refermés.",
+        )
+        if _primes_session_locked():
+            self.primes_enabled_check.configure(state="disabled")
+
+        # Widgets de réglage des montants/PKO ci-dessous : grisés/
+        # réactivés ensemble selon self.primes_enabled_var (voir
+        # _update_primes_section_state), jamais leurs VALEURS effacées.
+        self._primes_section_widgets = []
 
         presence_lbl = ttk.Label(right, text="Montant de la prime de présence (en points) :")
         presence_lbl.grid(row=bounty_start_row + 2, column=0, sticky="w", pady=4)
@@ -9411,10 +9727,10 @@ class App(tk.Tk):
             "soit son résultat. 0 = prime désactivée.",
         )
         attendance_var = tk.StringVar(value=self.db.get_setting("attendance_bonus_points", "0"))
-        ttk.Entry(right, textvariable=attendance_var, width=25).grid(
-            row=bounty_start_row + 2, column=1, pady=4, padx=10
-        )
+        attendance_entry = ttk.Entry(right, textvariable=attendance_var, width=25)
+        attendance_entry.grid(row=bounty_start_row + 2, column=1, pady=4, padx=10)
         self.settings_vars["attendance_bonus_points"] = attendance_var
+        self._primes_section_widgets += [presence_lbl, attendance_entry]
 
         assiduity_lbl = ttk.Label(right, text="Montant de la prime d'assiduité en points :")
         assiduity_lbl.grid(row=bounty_start_row + 3, column=0, sticky="w", pady=4)
@@ -9425,10 +9741,10 @@ class App(tk.Tk):
             "ce tournoi-ci inclus. 0 = prime désactivée.",
         )
         assiduity_var = tk.StringVar(value=self.db.get_setting("assiduity_bonus_points", "0"))
-        ttk.Entry(right, textvariable=assiduity_var, width=25).grid(
-            row=bounty_start_row + 3, column=1, pady=4, padx=10
-        )
+        assiduity_entry = ttk.Entry(right, textvariable=assiduity_var, width=25)
+        assiduity_entry.grid(row=bounty_start_row + 3, column=1, pady=4, padx=10)
         self.settings_vars["assiduity_bonus_points"] = assiduity_var
+        self._primes_section_widgets += [assiduity_lbl, assiduity_entry]
 
         consecutive_lbl = ttk.Label(right, text="Nombre de jours consécutifs :")
         consecutive_lbl.grid(row=bounty_start_row + 4, column=0, sticky="w", pady=4)
@@ -9441,16 +9757,17 @@ class App(tk.Tk):
             "dossier) pour vérifier la chaîne complète.",
         )
         consecutive_var = tk.StringVar(value=self.db.get_setting("assiduity_consecutive_days", "2"))
-        ttk.Entry(right, textvariable=consecutive_var, width=25).grid(
-            row=bounty_start_row + 4, column=1, pady=4, padx=10
-        )
+        consecutive_entry = ttk.Entry(right, textvariable=consecutive_var, width=25)
+        consecutive_entry.grid(row=bounty_start_row + 4, column=1, pady=4, padx=10)
         self.settings_vars["assiduity_consecutive_days"] = consecutive_var
-        ttk.Label(
+        consecutive_note = ttk.Label(
             right,
             text=("0 = pas de prime d'assiduité ; 2 = ce tournoi + le précédent ;\n"
                   "3 = ce tournoi + les 2 précédents ; etc."),
             foreground=MUTED,
-        ).grid(row=bounty_start_row + 5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        )
+        consecutive_note.grid(row=bounty_start_row + 5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._primes_section_widgets += [consecutive_lbl, consecutive_entry, consecutive_note]
 
         ranking_lbl = ttk.Label(right, text="Montant de la prime de classement en points :")
         ranking_lbl.grid(row=bounty_start_row + 6, column=0, sticky="w", pady=4)
@@ -9464,10 +9781,10 @@ class App(tk.Tk):
             "vainqueur, tournoi terminé).",
         )
         ranking_var = tk.StringVar(value=self.db.get_setting("ranking_bonus_points", "0"))
-        ttk.Entry(right, textvariable=ranking_var, width=25).grid(
-            row=bounty_start_row + 6, column=1, pady=4, padx=10
-        )
+        ranking_entry = ttk.Entry(right, textvariable=ranking_var, width=25)
+        ranking_entry.grid(row=bounty_start_row + 6, column=1, pady=4, padx=10)
         self.settings_vars["ranking_bonus_points"] = ranking_var
+        self._primes_section_widgets += [ranking_lbl, ranking_entry]
 
         bounty_lbl = ttk.Label(right, text="Montant du bounty en points :")
         bounty_lbl.grid(row=bounty_start_row + 7, column=0, sticky="w", pady=4)
@@ -9481,10 +9798,10 @@ class App(tk.Tk):
             "d'éliminations ce tournoi-ci.",
         )
         bounty_var = tk.StringVar(value=self.db.get_setting("bounty_amount", "0"))
-        ttk.Entry(right, textvariable=bounty_var, width=25).grid(
-            row=bounty_start_row + 7, column=1, pady=4, padx=10
-        )
+        bounty_entry = ttk.Entry(right, textvariable=bounty_var, width=25)
+        bounty_entry.grid(row=bounty_start_row + 7, column=1, pady=4, padx=10)
         self.settings_vars["bounty_amount"] = bounty_var
+        self._primes_section_widgets += [bounty_lbl, bounty_entry]
 
         pko_var = tk.BooleanVar(value=self.db.get_setting_int("pko_mode", 0) == 1)
         pko_check = ttk.Checkbutton(right, text="Mode PKO (prime progressive)", variable=pko_var)
@@ -9498,6 +9815,7 @@ class App(tk.Tk):
             "propre tête pour la suite du tournoi.",
         )
         self.settings_vars["pko_mode"] = pko_var
+        self._primes_section_widgets.append(pko_check)
 
         pko_pct_lbl = ttk.Label(right, text="Part en Perso immédiat en PKO (%) :")
         pko_pct_lbl.grid(row=bounty_start_row + 9, column=0, sticky="w", pady=4)
@@ -9508,18 +9826,27 @@ class App(tk.Tk):
             "propre bounty, à remporter par qui l'éliminera à son tour.",
         )
         pko_pct_var = tk.StringVar(value=self.db.get_setting("pko_cash_percent", "50"))
-        ttk.Entry(right, textvariable=pko_pct_var, width=25).grid(
-            row=bounty_start_row + 9, column=1, pady=4, padx=10
-        )
+        pko_pct_entry = ttk.Entry(right, textvariable=pko_pct_var, width=25)
+        pko_pct_entry.grid(row=bounty_start_row + 9, column=1, pady=4, padx=10)
         self.settings_vars["pko_cash_percent"] = pko_pct_var
+        self._primes_section_widgets += [pko_pct_lbl, pko_pct_entry]
 
-        ttk.Label(
+        primes_note = ttk.Label(
             right,
             text=("Le bounty s'applique aux nouvelles inscriptions/rebuys après "
                   "avoir enregistré. En mode classique, l'éliminateur empoche toute "
                   "la prime en Perso ; en PKO, une partie s'ajoute à sa propre prime."),
             foreground=MUTED, wraplength=340, justify="left",
-        ).grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        )
+        primes_note.grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        self._primes_section_widgets.append(primes_note)
+
+        # État initial (grisé si la case est déjà décochée pour ce
+        # tournoi, ex. réouverture d'un tournoi créé alors que "Calculer
+        # les primes" était décochée, ET/OU si la session est déjà
+        # verrouillée — voir _update_primes_section_state, `locked=None`
+        # recalcule l'état de verrouillage ici automatiquement).
+        self._update_primes_section_state(self.primes_enabled_var.get())
 
         # -- Raccourcis clavier "Élimination"/"Terminé"/"Chronomètre" :
         # toujours actifs, rien à activer. Voir aussi le contrôle à
@@ -9659,6 +9986,20 @@ class App(tk.Tk):
     def _on_single_tournament_toggle(self):
         export_prefs.save_value(SINGLE_TOURNAMENT_PREF_KEY, self.single_tournament_var.get())
 
+    def _test_mode_enabled(self):
+        """Mode Test (demande du 2026-09-09) : jamais mémorisé, propre à
+        CE process — voir self.test_mode_var (App.__init__) et la case
+        "Mode Test" (_build_settings_tab). Assouplit UNIQUEMENT les
+        facilités d'élimination (_eliminate_selected/_remote_eliminate) :
+        élimination groupée sans désigner d'éliminateur, et éliminateur
+        redevenant facultatif (bouton "Ignorer") pour une élimination
+        individuelle hors PKO+bounty — jamais d'autre effet sur le
+        fonctionnement du logiciel."""
+        return self.test_mode_var.get()
+
+    def _on_test_mode_toggle(self):
+        self._update_window_title()
+
     def _sync_single_tournament_pref_checkbox(self):
         """Préférence GLOBALE (voir SINGLE_TOURNAMENT_PREF_KEY) : une
         SEULE valeur dans export_prefs.json, partagée par tous les
@@ -9676,6 +10017,88 @@ class App(tk.Tk):
         current = _single_tournament_pref_enabled()
         if self.single_tournament_var.get() != current:
             self.single_tournament_var.set(current)
+
+    def _on_primes_enabled_toggle(self):
+        """Case "Calculer les primes" (Paramètres, demande du
+        2026-09-09) : modifiable uniquement tant qu'aucun tournoi de la
+        session n'a démarré son chronomètre — la case est déjà grisée
+        dans ce cas (voir _sync_primes_enabled_checkbox), ce garde n'est
+        qu'un filet de sécurité (ex. clic "en vol" juste au moment où un
+        autre tournoi démarre). Répercute le choix (a) dans la valeur
+        globale "proposée" (export_prefs, voir _set_primes_enabled_
+        proposed), pour que les autres tournois pas encore démarrés
+        convergent au prochain tick (voir _sync_primes_enabled_pref), et
+        (b) tout de suite dans la copie SQLite de CE tournoi précis, sans
+        attendre ce prochain tick, pour que son propre onglet Primes et
+        le grisement de la section réagissent sans délai perceptible."""
+        if _primes_session_locked():
+            current = self.db.get_setting_int("primes_enabled", 1) == 1
+            self.primes_enabled_var.set(current)
+            self.primes_enabled_check.configure(state="disabled")
+            self._update_primes_section_state(current, locked=True)
+            return
+        value = self.primes_enabled_var.get()
+        _set_primes_enabled_proposed(value)
+        self.db.set_setting("primes_enabled", "1" if value else "0")
+        self._update_primes_section_state(value, locked=False)
+        self._refresh_bounty_tab()
+
+    def _update_primes_section_state(self, enabled, locked=None):
+        """Grise (valeurs conservées, jamais effacées) ou réactive tous
+        les widgets de réglage des montants/PKO de la section Primes
+        (voir self._primes_section_widgets, remplie dans _build_settings_
+        tab), selon `enabled` ET `locked` combinés (demande du 2026-09-09,
+        point 2 : "TOUS les paramètres de la section Primes sont
+        verrouillés" dès que la session a démarré — pas seulement la case
+        "Calculer les primes" elle-même) :
+          - avant tout démarrage (locked=False) : modifiables normalement
+            si `enabled`, grisés (valeurs conservées) sinon — comportement
+            déjà en place (point 5 de la demande précédente).
+          - dès que la session est verrouillée (locked=True) : TOUJOURS
+            grisés, même si `enabled` est vrai — un tournoi de la session
+            ne doit plus pouvoir changer un montant/le mode PKO en cours
+            de route, qu'il ait démarré lui-même ou non.
+        `locked=None` (valeur par défaut) : recalculé ici via
+        _primes_session_locked() — permet d'appeler cette méthode avec
+        seulement `enabled` (ex. juste après un changement local qui ne
+        change pas le verrouillage) sans le refaire à chaque appelant.
+        N'agit jamais sur la case "Calculer les primes" elle-même (son
+        propre état "disabled" est géré par ses appelants, voir
+        _sync_primes_enabled_checkbox / _on_primes_enabled_toggle)."""
+        if locked is None:
+            locked = _primes_session_locked()
+        editable = enabled and not locked
+        state = "normal" if editable else "disabled"
+        for widget in getattr(self, "_primes_section_widgets", []):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass  # widget sans option "state" (ne devrait pas arriver ici)
+
+    def _sync_primes_enabled_checkbox(self):
+        """Appelée depuis _tick (1x/seconde), juste après _sync_primes_
+        enabled_pref (qui vient de faire converger la copie SQLite locale
+        de ce tournoi vers la valeur globale proposée, tant qu'il n'a pas
+        démarré) : reflète cette copie locale dans la case et grise/
+        réactive à la fois la case elle-même ET tout le reste de la
+        section Primes (voir _update_primes_section_state) selon l'état
+        de verrouillage de la SESSION (_primes_session_locked, demande du
+        2026-09-09 : verrouillage global, pas seulement la case) — même
+        principe que _sync_single_tournament_pref_checkbox, pour qu'un
+        tournoi A reflète un changement fait depuis les Paramètres d'un
+        tournoi B, ou le verrouillage causé par le démarrage d'un
+        tournoi C de la même session, sans qu'aucune action ne soit
+        nécessaire sur A."""
+        if self.db is None:
+            return
+        current = self.db.get_setting_int("primes_enabled", 1) == 1
+        if self.primes_enabled_var.get() != current:
+            self.primes_enabled_var.set(current)
+        locked = _primes_session_locked()
+        check_state = "disabled" if locked else "normal"
+        if str(self.primes_enabled_check.cget("state")) != check_state:
+            self.primes_enabled_check.configure(state=check_state)
+        self._update_primes_section_state(current, locked=locked)
 
     def _on_bb_rebalance_prompt_toggle(self):
         """Case "Équilibrage guidé par la grosse blinde" (Paramètres) :
@@ -10101,6 +10524,16 @@ class App(tk.Tk):
         self._check_pending_rebalance()
         self._check_phone_selected_pid()
         self._sync_single_tournament_pref_checkbox()
+        # Interrupteur général "Calculer les primes" (voir le grand bloc
+        # de commentaires au-dessus de _sync_primes_enabled_pref) :
+        # appelé INCONDITIONNELLEMENT ici, à chaque tick de CHAQUE
+        # fenêtre ouverte (pas seulement si l'onglet Paramètres est
+        # affiché), pour garantir qu'aucun tournoi pas encore démarré ne
+        # puisse rester bloqué sur une ancienne valeur plus d'environ une
+        # seconde après un changement fait depuis une autre fenêtre.
+        if self.db is not None:
+            _sync_primes_enabled_pref(self.db)
+        self._sync_primes_enabled_checkbox()
         self._tick_after_id = self.after(1000, self._tick)
 
     def _maybe_reclaim_default_remote_port(self):

@@ -15,6 +15,11 @@ dont le PID ne correspond plus à un processus en cours sont
 automatiquement retirées à chaque lecture (_prune) : pas besoin qu'un
 processus se ferme proprement pour que son entrée disparaisse (plantage,
 "Forcer à quitter"...).
+
+Contient aussi (fichiers séparés, voir leurs docstrings) : la sélection
+téléphone du Lobby (set_phone_selected_pid) et le verrouillage de
+session de "Calculer les primes" (mark_primes_session_started /
+primes_session_started, demande du 2026-09-09).
 """
 import ctypes
 import json
@@ -136,10 +141,25 @@ def register(path):
     jamais modifié ensuite par update_remote_info (simple merge, voir sa
     docstring) : reprendre plus tard le port 8765 (voir App._maybe_
     reclaim_default_remote_port) ne doit jamais faire passer un tournoi
-    pour "le plus récent" à sa place."""
+    pour "le plus récent" à sa place.
+
+    Nettoyage robuste du verrou de session "Calculer les primes" (demande
+    du 2026-09-09) : si, une fois les PID morts purgés (_prune ci-dessus),
+    il ne restait PLUS AUCUNE fenêtre vivante de l'éventuelle ancienne
+    session, tout drapeau `primes_session_started.json` résiduel ne peut
+    appartenir qu'à cette session déjà éteinte (ex. dernier processus
+    disparu par plantage plutôt que par unregister propre, voir la même
+    précaution symétrique dans unregister ci-dessous) — nettoyé ICI, AVANT
+    d'ajouter cette nouvelle fenêtre, pour qu'un "started=true" périmé ne
+    puisse jamais survivre jusqu'à la nouvelle session qui commence avec
+    cet enregistrement. `primes_session_started()` fait déjà ce même
+    contrôle paresseusement à chaque lecture (filet de sécurité), mais on
+    ne veut pas dépendre du hasard d'un futur appel."""
     if not path:
         return
     data = _prune(_load())
+    if not data:
+        _clear_primes_session_started()
     data[os.path.abspath(path)] = {"pid": os.getpid(), "registered_at": time.time()}
     _save(data)
 
@@ -194,7 +214,17 @@ def list_remote_tournaments():
 def unregister(path):
     """Retire l'entrée de `path` si elle appartient au processus courant
     (par précaution, pour ne jamais effacer par erreur celle d'un autre
-    processus en cas de course) — voir App._cleanup_for_close."""
+    processus en cas de course) — voir App._cleanup_for_close.
+
+    Nettoyage robuste du verrou de session "Calculer les primes" (demande
+    du 2026-09-09) : si ce tournoi était le DERNIER de la session
+    (registre vide une fois cette entrée retirée), le drapeau
+    `primes_session_started.json` n'a plus lieu d'exister — nettoyé
+    immédiatement ici, sans attendre un éventuel futur appel à
+    primes_session_started() qui pourrait ne jamais avoir lieu si aucune
+    autre fenêtre ne se rouvre avant longtemps (voir la même précaution
+    symétrique dans register ci-dessus, et le filet de sécurité
+    paresseux déjà présent dans primes_session_started elle-même)."""
     if not path:
         return
     data = _prune(_load())
@@ -203,6 +233,8 @@ def unregister(path):
     if entry and entry.get("pid") == os.getpid():
         del data[abs_path]
         _save(data)
+        if not data:
+            _clear_primes_session_started()
 
 
 def find_open_pid(path):
@@ -285,6 +317,76 @@ def get_phone_selected_pid():
         return None
     pid = data.get("pid") if isinstance(data, dict) else None
     return pid if isinstance(pid, int) else None
+
+
+def _primes_session_lock_path():
+    return os.path.join(os.path.expanduser("~"), ".poker_tournament", "primes_session_started.json")
+
+
+def mark_primes_session_started():
+    """Mémorise que le PREMIER tournoi de la session actuelle vient de
+    démarrer son chronomètre (demande du 2026-09-09, correction du
+    verrouillage de "Calculer les primes" — voir main.py:_clock_resume,
+    appelée à chaque transition clock_started 0->1, y compris pour un
+    tournoi qui ne serait pas le tout premier : écriture idempotente,
+    sans effet si déjà posée).
+
+    Fichier SÉPARÉ du registre principal (open_windows.json) — même
+    raison que _phone_selection_path : celui-ci associe à chaque clé (un
+    chemin de fichier .tournoi) un dict {"pid": ...} que _prune() relit
+    systématiquement en boucle, y mélanger une clé non-chemin le
+    casserait.
+
+    Ne PAS confondre avec un simple booléen "un tournoi a démarré une
+    fois dans le passé" : voir primes_session_started(), qui limite sa
+    portée à la session ACTUELLE (tant qu'il reste au moins un tournoi
+    ouvert)."""
+    try:
+        _atomic_write_json(_primes_session_lock_path(), {"started": True})
+    except OSError:
+        pass
+
+
+def _clear_primes_session_started():
+    try:
+        os.remove(_primes_session_lock_path())
+    except OSError:
+        pass
+
+
+def primes_session_started():
+    """True si un tournoi de la session ACTUELLE a déjà démarré son
+    chronomètre à un moment donné, ET qu'il reste encore au moins un
+    tournoi ouvert depuis (n'importe lequel — pas forcément celui qui a
+    démarré : voir la demande du 2026-09-09, exemple OPEN+Sit&Go où
+    l'OPEN démarre puis se ferme alors que le Sit&Go, jamais démarré,
+    reste ouvert -> doit rester verrouillé).
+
+    Dès que list_open_paths() (déjà nettoyé des PID morts par _prune,
+    donc robuste à un plantage) devient complètement vide, la session
+    est considérée TERMINÉE : ce drapeau est alors ignoré (et le fichier
+    supprimé) pour la session SUIVANTE. En pratique, ce nettoyage a déjà
+    eu lieu ACTIVEMENT, dès l'instant précis où le dernier tournoi s'est
+    fermé (voir unregister) ou dès l'enregistrement du premier tournoi
+    d'une session suivante si un résidu avait survécu (voir register,
+    ex. dernier processus disparu par plantage plutôt que par unregister
+    propre) — cette vérification ici n'est qu'un filet de sécurité
+    supplémentaire (défense en profondeur), jamais le seul mécanisme de
+    nettoyage : aucune valeur `started=true` périmée ne peut donc
+    survivre jusqu'à une session suivante, peu importe qui/quand relit
+    ce drapeau en premier."""
+    if not list_open_paths():
+        _clear_primes_session_started()
+        return False
+    path = _primes_session_lock_path()
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return False
+    return bool(data.get("started")) if isinstance(data, dict) else False
 
 
 def bring_pid_to_front(pid):

@@ -229,6 +229,17 @@ DEFAULT_SETTINGS = {
     "movement_signal_duration_ms": "300",
     "highlight_duration_minutes": "5",
     "rake_percent": "0",
+    # Interrupteur général des primes (demande du 2026-09-09, voir
+    # Database._primes_enabled) : "1" = calcule présence/assiduité/
+    # classement/bounty classique/PKO normalement (comportement
+    # historique, compatibilité des anciens fichiers sans cette clé —
+    # voir _init_defaults/INSERT OR IGNORE) ; "0" = aucun calcul, aucune
+    # mutation bounty/bounty_won/kills, tableau Primes vide — jamais
+    # juste masqué. Valeur figée pour CE tournoi par main.py au moment
+    # opportun (voir _sync_primes_enabled_pref/_clock_resume) ; ne
+    # jamais modifier ce réglage directement en base sans passer par ce
+    # mécanisme (verrouillage multi-tournois, voir main.py).
+    "primes_enabled": "1",
     "bounty_amount": "0",
     "pko_mode": "0",
     "pko_cash_percent": "50",
@@ -548,13 +559,36 @@ class Database:
                 return path
         return None
 
+    def _primes_enabled(self):
+        """Interrupteur général des primes pour CE tournoi (réglage
+        `primes_enabled`, demande du 2026-09-09) : True = comportement
+        historique inchangé ; False = aucun calcul de prime ne doit avoir
+        lieu nulle part (présence/assiduité/classement/bounty classique/
+        PKO), y compris à l'inscription (bounty jamais stampée) et à
+        l'élimination (kills/bounty/bounty_won/bounty_events/clôture du
+        vainqueur jamais touchés) — jamais un simple masquage à
+        l'affichage. Absent d'un ancien fichier -> True (voir
+        DEFAULT_SETTINGS, compatibilité historique)."""
+        return self.get_setting_int("primes_enabled", 1) == 1
+
+    def primes_enabled(self):
+        """Équivalent public de `_primes_enabled` — à utiliser depuis
+        l'extérieur de cette classe (main.py notamment, pour décider
+        d'appliquer ou non la contrainte PKO d'éliminateur obligatoire
+        AVANT même d'appeler eliminate_player, voir _eliminate_selected/
+        _ask_eliminator/_remote_eliminate) plutôt que d'accéder
+        directement à une méthode "privée"."""
+        return self._primes_enabled()
+
     def add_player(self, name, club=""):
         """`club` : copié dans ce tournoi au moment de l'ajout (voir
         roster.get_club côté appelant) — n'est ensuite plus synchronisé
         avec le répertoire si celui-ci change, ce tournoi garde la photo
         du club tel qu'il était à l'inscription."""
         starting_chips = self.get_setting_int("starting_chips", 10000)
-        bounty_amount = self.get_setting_int("bounty_amount", 0)
+        # Primes désactivées (_primes_enabled) : jamais de bounty stampée
+        # à l'inscription, quel que soit le réglage `bounty_amount`.
+        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
         cur = self.conn.execute(
             "INSERT INTO players(name, buyin_count, rebuy_count, addon_count, "
             "chips, status, bounty, club) VALUES (?, 1, 0, 0, ?, 'active', ?, ?)",
@@ -568,7 +602,9 @@ class Database:
 
     def rebuy_player(self, player_id):
         chips = self.get_setting_int("rebuy_chips", 10000)
-        bounty_amount = self.get_setting_int("bounty_amount", 0)
+        # Voir add_player : jamais de bounty ajoutée si les primes sont
+        # désactivées pour ce tournoi.
+        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
         self.conn.execute(
             "UPDATE players SET rebuy_count = rebuy_count + 1, "
             "chips = chips + ?, bounty = bounty + ? WHERE id=?",
@@ -617,7 +653,7 @@ class Database:
         )
         self.conn.commit()
 
-    def eliminate_player(self, player_id, eliminated_by_id=None):
+    def eliminate_player(self, player_id, eliminated_by_id=None, orphan_bounty_ok=False):
         """Élimine un joueur. Si `eliminated_by_id` est fourni, l'éliminateur
         voit son compteur de bounty (kills, prime de bounty en points —
         voir get_bounty_bonuses) incrémenté de 1, quel que soit le mode de
@@ -634,7 +670,39 @@ class Database:
         du 2026-09-08 — une bounty PKO ne doit jamais devenir orpheline).
         Ne s'applique jamais hors PKO ni si la bounty du joueur est à 0 :
         toutes les autres possibilités existantes (élimination sans
-        éliminateur) restent inchangées."""
+        éliminateur) restent inchangées.
+
+        `orphan_bounty_ok=True` (demande du 2026-09-09, Mode Test — voir
+        App._eliminate_selected, élimination groupée) : lève CETTE
+        contrainte précise pour ce seul appel, SANS créer de faux
+        éliminateur ni transférer la bounty du joueur éliminé à qui que
+        ce soit (aucun bounty_won ajouté, aucune ligne bounty_events,
+        aucun partage PKO normal) — mais REMET SA BOUNTY À 0 (demande du
+        2026-09-09, 3e relecture) plutôt que de la laisser telle quelle :
+        un joueur désormais éliminé/inactif ne doit jamais rester porteur
+        d'une bounty non nulle en base, considéré comme un état
+        incohérent même à des fins de test. Cette bounty est donc
+        simplement ABANDONNÉE (perdue pour tout le monde), jamais
+        attribuée. RÉSERVÉ à un appelant qui a déjà vérifié lui-même que
+        le Mode Test est actif : cette méthode ne connaît rien du Mode
+        Test (concept purement main.py/UI, jamais persisté), elle se
+        contente d'un simple paramètre d'appel explicite — jamais activé
+        par défaut, jamais accessible autrement que par ce paramètre.
+        Sans effet si `eliminated_by_id` est fourni (la contrainte ne
+        s'applique de toute façon que si aucun éliminateur n'est désigné,
+        et le bloc de transfert normal ci-dessous remet déjà la bounty à
+        0 dans ce cas).
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        AUCUN de ces mécanismes ne s'applique — ni la contrainte
+        d'éliminateur obligatoire (elle n'a plus lieu d'être puisqu'aucune
+        bounty n'est jamais assignée dans ce mode, voir add_player), ni
+        le comptage de kills, ni le moindre transfert bounty/bounty_won/
+        bounty_events, ni la clôture de la bounty du vainqueur. Seule
+        l'inscription du round/nom de l'éliminateur (`eliminated_by_name`/
+        `elim_round`) reste enregistrée dans tous les cas : elle sert au
+        bandeau d'élimination, à l'onglet Classement/Joueurs et aux
+        statistiques, indépendamment des primes — jamais supprimée ici."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
@@ -643,8 +711,10 @@ class Database:
         eliminator_row = self.get_player(eliminated_by_id) if eliminated_by_id else None
         eliminator_name = eliminator_row["name"] if eliminator_row else None
 
-        pko_mode = self.get_setting_int("pko_mode", 0) == 1
-        if pko_mode and eliminated and eliminated["bounty"] > 0 and eliminator_row is None:
+        primes_enabled = self._primes_enabled()
+        pko_mode = primes_enabled and self.get_setting_int("pko_mode", 0) == 1
+        if (pko_mode and eliminated and eliminated["bounty"] > 0
+                and eliminator_row is None and not orphan_bounty_ok):
             raise ValueError(
                 f"{eliminated['name']} porte une prime PKO de "
                 f"{eliminated['bounty']} pts : un éliminateur doit être "
@@ -657,12 +727,24 @@ class Database:
             (place, now, current_round, eliminator_name, player_id),
         )
 
-        if eliminated_by_id:
+        if orphan_bounty_ok and eliminated_by_id is None and eliminated and eliminated["bounty"] > 0:
+            # Mode Test, élimination groupée sans éliminateur (demande du
+            # 2026-09-09, 3e relecture) : la bounty de ce joueur n'est
+            # transférée à personne (voir le bloc de transfert normal
+            # ci-dessous, jamais atteint ici puisque eliminated_by_id est
+            # None) — mais elle ne doit pas non plus rester non nulle sur
+            # un joueur désormais éliminé/inactif (état incohérent, même
+            # à des fins de test) : elle est donc ABANDONNÉE, remise à 0
+            # sans être créditée nulle part (aucun bounty_won, aucune
+            # ligne bounty_events, aucun partage PKO).
+            self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
+
+        if primes_enabled and eliminated_by_id:
             self.conn.execute(
                 "UPDATE players SET kills = kills + 1 WHERE id=?", (eliminated_by_id,)
             )
 
-        if eliminated_by_id and eliminated and eliminated["bounty"] > 0:
+        if primes_enabled and eliminated_by_id and eliminated and eliminated["bounty"] > 0:
             bounty = eliminated["bounty"]
             eliminator = self.get_player(eliminated_by_id)
             if pko_mode:
@@ -696,9 +778,11 @@ class Database:
         if len(still_active) <= 1:
             self.set_setting("tournament_end_epoch", int(time.time()))
             # Clôture de la bounty finale du vainqueur (mode PKO
-            # uniquement, demande du 2026-09-08) : dès qu'il ne reste
-            # plus qu'un seul joueur actif, sa bounty encore portée lui
-            # est définitivement attribuée — voir _close_out_winner_bounty.
+            # uniquement, demande du 2026-09-08 ; jamais si les primes
+            # sont désactivées, demande du 2026-09-09) : dès qu'il ne
+            # reste plus qu'un seul joueur actif, sa bounty encore
+            # portée lui est définitivement attribuée — voir
+            # _close_out_winner_bounty.
             if pko_mode and len(still_active) == 1:
                 self._close_out_winner_bounty(still_active[0]["id"], now)
 
@@ -1576,7 +1660,13 @@ class Database:
         """Prime de présence (en points) : chaque joueur du tournoi en
         cours reçoit `attendance_bonus_points` (réglage) pour le simple
         fait d'avoir participé à ce tournoi, 0 si le réglage est nul.
-        Renvoie {nom: points}."""
+        Renvoie {nom: points}.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        aucun calcul, {} inconditionnellement — court-circuit à la
+        source, pas un simple masquage à l'affichage."""
+        if not self._primes_enabled():
+            return {}
         points = self.get_setting_int("attendance_bonus_points", 0)
         return {p["name"]: points for p in self.list_players()}
 
@@ -1596,7 +1686,10 @@ class Database:
         encore assez de tournois précédents, il n'est pas éligible.
         Renvoie une liste de dicts {name, present_previous, points} triée
         par nom ; liste vide si la prime est désactivée (l'un des deux
-        réglages à 0)."""
+        réglages à 0) ou si `_primes_enabled` est faux (interrupteur
+        général, demande du 2026-09-09 — court-circuit à la source)."""
+        if not self._primes_enabled():
+            return []
         points = self.get_setting_int("assiduity_bonus_points", 0)
         consecutive_days = self.get_setting_int("assiduity_consecutive_days", 0)
         if points <= 0 or consecutive_days <= 0:
@@ -1637,7 +1730,11 @@ class Database:
         rang affiché dans l'onglet Joueurs / les exports). Les joueurs
         encore actifs en cours de tournoi (rang pas encore connu) n'ont pas
         de ligne. Renvoie une liste de dicts {name, place, nombre, valeur,
-        montant} (montant = nombre × valeur), triée par rang croissant."""
+        montant} (montant = nombre × valeur), triée par rang croissant ;
+        liste vide si `_primes_enabled` est faux (interrupteur général,
+        demande du 2026-09-09 — court-circuit à la source)."""
+        if not self._primes_enabled():
+            return []
         flat_value = self.get_setting_int("ranking_bonus_points", 0)
         n_players = self.get_stats()["total_players_ever"]
         all_players = self.list_players()
@@ -1687,7 +1784,14 @@ class Database:
         tous les joueurs, triée par montant décroissant. Utilisé par
         get_primes_summary (dont le TOTAL, dans les deux modes) et son
         export dédié — jamais de double comptage : le calcul classique et
-        le calcul PKO sont mutuellement exclusifs, jamais additionnés."""
+        le calcul PKO sont mutuellement exclusifs, jamais additionnés.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        liste vide inconditionnellement — court-circuit à la source (de
+        toute façon `kills`/`bounty_won` ne sont jamais alimentés dans ce
+        cas, voir eliminate_player, mais on ne dépend pas de cela ici)."""
+        if not self._primes_enabled():
+            return []
         pko_mode = self.get_setting_int("pko_mode", 0) == 1
         if not pko_mode:
             flat_value = self.get_setting_int("bounty_amount", 0)
@@ -1738,7 +1842,16 @@ class Database:
         `sort_column` : 'rang', 'bo_nombre' ou 'total' (autre valeur ou
         None -> tri par défaut, TOTAL décroissant). Les valeurs manquantes
         (ex : rang d'un joueur encore actif) sont toujours reléguées en
-        fin de liste, quel que soit le sens du tri."""
+        fin de liste, quel que soit le sens du tri.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        liste vide inconditionnellement — l'onglet Primes reste
+        simplement vide, aucun message de remplacement (les quatre
+        get_*_bonuses renvoient déjà [] / {} chacun de leur côté, mais on
+        court-circuite aussi ici pour ne dépendre d'aucun détail interne
+        de ces sous-fonctions)."""
+        if not self._primes_enabled():
+            return []
         presence_by_name = self.get_presence_bonuses()
         assiduity_by_name = {r["name"]: r for r in self.get_assiduity_bonuses()}
         ranking_by_name = {r["name"]: r for r in self.get_ranking_bonuses()}
