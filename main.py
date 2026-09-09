@@ -416,7 +416,7 @@ def _refresh_launch_buttons_state(win, buttons):
 # fermeture brutale (même robustesse que _other_tournament_is_open, qui
 # repose déjà sur ce même registre auto-nettoyé).
 
-PRIMES_ENABLED_PROPOSED_KEY = "primes_enabled_session_proposed"
+PRIMES_ENABLED_PROPOSED_KEY = open_windows.PRIMES_ENABLED_PROPOSED_KEY
 
 
 def _primes_enabled_proposed():
@@ -427,8 +427,15 @@ def _primes_enabled_proposed():
     PAS forcément la valeur en vigueur si la session est verrouillée sur
     une valeur différente d'une session précédente non nettoyée — c'est
     toujours la copie SQLite de chaque tournoi qui fait foi pour les
-    calculs, jamais cette valeur directement."""
-    return export_prefs.load_value(PRIMES_ENABLED_PROPOSED_KEY, True) is not False
+    calculs, jamais cette valeur directement.
+
+    Simple délégation à open_windows.primes_enabled_proposed() (demande
+    du 2026-09-09, point 2, CORRIGÉE après un vrai bug détecté par
+    tests/test_primes_multi_process_real_subprocess.py) : c'est CE
+    module qui porte l'auto-réinitialisation "nouvelle session = ON par
+    défaut" (vérifiée à chaque lecture, pas seulement à l'écriture),
+    car c'est lui qui connaît déjà list_open_paths()."""
+    return open_windows.primes_enabled_proposed()
 
 
 def _set_primes_enabled_proposed(value):
@@ -437,8 +444,9 @@ def _set_primes_enabled_proposed(value):
     elle-même, désactivée sinon). N'a par elle-même aucun effet sur les
     tournois déjà ouverts : c'est `_sync_primes_enabled_pref`, rappelée
     par chaque fenêtre à chaque tick, qui répercute ce changement dans
-    leur copie SQLite locale respective."""
-    export_prefs.save_value(PRIMES_ENABLED_PROPOSED_KEY, bool(value))
+    leur copie SQLite locale respective. Délègue à open_windows.
+    set_primes_enabled_proposed (même raison que ci-dessus)."""
+    open_windows.set_primes_enabled_proposed(value)
 
 
 def _primes_session_locked():
@@ -9661,11 +9669,28 @@ class App(tk.Tk):
         ttk.Separator(right, orient="horizontal").grid(
             row=bounty_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
         )
+        # Titre "Primes" + case "Calculer les primes" côte à côte, avec un
+        # simple petit espacement (demande du 2026-09-09) : regroupés
+        # dans une SOUS-FRAME dédiée (pack, pas grid) plutôt que placés
+        # chacun dans une colonne différente de la grille de `right` —
+        # sinon la case se serait retrouvée à l'aplomb de la colonne 1
+        # PARTAGÉE avec les champs larges (Entry(width=25)) de tout le
+        # reste de l'onglet, créant un grand espace vide entre le titre
+        # et la case au lieu d'un petit. Cette sous-frame est ensuite
+        # placée en `columnspan=2` (une seule "cellule" du point de vue
+        # de la grille) : elle ne force donc JAMAIS la colonne 1 à
+        # s'élargir pour elle, et ne décale rien du reste de la section
+        # (montants, PKO...) toujours alignée sur les colonnes 0/1
+        # habituelles juste en dessous.
+        primes_header = ttk.Frame(right)
+        primes_header.grid(
+            row=bounty_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
         primes_title = ttk.Label(
-            right, text="Primes",
+            primes_header, text="Primes",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
         )
-        primes_title.grid(row=bounty_start_row + 1, column=0, sticky="w", pady=(0, 8))
+        primes_title.pack(side="left")
         Tooltip(
             primes_title,
             "4 primes en points, cumulées par joueur dans l'onglet Primes :\n"
@@ -9695,10 +9720,13 @@ class App(tk.Tk):
             value=self.db.get_setting_int("primes_enabled", 1) == 1
         )
         self.primes_enabled_check = ttk.Checkbutton(
-            right, text="Calculer les primes",
+            primes_header, text="Calculer les primes",
             variable=self.primes_enabled_var, command=self._on_primes_enabled_toggle,
         )
-        self.primes_enabled_check.grid(row=bounty_start_row + 1, column=1, sticky="w", pady=(0, 8))
+        # padx=(8, 0) : le "seulement un petit espace" demandé, entre le
+        # titre et la case — jamais un grand espace lié à une colonne de
+        # grille partagée (voir le commentaire de primes_header ci-dessus).
+        self.primes_enabled_check.pack(side="left", padx=(8, 0))
         Tooltip(
             self.primes_enabled_check,
             "Cochée (par défaut) : comportement inchangé. Décochée :\n"
@@ -10476,65 +10504,93 @@ class App(tk.Tk):
     def _tick(self):
         if not self.winfo_exists():
             return
-        current = self.notebook.tab(self.notebook.select(), "text")
-        # Expiration du bandeau d'élimination : vérifiée ICI,
-        # INCONDITIONNELLEMENT à chaque tick (1x/seconde), plutôt que
-        # seulement dans _refresh_clock_tab() ci-dessous (qui, elle, ne
-        # tourne QUE si l'onglet Chronomètre est affiché ou l'écran
-        # projecteur est ouvert — voir la condition juste en dessous). Un
-        # bandeau doit disparaître à l'heure même si aucun des deux n'est
-        # vrai au moment précis de son échéance (ex : l'écran projecteur
-        # fermé puis rouvert entre-temps) — voir aussi _refresh_clock_tab,
-        # qui n'a plus besoin de repasser dessus (source unique, testé en
-        # conditions réelles : onglet différent, fenêtre projecteur
-        # ouverte plus de 15s, éliminations rapprochées, bouton
-        # "Chronomètre" du téléphone).
-        if (self._elimination_banner_current is not None
-                and time.time() >= self._elimination_banner_current["until"]):
-            self._advance_elimination_banner()
-        elif self._elimination_banner_current is None and self._elimination_banner_queue:
-            self._advance_elimination_banner()
-        if current == "Chronomètre" or (self.clock_window is not None and self.clock_window.winfo_exists()):
-            self._refresh_clock_tab()
-        elif current == "Mouvements":
-            self._refresh_moves_tab()
-        if self._remote_photo_uploaded:
-            # Une photo vient d'être envoyée depuis le téléphone (voir
-            # _remote_upload_photo) : rafraîchit la colonne Photo de
-            # l'onglet actuellement affiché, sans attendre que l'utilisateur
-            # change d'onglet et y revienne.
-            self._remote_photo_uploaded = False
-            if current == "Répertoire":
-                self.roster_tab._refresh()
-            elif current == "Joueurs":
-                self._refresh_players_tab()
-        # Tenu à jour ici (thread principal) plutôt que lu directement
-        # depuis le thread du serveur de contrôle à distance — voir
-        # _start_remote_control_if_enabled.
-        if self.remote_control_server is not None and self.db is not None:
-            self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
-            self._refresh_remote_players_cache()
-            self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
-            self._remote_has_pending_moves = self.db.count_seat_moves() > 0
-            self._maybe_reclaim_default_remote_port()
-        # Filet de sécurité (voir docstring de _check_pending_rebalance) :
-        # garantit qu'une question "grosse blinde" en attente est toujours
-        # affichée/rafraîchie au moins une fois par seconde, même si
-        # l'action qui l'a créée ne l'a pas déjà fait explicitement.
-        self._check_pending_rebalance()
-        self._check_phone_selected_pid()
-        self._sync_single_tournament_pref_checkbox()
-        # Interrupteur général "Calculer les primes" (voir le grand bloc
-        # de commentaires au-dessus de _sync_primes_enabled_pref) :
-        # appelé INCONDITIONNELLEMENT ici, à chaque tick de CHAQUE
-        # fenêtre ouverte (pas seulement si l'onglet Paramètres est
-        # affiché), pour garantir qu'aucun tournoi pas encore démarré ne
-        # puisse rester bloqué sur une ancienne valeur plus d'environ une
-        # seconde après un changement fait depuis une autre fenêtre.
-        if self.db is not None:
-            _sync_primes_enabled_pref(self.db)
-        self._sync_primes_enabled_checkbox()
-        self._tick_after_id = self.after(1000, self._tick)
+        # Corps de _tick() entièrement protégé (demande du 2026-09-09,
+        # diagnostic du bug de non-propagation de "Calculer les primes"
+        # entre deux fenêtres) : une exception survenue N'IMPORTE OÙ
+        # ci-dessous (bandeau d'élimination, contrôle à distance,
+        # rééquilibrage en attente, sélection téléphone...) ne doit
+        # JAMAIS empêcher la reprogrammation du tick suivant (`finally`
+        # ci-dessous) — sans cette protection, un incident isolé sur
+        # UNE seule fonctionnalité arrêtait silencieusement TOUTE la
+        # boucle périodique de cette fenêtre pour de bon, y compris la
+        # synchronisation des primes (placée plus loin dans cette même
+        # fonction) alors que rien ne le signalait à l'utilisateur.
+        # `except Exception` (jamais un `except:` nu, jamais un simple
+        # `pass`) : laisse passer KeyboardInterrupt/SystemExit, et
+        # consigne l'exception de façon EXPLICITE et exploitable dans
+        # crash.log (voir _log_exception, déjà utilisé par ailleurs
+        # dans ce fichier) — jamais avalée sans trace. Voir aussi
+        # tests/test_tick_never_stops_scheduling.py, qui injecte une
+        # exception avant la synchronisation des primes et vérifie les
+        # trois garanties : trace journalisée, prochain tick programmé,
+        # boucle non interrompue.
+        try:
+            current = self.notebook.tab(self.notebook.select(), "text")
+            # Expiration du bandeau d'élimination : vérifiée ICI,
+            # INCONDITIONNELLEMENT à chaque tick (1x/seconde), plutôt que
+            # seulement dans _refresh_clock_tab() ci-dessous (qui, elle, ne
+            # tourne QUE si l'onglet Chronomètre est affiché ou l'écran
+            # projecteur est ouvert — voir la condition juste en dessous). Un
+            # bandeau doit disparaître à l'heure même si aucun des deux n'est
+            # vrai au moment précis de son échéance (ex : l'écran projecteur
+            # fermé puis rouvert entre-temps) — voir aussi _refresh_clock_tab,
+            # qui n'a plus besoin de repasser dessus (source unique, testé en
+            # conditions réelles : onglet différent, fenêtre projecteur
+            # ouverte plus de 15s, éliminations rapprochées, bouton
+            # "Chronomètre" du téléphone).
+            if (self._elimination_banner_current is not None
+                    and time.time() >= self._elimination_banner_current["until"]):
+                self._advance_elimination_banner()
+            elif self._elimination_banner_current is None and self._elimination_banner_queue:
+                self._advance_elimination_banner()
+            if current == "Chronomètre" or (self.clock_window is not None and self.clock_window.winfo_exists()):
+                self._refresh_clock_tab()
+            elif current == "Mouvements":
+                self._refresh_moves_tab()
+            if self._remote_photo_uploaded:
+                # Une photo vient d'être envoyée depuis le téléphone (voir
+                # _remote_upload_photo) : rafraîchit la colonne Photo de
+                # l'onglet actuellement affiché, sans attendre que l'utilisateur
+                # change d'onglet et y revienne.
+                self._remote_photo_uploaded = False
+                if current == "Répertoire":
+                    self.roster_tab._refresh()
+                elif current == "Joueurs":
+                    self._refresh_players_tab()
+            # Tenu à jour ici (thread principal) plutôt que lu directement
+            # depuis le thread du serveur de contrôle à distance — voir
+            # _start_remote_control_if_enabled.
+            if self.remote_control_server is not None and self.db is not None:
+                self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
+                self._refresh_remote_players_cache()
+                self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+                self._remote_has_pending_moves = self.db.count_seat_moves() > 0
+                self._maybe_reclaim_default_remote_port()
+            # Filet de sécurité (voir docstring de _check_pending_rebalance) :
+            # garantit qu'une question "grosse blinde" en attente est toujours
+            # affichée/rafraîchie au moins une fois par seconde, même si
+            # l'action qui l'a créée ne l'a pas déjà fait explicitement.
+            self._check_pending_rebalance()
+            self._check_phone_selected_pid()
+            self._sync_single_tournament_pref_checkbox()
+            # Interrupteur général "Calculer les primes" (voir le grand bloc
+            # de commentaires au-dessus de _sync_primes_enabled_pref) :
+            # appelé INCONDITIONNELLEMENT ici, à chaque tick de CHAQUE
+            # fenêtre ouverte (pas seulement si l'onglet Paramètres est
+            # affiché), pour garantir qu'aucun tournoi pas encore démarré ne
+            # puisse rester bloqué sur une ancienne valeur plus d'environ une
+            # seconde après un changement fait depuis une autre fenêtre.
+            if self.db is not None:
+                _sync_primes_enabled_pref(self.db)
+            self._sync_primes_enabled_checkbox()
+        except Exception:
+            _log_exception(*sys.exc_info())
+        finally:
+            # Reprogrammé INCONDITIONNELLEMENT — y compris après une
+            # exception ci-dessus — voir le commentaire au tout début de
+            # cette méthode : c'est LA garantie que cette correction
+            # apporte.
+            self._tick_after_id = self.after(1000, self._tick)
 
     def _maybe_reclaim_default_remote_port(self):
         """Corrige la perte de connexion du téléphone après "Fin de la

@@ -65,6 +65,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import database  # noqa: E402
+import export_prefs  # noqa: E402
 import main  # noqa: E402
 
 
@@ -509,20 +510,27 @@ class _FakeApp:
 
 
 class PrimesEnabledProposedTest(unittest.TestCase):
-    def test_valeur_par_defaut_activee(self):
-        with patch.object(main.export_prefs, "load_value", side_effect=lambda k, default=None: default):
-            self.assertTrue(main._primes_enabled_proposed())
+    """`main._primes_enabled_proposed`/`_set_primes_enabled_proposed` :
+    simple délégation à open_windows.primes_enabled_proposed()/
+    set_primes_enabled_proposed() (CORRECTION du 2026-09-09, 3e
+    relecture — voir tests/test_primes_enabled_toggle.py:
+    PrimesEnabledProposedResetsAcrossSessionsTest et tests/test_primes_
+    multi_process_real_subprocess.py pour la vraie logique, notamment
+    l'auto-réinitialisation à la LECTURE dès que list_open_paths() est
+    vide, qui n'existait pas avant la découverte d'un vrai bug via un
+    test à deux vrais process séparés)."""
 
-    def test_relit_bien_la_valeur_enregistree(self):
-        with patch.object(main.export_prefs, "load_value", return_value=False):
+    def test_delegue_a_open_windows_primes_enabled_proposed(self):
+        with patch.object(main.open_windows, "primes_enabled_proposed", return_value=False) as mock_read:
             self.assertFalse(main._primes_enabled_proposed())
-        with patch.object(main.export_prefs, "load_value", return_value=True):
+        mock_read.assert_called_once_with()
+        with patch.object(main.open_windows, "primes_enabled_proposed", return_value=True):
             self.assertTrue(main._primes_enabled_proposed())
 
-    def test_set_enregistre_sous_la_bonne_cle(self):
-        with patch.object(main.export_prefs, "save_value") as mock_save:
+    def test_set_delegue_a_open_windows_set_primes_enabled_proposed(self):
+        with patch.object(main.open_windows, "set_primes_enabled_proposed") as mock_set:
             main._set_primes_enabled_proposed(False)
-        mock_save.assert_called_once_with(main.PRIMES_ENABLED_PROPOSED_KEY, False)
+        mock_set.assert_called_once_with(False)
 
 
 class PrimesSessionLockedDelegatesTest(unittest.TestCase):
@@ -696,6 +704,110 @@ class PrimesSessionStartedTest(unittest.TestCase):
         main.open_windows.register("/tmp/B.tournoi")  # 2e fenêtre de la MÊME session
         self.assertTrue(os.path.exists(lock_path))
         self.assertTrue(main.open_windows.primes_session_started())
+
+
+# ---------------------------------------------------------------------
+# Point 2 de la demande du 2026-09-09 (correction après diagnostic) :
+# "nouvelle session = primes ON par défaut" — la valeur "proposée"
+# (export_prefs) doit se réinitialiser à ON dès que TOUS les tournois
+# d'une session sont fermés, exactement comme primes_session_started.
+# ---------------------------------------------------------------------
+class PrimesEnabledProposedResetsAcrossSessionsTest(unittest.TestCase):
+    """open_windows.register/unregister : nettoyage robuste, comme pour
+    primes_session_started (voir PrimesSessionStartedTest ci-dessus) —
+    export_prefs.json redirigé EN PLUS du registre/verrou, jamais le vrai
+    ~/.poker_tournament."""
+
+    def setUp(self):
+        self._tmpdir_ctx = tempfile.TemporaryDirectory(prefix="poker_primes_proposed_reset_test_")
+        self.addCleanup(self._tmpdir_ctx.cleanup)
+        export_prefs_path = os.path.join(self._tmpdir_ctx.name, "export_prefs.json")
+        registry_path = os.path.join(self._tmpdir_ctx.name, "open_windows.json")
+        lock_path = os.path.join(self._tmpdir_ctx.name, "primes_session_started.json")
+        for target in (
+            patch.object(export_prefs, "_prefs_path", return_value=export_prefs_path),
+            patch.object(main.open_windows, "_registry_path", return_value=registry_path),
+            patch.object(main.open_windows, "_primes_session_lock_path", return_value=lock_path),
+        ):
+            self.addCleanup(target.stop)
+            target.start()
+
+    def test_session_1_off_puis_tout_ferme_puis_session_2_on_par_defaut(self):
+        """LE scénario exact validé par l'utilisateur."""
+        # Session 1 : A ouvert, décoché.
+        main.open_windows.register("/tmp/A.tournoi")
+        main._set_primes_enabled_proposed(False)
+        self.assertFalse(main._primes_enabled_proposed())
+
+        # Tout fermé (dernier tournoi de la session 1).
+        main.open_windows.unregister("/tmp/A.tournoi")
+        self.assertEqual(main.open_windows.list_open_paths(), [])
+
+        # Session 2 : un nouveau tournoi C s'ouvre.
+        main.open_windows.register("/tmp/C.tournoi")
+        self.assertTrue(
+            main._primes_enabled_proposed(),
+            "nouvelle session -> primes ON par défaut, jamais l'ancienne valeur OFF",
+        )
+
+    def test_ne_touche_pas_une_session_encore_active(self):
+        """"Cela ne doit pas affecter une session encore active" — tant
+        qu'il reste au moins un tournoi ouvert, la valeur décochée doit
+        rester décochée pour TOUS les tournois de CETTE session, jusqu'à
+        fermeture du DERNIER."""
+        main.open_windows.register("/tmp/A.tournoi")
+        main.open_windows.register("/tmp/B.tournoi")
+        main._set_primes_enabled_proposed(False)
+
+        main.open_windows.unregister("/tmp/A.tournoi")  # B reste ouvert
+        self.assertFalse(
+            main._primes_enabled_proposed(),
+            "B est encore ouvert : la session est TOUJOURS active, la valeur ne doit pas se réinitialiser",
+        )
+
+        main.open_windows.unregister("/tmp/B.tournoi")  # dernier tournoi fermé
+        self.assertTrue(main._primes_enabled_proposed(), "session terminée -> réinitialisée à ON")
+
+    def test_reset_a_la_fermeture_du_dernier_meme_sans_reouverture_immediate(self):
+        """Le nettoyage a lieu DANS unregister() lui-même (pas seulement
+        au prochain register()) : vérifiable même sans qu'un nouveau
+        tournoi ne soit encore ouvert."""
+        main.open_windows.register("/tmp/A.tournoi")
+        main._set_primes_enabled_proposed(False)
+        main.open_windows.unregister("/tmp/A.tournoi")
+        self.assertTrue(main._primes_enabled_proposed())
+
+    def test_reset_filet_de_securite_au_prochain_register_apres_un_plantage(self):
+        """Reproduit un plantage : le dernier processus disparaît SANS
+        jamais appeler unregister — le registre PID redevient vide dès
+        que _prune l'a constaté (simulé ici par son absence), mais
+        export_prefs.json garde encore l'ancienne valeur OFF.
+
+        CORRECTION du 2026-09-09 (3e relecture, après un vrai bug détecté
+        par tests/test_primes_multi_process_real_subprocess.py) : cette
+        valeur résiduelle est désormais ignorée dès la LECTURE elle-même
+        (voir open_windows.primes_enabled_proposed — auto-
+        réinitialisation si list_open_paths() est vide), pas seulement
+        au prochain register() — donc déjà `True` ICI, avant même
+        d'appeler register(). register() reste appelé ensuite pour
+        vérifier qu'il nettoie aussi le fichier lui-même (filet de
+        sécurité supplémentaire, plus seulement LA garantie)."""
+        main._set_primes_enabled_proposed(False)  # résidu, sans aucune fenêtre enregistrée
+        self.assertTrue(
+            main._primes_enabled_proposed(),
+            "aucune fenêtre ouverte -> ignoré dès la lecture, pas besoin d'attendre un register()",
+        )
+        main.open_windows.register("/tmp/nouvelle_session.tournoi")
+        self.assertTrue(main._primes_enabled_proposed())
+
+    def test_register_ne_reinitialise_pas_si_une_session_est_deja_en_cours(self):
+        main.open_windows.register("/tmp/A.tournoi")
+        main._set_primes_enabled_proposed(False)
+        main.open_windows.register("/tmp/B.tournoi")  # 2e fenêtre de la MÊME session
+        self.assertFalse(
+            main._primes_enabled_proposed(),
+            "une session déjà active ne doit jamais être réinitialisée par un nouvel ajout",
+        )
 
 
 class SyncPrimesEnabledPrefTest(unittest.TestCase):

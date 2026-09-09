@@ -29,6 +29,69 @@ import sys
 import tempfile
 import time
 
+import export_prefs
+
+# Clé export_prefs de la valeur "proposée" pour "Calculer les primes" —
+# voir primes_enabled_proposed/set_primes_enabled_proposed ci-dessous,
+# désormais LA source de vérité pour main.py (_primes_enabled_proposed/
+# _set_primes_enabled_proposed délèguent ici, ne touchent plus
+# export_prefs directement) : centralisée dans CE module pour que la
+# vérification "session déjà éteinte -> ignorer/nettoyer" ci-dessous
+# s'applique invariablement, quel que soit l'appelant.
+PRIMES_ENABLED_PROPOSED_KEY = "primes_enabled_session_proposed"
+
+
+def primes_enabled_proposed():
+    """Valeur "proposée" pour "Calculer les primes" (voir main.py:
+    _primes_enabled_proposed, qui délègue ici) — True par défaut.
+
+    AUTO-RÉINITIALISATION (demande du 2026-09-09, point 2 : "nouvelle
+    session = primes ON par défaut", CORRIGÉE après un vrai bug détecté
+    par tests/test_primes_multi_process_real_subprocess.py — deux VRAIS
+    process séparés, pas seulement deux objets en mémoire) : si
+    list_open_paths() est actuellement VIDE, la valeur stockée ne peut
+    provenir que d'une session déjà éteinte -> ignorée, True renvoyé
+    inconditionnellement (et la valeur stockée nettoyée au passage) —
+    exactement le même principe que primes_session_started().
+
+    Point CRITIQUE qui justifie cette vérification ICI, à la LECTURE,
+    plutôt que de compter uniquement sur le nettoyage fait dans
+    register()/unregister() (conservé plus bas comme filet de sécurité
+    supplémentaire, jamais LA garantie) : main.py:_choose_tournament_
+    file lit cette valeur pour "stamper" un tournoi flambant neuf AVANT
+    d'appeler open_windows.register() pour lui (ce nouveau tournoi n'est
+    donc pas encore dans le registre au moment de cette lecture). Sans
+    la vérification ci-dessous, un tournoi créé comme PREMIÈRE fenêtre
+    d'une session neuve lisait à tort l'ancienne valeur de la session
+    précédente — le nettoyage de register() n'intervenant, lui, qu'un
+    instant trop tard (juste après cette lecture, pas avant)."""
+    if not list_open_paths():
+        _clear_primes_enabled_proposed()
+        return True
+    return export_prefs.load_value(PRIMES_ENABLED_PROPOSED_KEY, True) is not False
+
+
+def set_primes_enabled_proposed(value):
+    """Modifie la valeur "proposée" (voir main.py:
+    _set_primes_enabled_proposed, qui délègue ici) — à n'appeler que si
+    la session n'est pas verrouillée (voir primes_session_started)."""
+    try:
+        export_prefs.save_value(PRIMES_ENABLED_PROPOSED_KEY, bool(value))
+    except OSError:
+        pass
+
+
+def _clear_primes_enabled_proposed():
+    """Remet la valeur "proposée" à ON (cochée) — filet de sécurité
+    supplémentaire (voir register/unregister ci-dessous, mêmes points
+    d'appel que _clear_primes_session_started), en plus de la
+    vérification à la lecture ci-dessus qui est LA garantie réelle :
+    ne touche jamais une session encore active."""
+    try:
+        export_prefs.save_value(PRIMES_ENABLED_PROPOSED_KEY, True)
+    except OSError:
+        pass
+
 
 def _atomic_write_json(path, data):
     """Écrit `data` (JSON) dans `path` de façon atomique : écrit d'abord
@@ -154,12 +217,20 @@ def register(path):
     puisse jamais survivre jusqu'à la nouvelle session qui commence avec
     cet enregistrement. `primes_session_started()` fait déjà ce même
     contrôle paresseusement à chaque lecture (filet de sécurité), mais on
-    ne veut pas dépendre du hasard d'un futur appel."""
+    ne veut pas dépendre du hasard d'un futur appel.
+
+    Même précaution pour la valeur "proposée" de "Calculer les primes"
+    (demande du 2026-09-09, point 2) : si elle avait été laissée à OFF
+    par une session précédente entièrement close SANS que unregister()
+    n'ait pu la remettre à ON lui-même (même scénario de plantage
+    ci-dessus), remise à ON ICI aussi, avant d'ajouter cette nouvelle
+    fenêtre — voir _clear_primes_enabled_proposed."""
     if not path:
         return
     data = _prune(_load())
     if not data:
         _clear_primes_session_started()
+        _clear_primes_enabled_proposed()
     data[os.path.abspath(path)] = {"pid": os.getpid(), "registered_at": time.time()}
     _save(data)
 
@@ -224,7 +295,13 @@ def unregister(path):
     primes_session_started() qui pourrait ne jamais avoir lieu si aucune
     autre fenêtre ne se rouvre avant longtemps (voir la même précaution
     symétrique dans register ci-dessus, et le filet de sécurité
-    paresseux déjà présent dans primes_session_started elle-même)."""
+    paresseux déjà présent dans primes_session_started elle-même).
+
+    Même chose pour la valeur "proposée" (demande du 2026-09-09, point 2,
+    "nouvelle session = primes ON par défaut") : remise à ON dès la
+    fermeture du DERNIER tournoi de la session, sans affecter en rien la
+    session en cours tant qu'il en reste au moins un ouvert — voir
+    _clear_primes_enabled_proposed."""
     if not path:
         return
     data = _prune(_load())
@@ -235,6 +312,7 @@ def unregister(path):
         _save(data)
         if not data:
             _clear_primes_session_started()
+            _clear_primes_enabled_proposed()
 
 
 def find_open_pid(path):
