@@ -14,7 +14,9 @@ dépendance en plus de la bibliothèque standard, sert :
   l'écran projecteur) ; le bouton ON/OFF bascule directement pause/
   reprise du chrono, sans passer par l'écran projecteur ni l'onglet
   Joueurs (voir /clock_state, sondé toutes les 3s pour refléter l'état
-  réel même s'il a changé par un autre moyen, ex. au clavier) ;
+  réel même s'il a changé par un autre moyen, ex. au clavier) ; ce même
+  sondage fait aussi clignoter "Mouvements" tant que l'onglet Mouvements
+  du Mac contient au moins un déplacement en attente ;
 - une page "Éliminations" à deux colonnes (glisser un joueur éliminé, à
   gauche, sur son éliminateur, à droite, avec confirmation — cet ordre,
   éliminé puis éliminateur, correspond à l'usage en salle de poker) pour
@@ -49,15 +51,62 @@ dépendance en plus de la bibliothèque standard, sert :
 Rien n'est installé sur le téléphone : juste ouvrir une adresse dans son
 navigateur, sur le wifi du club.
 
-Volontairement sans mot de passe ni compte : l'accès est limité à qui est
-déjà sur le même réseau Wifi local (comme le reste de l'application, qui
-n'a pas non plus de système d'authentification), et les actions
-déclenchées sont les mêmes que celles déjà disponibles au clavier
-(Ctrl+Maj+J/C/T) ou dans l'onglet Joueurs — rien de destructeur, rien qui
-touche aux données du tournoi autrement que par une élimination normale.
+Protégé par un code à 6 chiffres PUIS une approbation par appareil
+(demande du 2026-09-09) : avant ce correctif, l'accès reposait
+uniquement sur le fait d'être déjà sur le même réseau Wifi local.
+Désormais, toute connexion doit d'abord passer par /login puis
+/authenticate (voir Handler._handle_login/_handle_authenticate) et
+indiquer le code de la session en cours (voir open_windows.
+remote_session_code, affiché dans Paramètres à côté de la case "Activer
+le contrôle à distance"), IDENTIQUE pour tous les tournois ouverts
+pendant une même session de l'application. Un code de test permanent
+(131261) est accepté EN PLUS du code de session pour les besoins de
+test — jamais affiché dans l'interface, soumis à la même protection
+anti-force-brute que le code réel (open_windows.record_remote_auth_
+failure/_success), aucune route ni aucun contournement spécifique pour
+lui.
+
+Le code seul ne suffit PAS : un appareil qui ne s'est jamais connecté
+doit en plus être explicitement APPROUVÉ depuis le PC/Mac (Paramètres,
+voir main.py) avant d'accéder à la moindre commande — voir open_windows.
+register_device_attempt/approve_remote_device/verify_device_session.
+Un appareil déjà approuvé lors d'une session précédente retrouve un
+accès immédiat en resaisissant le nouveau code de la session en cours,
+sans réapprobation (voir open_windows.get_or_mint_device_session_
+token) ; une révocation (bouton "Révoquer" dans Paramètres) invalide
+l'accès de cet appareil IMMÉDIATEMENT, même en cours de session.
+
+Une fois authentifié ET approuvé, le téléphone reste autorisé pour
+toute la session (cookies "rc_bid"/"rc_auth", HttpOnly — jamais lus par
+le JavaScript de la page) : il n'a PAS à ressaisir le code à chaque
+page ni en changeant de tournoi depuis le Lobby, mais DOIT s'authentifier
+à nouveau à la session suivante (code et jetons de session régénérés,
+voir open_windows._ensure_remote_session_auth_locked).
+
+Vérification faite CÔTÉ SERVEUR sur CHAQUE route sensible (voir
+_AUTH_EXEMPT_PATHS/_AUTH_PAGE_PATHS et le tout début de do_GET/do_POST
+ci-dessous) — pas seulement sur les pages HTML ou les boutons JS :
+connaître directement l'URL d'une action (ex. /end_tournament) sans
+authentification valide ne suffit pas à l'exécuter. Aucune route HTTP
+ne permet à un téléphone de s'auto-approuver, se révoquer ou modifier
+la liste des appareils : Autoriser/Refuser/Révoquer sont exclusivement
+des actions de l'interface Tkinter locale (voir main.py).
+
+Limite connue et assumée : ce serveur tourne en HTTP simple (pas de
+TLS) sur le Wifi local — code, cookies et jetons y circulent donc EN
+CLAIR sur le réseau. La protection mise en place vise un accès non
+autorisé qui ne serait ni sur le Wifi club ni approuvé, un ancien
+responsable dont le téléphone a été révoqué, et le brute-force du code
+— pas une interception réseau active sur ce même Wifi (HTTPS pourrait
+être traité séparément plus tard). Les actions déclenchées restent les
+mêmes que celles déjà disponibles au clavier (Ctrl+Maj+J/C/T) ou dans
+l'onglet Joueurs — rien de destructeur, rien qui touche aux données du
+tournoi autrement que par une élimination normale.
 """
 import json
 import os
+import re
+import secrets
 import socket
 import threading
 import urllib.error
@@ -89,6 +138,217 @@ _RELOAD_SCRIPT = (
     "  window.location.href = window.location.pathname + '?_r=' + Date.now();\n"
     "}"
 )
+
+# ---------------------------------------------------------------------
+# Authentification (demande du 2026-09-09) : code à 6 chiffres puis
+# approbation par appareil — voir la docstring de ce module et celle,
+# bien plus détaillée, de la section correspondante dans open_windows.py
+# (registre persistant des appareils / fichier éphémère de session).
+# ---------------------------------------------------------------------
+
+# Cookie HttpOnly, jamais lu ni écrit par le JavaScript de la page —
+# identifiant de navigateur (rc_bid, 128 bits, non sensible : ne sert
+# qu'à retrouver un appareil déjà approuvé, voir open_windows.
+# register_device_attempt) et jeton de session par appareil (rc_auth,
+# 256 bits, voir open_windows.get_or_mint_device_session_token).
+_BROWSER_ID_COOKIE_NAME = "rc_bid"
+_AUTH_COOKIE_NAME = "rc_auth"
+
+# Un an : rc_bid identifie l'APPAREIL, pas la session — doit survivre à
+# la fermeture de Safari pour qu'un responsable déjà approuvé n'ait
+# jamais à re-demander une approbation d'une soirée à l'autre (voir
+# open_windows, section "approbation persistante").
+_BROWSER_ID_COOKIE_MAX_AGE = 365 * 24 * 3600
+# 24h : largement plus qu'une soirée de tournoi, mais borné plutôt
+# qu'un cookie de session pur — un responsable qui ferme et rouvre
+# Safari en cours de soirée garde son accès sans ressaisir le code.
+_AUTH_COOKIE_MAX_AGE = 24 * 3600
+
+# Routes accessibles SANS authentification (demande du 2026-09-09) :
+# strictement celles nécessaires pour saisir/vérifier le code et
+# sonder l'état d'une demande d'approbation en attente — TOUT le reste
+# (pages ET actions) exige une session valide ET un appareil approuvé,
+# vérifiés ICI côté serveur (voir do_GET/do_POST), jamais seulement
+# côté page/JS.
+_AUTH_EXEMPT_PATHS = {"/login", "/authenticate", "/auth_status"}
+
+# Routes GET qui correspondent à une VRAIE navigation plein écran
+# (typiquement suivies d'un rendu HTML plein écran par le téléphone) :
+# une requête non authentifiée y répond par une redirection 302 vers
+# /login, plutôt que par un 401 JSON — sans ça, /login recevrait un
+# fetch() en boucle plutôt qu'un affichage utilisable. Tout le reste
+# (endpoints JSON, tout do_POST) répond 401 en JSON — voir
+# _AUTH_REDIRECT_SCRIPT côté client, qui intercepte ce 401 pour
+# rediriger lui-même vers /login.
+_AUTH_PAGE_PATHS = {
+    "/", "/index.html", "/eliminate", "/eliminate.html",
+    "/photos", "/photos.html", "/lobbylist", "/select_tournament",
+}
+
+
+def _parse_cookie(cookie_header, name):
+    """Valeur du cookie `name` dans l'en-tête Cookie brut, ou None —
+    petit utilitaire partagé (identifiant de navigateur, jeton
+    d'authentification...) ; le cookie "selected_pid" garde son
+    analyse propre dans resolve_current_pid, laissée telle quelle pour
+    ne rien changer à un comportement déjà en place et testé."""
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part.split("=", 1)[1]
+    return None
+
+
+_BROWSER_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+# Injecté en tout début du <script> de chaque page accessible une fois
+# authentifié (voir _PAGE_TEMPLATE/_ELIMINATE_PAGE/_PHOTOS_PAGE) : dès
+# qu'une session serveur devient invalide (nouvelle session côté PC,
+# donc nouveau code/jetons — voir open_windows._ensure_remote_session_
+# auth_locked — OU appareil révoqué entre-temps), toute réponse 401
+# d'un fetch() quelconque de la page renvoie directement au formulaire
+# de code plutôt que de laisser la page continuer à afficher des
+# données obsolètes/vides silencieusement. Une seule interception
+# centrale plutôt que de modifier individuellement chaque .then() de
+# chaque page (il y en a une bonne dizaine, réparties sur 4 templates).
+_AUTH_REDIRECT_SCRIPT = (
+    "(function() {\n"
+    "  var _origFetch = window.fetch;\n"
+    "  window.fetch = function() {\n"
+    "    return _origFetch.apply(this, arguments).then(function(response) {\n"
+    "      if (response.status === 401) {\n"
+    "        window.location.href = '/login';\n"
+    "        throw new Error('auth_required');\n"
+    "      }\n"
+    "      return response;\n"
+    "    });\n"
+    "  };\n"
+    "})();"
+)
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Code d'accès</title>
+<style>
+  body {
+    margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    text-align: center;
+  }
+  h1 { font-size: 19px; color: #e8c468; margin: 0 0 6px; }
+  p.hint { color: #b9ad8f; font-size: 14px; margin: 0 0 26px; }
+  input {
+    display: block; width: 100%; max-width: 280px; margin: 0 auto 16px;
+    padding: 16px 10px; font-size: 28px; letter-spacing: 6px; text-align: center;
+    border: none; border-radius: 10px; box-sizing: border-box;
+    -webkit-appearance: none;
+  }
+  button {
+    display: block; width: 100%; max-width: 280px; margin: 0 auto;
+    padding: 14px 10px; font-size: 17px; font-weight: 700;
+    border: none; border-radius: 10px; color: #fff; background: #2c6e8a;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.55; }
+  #msg { min-height: 40px; margin: 18px auto 0; max-width: 280px; color: #d98a5f; font-size: 14px; }
+  #msg.pending { color: #e8c468; }
+</style>
+</head>
+<body>
+  <h1>🔒 Contrôle à distance</h1>
+  <p class="hint" id="hint">Code affiché dans Paramètres, sur le PC</p>
+  <input id="code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" autofocus>
+  <button id="btn-submit" onclick="submitCode()">Valider</button>
+  <p id="msg"></p>
+<script>
+var pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+// Sondage de l'état d'une demande en attente (demande du 2026-09-09) :
+// toutes les 2 secondes seulement, jamais plus fréquent — l'iPhone
+// détecte ainsi tout seul le moment où le responsable clique
+// "Autoriser" sur le PC, sans que l'utilisateur ait à recharger la
+// page ou ressaisir le code.
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(function() {
+    fetch('/auth_status').then(function(r) { return r.json(); }).then(function(data) {
+      if (data.status === 'approved') {
+        stopPolling();
+        window.location.href = '/';
+      } else if (data.status === 'refused') {
+        stopPolling();
+        var msg = document.getElementById('msg');
+        msg.className = '';
+        msg.textContent = "Accès refusé par le responsable du tournoi.";
+      }
+    }).catch(function() { /* réseau momentanément indisponible : on retentera */ });
+  }, 2000);
+}
+
+function submitCode() {
+  var input = document.getElementById('code');
+  var btn = document.getElementById('btn-submit');
+  var msg = document.getElementById('msg');
+  var code = input.value.trim();
+  if (!/^[0-9]{6}$/.test(code)) {
+    msg.className = '';
+    msg.textContent = 'Entrez les 6 chiffres du code.';
+    return;
+  }
+  btn.disabled = true;
+  msg.className = '';
+  msg.textContent = '';
+  fetch('/authenticate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({code: code}),
+  }).then(function(r) {
+    if (r.status === 429) {
+      return r.json().then(function(data) { throw {rateLimited: true, message: data.message}; });
+    }
+    return r.json();
+  }).then(function(data) {
+    btn.disabled = false;
+    if (!data.ok) {
+      msg.className = '';
+      msg.textContent = 'Code incorrect.';
+      input.value = '';
+      input.focus();
+      return;
+    }
+    if (data.status === 'approved') {
+      window.location.href = '/';
+    } else {
+      msg.className = 'pending';
+      msg.textContent = "Code correct. En attente d'autorisation par le responsable du tournoi.";
+      startPolling();
+    }
+  }).catch(function(err) {
+    btn.disabled = false;
+    msg.className = '';
+    if (err && err.rateLimited) {
+      msg.textContent = err.message || 'Trop de tentatives. Réessayez plus tard.';
+    } else {
+      msg.textContent = 'Connexion impossible. Réessayez.';
+    }
+  });
+}
+document.getElementById('code').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') submitCode();
+});
+</script>
+</body>
+</html>
+"""
 
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="fr">
@@ -123,6 +383,19 @@ _PAGE_TEMPLATE = """<!doctype html>
   #btn-eliminations {{ background: #2c4a6e; }}
   #btn-tables {{ background: #1f6b6b; }}
   #btn-mouvements {{ background: #8a4a1f; }}
+  /* Clignotement doux tant qu'un mouvement est en attente (voir
+     refreshClockState/has_pending_moves) : alternance d'opacité, pas de
+     couleur criarde ni de changement de taille — le texte "📋 Afficher
+     Mouvements" et la mise en page du bouton restent identiques, seule
+     son apparence pulse légèrement. Portée à CE bouton uniquement
+     (jamais toute la page). */
+  @keyframes btn-mouvements-blink {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.55; }}
+  }}
+  #btn-mouvements.blink {{
+    animation: btn-mouvements-blink 1.4s ease-in-out infinite;
+  }}
   #btn-niveau-suivant {{ background: #2c6e8a; }}
   #btn-photos {{ background: #6e2c6e; }}
   /* Ligne Chronomètre + petit bouton ON/OFF de pause à sa droite : les
@@ -158,12 +431,22 @@ _PAGE_TEMPLATE = """<!doctype html>
     background: #1c3d2c; font-size: 18px; line-height: 40px;
     box-shadow: 0 2px 6px rgba(0,0,0,.4);
   }}
+  /* "Fin de la partie" : nettement séparée des autres boutons (ligne de
+     séparation + marge au-dessus) et d'une couleur plus sombre/alarmante
+     que "Éliminations" (#b5442e) pour qu'un geste distrait ne suffise
+     pas à la confondre avec une action courante — une confirmation
+     (window.confirm) est de toute façon exigée avant tout envoi. */
+  #end-tournament-section {{
+    max-width: 420px; margin: 28px auto 0; padding-top: 16px;
+    border-top: 1px solid #294235;
+  }}
+  #btn-end-tournament {{ background: #6e1f1f; }}
 </style>
 </head>
 <body>
   <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   <h1>🎙 Contrôle à distance</h1>
-  <p class="tournoi">{tournament_name}</p>
+  <p class="tournoi" id="tournoi-name">{tournament_name}</p>
   <p class="version">v{app_version}</p>
 
   {lobby_button}
@@ -185,7 +468,91 @@ _PAGE_TEMPLATE = """<!doctype html>
 
   <p id="status"></p>
 
+  <div id="end-tournament-section">
+    <button id="btn-end-tournament" onclick="confirmEndTournament()">⛔ Fin de la partie</button>
+  </div>
+
 <script>
+{auth_redirect_script}
+var OWN_PID = {own_pid};  // capturé au chargement de cette page — voir /end_tournament et sa docstring côté serveur
+// Nom du tournoi RÉELLEMENT affiché sur CETTE page (voir tournament_name_json
+// côté serveur) — celui du tournoi sélectionné/servi ici, jamais forcément
+// celui qui héberge le port 8765 (voir le correctif Cookie de _proxy).
+var TOURNAMENT_NAME = {tournament_name_json};
+function confirmEndTournament() {{
+  if (!window.confirm('Confirmer la Fin de partie pour le ' + TOURNAMENT_NAME + ' ?')) return;
+  var status = document.getElementById('status');
+  status.textContent = 'Fermeture en cours...';
+  fetch('/end_tournament', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{pid: OWN_PID}})
+  }}).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (!data.ok) {{
+      status.textContent = data.message || 'Échec.';
+      return;
+    }}
+    // Ce tournoi n'existe plus : garder sa sélection ferait, au prochain
+    // appel, retomber EN SILENCE sur un autre tournoi que celui affiché
+    // ici (voir resolve_proxy_port côté serveur — un pid disparu du
+    // registre est traité comme "aucune sélection", jamais signalé comme
+    // une erreur) — mieux vaut repartir sans aucune sélection.
+    document.cookie = 'selected_pid=; Max-Age=0; Path=/';
+    // En-tête immédiatement neutre : ce process va fermer (via la file
+    // d'attente vocale côté Python — voir _poll_voice_queue — donc pas
+    // forcément instantané), plus question d'afficher encore le nom de
+    // ce tournoi pendant l'attente qui suit.
+    document.getElementById('tournoi-name').textContent = 'En attente d\\'un tournoi';
+    status.textContent = data.other_tournaments_remain
+      ? 'Partie terminée. Retour au Lobby...'
+      : 'Partie terminée. En attente d\\'un nouveau tournoi...';
+    waitForDifferentTournamentThenReload(OWN_PID);
+  }}).catch(function(e) {{
+    status.textContent = 'Échec (' + e.message + ') — vérifiez le wifi.';
+  }});
+}}
+// Après "Fin de la partie" : sonde périodiquement le point d'entrée
+// normal (port 8765 — toujours l'origine de CETTE page déjà chargée,
+// jamais un port/pid figé en dur) jusqu'à ce qu'un tournoi VIVANT et
+// DIFFÉRENT de celui qu'on vient de fermer (closedPid) réponde
+// réellement. Ne navigue JAMAIS (ni window.location, ni location.href,
+// ni reload) avant cette confirmation.
+//
+// Pourquoi pas simplement "la requête a réussi" (r.ok) : le tournoi
+// qu'on vient de fermer reste souvent joignable un court instant après
+// avoir répondu à /end_tournament — la fermeture réelle passe par la
+// file d'attente vocale de Tkinter (_poll_voice_queue côté Python,
+// scrutée toutes les 150 ms), pendant laquelle son propre serveur HTTP
+// continue de tourner normalement. Une redirection déclenchée sur la
+// seule foi d'un "r.ok" pouvait donc atterrir en fait sur CE MÊME
+// process en train de mourir, et échouer (le port pouvant se refermer
+// entre cette vérification et la navigation réelle) : c'est exactement
+// ce qui produisait l'écran natif Safari "ERR_CONNECTION_FAILED".
+//
+// /lobbylist expose maintenant l'en-tête X-Own-Pid (voir
+// _handle_lobbylist côté serveur) : le pid de QUI répond VRAIMENT à
+// CETTE requête précise (/lobbylist n'est jamais relayée vers un autre
+// process — voir do_GET, elle est toujours traitée localement). Un
+// tournoi n'est considéré "détecté" que si ce pid diffère de closedPid
+// — jamais sur la seule réussite de la requête. Un échec réseau (port
+// encore libre, personne n'écoute sur 8765 pour l'instant) est
+// silencieux et simplement retenté, comme une réponse dont le pid ne
+// diffère pas encore (le tournoi qu'on ferme lui-même, ou une réponse
+// sans cet en-tête) : dans les deux cas, on continue d'attendre, sans
+// jamais afficher d'erreur ni de popup.
+var RECONNECT_POLL_MS = 1500;
+function waitForDifferentTournamentThenReload(closedPid) {{
+  fetch('/lobbylist', {{ cache: 'no-store' }}).then(function(r) {{
+    var responderPid = r.ok ? Number(r.headers.get('X-Own-Pid')) : NaN;
+    if (r.ok && responderPid && responderPid !== closedPid) {{
+      window.location.href = '/lobbylist';
+      return;
+    }}
+    setTimeout(function() {{ waitForDifferentTournamentThenReload(closedPid); }}, RECONNECT_POLL_MS);
+  }}).catch(function() {{
+    setTimeout(function() {{ waitForDifferentTournamentThenReload(closedPid); }}, RECONNECT_POLL_MS);
+  }});
+}}
 function sendAction(action, btn) {{
   var status = document.getElementById('status');
   status.textContent = 'Envoi...';
@@ -208,6 +575,12 @@ function sendAction(action, btn) {{
 function refreshClockState() {{
   fetch('/clock_state').then(function(r) {{ return r.json(); }}).then(function(data) {{
     document.getElementById('btn-pause-toggle').textContent = data.paused ? 'ON' : 'OFF';
+    // Clignotement de "📋 Afficher Mouvements" tant qu'un mouvement est en
+    // attente (voir has_pending_moves ci-dessus, même sondage 3s que le
+    // bouton ON/OFF juste au-dessus — aucun sondage supplémentaire créé) :
+    // ajoute/retire uniquement la classe CSS .blink, jamais le texte du
+    // bouton ni sa position.
+    document.getElementById('btn-mouvements').classList.toggle('blink', !!data.has_pending_moves);
   }}).catch(function() {{ /* réseau momentanément indisponible : le prochain sondage rattrapera */ }});
 }}
 function togglePause() {{
@@ -227,6 +600,7 @@ refreshClockState();
 setInterval(refreshClockState, 3000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
 """
@@ -253,7 +627,19 @@ _LOBBY_PAGE = """<!doctype html>
     text-align: center;
   }}
   h1 {{ font-size: 20px; color: #e8c468; margin: 0 0 20px; }}
-  a.back {{ display: block; color: #b9ad8f; text-decoration: none; margin-bottom: 22px; font-size: 15px; }}
+  /* "← Retour" : un vrai bouton tactile (comme sur la page Éliminations),
+     pas un simple lien texte discret — mène toujours à "/", résolu à
+     CHAQUE clic par la même logique de routage que le reste (voir
+     resolve_current_pid côté serveur) : jamais un pid figé dans ce
+     bouton, donc toujours valide même après changement de sélection,
+     fermeture d'un tournoi, ou reprise du port 8765 par un autre. */
+  #btn-back {{
+    display: block; width: 100%; max-width: 420px; margin: 0 auto 22px;
+    border: none; border-radius: 10px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 12px 16px;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
   button {{
     display: block; width: 100%; max-width: 420px; margin: 0 auto 14px;
     padding: 22px 10px; font-size: 19px; font-weight: 700;
@@ -273,7 +659,7 @@ _LOBBY_PAGE = """<!doctype html>
 </head>
 <body>
   <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
-  <a class="back" href="/">← Retour</a>
+  <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
   <h1>🏛 Choisir un tournoi</h1>
   {rows}
 <script>
@@ -308,8 +694,17 @@ _ELIMINATE_PAGE = """<!doctype html>
     display: flex; align-items: center; justify-content: space-between;
     padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
   }}
-  #topbar a {{ color: #b9ad8f; text-decoration: none; font-size: 15px; }}
   #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  /* "← Retour" : un vrai bouton tactile (fond plein, coins arrondis,
+     zone de frappe confortable), pas un simple lien texte discret —
+     pour qu'il soit immédiatement identifiable comme actionnable sur un
+     écran d'iPhone tenu à bout de bras/au-dessus de la table. */
+  #btn-back {{
+    border: none; border-radius: 8px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 9px 16px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
   #btn-reload {{
     width: 32px; height: 32px; border: none; border-radius: 50%;
     background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
@@ -368,7 +763,7 @@ _ELIMINATE_PAGE = """<!doctype html>
 </head>
 <body>
   <div id="topbar">
-    <a href="/">← Retour</a>
+    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
@@ -385,6 +780,7 @@ _ELIMINATE_PAGE = """<!doctype html>
   <div id="ghost"></div>
 
 <script>
+{auth_redirect_script}
 var players = [];
 var lastSignature = null;
 var pending = null;    // candidat de glissement pas encore confirmé : {{id, label, sub, el, startX, startY, engaged}}
@@ -639,6 +1035,16 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
     body: JSON.stringify({{eliminated_id: eliminatedId, eliminator_id: eliminatorId}})
   }}).then(function(r) {{
     if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    // data.ok peut être faux même avec une réponse HTTP 200 (demande du
+    // 2026-09-08) : refus explicite (ex. bounty PKO sans éliminateur
+    // désigné), jamais un échec silencieux — data.message est affiché tel
+    // quel, jamais rien n'est modifié côté serveur dans ce cas.
+    if (!data.ok) {{
+      window.alert(data.message || 'Élimination refusée.');
+      return;
+    }}
     lastSignature = null;  // forcer le prochain rendu même si la liste redevient identique entre-temps
     loadPlayers();
   }}).catch(function(e) {{
@@ -650,6 +1056,7 @@ loadPlayers();
 refreshTimer = setInterval(loadPlayers, 4000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
 """
@@ -683,8 +1090,20 @@ _PHOTOS_PAGE = """<!doctype html>
     padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
     position: sticky; top: 0; z-index: 10;
   }}
-  #topbar a {{ color: #b9ad8f; text-decoration: none; font-size: 15px; }}
   #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  /* "← Retour" : un vrai bouton tactile (même principe et même
+     présentation que sur la page Éliminations), pas un simple lien
+     texte discret — mène toujours à "/", résolu à CHAQUE clic par la
+     même logique de routage que le reste (voir resolve_current_pid
+     côté serveur) : jamais un pid figé dans ce bouton, donc toujours
+     valide même après changement de sélection, fermeture d'un
+     tournoi, ou reprise du port 8765 par un autre. */
+  #btn-back {{
+    border: none; border-radius: 8px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 9px 16px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
   #btn-reload {{
     width: 32px; height: 32px; border: none; border-radius: 50%;
     background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
@@ -749,7 +1168,7 @@ _PHOTOS_PAGE = """<!doctype html>
 </head>
 <body>
   <div id="topbar">
-    <a href="/">← Retour</a>
+    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
@@ -768,6 +1187,7 @@ _PHOTOS_PAGE = """<!doctype html>
   </div>
 
 <script>
+{auth_redirect_script}
 var players = [];
 var pendingPlayer = null;
 var lastPlayersJSON = null;
@@ -1033,8 +1453,98 @@ loadPlayers();
 setInterval(loadPlayers, 4000);
 {reload_script}
 </script>
+{rebalance_widget}
 </body>
 </html>
+"""
+
+
+# Widget "Équilibrage des tables" (question "quel siège est actuellement
+# grosse blinde ?" — version TEST, voir database.py: rebalance_tables /
+# resolve_pending_rebalance) : inséré tel quel (voir {rebalance_widget})
+# dans les TROIS pages du contrôle à distance (index, Éliminations,
+# Photos), pas seulement celle des Éliminations — un rééquilibrage peut
+# survenir à tout instant, quelle que soit la page ouverte sur le
+# téléphone à ce moment-là. Sondé toutes les 2s via /rebalance_pending ;
+# répondre poste sur /rebalance_answer. Pas d'association téléphone/table
+# ni de mot de passe (comme le reste du contrôle à distance, voir
+# docstring du module) : la PREMIÈRE RÉPONSE VALIDE traitée gagne (voir
+# database.py: resolve_pending_rebalance) — une réponse invalide (siège
+# obsolète, demande déjà remplacée...) ne consomme rien et ne l'emporte
+# jamais sur une réponse valide arrivant ensuite. Les autres appareils
+# voient simplement leur superposition disparaître au sondage suivant
+# (voir pollRebalance), sans jamais afficher d'erreur pour ça.
+_REBALANCE_WIDGET = """
+<div id="rebalance-overlay" style="display:none; position:fixed; inset:0; z-index:900; background:rgba(0,0,0,.72); align-items:center; justify-content:center; padding:20px;">
+  <div style="background:#10241a; border:2px solid #e8c468; border-radius:14px; padding:22px 20px; max-width:360px; width:100%; min-width:0; box-sizing:border-box; text-align:center; box-shadow:0 6px 24px rgba(0,0,0,.5);">
+    <h2 style="color:#e8c468; font-size:16px; margin:0 0 10px; letter-spacing:.02em;">ÉQUILIBRAGE DES TABLES</h2>
+    <p id="rebalance-table-msg" style="color:#f5efe0; font-size:15px; font-weight:700; margin:0 0 10px;"></p>
+    <p style="color:#b9ad8f; font-size:14px; margin:0 0 4px;">Quel siège est actuellement grosse blinde ?</p>
+    <p style="color:#8a7f66; font-size:12px; margin:0 0 14px;">Le joueur juste après changera de table.</p>
+    <div id="rebalance-seats" style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 10px; margin-bottom:16px;"></div>
+    <button id="rebalance-skip" type="button" style="width:100%; padding:12px; border:none; border-radius:10px; background:#4a4a4a; color:#fff; font-size:14px; font-weight:700; -webkit-tap-highlight-color:transparent;">Continuer sans indiquer la BB</button>
+  </div>
+</div>
+<script>
+(function() {
+  var shownId = null;
+  function pollRebalance() {
+    fetch('/rebalance_pending').then(function(r) { return r.json(); }).then(function(data) {
+      var overlay = document.getElementById('rebalance-overlay');
+      if (!data) {
+        if (shownId !== null) { overlay.style.display = 'none'; shownId = null; }
+        return;
+      }
+      if (data.request_id === shownId) return;
+      shownId = data.request_id;
+      document.getElementById('rebalance-table-msg').textContent = data.table_name + ' doit donner un joueur';
+      var seatsDiv = document.getElementById('rebalance-seats');
+      seatsDiv.innerHTML = '';
+      var seatPlayers = data.seat_players || {};
+      data.seats.forEach(function(s) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        // Nom du joueur assis à ce siège quand connu (voir seat_players,
+        // /rebalance_pending) — sinon repli sur le seul numéro de siège,
+        // comme avant cet ajout.
+        var playerName = seatPlayers[s];
+        b.textContent = playerName ? (playerName + ' [' + s + ']') : ('[' + s + ']');
+        // 2 boutons par ligne (voir grid-template-columns du conteneur
+        // ci-dessus) : width:100% + box-sizing:border-box pour que
+        // chaque bouton remplisse exactement sa colonne sans jamais
+        // déborder horizontalement, même avec un nom de joueur long
+        // (white-space:normal + word-break autorisent alors un
+        // retour à la ligne DANS le bouton plutôt qu'un débordement —
+        // min-height, pas height, pour que le bouton grandisse tout
+        // seul si le texte prend 2 lignes, tout en gardant une bonne
+        // zone de clic même pour un texte court sur 1 seule ligne).
+        b.style.cssText = 'width:100%; min-width:0; box-sizing:border-box; padding:12px 8px; border:none; border-radius:10px; background:#1f6b6b; color:#fff; font-size:15px; font-weight:700; line-height:1.25; min-height:48px; white-space:normal; word-break:break-word; text-align:center; -webkit-tap-highlight-color:transparent;';
+        b.addEventListener('click', function() { answerRebalance(data.request_id, s); });
+        seatsDiv.appendChild(b);
+      });
+      overlay.style.display = 'flex';
+    }).catch(function() { /* réseau momentanément indisponible : le prochain sondage rattrapera */ });
+  }
+  function answerRebalance(requestId, seat) {
+    // Masquée tout de suite (optimiste), sans attendre la réponse du
+    // serveur : si la requête échoue (wifi), le prochain sondage la
+    // réaffichera automatiquement tant que la demande est toujours en
+    // attente côté PC — inutile de bloquer l'interface pour ça.
+    document.getElementById('rebalance-overlay').style.display = 'none';
+    shownId = null;
+    fetch('/rebalance_answer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({request_id: requestId, seat: seat})
+    }).catch(function() { /* le prochain sondage rattrapera si besoin */ });
+  }
+  document.getElementById('rebalance-skip').addEventListener('click', function() {
+    if (shownId !== null) answerRebalance(shownId, null);
+  });
+  pollRebalance();
+  setInterval(pollRebalance, 2000);
+})();
+</script>
 """
 
 
@@ -1075,6 +1585,51 @@ def local_ip():
     return "127.0.0.1"
 
 
+def resolve_current_pid(cookie_header, own_pid, live_tournaments):
+    """Pid du tournoi actuellement COURANT pour un téléphone donné —
+    celui que /lobbylist doit marquer "(celui-ci)" (voir
+    RemoteControlServer.start: _handle_lobbylist) et celui vers lequel
+    les pages de contenu doivent être servies/relayées (voir
+    resolve_proxy_port). Notion délibérément INDÉPENDANTE de `own_pid`
+    (le tournoi qui héberge physiquement le port 8765, un simple relais
+    réseau pour les autres — voir la docstring de RemoteControlServer) :
+    avant ce correctif, une sélection absente ou invalide retombait
+    silencieusement sur `own_pid`, confondant "détient le routeur" et
+    "est le tournoi courant" — symptôme observé : un tournoi ouvert en
+    premier (et devenu routeur) restait affiché "(celui-ci)" même après
+    l'ouverture de tournois plus récents jamais sélectionnés depuis un
+    téléphone.
+
+    Priorité :
+    1. le cookie "selected_pid" de CE téléphone (posé par
+       /select_tournament), REVALIDÉ ici contre `live_tournaments` à
+       CHAQUE appel (jamais un pid conservé sans vérifier qu'il
+       correspond encore à un tournoi vivant et joignable — un
+       processus fermé, y compris l'ancien routeur, est ainsi
+       automatiquement écarté sans action explicite) ;
+    2. à défaut (cookie absent, ou pid mort/invalide/inconnu), le
+       tournoi le plus RÉCEMMENT ouvert parmi `live_tournaments` (voir
+       open_windows.register: "registered_at") — jamais `own_pid` par
+       défaut.
+    `live_tournaments` : liste au format de open_windows.
+    list_remote_tournaments(), passée par l'appelant plutôt que relue
+    ici, pour ne jamais la relire deux fois inutilement dans le même
+    traitement de requête."""
+    selected_pid = None
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if part.startswith("selected_pid="):
+            try:
+                selected_pid = int(part.split("=", 1)[1])
+            except ValueError:
+                selected_pid = None
+    if selected_pid is not None and any(t["pid"] == selected_pid for t in live_tournaments):
+        return selected_pid
+    if not live_tournaments:
+        return own_pid
+    return max(live_tournaments, key=lambda t: t.get("registered_at", 0))["pid"]
+
+
 class RemoteControlServer:
     """Petit serveur HTTP embarqué (bibliothèque standard uniquement),
     tourne dans un thread dédié (un thread par requête, voir
@@ -1097,9 +1652,20 @@ class RemoteControlServer:
       la page Photos — liste de dicts {name, club, has_photo}, sans id
       numérique (voir on_upload_photo ci-dessous).
     - `on_eliminate(eliminated_id, eliminator_id)` : élimination décidée
-      depuis la page Éliminations (eliminator_id peut être None).
+      depuis la page Éliminations (eliminator_id peut être None). Appelé
+      DIRECTEMENT sur le thread HTTP de la requête (voir ThreadingHTTPServer
+      plus bas) — PAS le thread Tk — et doit renvoyer {"ok": bool,
+      "message": str} : "ok" indique si l'élimination a bien eu lieu,
+      "message" est affiché tel quel sur le téléphone si "ok" est faux
+      (ex. refus PKO sans éliminateur désigné, demande du 2026-09-08) —
+      jamais un échec silencieux.
     - `get_clock_paused()` : True si le chrono est actuellement en pause
       — pour le petit bouton ON/OFF à côté de "Chronomètre".
+    - `get_has_pending_moves()` : True s'il existe au moins un mouvement en
+      attente dans l'onglet Mouvements de CE tournoi (voir App._tick,
+      self.db.count_seat_moves() — même source que l'onglet lui-même,
+      aucune logique séparée) — fait clignoter le bouton "📋 Afficher
+      Mouvements" tant que c'est vrai.
     - `on_upload_photo(player_name, image_bytes)` : photo prise depuis la
       page Photos, à associer à ce joueur (identifié par NOM, pas par id
       — voir get_roster_players) dans le répertoire — renvoie
@@ -1114,21 +1680,49 @@ class RemoteControlServer:
       on_upload_photo (simple lecture de fichier).
     - `on_delete_photo(player_name)` : supprime la photo de ce joueur
       (bouton 🗑 de la page Photos) — renvoie (succès: bool, message:
-      str), même remarque thread-safe."""
+      str), même remarque thread-safe.
+    - `on_end_tournament()` : bouton "Fin de la partie" (tout en bas de la
+      page principale) — appelé UNIQUEMENT après que ce module a déjà
+      vérifié que le pid envoyé par le téléphone correspond à CE
+      processus-ci (voir /end_tournament dans start()) ; ne prend aucun
+      argument, ne fait que déposer la demande dans la file d'attente
+      thread-safe existante (voir App._start_remote_control_if_enabled)."""
 
     def __init__(self, on_word, get_tournament_name=None, get_players=None,
                  on_eliminate=None, get_clock_paused=None, on_upload_photo=None,
                  get_roster_players=None, get_photo_image=None, on_delete_photo=None,
+                 get_pending_rebalance=None, on_rebalance_answer=None,
+                 on_end_tournament=None, get_has_pending_moves=None,
                  port=DEFAULT_PORT):
         self.on_word = on_word
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
         self.get_players = get_players or (lambda: [])
         self.get_roster_players = get_roster_players or (lambda: [])
-        self.on_eliminate = on_eliminate or (lambda eliminated_id, eliminator_id: None)
+        self.on_eliminate = on_eliminate or (
+            lambda eliminated_id, eliminator_id: {"ok": True, "message": ""}
+        )
         self.get_clock_paused = get_clock_paused or (lambda: True)
+        self.get_has_pending_moves = get_has_pending_moves or (lambda: False)
         self.on_upload_photo = on_upload_photo or (lambda player_name, image_bytes: (False, "Non disponible"))
         self.get_photo_image = get_photo_image or (lambda player_name: (None, None))
         self.on_delete_photo = on_delete_photo or (lambda player_name: (False, "Non disponible"))
+        # Rééquilibrage simple : question "quel siège est grosse blinde ?"
+        # (version TEST, voir database.py: rebalance_tables /
+        # resolve_pending_rebalance). get_pending_rebalance() renvoie
+        # None ou {request_id, table_name, seats} — sondé par TOUS les
+        # téléphones (voir _REBALANCE_WIDGET) ; on_rebalance_answer(
+        # request_id, seat) est appelé quand l'un d'eux répond (seat=None
+        # pour "Continuer sans indiquer la BB").
+        self.get_pending_rebalance = get_pending_rebalance or (lambda: None)
+        self.on_rebalance_answer = on_rebalance_answer or (lambda request_id, seat: None)
+        # Bouton "Fin de la partie" (tout en bas de la page principale) :
+        # on_end_tournament() est appelé UNIQUEMENT après vérification, ici
+        # même (voir /end_tournament dans start()), que le pid envoyé par
+        # le téléphone correspond bien à CE processus-ci (os.getpid()) —
+        # jamais transmis tel quel à l'appelant, pour qu'il n'ait besoin
+        # d'aucune logique d'identification supplémentaire (voir
+        # App._start_remote_control_if_enabled dans main.py).
+        self.on_end_tournament = on_end_tournament or (lambda: None)
         self.port = port
         self._httpd = None
         self._thread = None
@@ -1142,31 +1736,30 @@ class RemoteControlServer:
         get_roster_players = self.get_roster_players
         on_eliminate = self.on_eliminate
         get_clock_paused = self.get_clock_paused
+        get_has_pending_moves = self.get_has_pending_moves
         on_upload_photo = self.on_upload_photo
         get_photo_image = self.get_photo_image
         on_delete_photo = self.on_delete_photo
+        get_pending_rebalance = self.get_pending_rebalance
+        on_rebalance_answer = self.on_rebalance_answer
+        on_end_tournament = self.on_end_tournament
         own_pid = os.getpid()
 
         def resolve_proxy_port(handler):
-            """Port du tournoi actuellement choisi par CE téléphone (cookie
-            "selected_pid", posé par /select_tournament — voir
-            _LOBBY_PAGE), s'il diffère de ce tournoi-ci. None si aucune
-            sélection, sélection = ce tournoi-ci, ou tournoi sélectionné
-            disparu depuis (fenêtre fermée entre-temps) — dans tous ces
-            cas, la requête est traitée localement, sur ce tournoi-ci."""
-            cookie_header = handler.headers.get("Cookie", "")
-            selected_pid = None
-            for part in cookie_header.split(";"):
-                part = part.strip()
-                if part.startswith("selected_pid="):
-                    try:
-                        selected_pid = int(part.split("=", 1)[1])
-                    except ValueError:
-                        selected_pid = None
-            if selected_pid is None or selected_pid == own_pid:
+            """Port du tournoi actuellement COURANT pour CE téléphone (voir
+            resolve_current_pid — cookie "selected_pid" revalidé, ou à
+            défaut le plus récemment ouvert, jamais own_pid par défaut),
+            s'il diffère de ce tournoi-ci. None si le tournoi courant EST
+            ce tournoi-ci (traité localement) — y compris quand aucune
+            sélection valide n'existe et que CE tournoi-ci s'avère être
+            lui-même le plus récemment ouvert."""
+            current_pid = resolve_current_pid(
+                handler.headers.get("Cookie", ""), own_pid, open_windows.list_remote_tournaments()
+            )
+            if current_pid == own_pid:
                 return None
             for t in open_windows.list_remote_tournaments():
-                if t["pid"] == selected_pid:
+                if t["pid"] == current_pid:
                     return t["port"]
             return None
 
@@ -1174,28 +1767,187 @@ class RemoteControlServer:
             def log_message(self, fmt, *args):
                 pass  # pas de log console à chaque requête (bruyant)
 
-            def _send_html(self, html):
+            def _send_html(self, html, extra_headers=None):
+                # extra_headers : liste de (nom, valeur) — PAS un dict,
+                # justement pour pouvoir poser PLUSIEURS "Set-Cookie"
+                # dans la même réponse (ex. rc_bid + rc_auth à la fois,
+                # voir _handle_authenticate) : un dict ne peut porter
+                # qu'une seule valeur par nom d'en-tête.
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                if extra_headers:
+                    for name, value in extra_headers:
+                        self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _send_json(self, obj, status=200):
+            def _send_json(self, obj, status=200, extra_headers=None):
+                # extra_headers : voir _send_html — même convention
+                # (liste de tuples), nécessaire ici aussi pour poser un
+                # cookie sur une réponse JSON (ex. /authenticate,
+                # /auth_status).
                 body = json.dumps(obj).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                if extra_headers:
+                    for name, value in extra_headers:
+                        self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _client_ip(self):
+                return self.client_address[0]
+
+            def _browser_id(self):
+                """(browser_id, is_new) — identifiant de navigateur
+                (demande du 2026-09-09) : 128 bits aléatoires
+                (secrets.token_hex), SANS aucune donnée personnelle, non
+                dérivé de l'IP, non prévisible — sert uniquement à
+                retrouver un appareil déjà (dés)approuvé (voir
+                open_windows.register_device_attempt) et à clé
+                l'anti-force-brute. `is_new` indique si CETTE réponse
+                doit poser le cookie (absent, ou valeur qui ne
+                ressemble pas à ce que ce serveur génère lui-même — un
+                cookie forgé/tronqué est alors simplement remplacé, pas
+                fait confiance)."""
+                existing = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                if existing and _BROWSER_ID_RE.fullmatch(existing):
+                    return existing, False
+                return secrets.token_hex(16), True
+
+            def _is_authenticated(self):
+                """LA vérification faite avant toute route sensible
+                (voir do_GET/do_POST) : les deux cookies HttpOnly
+                (rc_bid, rc_auth) doivent correspondre à un appareil
+                TOUJOURS approuvé, avec un jeton valide pour la session
+                EN COURS (voir open_windows.verify_device_session, qui
+                vérifie les deux conditions requises)."""
+                browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                token = _parse_cookie(self.headers.get("Cookie", ""), _AUTH_COOKIE_NAME)
+                return open_windows.verify_device_session(browser_id, token)
+
+            def _handle_login(self):
+                browser_id, is_new = self._browser_id()
+                extra_headers = []
+                if is_new:
+                    extra_headers.append((
+                        "Set-Cookie",
+                        f"{_BROWSER_ID_COOKIE_NAME}={browser_id}; Path=/; HttpOnly; "
+                        f"SameSite=Lax; Max-Age={_BROWSER_ID_COOKIE_MAX_AGE}",
+                    ))
+                self._send_html(_LOGIN_PAGE, extra_headers=extra_headers or None)
+
+            def _handle_authenticate(self):
+                """POST /authenticate — SEULE route qui compare un code
+                saisi (demande du 2026-09-09 : 131261 passe forcément
+                par ICI, comme le code réel, jamais de route ni de
+                bypass séparé). Ordre STRICT, chacun avant le suivant :
+                1) anti-bruteforce (avant même de lire le code, pour ne
+                   jamais évaluer un code pendant un blocage actif) ;
+                2) validité du code (échec -> compteur incrémenté,
+                   réponse {"ok": false}, RIEN d'autre) ;
+                3) succès -> compteurs remis à zéro, PUIS seulement :
+                   approbation de l'appareil (voir open_windows.
+                   register_device_attempt) — "approved" délivre
+                   immédiatement un jeton de session (cookie rc_auth),
+                   tout le reste (pending/nouveau/révoqué-redevenu-
+                   pending) renvoie {"ok": true, "status": "pending"}
+                   SANS aucun cookie rc_auth : le code était correct,
+                   mais ça ne suffit plus à donner accès."""
+                browser_id, browser_is_new = self._browser_id()
+                ip = self._client_ip()
+                extra_headers = []
+                if browser_is_new:
+                    extra_headers.append((
+                        "Set-Cookie",
+                        f"{_BROWSER_ID_COOKIE_NAME}={browser_id}; Path=/; HttpOnly; "
+                        f"SameSite=Lax; Max-Age={_BROWSER_ID_COOKIE_MAX_AGE}",
+                    ))
+                blocked, remaining = open_windows.remote_auth_rate_limit_status(browser_id, ip)
+                if blocked:
+                    minutes = int(remaining // 60) + (1 if remaining % 60 else 0)
+                    minutes = max(1, minutes)
+                    self._send_json(
+                        {"ok": False, "message": f"Trop de tentatives. Réessayez dans {minutes} min."},
+                        status=429,
+                        extra_headers=extra_headers or None,
+                    )
+                    return
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                    code = data.get("code")
+                except (ValueError, TypeError):
+                    code = None
+                if not isinstance(code, str) or not open_windows.verify_remote_code(code):
+                    open_windows.record_remote_auth_failure(browser_id, ip)
+                    self._send_json({"ok": False}, extra_headers=extra_headers or None)
+                    return
+                open_windows.record_remote_auth_success(browser_id, ip)
+                device_status = open_windows.register_device_attempt(browser_id, ip)
+                if device_status == "approved":
+                    token = open_windows.get_or_mint_device_session_token(browser_id)
+                    if token:
+                        extra_headers.append((
+                            "Set-Cookie",
+                            f"{_AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; "
+                            f"SameSite=Lax; Max-Age={_AUTH_COOKIE_MAX_AGE}",
+                        ))
+                    self._send_json({"ok": True, "status": "approved"}, extra_headers=extra_headers or None)
+                else:
+                    self._send_json({"ok": True, "status": "pending"}, extra_headers=extra_headers or None)
+
+            def _handle_auth_status(self):
+                """GET /auth_status — sondé toutes les 2s par /login tant
+                qu'une demande est "pending" (voir _LOGIN_PAGE). Réponse
+                STRICTEMENT limitée à {"status": "..."} (demande du
+                2026-09-09, point 2 : aucune liste, aucun nom, aucune
+                IP, aucun jeton, aucun session_id) — basée uniquement
+                sur le browser_id du cookie courant, jamais sur un
+                paramètre fourni par la requête. Pose le cookie rc_auth
+                (via Set-Cookie, jamais dans le corps JSON) dès que
+                l'approbation est détectée, pour que la redirection vers
+                "/" qui suit trouve déjà une session valide."""
+                browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                status = open_windows.get_device_auth_status(browser_id)
+                extra_headers = []
+                if status == "approved" and browser_id:
+                    token = open_windows.get_or_mint_device_session_token(browser_id)
+                    if token:
+                        extra_headers.append((
+                            "Set-Cookie",
+                            f"{_AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; "
+                            f"SameSite=Lax; Max-Age={_AUTH_COOKIE_MAX_AGE}",
+                        ))
+                self._send_json({"status": status}, extra_headers=extra_headers or None)
 
             def _proxy(self, target_port):
                 """Relaie telle quelle la requête en cours vers le VRAI
                 port du tournoi choisi via le Lobby (127.0.0.1 — toujours
                 la même machine, jamais le réseau externe) et renvoie au
                 téléphone la réponse obtenue, sans qu'il n'ait jamais eu
-                à connaître ce port lui-même."""
+                à connaître ce port lui-même.
+
+                Le Cookie ("selected_pid", voir _handle_select_tournament)
+                DOIT être relayé au process cible : celui-ci exécute le
+                MÊME do_GET/do_POST, donc le MÊME resolve_proxy_port sur
+                cette requête relayée — sans son cookie d'origine, il la
+                voit comme "sans sélection" et retombe sur resolve_
+                current_pid('', ...), qui peut désigner un troisième
+                tournoi (celui le plus récemment ouvert) au lieu de
+                conclure "c'est moi, sers localement" ; le tournoi
+                sélectionné pouvait alors afficher (nom, état...) celui
+                d'un AUTRE tournoi, et ce à chaque requête (donc y compris
+                juste après 🔄 Actualiser, sans rapport avec un cache) —
+                symptôme observé : le nom affiché sur l'écran principal ne
+                reflétait pas le tournoi réellement sélectionné dès que
+                celui-ci n'était ni le routeur (8765) ni, par coïncidence,
+                déjà celui que resolve_current_pid aurait choisi par
+                défaut sans cookie."""
                 length = int(self.headers.get("Content-Length", 0) or 0)
                 body = self.rfile.read(length) if length else None
                 url = f"http://127.0.0.1:{target_port}{self.path}"
@@ -1203,6 +1955,9 @@ class RemoteControlServer:
                 ctype = self.headers.get("Content-Type")
                 if ctype:
                     req.add_header("Content-Type", ctype)
+                cookie = self.headers.get("Cookie")
+                if cookie:
+                    req.add_header("Cookie", cookie)
                 try:
                     with urllib.request.urlopen(req, timeout=5) as resp:
                         data = resp.read()
@@ -1217,13 +1972,37 @@ class RemoteControlServer:
                     self.send_error(502, "Ce tournoi n'est momentanément plus joignable")
 
             def _handle_lobbylist(self):
+                # X-Own-Pid (voir confirmEndTournament/waitForDifferent
+                # TournamentThenReload côté client, dans _PAGE_TEMPLATE) :
+                # le pid de CE process, celui qui répond VRAIMENT à cette
+                # requête précise — jamais relayée vers un autre process
+                # (voir do_GET, "/lobbylist" est toujours traitée
+                # localement, avant même resolve_proxy_port). Permet au
+                # téléphone de distinguer, après "Fin de la partie", une
+                # réponse venant encore du tournoi en train de fermer
+                # (même pid) d'une réponse venant d'un tournoi VRAIMENT
+                # différent — sans quoi une navigation pouvait être
+                # déclenchée sur la foi d'une dernière réponse du process
+                # mourant, puis échouer si son port se refermait entre
+                # temps (écran natif Safari "ERR_CONNECTION_FAILED").
                 tournaments = open_windows.list_remote_tournaments()
                 if not tournaments:
                     rows = "<p class=\"empty\">Aucun tournoi joignable pour l'instant.</p>"
                 else:
+                    # current_pid (voir resolve_current_pid) : PAS own_pid —
+                    # "(celui-ci)" doit refléter le tournoi COURANT de CE
+                    # téléphone (sa sélection, ou à défaut le plus
+                    # récemment ouvert), jamais automatiquement celui qui
+                    # héberge le routeur réseau (port 8765). Recalculé à
+                    # chaque appel (donc à chaque 🔄 Actualiser), jamais
+                    # mis en cache : reflète toujours l'état réellement à
+                    # jour du registre partagé.
+                    current_pid = resolve_current_pid(
+                        self.headers.get("Cookie", ""), own_pid, tournaments
+                    )
                     parts = []
                     for t in sorted(tournaments, key=lambda x: x["name"].lower()):
-                        is_self = t["pid"] == own_pid
+                        is_self = t["pid"] == current_pid
                         css_class = " class=\"current\"" if is_self else ""
                         label = _escape_html(t["name"]) + (" (celui-ci)" if is_self else "")
                         parts.append(
@@ -1231,7 +2010,10 @@ class RemoteControlServer:
                             f'onclick="window.location.href=\'/select_tournament?pid={t["pid"]}\'">{label}</button>'
                         )
                     rows = "\n".join(parts)
-                self._send_html(_LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT))
+                self._send_html(
+                    _LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT),
+                    extra_headers=[("X-Own-Pid", str(own_pid))],
+                )
 
             def _handle_select_tournament(self):
                 from urllib.parse import parse_qs, urlparse
@@ -1242,6 +2024,17 @@ class RemoteControlServer:
                     try:
                         pid = int(pid_values[0])
                         self.send_header("Set-Cookie", f"selected_pid={pid}; Path=/")
+                        # Permet à une éventuelle fenêtre "Lobby" ouverte
+                        # sur le Mac (LobbyDialog, main.py) d'aligner sa
+                        # sélection visuelle sur ce même tournoi (voir
+                        # open_windows.get_phone_selected_pid) — simple
+                        # écriture de fichier, ne touche ni self.db ni
+                        # Tkinter, donc sans danger depuis ce thread (même
+                        # remarque que on_upload_photo/get_photo_image).
+                        # Ne change RIEN au mécanisme de proxy/routage
+                        # existant ci-dessus (cookie selected_pid) : purement
+                        # informatif pour ce seul usage visuel.
+                        open_windows.set_phone_selected_pid(pid)
                     except ValueError:
                         pass
                 self.send_header("Location", "/")
@@ -1258,6 +2051,30 @@ class RemoteControlServer:
                 # ont besoin de la chaîne de requête d'origine, continuent
                 # eux d'utiliser self.path tel quel).
                 path = self.path.split("?", 1)[0]
+
+                # Authentification (demande du 2026-09-09) : traitée
+                # avant TOUT le reste, y compris /lobbylist et le relais
+                # vers un autre tournoi — voir _AUTH_EXEMPT_PATHS/_AUTH_
+                # PAGE_PATHS et la docstring de ce module. /login et
+                # /auth_status doivent rester joignables SANS être
+                # authentifié (c'est justement leur rôle) ; tout le
+                # reste exige une session valide ET un appareil
+                # approuvé (voir Handler._is_authenticated), vérifié ICI
+                # côté serveur, jamais seulement côté page/JS.
+                if path == "/login":
+                    self._handle_login()
+                    return
+                if path == "/auth_status":
+                    self._handle_auth_status()
+                    return
+                if path not in _AUTH_EXEMPT_PATHS and not self._is_authenticated():
+                    if path in _AUTH_PAGE_PATHS:
+                        self.send_response(302)
+                        self.send_header("Location", "/login")
+                        self.end_headers()
+                    else:
+                        self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
+                    return
 
                 # Toujours traitées ICI, jamais relayées vers un autre
                 # tournoi : ce sont les pages qui permettent justement de
@@ -1282,19 +2099,35 @@ class RemoteControlServer:
                     )
                     self._send_html(_PAGE_TEMPLATE.format(
                         tournament_name=_escape_html(get_name()),
+                        # tournament_name_json : même nom que ci-dessus,
+                        # mais échappé pour être injecté tel quel comme
+                        # littéral JS (voir confirmEndTournament) — celui
+                        # du tournoi RÉELLEMENT servi ici (voir le
+                        # correctif Cookie de _proxy : sans lui, un
+                        # tournoi sélectionné via un relais pouvait
+                        # afficher/confirmer par erreur le nom d'un
+                        # AUTRE tournoi).
+                        tournament_name_json=json.dumps(get_name()),
                         lobby_button=lobby_button,
                         app_version=version.APP_VERSION,
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
+                        own_pid=own_pid,
                     ))
                 elif path in ("/eliminate", "/eliminate.html"):
                     self._send_html(_ELIMINATE_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
                 elif path in ("/photos", "/photos.html"):
                     self._send_html(_PHOTOS_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
                 elif path == "/players":
                     self._send_json(get_players())
@@ -1321,17 +2154,73 @@ class RemoteControlServer:
                     self.end_headers()
                     self.wfile.write(image_bytes)
                 elif path == "/clock_state":
-                    self._send_json({"paused": bool(get_clock_paused())})
+                    # has_pending_moves inséré ici (pas un endpoint séparé) :
+                    # réutilise le sondage toutes les 3s déjà en place pour
+                    # le bouton ON/OFF du chrono, voir refreshClockState()
+                    # côté page — clignotement du bouton "Afficher
+                    # Mouvements" (voir _PAGE_TEMPLATE), propre à CE
+                    # tournoi/processus (get_has_pending_moves, jamais
+                    # partagé entre tournois différents).
+                    self._send_json({
+                        "paused": bool(get_clock_paused()),
+                        "has_pending_moves": bool(get_has_pending_moves()),
+                    })
+                elif path == "/rebalance_pending":
+                    # Sondé toutes les 2s par TOUS les téléphones, sur
+                    # toutes les pages (voir _REBALANCE_WIDGET) : renvoie
+                    # null s'il n'y a aucune question "grosse blinde" en
+                    # attente en ce moment.
+                    pending = get_pending_rebalance()
+                    if pending is None:
+                        self._send_json(None)
+                    else:
+                        # seat_players : {siège: nom du joueur actuellement
+                        # assis là} pour LA SEULE table concernée (pending
+                        # ["table_name"]) — enrichit l'affichage (le
+                        # téléphone montre "Alice [3]" plutôt qu'un simple
+                        # numéro de siège), sans rien changer au calcul :
+                        # simple lecture de get_players() (déjà exposé pour
+                        # la page Éliminations), jointe ici uniquement pour
+                        # cette réponse JSON. Absent de la requête si le nom
+                        # n'a pas pu être retrouvé (siège occupé mais
+                        # joueur introuvable dans le cache, cas limite) —
+                        # le téléphone affiche alors juste le numéro de
+                        # siège, comme avant cet ajout.
+                        seat_players = {
+                            p["seat"]: p["name"] for p in get_players()
+                            if p.get("table") == pending["table_name"] and p.get("seat") in pending["seats"]
+                        }
+                        self._send_json({
+                            "request_id": pending["request_id"],
+                            "table_name": pending["table_name"],
+                            "seats": pending["seats"],
+                            "seat_players": seat_players,
+                        })
                 else:
                     self.send_error(404)
 
             def do_POST(self):
+                path = self.path.split("?", 1)[0]
+
+                # /authenticate est la SEULE route POST accessible sans
+                # authentification (voir _AUTH_EXEMPT_PATHS et la
+                # docstring de _handle_authenticate) — jamais relayée
+                # vers un autre tournoi non plus : l'état d'authenti-
+                # fication est de toute façon partagé entre tous les
+                # tournois de la session via open_windows, peu importe
+                # quel processus traite cette requête précise.
+                if path == "/authenticate":
+                    self._handle_authenticate()
+                    return
+                if not self._is_authenticated():
+                    self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
+                    return
+
                 target_port = resolve_proxy_port(self)
                 if target_port is not None:
                     self._proxy(target_port)
                     return
 
-                path = self.path.split("?", 1)[0]
                 if path.startswith("/action/"):
                     action = path[len("/action/"):]
                     if action not in _VALID_ACTIONS:
@@ -1350,8 +2239,13 @@ class RemoteControlServer:
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
-                    on_eliminate(eliminated_id, eliminator_id)
-                    self._send_json({"ok": True})
+                    # on_eliminate renvoie {"ok": bool, "message": str}
+                    # (demande du 2026-09-08) : renvoyé tel quel au
+                    # téléphone, qui affiche "message" si "ok" est faux
+                    # (ex. refus PKO sans éliminateur désigné) — jamais un
+                    # échec silencieux, voir sa docstring plus haut.
+                    result = on_eliminate(eliminated_id, eliminator_id)
+                    self._send_json(result)
                 elif path == "/upload_photo":
                     from urllib.parse import parse_qs, urlparse
                     query = parse_qs(urlparse(self.path).query)
@@ -1381,6 +2275,89 @@ class RemoteControlServer:
                         return
                     ok, message = on_delete_photo(player_name_values[0].strip())
                     self._send_json({"ok": ok, "message": message})
+                elif path == "/rebalance_answer":
+                    # Réponse à la question "quel siège est grosse
+                    # blinde ?" — comme /eliminate, ne fait que déposer la
+                    # réponse dans la file d'attente thread-safe côté
+                    # appelant (voir on_rebalance_answer/voice_command_
+                    # queue) : ce thread ne touche JAMAIS self.db ni
+                    # Tkinter directement. `seat` absent/null/vide =
+                    # "Continuer sans indiquer la BB". La PREMIÈRE RÉPONSE
+                    # VALIDE traitée (PC ou téléphone) à une demande donnée
+                    # gagne ; une réponse invalide (siège obsolète, demande
+                    # déjà remplacée...) ne consomme rien, et toute réponse
+                    # supplémentaire à la MÊME demande (même request_id)
+                    # une fois celle-ci résolue est ignorée proprement —
+                    # cette validation/consommation a lieu côté thread
+                    # principal (voir database.py: resolve_pending_
+                    # rebalance) — jamais ici, pour rester sans accès à
+                    # self.db.
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        request_id = str(data["request_id"])
+                        seat_raw = data.get("seat")
+                        seat = int(seat_raw) if seat_raw not in (None, "") else None
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    on_rebalance_answer(request_id, seat)
+                    self._send_json({"ok": True})
+                elif path == "/end_tournament":
+                    # Bouton "Fin de la partie" (tout en bas de la page
+                    # principale) : ferme proprement CE tournoi-ci
+                    # UNIQUEMENT — jamais un autre tournoi ouvert sur cette
+                    # même machine, jamais brutal (voir App._remote_end_
+                    # tournament dans main.py, qui réutilise _on_close()).
+                    #
+                    # Vérification cruciale, faite ICI (avant même de
+                    # déposer quoi que ce soit dans la file d'attente) :
+                    # `pid` envoyé par le téléphone doit correspondre à
+                    # own_pid (le processus qui traite RÉELLEMENT cette
+                    # requête, une fois le relais Lobby éventuel déjà
+                    # résolu — voir resolve_proxy_port/_proxy plus haut).
+                    # Ce `pid` a été capturé côté téléphone au chargement
+                    # de la page (voir OWN_PID dans _PAGE_TEMPLATE), donc
+                    # par le processus qui l'a alors RENDUE — le même que
+                    # own_pid ici tant que ce tournoi est resté ouvert et
+                    # sélectionné entre-temps. S'il ne correspond plus
+                    # (ex : le tournoi visé a déjà été fermé par un autre
+                    # moyen entre le chargement de la page et ce clic, et
+                    # cette requête retombe donc, faute de relais possible,
+                    # sur un AUTRE tournoi resté ouvert), on refuse net —
+                    # jamais fermer ce tournoi-ci à la place d'un autre
+                    # sur la seule foi d'un identifiant devenu obsolète.
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        requested_pid = int(data["pid"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    if requested_pid != own_pid:
+                        self._send_json({
+                            "ok": False,
+                            "message": "Ce tournoi n'est plus disponible ici. Rechargez la page.",
+                        })
+                        return
+                    # other_tournaments_remain : calculé AVANT on_end_tournament()
+                    # (qui ne fait que déposer la demande dans la file — la
+                    # fermeture réelle est asynchrone, ce process reste donc
+                    # inscrit au registre le temps de ce calcul) — dit à la
+                    # page cliente (voir confirmEndTournament) si elle doit
+                    # tenter de revenir au Lobby (un autre tournoi existe
+                    # encore, potentiellement joignable dans l'instant qui
+                    # suit via _maybe_reclaim_default_remote_port si CE
+                    # tournoi-ci tenait le port 8765 — voir main.py) ou
+                    # afficher directement un message de fin propre (plus
+                    # aucun tournoi nulle part).
+                    other_remain = any(
+                        t["pid"] != own_pid for t in open_windows.list_remote_tournaments()
+                    )
+                    on_end_tournament()
+                    self._send_json({"ok": True, "other_tournaments_remain": other_remain})
                 else:
                     self.send_error(404)
 
@@ -1405,6 +2382,43 @@ class RemoteControlServer:
             self._httpd.server_close()
             self._httpd = None
         self._thread = None
+
+    def try_reclaim_default_port(self):
+        """Bascule ce serveur (déjà démarré sur un port quelconque, voir
+        start() : c'est arrivé parce que DEFAULT_PORT était pris par un
+        AUTRE tournoi au démarrage) sur DEFAULT_PORT (8765) si ce port
+        est redevenu libre entre-temps — typiquement parce que le
+        tournoi qui l'occupait vient de se fermer via "Fin de la
+        partie" (voir App._maybe_reclaim_default_remote_port, appelé
+        depuis _tick sur TOUS les tournois encore ouverts : celui qui
+        s'en aperçoit et réussit le premier le récupère, sans protocole
+        de négociation entre processus — juste une nouvelle tentative de
+        bind()).
+
+        Ne fait RIEN si déjà sur DEFAULT_PORT, ou si un autre processus
+        a gagné la course entre-temps (bind() échoue alors avec
+        OSError, silencieusement — un prochain appel réessaiera). Ne
+        risque JAMAIS de se retrouver sans aucun port : le nouveau
+        serveur (sur 8765) n'est adopté qu'une fois son bind() réussi,
+        l'ancien (sur l'ancien port) n'est arrêté qu'ENSUITE — jamais
+        l'inverse. Le téléphone (qui ne parle jamais qu'à 8765) peut
+        ainsi retrouver directement CE tournoi, sans passer par le
+        Lobby d'un tournoi qui n'existe plus. Renvoie True si la
+        bascule a eu lieu."""
+        if not self.is_running or self.port == DEFAULT_PORT:
+            return False
+        try:
+            new_httpd = ThreadingHTTPServer(("0.0.0.0", DEFAULT_PORT), self._httpd.RequestHandlerClass)
+        except OSError:
+            return False  # toujours pris (par un autre tournoi, ou perdu la course) : on garde notre port actuel
+        old_httpd = self._httpd
+        old_httpd.shutdown()
+        old_httpd.server_close()
+        self._httpd = new_httpd
+        self.port = DEFAULT_PORT
+        self._thread = threading.Thread(target=new_httpd.serve_forever, daemon=True)
+        self._thread.start()
+        return True
 
     @property
     def is_running(self):

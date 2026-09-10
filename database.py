@@ -11,6 +11,9 @@ import os
 import glob
 import shutil
 import random
+import uuid
+
+import export_prefs
 
 # =====================================================================
 # Export PDF : petit utilitaire partagé par tous les export_*_pdf
@@ -203,7 +206,12 @@ CREATE TABLE IF NOT EXISTS bounty_events (
     eliminator_name TEXT,
     amount_won INTEGER NOT NULL,
     added_to_eliminator_bounty INTEGER NOT NULL DEFAULT 0,
-    event_time TEXT NOT NULL
+    event_time TEXT NOT NULL,
+    -- 'elimination' (défaut, une élimination normale) ou
+    -- 'victory_collect' (clôture de la bounty finale du vainqueur en fin
+    -- de tournoi PKO, voir Database._close_out_winner_bounty — jamais une
+    -- élimination supplémentaire, eliminator_name reste NULL dans ce cas).
+    event_type TEXT NOT NULL DEFAULT 'elimination'
 );
 """
 
@@ -221,6 +229,17 @@ DEFAULT_SETTINGS = {
     "movement_signal_duration_ms": "300",
     "highlight_duration_minutes": "5",
     "rake_percent": "0",
+    # Interrupteur général des primes (demande du 2026-09-09, voir
+    # Database._primes_enabled) : "1" = calcule présence/assiduité/
+    # classement/bounty classique/PKO normalement (comportement
+    # historique, compatibilité des anciens fichiers sans cette clé —
+    # voir _init_defaults/INSERT OR IGNORE) ; "0" = aucun calcul, aucune
+    # mutation bounty/bounty_won/kills, tableau Primes vide — jamais
+    # juste masqué. Valeur figée pour CE tournoi par main.py au moment
+    # opportun (voir _sync_primes_enabled_pref/_clock_resume) ; ne
+    # jamais modifier ce réglage directement en base sans passer par ce
+    # mécanisme (verrouillage multi-tournois, voir main.py).
+    "primes_enabled": "1",
     "bounty_amount": "0",
     "pko_mode": "0",
     "pko_cash_percent": "50",
@@ -272,6 +291,17 @@ def bounty_unit_value(n_players, flat_value=0):
 # tables alors qu'ils tiendraient sur une seule table finale.
 FINAL_TABLE_MAX_SEATS = 10
 
+# Préférence GLOBALE (voir export_prefs.py — même mécanisme que
+# "remote_control_enabled", partagée par tous les tournois/Sit & Go de
+# cette machine, pas une donnée du tournoi) qui active/désactive la
+# question "quel siège est actuellement grosse blinde ?" lors d'un simple
+# rééquilibrage (voir rebalance_tables, _bb_rebalance_prompt_enabled, et
+# App._build_settings_tab / App._on_bb_rebalance_prompt_toggle dans
+# main.py). Un seul et même nom de clé utilisé des deux côtés (importé
+# dans main.py) pour ne jamais risquer une faute de frappe entre les deux.
+# Activée par défaut (voir _bb_rebalance_prompt_enabled).
+BB_REBALANCE_PROMPT_PREF_KEY = "bb_rebalance_prompt_enabled"
+
 
 class Database:
     def __init__(self, path, read_only=False):
@@ -290,6 +320,17 @@ class Database:
         disparaissait alors silencieusement de la liste (exception
         avalée par l'appelant) le temps du conflit."""
         self.path = path
+        # Version TEST "grosse blinde" (voir rebalance_tables /
+        # resolve_pending_rebalance plus bas) : demande "quel siège est
+        # actuellement grosse blinde ?" actuellement en attente de réponse,
+        # ou None. État purement en mémoire (PAS en SQLite : ce n'est pas
+        # une donnée du tournoi, seulement un état de session éphémère
+        # côté interface), remis à None à chaque nouvelle instance de
+        # Database — jamais lu ni écrit depuis le thread du serveur de
+        # contrôle à distance (voir App._remote_pending_rebalance /
+        # remote_control.py dans main.py, même principe que
+        # _remote_clock_paused).
+        self.pending_rebalance = None
         if read_only:
             self.conn = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
             self.conn.row_factory = sqlite3.Row
@@ -318,6 +359,11 @@ class Database:
             self.conn.execute("ALTER TABLE players ADD COLUMN eliminated_by_name TEXT")
         if "club" not in cols:
             self.conn.execute("ALTER TABLE players ADD COLUMN club TEXT NOT NULL DEFAULT ''")
+        bounty_events_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(bounty_events)")}
+        if "event_type" not in bounty_events_cols:
+            self.conn.execute(
+                "ALTER TABLE bounty_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'elimination'"
+            )
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -513,13 +559,36 @@ class Database:
                 return path
         return None
 
+    def _primes_enabled(self):
+        """Interrupteur général des primes pour CE tournoi (réglage
+        `primes_enabled`, demande du 2026-09-09) : True = comportement
+        historique inchangé ; False = aucun calcul de prime ne doit avoir
+        lieu nulle part (présence/assiduité/classement/bounty classique/
+        PKO), y compris à l'inscription (bounty jamais stampée) et à
+        l'élimination (kills/bounty/bounty_won/bounty_events/clôture du
+        vainqueur jamais touchés) — jamais un simple masquage à
+        l'affichage. Absent d'un ancien fichier -> True (voir
+        DEFAULT_SETTINGS, compatibilité historique)."""
+        return self.get_setting_int("primes_enabled", 1) == 1
+
+    def primes_enabled(self):
+        """Équivalent public de `_primes_enabled` — à utiliser depuis
+        l'extérieur de cette classe (main.py notamment, pour décider
+        d'appliquer ou non la contrainte PKO d'éliminateur obligatoire
+        AVANT même d'appeler eliminate_player, voir _eliminate_selected/
+        _ask_eliminator/_remote_eliminate) plutôt que d'accéder
+        directement à une méthode "privée"."""
+        return self._primes_enabled()
+
     def add_player(self, name, club=""):
         """`club` : copié dans ce tournoi au moment de l'ajout (voir
         roster.get_club côté appelant) — n'est ensuite plus synchronisé
         avec le répertoire si celui-ci change, ce tournoi garde la photo
         du club tel qu'il était à l'inscription."""
         starting_chips = self.get_setting_int("starting_chips", 10000)
-        bounty_amount = self.get_setting_int("bounty_amount", 0)
+        # Primes désactivées (_primes_enabled) : jamais de bounty stampée
+        # à l'inscription, quel que soit le réglage `bounty_amount`.
+        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
         cur = self.conn.execute(
             "INSERT INTO players(name, buyin_count, rebuy_count, addon_count, "
             "chips, status, bounty, club) VALUES (?, 1, 0, 0, ?, 'active', ?, ?)",
@@ -533,7 +602,9 @@ class Database:
 
     def rebuy_player(self, player_id):
         chips = self.get_setting_int("rebuy_chips", 10000)
-        bounty_amount = self.get_setting_int("bounty_amount", 0)
+        # Voir add_player : jamais de bounty ajoutée si les primes sont
+        # désactivées pour ce tournoi.
+        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
         self.conn.execute(
             "UPDATE players SET rebuy_count = rebuy_count + 1, "
             "chips = chips + ?, bounty = bounty + ? WHERE id=?",
@@ -582,16 +653,56 @@ class Database:
         )
         self.conn.commit()
 
-    def eliminate_player(self, player_id, eliminated_by_id=None):
+    def eliminate_player(self, player_id, eliminated_by_id=None, orphan_bounty_ok=False):
         """Élimine un joueur. Si `eliminated_by_id` est fourni, l'éliminateur
         voit son compteur de bounty (kills, prime de bounty en points —
-        voir get_bounty_bonuses) incrémenté de 1, quel que soit l'ancien
-        mécanisme de bounty en €. Si en plus le joueur éliminé portait une
-        prime (bounty €), celle-ci est versée à l'éliminateur : intégralement
-        en mode classique, ou selon le partage PKO (une partie en cash
-        immédiat, le reste ajouté à la prime de l'éliminateur) en mode
+        voir get_bounty_bonuses) incrémenté de 1, quel que soit le mode de
+        bounty. Si en plus le joueur éliminé portait une prime (bounty, en
+        points), celle-ci est versée à l'éliminateur : intégralement en
+        mode classique, ou selon le partage PKO (une partie en points
+        immédiats, le reste ajouté à la prime de l'éliminateur) en mode
         progressif. Enregistre aussi, pour l'onglet Joueurs, le round et le
-        nom de l'éliminateur (indépendamment de tout bounty en €)."""
+        nom de l'éliminateur.
+
+        En mode PKO, un éliminateur est OBLIGATOIRE dès que le joueur
+        éliminé porte une bounty > 0 : lève ValueError sans rien modifier
+        si `eliminated_by_id` est absent ou invalide dans ce cas (demande
+        du 2026-09-08 — une bounty PKO ne doit jamais devenir orpheline).
+        Ne s'applique jamais hors PKO ni si la bounty du joueur est à 0 :
+        toutes les autres possibilités existantes (élimination sans
+        éliminateur) restent inchangées.
+
+        `orphan_bounty_ok=True` (demande du 2026-09-09, Mode Test — voir
+        App._eliminate_selected, élimination groupée) : lève CETTE
+        contrainte précise pour ce seul appel, SANS créer de faux
+        éliminateur ni transférer la bounty du joueur éliminé à qui que
+        ce soit (aucun bounty_won ajouté, aucune ligne bounty_events,
+        aucun partage PKO normal) — mais REMET SA BOUNTY À 0 (demande du
+        2026-09-09, 3e relecture) plutôt que de la laisser telle quelle :
+        un joueur désormais éliminé/inactif ne doit jamais rester porteur
+        d'une bounty non nulle en base, considéré comme un état
+        incohérent même à des fins de test. Cette bounty est donc
+        simplement ABANDONNÉE (perdue pour tout le monde), jamais
+        attribuée. RÉSERVÉ à un appelant qui a déjà vérifié lui-même que
+        le Mode Test est actif : cette méthode ne connaît rien du Mode
+        Test (concept purement main.py/UI, jamais persisté), elle se
+        contente d'un simple paramètre d'appel explicite — jamais activé
+        par défaut, jamais accessible autrement que par ce paramètre.
+        Sans effet si `eliminated_by_id` est fourni (la contrainte ne
+        s'applique de toute façon que si aucun éliminateur n'est désigné,
+        et le bloc de transfert normal ci-dessous remet déjà la bounty à
+        0 dans ce cas).
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        AUCUN de ces mécanismes ne s'applique — ni la contrainte
+        d'éliminateur obligatoire (elle n'a plus lieu d'être puisqu'aucune
+        bounty n'est jamais assignée dans ce mode, voir add_player), ni
+        le comptage de kills, ni le moindre transfert bounty/bounty_won/
+        bounty_events, ni la clôture de la bounty du vainqueur. Seule
+        l'inscription du round/nom de l'éliminateur (`eliminated_by_name`/
+        `elim_round`) reste enregistrée dans tous les cas : elle sert au
+        bandeau d'élimination, à l'onglet Classement/Joueurs et aux
+        statistiques, indépendamment des primes — jamais supprimée ici."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
@@ -600,21 +711,42 @@ class Database:
         eliminator_row = self.get_player(eliminated_by_id) if eliminated_by_id else None
         eliminator_name = eliminator_row["name"] if eliminator_row else None
 
+        primes_enabled = self._primes_enabled()
+        pko_mode = primes_enabled and self.get_setting_int("pko_mode", 0) == 1
+        if (pko_mode and eliminated and eliminated["bounty"] > 0
+                and eliminator_row is None and not orphan_bounty_ok):
+            raise ValueError(
+                f"{eliminated['name']} porte une prime PKO de "
+                f"{eliminated['bounty']} pts : un éliminateur doit être "
+                "désigné pour ne pas la rendre orpheline."
+            )
+
         self.conn.execute(
             "UPDATE players SET status='eliminated', place=?, elim_time=?, "
             "elim_round=?, eliminated_by_name=?, table_id=NULL, seat=NULL WHERE id=?",
             (place, now, current_round, eliminator_name, player_id),
         )
 
-        if eliminated_by_id:
+        if orphan_bounty_ok and eliminated_by_id is None and eliminated and eliminated["bounty"] > 0:
+            # Mode Test, élimination groupée sans éliminateur (demande du
+            # 2026-09-09, 3e relecture) : la bounty de ce joueur n'est
+            # transférée à personne (voir le bloc de transfert normal
+            # ci-dessous, jamais atteint ici puisque eliminated_by_id est
+            # None) — mais elle ne doit pas non plus rester non nulle sur
+            # un joueur désormais éliminé/inactif (état incohérent, même
+            # à des fins de test) : elle est donc ABANDONNÉE, remise à 0
+            # sans être créditée nulle part (aucun bounty_won, aucune
+            # ligne bounty_events, aucun partage PKO).
+            self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
+
+        if primes_enabled and eliminated_by_id:
             self.conn.execute(
                 "UPDATE players SET kills = kills + 1 WHERE id=?", (eliminated_by_id,)
             )
 
-        if eliminated_by_id and eliminated and eliminated["bounty"] > 0:
+        if primes_enabled and eliminated_by_id and eliminated and eliminated["bounty"] > 0:
             bounty = eliminated["bounty"]
             eliminator = self.get_player(eliminated_by_id)
-            pko_mode = self.get_setting_int("pko_mode", 0) == 1
             if pko_mode:
                 cash_pct = self.get_setting_int("pko_cash_percent", 50)
                 cash_part = round(bounty * cash_pct / 100)
@@ -630,8 +762,8 @@ class Database:
             self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
             self.conn.execute(
                 "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
-                "amount_won, added_to_eliminator_bounty, event_time) "
-                "VALUES (?,?,?,?,?)",
+                "amount_won, added_to_eliminator_bounty, event_time, event_type) "
+                "VALUES (?,?,?,?,?,'elimination')",
                 (eliminated["name"], eliminator["name"] if eliminator else "?",
                  cash_part, grow_part, now),
             )
@@ -642,10 +774,73 @@ class Database:
         # (le vainqueur) — sert à figer l'affichage "Durée" du chrono
         # projecteur au lieu de continuer à défiler après la fin de la
         # partie, et à y afficher "Partie terminée" (voir get_stats()).
-        if len(self.list_players(status="active")) <= 1:
+        still_active = self.list_players(status="active")
+        if len(still_active) <= 1:
             self.set_setting("tournament_end_epoch", int(time.time()))
+            # Clôture de la bounty finale du vainqueur (mode PKO
+            # uniquement, demande du 2026-09-08 ; jamais si les primes
+            # sont désactivées, demande du 2026-09-09) : dès qu'il ne
+            # reste plus qu'un seul joueur actif, sa bounty encore
+            # portée lui est définitivement attribuée — voir
+            # _close_out_winner_bounty.
+            if pko_mode and len(still_active) == 1:
+                self._close_out_winner_bounty(still_active[0]["id"], now)
 
         return self.rebalance_tables(record_moves=True)
+
+    def _close_out_winner_bounty(self, winner_id, now=None):
+        """Clôture la bounty finale du VAINQUEUR d'un tournoi PKO (demande
+        du 2026-09-08) : transfère sa bounty encore portée vers son propre
+        bounty_won (elle est "définitivement gagnée", voir
+        get_bounty_bonuses), remet sa bounty portée à 0, et enregistre un
+        événement bounty_events distinct — event_type='victory_collect',
+        eliminator_name=NULL — pour qu'on comprenne sans ambiguïté qu'il
+        s'agit de la récupération de sa propre bounty finale, PAS d'une
+        élimination supplémentaire (ne touche jamais `kills`).
+
+        Idempotent : si la bounty portée est déjà à 0 (déjà clôturée, ou
+        rien à clôturer), ne fait rien — sûr à appeler plusieurs fois.
+        Appelé automatiquement par eliminate_player() dès qu'il ne reste
+        plus qu'un joueur actif. Les tournois déjà terminés AVANT ce
+        correctif ne sont PAS corrigés rétroactivement par cette méthode
+        (aucune nouvelle élimination n'y déclenche plus jamais cet appel)
+        — voir Database._pko_effective_bounty_won pour le filet de
+        sécurité en LECTURE SEULE qui couvre ce cas à l'affichage/export."""
+        winner = self.get_player(winner_id)
+        if not winner or winner["bounty"] <= 0:
+            return
+        amount = winner["bounty"]
+        now = now or time.strftime("%Y-%m-%d %H:%M:%S")
+        self.conn.execute(
+            "UPDATE players SET bounty_won = bounty_won + ?, bounty = 0 WHERE id=?",
+            (amount, winner_id),
+        )
+        self.conn.execute(
+            "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
+            "amount_won, added_to_eliminator_bounty, event_time, event_type) "
+            "VALUES (?,NULL,?,0,?,'victory_collect')",
+            (winner["name"], amount, now),
+        )
+        self.conn.commit()
+
+    def _pko_effective_bounty_won(self, player):
+        """bounty_won réel d'un joueur en mode PKO, EN LECTURE SEULE (ne
+        modifie jamais la base — utilisable même sur une connexion
+        read_only) : inclut la bounty encore portée par le VAINQUEUR si le
+        tournoi est terminé et que cette clôture n'a pas encore été
+        physiquement appliquée en base (voir _close_out_winner_bounty) —
+        filet de sécurité pour les tournois déjà terminés AVANT ce
+        correctif (aucune nouvelle élimination n'y déclenche plus jamais
+        la clôture réelle). Sans effet (renvoie bounty_won tel quel) hors
+        PKO, ou si la clôture a déjà eu lieu (bounty déjà à 0 -> somme
+        inchangée, sans double comptage)."""
+        won = player["bounty_won"]
+        if self.get_setting_int("pko_mode", 0) != 1:
+            return won
+        active = self.list_players(status="active")
+        if len(active) == 1 and active[0]["id"] == player["id"]:
+            won += player["bounty"]
+        return won
 
     def withdraw_player(self, player_id):
         """Retire un joueur de la liste active sans lui attribuer de place
@@ -884,60 +1079,140 @@ class Database:
             for p in players_to_move:
                 self._seat_player(p["id"])
 
-        # Ré-équilibre : déplace un joueur de la table la plus pleine vers la
-        # table la moins pleine tant que l'écart est >= 2
-        for _ in range(200):  # garde-fou anti boucle infinie
-            tables = list(self.list_tables())
-            if len(tables) < 2:
-                break
-            counts = []
-            for t in tables:
-                occ = self.conn.execute(
-                    "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
-                    (t["id"],),
-                ).fetchone()["c"]
-                counts.append((occ, t))
-            counts.sort(key=lambda x: x[0])
-            smallest_count, smallest_table = counts[0]
-            largest_count, largest_table = counts[-1]
-            if largest_count - smallest_count < 2:
-                break
-            if smallest_count >= smallest_table["max_seats"]:
-                break
-            candidates = self.conn.execute(
-                "SELECT id FROM players WHERE table_id=? AND status='active'",
-                (largest_table["id"],),
-            ).fetchall()
-            if not candidates:
-                break
-            # Préfère déplacer un joueur déjà en mouvement ce rééquilibrage
-            # (replacé ici suite à la fermeture d'une autre table, ou par
-            # un tour précédent de cette même boucle) plutôt qu'un joueur
-            # assis à cette table depuis le début : celui-ci compte déjà
-            # comme "déplacé" quoi qu'il arrive, le déranger ne coûte
-            # donc rien de plus — alors que déplacer quelqu'un de stable
-            # sans nécessité crée un mouvement évitable dans l'historique
-            # (voir onglet Mouvements). Ne change rien au résultat final
-            # (nombre de joueurs par table) : seulement LEQUEL bouge.
-            mover = next(
-                (c for c in candidates if before_state.get(c["id"], (None, None))[0] != largest_table["id"]),
-                candidates[0],
+        # Ré-équilibre : si la table la plus pleine et la moins pleine ont
+        # un écart >= 2, un joueur doit passer de l'une à l'autre.
+        #
+        # Version TEST "grosse blinde" (voir pending_rebalance, docstring
+        # de Database.__init__, _detect_simple_rebalance_need et
+        # resolve_pending_rebalance plus bas) : un rééquilibrage SIMPLE
+        # comme celui-ci (PAS un cassage de table, traité plus haut —
+        # random.shuffle des joueurs évincés, INCHANGÉ) ne choisit plus
+        # lui-même qui bouge. Dès qu'un mouvement est nécessaire, on POSE
+        # LA QUESTION ("quel siège est actuellement grosse blinde ?", voir
+        # App._open_pending_rebalance_dialog et remote_control.py côté
+        # téléphone) au lieu d'agir tout de suite, et on s'arrête là pour
+        # CET appel : un seul mouvement simple est décidé par appel — la
+        # suite ne reprendra qu'au prochain appel de rebalance_tables(),
+        # déclenché par resolve_pending_rebalance() une fois la réponse
+        # traitée (ou par tout autre événement entre-temps) — jamais en
+        # rappelant cette méthode elle-même pendant qu'on attend, ce qui
+        # bloquerait le thread principal Tkinter. Une seule question à la
+        # fois : si une question posée par un appel précédent est toujours
+        # sans réponse, on n'en pose pas une seconde — mais on la
+        # REVALIDE D'ABORD sur l'état COURANT (au lieu de se contenter de
+        # vérifier que sa table existe encore) : rebalance_tables() peut
+        # être rappelée (par une élimination CONCURRENTE sur une AUTRE
+        # table, un ajout de joueur...) pendant qu'une demande est encore
+        # affichée sur le téléphone, sans attendre sa réponse — voir
+        # eliminate_player, qui rappelle toujours rebalance_tables()
+        # inconditionnellement. Sans cette revalidation ICI (au moment du
+        # recalcul, PAS seulement à la réponse — resolve_pending_rebalance
+        # le fait déjà, mais seulement quand l'utilisateur répond, ce qui
+        # peut prendre un moment), une demande devenue obsolète entre-temps
+        # (écart déjà résorbé, ou déplacé sur une autre table par un
+        # cassage de table ci-dessus) restait affichée sur le téléphone
+        # jusqu'à ce que l'utilisateur y réponde pour rien — symptôme
+        # observé : une deuxième question de grosse blinde alors qu'un
+        # seul déplacement était en réalité nécessaire.
+        if self.pending_rebalance is not None:
+            still_valid = any(
+                t["id"] == self.pending_rebalance["table_id"] for t in self.list_tables()
             )
-            taken = {
-                r["seat"]
-                for r in self.conn.execute(
-                    "SELECT seat FROM players WHERE table_id=? AND status='active'",
-                    (smallest_table["id"],),
-                )
-            }
-            seat = 1
-            while seat in taken:
-                seat += 1
-            self.conn.execute(
-                "UPDATE players SET table_id=?, seat=? WHERE id=?",
-                (smallest_table["id"], seat, mover["id"]),
-            )
-            self.conn.commit()
+            if not still_valid:
+                # Cassage de table (ci-dessus) : la table de cette demande
+                # vient d'être fermée. Plus rien à répondre.
+                self.pending_rebalance = None
+            else:
+                need = self._detect_simple_rebalance_need()
+                if need is None:
+                    # Écart déjà résorbé entre-temps (par le déplacement
+                    # d'un autre joueur, une élimination ailleurs...) :
+                    # cette demande n'a plus d'objet, retirée sans
+                    # attendre une réponse qui ne déplacerait plus
+                    # personne de toute façon (voir resolve_pending_
+                    # rebalance, étape 2 — même logique, appliquée ici
+                    # PLUS TÔT, dès ce recalcul plutôt qu'à la réponse).
+                    self.pending_rebalance = None
+                else:
+                    source_table, occupied_seats = need
+                    if source_table["id"] != self.pending_rebalance["table_id"]:
+                        # Le besoin a basculé sur une AUTRE table entre-
+                        # temps : l'ancienne demande ne correspond plus à
+                        # rien de valide — remplacée par une nouvelle
+                        # demande cohérente, avec un NOUVEL identifiant
+                        # (l'ancien ne doit plus jamais pouvoir "gagner",
+                        # même par coïncidence côté téléphone — même
+                        # principe que l'étape 3 de resolve_pending_
+                        # rebalance, appliqué ici au recalcul plutôt qu'à
+                        # la réponse).
+                        self.pending_rebalance = {
+                            "request_id": uuid.uuid4().hex,
+                            "table_id": source_table["id"],
+                            "table_name": source_table["name"],
+                            "seats": occupied_seats,
+                            "record_moves": self.pending_rebalance["record_moves"],
+                            "before_state": dict(before_state),
+                            "created_at": time.time(),
+                        }
+                    else:
+                        # Toujours la même table source : la demande reste
+                        # valide TELLE QUELLE — même request_id, jamais
+                        # recréée inutilement (une nouvelle demande à
+                        # chaque appel casserait la réponse déjà envoyée
+                        # par un téléphone entre-temps, voir la règle de
+                        # consommation de resolve_pending_rebalance). Seuls
+                        # les sièges affichés sont rafraîchis si
+                        # l'occupation de CETTE table a changé (ex : un de
+                        # ses propres joueurs éliminé entre-temps, sans que
+                        # ça ne change QUELLE table doit donner un joueur).
+                        self.pending_rebalance["seats"] = occupied_seats
+
+        if self.pending_rebalance is None:
+            if self._bb_rebalance_prompt_enabled():
+                need = self._detect_simple_rebalance_need()
+                if need is not None:
+                    source_table, occupied_seats = need
+                    # La table de DESTINATION n'est volontairement pas
+                    # mémorisée ici — elle sera recalculée à l'état courant
+                    # au moment de la réponse (resolve_pending_rebalance ->
+                    # _move_player_to_least_full_table), sans changer sa
+                    # logique de choix actuelle (consigne explicite de
+                    # cette version TEST). before_state (qui était où AVANT
+                    # ce rééquilibrage-ci) est mémorisé tel quel dans la
+                    # demande : c'est la référence historique nécessaire à
+                    # _legacy_pick_mover si "Continuer sans indiquer la BB"
+                    # est utilisé plus tard pour y répondre (voir
+                    # resolve_pending_rebalance) — y compris si cette
+                    # demande est ensuite recréée pour une autre table
+                    # entre-temps.
+                    self.pending_rebalance = {
+                        "request_id": uuid.uuid4().hex,
+                        "table_id": source_table["id"],
+                        "table_name": source_table["name"],
+                        "seats": occupied_seats,
+                        "record_moves": record_moves,
+                        "before_state": dict(before_state),
+                        "created_at": time.time(),
+                    }
+            else:
+                # Préférence "Afficher la fenêtre d'équilibrage guidé par
+                # la grosse blinde" désactivée (voir Paramètres) : jamais
+                # de question posée, jamais de pending_rebalance créé — le
+                # mécanisme historique choisit directement qui bouge
+                # (_legacy_pick_mover, EXACTEMENT comme "Continuer sans
+                # indiquer la BB"), en boucle tant qu'un écart persiste —
+                # repris ici du mécanisme d'origine (avant cette version
+                # TEST) pour résoudre tous les mouvements nécessaires en un
+                # seul appel, sans dépendre d'un enchaînement de réponses.
+                for _ in range(200):  # garde-fou anti boucle infinie
+                    need = self._detect_simple_rebalance_need()
+                    if need is None:
+                        break
+                    source_table, _occupied_seats = need
+                    mover_id = self._legacy_pick_mover(source_table["id"], before_state)
+                    if mover_id is None:
+                        break
+                    self._move_player_to_least_full_table(mover_id, exclude_table_id=source_table["id"])
 
         # NE comble PAS les sièges laissés vides par un joueur éliminé (ou
         # déplacé ailleurs) à une table par ailleurs inchangée : au poker,
@@ -1019,6 +1294,329 @@ class Database:
             self.conn.commit()
         return moves
 
+    # ---------- rééquilibrage simple : question "grosse blinde" (TEST) ----------
+    def _bb_rebalance_prompt_enabled(self):
+        """Préférence globale (voir BB_REBALANCE_PROMPT_PREF_KEY) : True
+        par défaut, désactivée seulement si explicitement enregistrée à
+        False (case décochée dans Paramètres). Relue à CHAQUE appel
+        (jamais mise en cache) : un changement de ce réglage prend ainsi
+        effet immédiatement sur le prochain rééquilibrage, sans redémarrer
+        l'application."""
+        return export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
+
+    def _detect_simple_rebalance_need(self):
+        """Détecte si un rééquilibrage SIMPLE (pas un cassage de table,
+        qui reste géré séparément plus haut dans rebalance_tables) est
+        nécessaire à l'état COURANT : renvoie (table, occupied_seats) où
+        `table` est la ligne de la table qui doit donner un joueur (la
+        plus pleine, si l'écart avec la moins pleine est >= 2 ET que
+        celle-ci a encore de la place) et `occupied_seats` la liste triée
+        de ses sièges actuellement occupés ; renvoie None si aucun
+        mouvement de ce type n'est nécessaire.
+
+        Factorise EXACTEMENT la détection utilisée à la fois par
+        rebalance_tables() (pour savoir s'il faut poser une nouvelle
+        question) et par resolve_pending_rebalance() (pour revalider une
+        question existante quand l'état a changé depuis qu'elle a été
+        posée — voir sa docstring) : les deux doivent s'accorder sur la
+        même notion de "toujours nécessaire", sans quoi une réponse
+        pourrait être acceptée ou refusée de façon incohérente selon qui
+        appelle."""
+        tables = list(self.list_tables())
+        if len(tables) < 2:
+            return None
+        counts = []
+        for t in tables:
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            counts.append((occ, t))
+        counts.sort(key=lambda x: x[0])
+        smallest_count, smallest_table = counts[0]
+        largest_count, largest_table = counts[-1]
+        if largest_count - smallest_count < 2:
+            return None
+        if smallest_count >= smallest_table["max_seats"]:
+            return None
+        occupied_seats = sorted(
+            r["seat"] for r in self.conn.execute(
+                "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                (largest_table["id"],),
+            )
+        )
+        if not occupied_seats:
+            return None
+        return largest_table, occupied_seats
+
+    def _legacy_pick_mover(self, table_id, before_state):
+        """Algorithme HISTORIQUE de choix du joueur à déplacer d'une table
+        lors d'un simple rééquilibrage — EXACTEMENT celui qui existait
+        avant la version TEST "grosse blinde" (voir l'historique git de
+        rebalance_tables) : préfère un joueur déjà en mouvement PENDANT LE
+        MÊME rééquilibrage (avant_state différent de table_id — ex : un
+        joueur replacé ici par un cassage de table plus tôt dans le même
+        appel de rebalance_tables) plutôt qu'un joueur assis à cette table
+        depuis le début de ce rééquilibrage ; celui-ci compte déjà comme
+        "déplacé" quoi qu'il arrive, le déranger ne coûte donc rien de
+        plus — alors que déplacer quelqu'un de stable sans nécessité crée
+        un mouvement évitable dans l'historique (onglet Mouvements). Ne
+        change rien au résultat final (nombre de joueurs par table) :
+        seulement LEQUEL bouge. Retombe sur le premier candidat trouvé
+        (ordre naturel de la requête, sans tri) si personne n'est déjà en
+        mouvement.
+
+        `before_state` : dict {player_id: (table_id, seat)} capturé par
+        l'appelant AVANT le début de ce rééquilibrage (voir
+        rebalance_tables et pending_rebalance["before_state"]) ; un dict
+        vide revient à toujours prendre le premier candidat trouvé (aucune
+        préférence possible sans historique). Utilisé UNIQUEMENT par
+        "Continuer sans indiquer la BB" (voir resolve_pending_rebalance) —
+        la réponse "quel siège est BB" utilise une règle différente et
+        volontairement nouvelle (voir _next_active_seat_player).
+        Renvoie None si cette table n'a plus aucun joueur actif."""
+        candidates = self.conn.execute(
+            "SELECT id FROM players WHERE table_id=? AND status='active'",
+            (table_id,),
+        ).fetchall()
+        if not candidates:
+            return None
+        mover = next(
+            (c for c in candidates if before_state.get(c["id"], (None, None))[0] != table_id),
+            candidates[0],
+        )
+        return mover["id"]
+
+    def _next_active_seat_player(self, table_id, bb_seat, occupied_seats=None):
+        """Joueur à déplacer selon la règle "grosse blinde" (voir
+        rebalance_tables / resolve_pending_rebalance) : le PROCHAIN joueur
+        actif dans l'ordre des sièges après `bb_seat`, sièges vides
+        sautés, avec retour circulaire au premier siège occupé après le
+        dernier (ex : sièges actifs 1,2,4,5,8 et bb_seat=8 -> siège 1).
+        Toujours recalculé à l'état COURANT de la table (occupied_seats
+        n'est accepté que pour éviter une requête redondante à l'appelant
+        qui l'a déjà sous la main ; jamais une liste mémorisée au moment
+        de la question, qui peut être obsolète — voir resolve_pending_
+        rebalance). Renvoie None si `bb_seat` ne correspond (plus) à un
+        siège occupé de cette table, ou si elle n'a plus qu'un seul joueur
+        actif (rien à "sauter") : l'appelant retombe alors sur l'ancien
+        mécanisme historique."""
+        if occupied_seats is None:
+            occupied_seats = sorted(
+                r["seat"] for r in self.conn.execute(
+                    "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                    (table_id,),
+                )
+            )
+        if bb_seat not in occupied_seats or len(occupied_seats) < 2:
+            return None
+        idx = occupied_seats.index(bb_seat)
+        next_seat = occupied_seats[(idx + 1) % len(occupied_seats)]
+        row = self.conn.execute(
+            "SELECT id FROM players WHERE table_id=? AND seat=? AND status='active'",
+            (table_id, next_seat),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def _move_player_to_least_full_table(self, player_id, exclude_table_id):
+        """Déplace un joueur déjà désigné vers la table active la moins
+        remplie (hors `exclude_table_id`, sa table actuelle) qui a encore
+        de la place, au premier siège libre — exactement le même choix de
+        destination que la boucle de rééquilibrage de rebalance_tables
+        (INCHANGÉ, consigne de cette version TEST), mais recalculé à
+        l'état courant plutôt que de réutiliser une table de destination
+        évaluée au moment de la question, qui a pu changer entre-temps
+        (voir resolve_pending_rebalance). Ne fait rien si aucune autre
+        table n'a de place libre (ne devrait pas arriver : on vient
+        justement d'en détecter une)."""
+        counts = []
+        for t in self.list_tables():
+            if t["id"] == exclude_table_id:
+                continue
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            if occ < t["max_seats"]:
+                counts.append((occ, t))
+        if not counts:
+            return
+        counts.sort(key=lambda x: x[0])
+        dest_table = counts[0][1]
+        taken = {
+            r["seat"] for r in self.conn.execute(
+                "SELECT seat FROM players WHERE table_id=? AND status='active'",
+                (dest_table["id"],),
+            )
+        }
+        seat = 1
+        while seat in taken:
+            seat += 1
+        self.conn.execute(
+            "UPDATE players SET table_id=?, seat=? WHERE id=?",
+            (dest_table["id"], seat, player_id),
+        )
+        self.conn.commit()
+
+    def resolve_pending_rebalance(self, request_id, seat):
+        """Traite une réponse à la question "quel siège est actuellement
+        grosse blinde ?" (voir rebalance_tables ci-dessus) — à appeler
+        UNIQUEMENT depuis le thread principal Tkinter (voir App._resolve_
+        pending_rebalance dans main.py) ; jamais directement depuis le
+        thread du serveur de contrôle à distance (remote_control.py ne
+        fait que déposer la réponse dans la file d'attente thread-safe
+        existante, voir on_rebalance_answer/voice_command_queue).
+
+        `seat` : numéro de siège répondu, ou None ("Continuer sans
+        indiquer la BB").
+
+        RÈGLE DE CONSOMMATION — "première réponse VALIDE traitée gagne" :
+        pending_rebalance n'est mis à None (consommant définitivement la
+        demande) QUE lorsque cette réponse est jugée VALIDE ET qu'un
+        mouvement est réellement décidé. Une réponse INVALIDE (mauvais/
+        vieux request_id, siège vide/invalide, siège dont l'occupant n'est
+        plus actif, ou état devenu obsolète) NE consomme RIEN : la demande
+        reste ouverte (avec le même request_id si elle concerne toujours
+        la même table) pour qu'une réponse valide arrivant ensuite —
+        d'un autre appareil ou du même — puisse encore déterminer le
+        mouvement. Étapes, dans l'ordre :
+
+        1. request_id ne correspond pas à la demande actuellement en
+           attente (déjà traitée par une réponse VALIDE précédente, déjà
+           remplacée par une nouvelle demande — voir 3 —, ou inconnue) :
+           ignoré, sans aucun effet sur pending_rebalance.
+        2. Le besoin de rééquilibrage est recalculé sur l'état COURANT
+           (voir _detect_simple_rebalance_need), AVANT même de regarder ce
+           que cette réponse précise contient : l'état a pu changer depuis
+           que la question a été posée (élimination, cassage de table...).
+           Si plus aucun mouvement n'est nécessaire : la demande est
+           fermée SANS déplacer personne, quelle qu'ait été la réponse —
+           jamais un déplacement "par défaut" alors qu'il n'y a plus rien
+           à équilibrer.
+        3. Si la table qui doit maintenant donner un joueur diffère de
+           celle de la demande d'origine (la situation a basculé sur une
+           autre table pendant l'attente) : la demande d'origine n'a plus
+           de sens et n'est PAS utilisée pour décider quoi que ce soit —
+           elle est remplacée par une nouvelle demande cohérente avec
+           l'état courant (nouveau request_id ; l'ancien ne peut plus
+           jamais gagner, y compris s'il semblait numériquement valide
+           pour l'ancienne table).
+        4. Toujours la même table : si un siège est indiqué mais ne
+           correspond plus à un joueur actif de cette table (siège vide,
+           invalide, ou son occupant a été éliminé entre la question et la
+           réponse), la réponse est INVALIDE — voir règle de consommation
+           ci-dessus : la demande reste ouverte (sièges réaffichés à jour),
+           rien n'est déplacé, on ne choisit PAS de joueur à sa place.
+        5. "Continuer sans indiquer la BB" (seat=None) est toujours traité
+           comme une réponse VALIDE (choix explicite et délibéré), dès
+           lors que l'étape 2 confirme qu'un mouvement reste nécessaire :
+           utilise alors l'ancien mécanisme HISTORIQUE exact (voir
+           _legacy_pick_mover), y compris sa préférence pour un joueur
+           déjà déplacé pendant CE rééquilibrage (before_state mémorisé
+           dans la demande au moment de sa création, voir
+           rebalance_tables) — jamais une simplification approximative.
+
+        Renvoie la liste des mouvements RÉELLEMENT effectués par cette
+        résolution (le mouvement décidé ici, plus tout mouvement
+        supplémentaire enchaîné par la suite du rééquilibrage), au même
+        format que rebalance_tables() ; les archive dans l'historique
+        (onglet Mouvements) si la demande d'origine le demandait (voir
+        `record_moves` dans rebalance_tables)."""
+        pending = self.pending_rebalance
+        if pending is None or pending["request_id"] != request_id:
+            # Étape 1 : requête inconnue, déjà traitée par une réponse
+            # valide précédente, ou remplacée par une nouvelle demande
+            # (étape 3) — ignorée SANS AUCUN EFFET.
+            return []
+
+        # Étape 2 : revalide D'ABORD le besoin sur l'état courant, avant de
+        # regarder le contenu de cette réponse.
+        need = self._detect_simple_rebalance_need()
+        if need is None:
+            self.pending_rebalance = None
+            return []
+        source_table, occupied_seats = need
+
+        if source_table["id"] != pending["table_id"]:
+            # Étape 3 : la situation a changé de table entre-temps. On ne
+            # consomme PAS la réponse reçue (elle ne concerne plus la
+            # bonne table) — on la remplace par une demande cohérente,
+            # avec un NOUVEL identifiant.
+            self.pending_rebalance = {
+                "request_id": uuid.uuid4().hex,
+                "table_id": source_table["id"],
+                "table_name": source_table["name"],
+                "seats": occupied_seats,
+                "record_moves": pending["record_moves"],
+                "before_state": {
+                    p["id"]: (p["table_id"], p["seat"])
+                    for p in self.list_players(status="active")
+                },
+                "created_at": time.time(),
+            }
+            return []
+
+        # Toujours la même table : détermine le joueur à déplacer.
+        if seat is not None:
+            mover_id = self._next_active_seat_player(source_table["id"], seat, occupied_seats)
+            if mover_id is None:
+                # Étape 4 : réponse INVALIDE — ne consomme PAS la demande,
+                # qui reste ouverte (même request_id) pour une réponse
+                # valide ultérieure. Sièges réaffichés à jour uniquement.
+                self.pending_rebalance["seats"] = occupied_seats
+                return []
+        else:
+            # Étape 5 : "Continuer sans indiquer la BB" — toujours valide
+            # ici (un mouvement est bien nécessaire, voir étape 2).
+            mover_id = self._legacy_pick_mover(source_table["id"], pending.get("before_state", {}))
+
+        # Réponse VALIDE : consommée SEULEMENT MAINTENANT (jamais avant ce
+        # point) — elle gagne définitivement contre toute réponse
+        # ultérieure à cette même demande (son request_id ne correspondra
+        # plus à l'étape 1 dès l'instruction suivante).
+        self.pending_rebalance = None
+
+        my_move = None
+        if mover_id is not None:
+            mover_before = self.get_player(mover_id)
+            old_table_id, old_seat = mover_before["table_id"], mover_before["seat"]
+            self._move_player_to_least_full_table(mover_id, exclude_table_id=source_table["id"])
+            mover_after = self.get_player(mover_id)
+            if mover_after["table_id"] != old_table_id:
+                table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+                my_move = {
+                    "player_name": mover_after["name"],
+                    "old_table_name": table_names.get(old_table_id),
+                    "old_seat": old_seat,
+                    "new_table_name": table_names.get(mover_after["table_id"]),
+                    "new_seat": mover_after["seat"],
+                    "moved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+        # Reprend le rééquilibrage sur l'état courant (peut fermer
+        # d'autres tables devenues inutiles, ou poser une NOUVELLE
+        # question si un écart persiste ailleurs). record_moves=False ici
+        # dans tous les cas : le mouvement décidé ci-dessus (my_move) a
+        # déjà eu lieu et ne serait de toute façon plus visible dans le
+        # diff avant/après de cet appel-là ; c'est ce résolveur-ci qui
+        # archive l'ensemble (my_move + further_moves) plus bas, une seule
+        # fois, selon le `record_moves` demandé par l'appel d'ORIGINE
+        # (celui qui a posé la question).
+        further_moves = self.rebalance_tables(record_moves=False)
+        moves = ([my_move] if my_move else []) + further_moves
+
+        if moves and pending["record_moves"]:
+            self.conn.execute("DELETE FROM seat_moves")
+            for move in moves:
+                self.conn.execute(
+                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
+                    "new_table_name, new_seat, moved_at) VALUES (?,?,?,?,?,?)",
+                    (move["player_name"], move["old_table_name"], move["old_seat"],
+                     move["new_table_name"], move["new_seat"], move["moved_at"]),
+                )
+            self.conn.commit()
+        return moves
+
     def get_seat_moves(self, limit=500):
         """Historique des déplacements de joueurs entre tables/sièges (le
         plus récent en premier), pour l'onglet Mouvements."""
@@ -1062,7 +1660,13 @@ class Database:
         """Prime de présence (en points) : chaque joueur du tournoi en
         cours reçoit `attendance_bonus_points` (réglage) pour le simple
         fait d'avoir participé à ce tournoi, 0 si le réglage est nul.
-        Renvoie {nom: points}."""
+        Renvoie {nom: points}.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        aucun calcul, {} inconditionnellement — court-circuit à la
+        source, pas un simple masquage à l'affichage."""
+        if not self._primes_enabled():
+            return {}
         points = self.get_setting_int("attendance_bonus_points", 0)
         return {p["name"]: points for p in self.list_players()}
 
@@ -1082,7 +1686,10 @@ class Database:
         encore assez de tournois précédents, il n'est pas éligible.
         Renvoie une liste de dicts {name, present_previous, points} triée
         par nom ; liste vide si la prime est désactivée (l'un des deux
-        réglages à 0)."""
+        réglages à 0) ou si `_primes_enabled` est faux (interrupteur
+        général, demande du 2026-09-09 — court-circuit à la source)."""
+        if not self._primes_enabled():
+            return []
         points = self.get_setting_int("assiduity_bonus_points", 0)
         consecutive_days = self.get_setting_int("assiduity_consecutive_days", 0)
         if points <= 0 or consecutive_days <= 0:
@@ -1123,7 +1730,11 @@ class Database:
         rang affiché dans l'onglet Joueurs / les exports). Les joueurs
         encore actifs en cours de tournoi (rang pas encore connu) n'ont pas
         de ligne. Renvoie une liste de dicts {name, place, nombre, valeur,
-        montant} (montant = nombre × valeur), triée par rang croissant."""
+        montant} (montant = nombre × valeur), triée par rang croissant ;
+        liste vide si `_primes_enabled` est faux (interrupteur général,
+        demande du 2026-09-09 — court-circuit à la source)."""
+        if not self._primes_enabled():
+            return []
         flat_value = self.get_setting_int("ranking_bonus_points", 0)
         n_players = self.get_stats()["total_players_ever"]
         all_players = self.list_players()
@@ -1149,26 +1760,78 @@ class Database:
 
     def get_bounty_bonuses(self):
         """Calcule la prime de bounty (en points) de chaque joueur du
-        tournoi en cours : Nombre = nombre de joueurs qu'il a éliminés
+        tournoi en cours. Nombre = nombre de joueurs qu'il a éliminés
         (players.kills, incrémenté sur toute élimination avec éliminateur
-        désigné — indépendant de l'ancien mécanisme de bounty en €/PKO),
-        Valeur = réglage manuel `bounty_amount` s'il est non nul, sinon
-        10×√N points par bounty (N = nombre total de joueurs du tournoi),
-        Montant = Nombre × Valeur. Renvoie une liste de dicts
-        {name, nombre, valeur, montant} pour tous les joueurs, triée par
-        montant décroissant."""
-        flat_value = self.get_setting_int("bounty_amount", 0)
-        n_players = self.get_stats()["total_players_ever"]
-        valeur = bounty_unit_value(n_players, flat_value)
-        result = [
-            {
-                "name": p["name"], "nombre": p["kills"],
-                "valeur": valeur, "montant": p["kills"] * valeur,
-            }
-            for p in self.list_players()
-        ]
+        désigné) — JAMAIS incrémenté par la clôture de la bounty finale du
+        vainqueur (voir _close_out_winner_bounty), dans les deux modes.
+
+        Mode CLASSIQUE (pko_mode=0, inchangé) :
+          Valeur = réglage manuel `bounty_amount` s'il est non nul, sinon
+          10×√N points par bounty (N = nombre total de joueurs du
+          tournoi) ; Montant = Nombre × Valeur.
+
+        Mode PKO (demande du 2026-09-08) : Valeur × Nombre ne représente
+          plus les vrais gains (une bounty grandit/se transmet en chaîne,
+          voir eliminate_player) — on utilise donc directement les vrais
+          gains PKO définitivement acquis :
+          Montant = bounty_won réel du joueur (y compris sa propre bounty
+          finale s'il est le vainqueur — voir _pko_effective_bounty_won,
+          qui couvre aussi les tournois déjà terminés avant ce correctif) ;
+          Valeur = Montant ÷ Nombre, arrondi (moyenne par bounty gagnée),
+          0 si Nombre = 0 (aucune division par zéro).
+
+        Renvoie une liste de dicts {name, nombre, valeur, montant} pour
+        tous les joueurs, triée par montant décroissant. Utilisé par
+        get_primes_summary (dont le TOTAL, dans les deux modes) et son
+        export dédié — jamais de double comptage : le calcul classique et
+        le calcul PKO sont mutuellement exclusifs, jamais additionnés.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        liste vide inconditionnellement — court-circuit à la source (de
+        toute façon `kills`/`bounty_won` ne sont jamais alimentés dans ce
+        cas, voir eliminate_player, mais on ne dépend pas de cela ici)."""
+        if not self._primes_enabled():
+            return []
+        pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        if not pko_mode:
+            flat_value = self.get_setting_int("bounty_amount", 0)
+            n_players = self.get_stats()["total_players_ever"]
+            valeur = bounty_unit_value(n_players, flat_value)
+            result = [
+                {
+                    "name": p["name"], "nombre": p["kills"],
+                    "valeur": valeur, "montant": p["kills"] * valeur,
+                }
+                for p in self.list_players()
+            ]
+        else:
+            result = []
+            for p in self.list_players():
+                nombre = p["kills"]
+                montant = self._pko_effective_bounty_won(p)
+                valeur = round(montant / nombre) if nombre else 0
+                result.append({
+                    "name": p["name"], "nombre": nombre,
+                    "valeur": valeur, "montant": montant,
+                })
         result.sort(key=lambda r: (-r["montant"], r["name"].casefold()))
         return result
+
+    def primes_columns(self):
+        """PRIMES_COLUMNS pour CE tournoi précis : l'en-tête de la colonne
+        'bo_valeur' s'adapte au mode (demande du 2026-09-08) — "Val
+        Bounty" en classique (valeur fixe par bounty), "Moy Bounty" en PKO
+        (Mon Bounty ÷ Nb Bounty, arrondi — voir get_bounty_bonuses).
+        Source UNIQUE de cette adaptation : utilisée à la fois par
+        l'onglet Primes (main.py) et les exports dédiés
+        (export_primes_csv/xlsx/pdf) pour qu'ils ne divergent jamais."""
+        pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        if not pko_mode:
+            return PRIMES_COLUMNS
+        return [
+            (key, "Moy Bounty", fn) if key == "bo_valeur" else (key, header, fn)
+            for key, header, fn in PRIMES_COLUMNS
+        ]
 
     def get_primes_summary(self, sort_column=None, ascending=True):
         """Construit, pour chaque joueur du tournoi en cours, la ligne
@@ -1179,7 +1842,16 @@ class Database:
         `sort_column` : 'rang', 'bo_nombre' ou 'total' (autre valeur ou
         None -> tri par défaut, TOTAL décroissant). Les valeurs manquantes
         (ex : rang d'un joueur encore actif) sont toujours reléguées en
-        fin de liste, quel que soit le sens du tri."""
+        fin de liste, quel que soit le sens du tri.
+
+        Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
+        liste vide inconditionnellement — l'onglet Primes reste
+        simplement vide, aucun message de remplacement (les quatre
+        get_*_bonuses renvoient déjà [] / {} chacun de leur côté, mais on
+        court-circuite aussi ici pour ne dépendre d'aucun détail interne
+        de ces sous-fonctions)."""
+        if not self._primes_enabled():
+            return []
         presence_by_name = self.get_presence_bonuses()
         assiduity_by_name = {r["name"]: r for r in self.get_assiduity_bonuses()}
         ranking_by_name = {r["name"]: r for r in self.get_ranking_bonuses()}
@@ -1218,7 +1890,7 @@ class Database:
         toutes). `sort_column`/`ascending` : voir get_primes_summary."""
         import csv
 
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
             writer.writerow([h for _, h, _ in cols])
@@ -1235,7 +1907,7 @@ class Database:
         from openpyxl.styles import Font, Alignment, PatternFill
         from openpyxl.utils import get_column_letter
 
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
 
         wb = Workbook()
@@ -1368,7 +2040,7 @@ class Database:
         """Exporte le tableau de l'onglet Primes en PDF. `columns`,
         `sort_column`, `ascending` : voir export_primes_csv. `title` : voir
         export_primes_xlsx. Nécessite 'fpdf2'."""
-        cols = _selected_period_columns(PRIMES_COLUMNS, columns)
+        cols = _selected_period_columns(self.primes_columns(), columns)
         rows = self.get_primes_summary(sort_column=sort_column, ascending=ascending)
         name = title or self.get_setting("tournament_name", "Tournoi")
         return _write_pdf_table(
@@ -1711,7 +2383,11 @@ class Database:
                 "name": p["name"], "status": "En cours" if not finished else "Terminé",
                 "gain": payouts_by_place.get(1) if finished else None,
                 "buyin": p["buyin_count"], "rebuy": p["rebuy_count"], "addon": p["addon_count"],
-                "bounty_won": p["bounty_won"],
+                # _pko_effective_bounty_won (pas p["bounty_won"] brut) :
+                # inclut la bounty finale du vainqueur même sur un tournoi
+                # déjà terminé avant le correctif du 2026-09-08 (filet de
+                # sécurité en lecture seule, voir sa docstring).
+                "bounty_won": self._pko_effective_bounty_won(p),
             })
         for p in eliminated:
             rows.append({
@@ -2331,12 +3007,14 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
 
     "total_bounty_won" (par joueur) et "bounty_distributed" (par tournoi)
     viennent de la MÊME source que l'onglet Primes de chaque tournoi (voir
-    Database.get_primes_summary, colonne "Mon Bounty") : nombre
-    d'éliminations (kills) × valeur d'un bounty (réglage manuel
-    `bounty_amount`, sinon 10×√N points) — PAS l'ancien champ
-    `bounty_won`/`bounty` (mécanisme cash/PKO indépendant, plus utilisé par
-    l'onglet Primes), qui reste à 0 dès que `bounty_amount` vaut 0 (valeur
-    par défaut de ce club, qui ne joue qu'en points).
+    Database.get_primes_summary, colonne "Mon Bounty" -> Database.
+    get_bounty_bonuses) : nombre d'éliminations (kills) × valeur fixe d'un
+    bounty en mode CLASSIQUE, ou les vrais gains PKO définitivement acquis
+    (`bounty_won`, bounty finale du vainqueur incluse) en mode PKO — les
+    deux mécanismes ont été unifiés le 2026-09-08, il n'y a plus de champ
+    "ancien"/"indépendant" ici : cette synthèse reflète toujours exactement
+    ce qu'affiche l'onglet Primes du tournoi correspondant, quel que soit
+    son mode.
 
     "total_points" par joueur = somme, sur toute la période, du TOTAL de
     l'onglet Primes de chaque tournoi joué (Présence + Assiduité +
@@ -2463,7 +3141,7 @@ PERIOD_TOURNAMENT_COLUMNS = [
     ("entries", "Entrées", lambda t: t["entries"]),
     ("prize_pool", "Prize pool (€)", lambda t: round(t["prize_pool"], 2)),
     ("winner", "Vainqueur", lambda t: t["winner"]),
-    ("bounty_distributed", "Primes distribuées (€)", lambda t: t["bounty_distributed"]),
+    ("bounty_distributed", "Primes distribuées (pts)", lambda t: t["bounty_distributed"]),
 ]
 
 PERIOD_PLAYER_COLUMNS = [
@@ -2489,7 +3167,7 @@ RESULT_COLUMNS = [
     ("buyin", "Buy-ins", lambda r: r["buyin"]),
     ("rebuy", "Rebuys", lambda r: r["rebuy"]),
     ("addon", "Add-ons", lambda r: r["addon"]),
-    ("bounty_won", "Prime gagnée (€)", lambda r: r["bounty_won"]),
+    ("bounty_won", "Prime gagnée (pts)", lambda r: r["bounty_won"]),
 ]
 
 # Colonnes disponibles pour l'export de la grille de gains telle

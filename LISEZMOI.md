@@ -1,8 +1,12 @@
 # Gestionnaire de Tournoi de Poker
 
-Application de bureau pour gérer un tournoi de poker multi-tables (testée
-avec 100+ joueurs) : joueurs, tables, chips, chronomètre de blindes et
-gains.
+Application de bureau pour gérer un ou plusieurs tournois de poker
+multi-tables (Sit & Go compris), chacun dans sa propre fenêtre — testée
+avec 100+ joueurs simultanés : joueurs, tables, chips, chronomètre de
+blindes, primes en points (bounty classique et PKO), sauvegarde/
+restauration et contrôle à distance depuis un téléphone.
+
+Manuel utilisateur complet : [`MANUEL_UTILISATEUR_TOURNOI_CPC.docx`](MANUEL_UTILISATEUR_TOURNOI_CPC.docx).
 
 ## Installation
 
@@ -25,6 +29,15 @@ Si ce paquet n'est pas installé, l'application vous le rappellera
 automatiquement au moment de l'export et vous pourrez toujours exporter en
 CSV en attendant.
 
+### Pour l'export PDF uniquement
+
+Certains exports (résultats, primes, synthèse par période...) proposent
+aussi le PDF, en plus du CSV et de l'Excel. Il faut le paquet `fpdf2` :
+
+```
+pip3 install fpdf2
+```
+
 ### Pour les photos de joueurs uniquement
 
 Importer une photo depuis un fichier existant fonctionne sans rien
@@ -42,7 +55,7 @@ au moment de prendre une photo (l'import de fichier reste disponible).
 ## Lancement
 
 **Le plus simple : double-cliquez sur `Lancer_le_tournoi.command`** dans le
-dossier. Une fenêtre de Terminal s'ouvre brièvement (normal) puis
+dossier (macOS). Une fenêtre de Terminal s'ouvre brièvement (normal) puis
 l'application démarre — vous n'avez rien à taper.
 
 *La toute première fois*, macOS peut refuser en disant que l'éditeur n'est
@@ -50,6 +63,11 @@ pas vérifié. Dans ce cas : clic droit (ou Ctrl+clic) sur
 `Lancer_le_tournoi.command` → **Ouvrir** → confirmez **Ouvrir** dans la
 boîte de dialogue. Cette étape n'est nécessaire qu'une seule fois ; les
 lancements suivants se feront par simple double-clic.
+
+Des installateurs prêts à l'emploi existent aussi pour Windows (`.msi`,
+voir [`windows/README.md`](windows/README.md)) et macOS (`.dmg`/`.pkg`,
+voir [`macos/README.md`](macos/README.md)) : rien à installer côté
+utilisateur final dans ce cas non plus.
 
 ### Alternative : en ligne de commande
 
@@ -59,103 +77,122 @@ Ouvrez un terminal dans le dossier `poker_tournament` puis :
 python3 main.py
 ```
 
-(sous Windows, `python main.py` — le fichier `.command` ne fonctionne que
-sur Mac ; sous Windows, utilisez cette méthode.)
+(sous Windows, `python main.py`.)
 
-Au démarrage, choisissez **"Nouveau tournoi"** (vous créez un fichier
-`.tournoi`, qui contient toutes les données) ou **"Ouvrir un tournoi
-existant"** pour reprendre un tournoi déjà commencé.
+Au démarrage (Menu principal), choisissez **"Nouveau tournoi"** /
+**"Sit & Go rapide"** (vous créez un fichier `.tournoi`, qui contient
+toutes les données), **"Ouvrir un tournoi existant"** pour reprendre un
+tournoi déjà commencé, ou **"Lobby"** pour une vue d'ensemble de tous les
+tournois d'un dossier.
 
 ## Fonctionnalités
 
-- **Répertoire de joueurs** : vos joueurs habituels sont mémorisés (indépendamment
-  des tournois) et proposés sous forme de liste à cocher/décocher à la
-  création d'un nouveau tournoi. Gérable à tout moment via le menu
-  "Répertoire > Gérer le répertoire de joueurs...". On peut aussi piocher
-  dans le répertoire en cours de tournoi avec "Ajouter depuis le
-  répertoire..." (utile pour les inscriptions tardives). Le répertoire
-  affiche un tableau **Nom / Club**, triable en cliquant sur l'un ou
-  l'autre en-tête (re-cliquer inverse l'ordre) ; un bouton "Modifier le
-  club..." permet de renseigner ou corriger le club d'un joueur à tout
-  moment. La liste à cocher (nouveau tournoi / "Ajouter depuis le
-  répertoire...") affiche elle aussi le club dans une colonne séparée,
-  avec des en-têtes "Joueur"/"Club" tout aussi triables ; un champ Club
-  accompagne l'ajout d'un nouveau nom, et cliquer sur la cellule Club
-  d'un joueur déjà listé ("+ ajouter un club" si vide) permet de le
-  définir ou le corriger directement depuis cette fenêtre.
-- **Joueurs** : inscription, rebuy, add-on, modification manuelle des chips,
-  élimination (place calculée automatiquement), réinscription, suppression.
-  Case « Temp » à cocher avant d'ajouter un joueur pour l'inscrire au
-  tournoi sans l'ajouter au répertoire de joueurs habituels (utile pour
-  un invité ponctuel). Un champ **Club** (menu déroulant des clubs déjà
-  connus, ou saisie libre d'un nouveau club) accompagne l'ajout d'un
-  joueur et se pré-remplit automatiquement pour un nom déjà présent dans
-  le répertoire. Le champ **Nom du joueur** propose aussi, dès la
-  première lettre tapée, une liste déroulante des joueurs du répertoire
-  correspondants (déjà inscrits au tournoi exclus) ; cliquer une
-  suggestion inscrit le joueur immédiatement, sans passer par le bouton
-  « Ajouter ».
-- **Tables** : placement automatique des joueurs, rééquilibrage automatique
-  après chaque élimination/inscription (fermeture des tables devenues
-  inutiles, déplacement des joueurs pour garder les tables équilibrées).
-  Un bouton permet aussi de forcer un rééquilibrage. Si le nombre de
-  tables dépasse la capacité d'affichage de l'écran, l'onglet défile
-  automatiquement, lentement et en boucle (utile pour laisser cet onglet
-  affiché en continu sur un écran dédié) ; sinon rien ne défile. La
-  molette de la souris permet aussi de défiler manuellement à tout
-  moment.
-- **Chronomètre** : structure de blindes standard préchargée (modifiable),
-  démarrage/pause/niveau suivant-précédent, passage automatique au niveau
-  suivant à la fin du temps. Un écran séparé ("Affichage > Ouvrir l'écran
-  chronomètre") peut être mis en plein écran (touche F11) sur un
-  vidéoprojecteur ou un second écran.
-- **Gains** : génération automatique d'une grille de gains standard basée
-  sur le nombre d'entrées (buy-ins), modifiable place par place. Le prize
-  pool est calculé à partir des buy-ins/rebuys/add-ons et d'un pourcentage
-  de rake éventuel. Export du classement final en **CSV** ou **Excel
-  (.xlsx)**, depuis le menu Fichier ou l'onglet Gains.
-- **Joueurs** (compléments) : renommage d'un joueur, correction manuelle
-  des compteurs buy-in/rebuy/add-on en cas d'erreur de saisie.
-- **Paramètres** : montants de buy-in/rebuy/add-on, tapis de départ,
-  nombre de sièges par table, rake.
-- **Synthèse par période** (menu "Statistiques > Synthèse par
-  période...") : balaye tous les fichiers `.tournoi` d'un dossier (et
-  ses sous-dossiers si besoin) et affiche, pour une période donnée (dates
-  de début/fin, bornes optionnelles) :
-  - la liste des tournois de la période (date, statut, entrées, prize
-    pool, vainqueur, primes distribuées) ;
-  - le classement cumulé des joueurs sur la période, **primes (bounty)
-    comprises** : nombre de tournois joués, victoires, meilleure place,
-    total investi, gains de classement, primes empochées et solde net.
-
-  La date d'un tournoi est celle fixée à sa création ; pour les fichiers
-  créés avant l'existence de ce réglage, elle est déduite de la date de
-  création du fichier lui-même. Exportable en **CSV ou Excel (.xlsx)**
-  depuis la fenêtre de synthèse (bouton "Exporter..."), avec le choix des
-  colonnes à inclure (séparément pour la liste des tournois et pour le
-  classement des joueurs).
+- **Gestion de tournoi et Sit & Go** : inscription, rebuy, add-on,
+  élimination (place calculée automatiquement), réinscription,
+  suppression, placement et rééquilibrage automatique des tables
+  (y compris table finale automatique à 10 joueurs ou moins, et
+  rééquilibrage guidé par la grosse blinde), chronomètre de blindes
+  avec écran projecteur dédié.
+- **Répertoire de joueurs** : joueurs habituels mémorisés indépendamment
+  des tournois (nom, club, photo), proposés à la création d'un nouveau
+  tournoi ou piochables en cours de route.
+- **Photos de joueurs** : import depuis un fichier, capture caméra
+  (ordinateur ou téléphone, avec cadrage tactile côté téléphone),
+  affichées dans le répertoire, l'onglet Joueurs et le bandeau
+  d'élimination.
+- **Chronomètre & bandeaux** : structure de blindes personnalisable
+  (modèles réutilisables), sons configurables (fin de round/pause,
+  prochain changement de blindes, sortie d'un joueur), écran projecteur
+  plein écran. Après chaque élimination, un bandeau dédié (« XXX est
+  sorti par YYY ») s'affiche sur le projecteur, avec photos si
+  disponibles ; sa durée d'affichage est réglable (0 = désactivé, le son
+  continue de jouer). Un bandeau séparé signale un mouvement de tables
+  en cours.
+- **Rééquilibrage des tables** : automatique après chaque
+  inscription/élimination, avec redistribution aléatoire lors de la
+  fermeture d'une table et confirmation guidée du siège "grosse blinde"
+  quand c'est nécessaire (relayée sur le contrôle à distance).
+- **Primes en points — bounty classique et PKO** : quatre primes
+  cumulées (Présence, Assiduité, Classement, Bounty). En bounty
+  classique, Nb Bounty × Val Bounty. En mode PKO (bounty progressive),
+  une partie de la bounty d'un joueur éliminé est empochée immédiatement
+  par l'éliminateur, le reste grossit sa propre bounty jusqu'à ce qu'il
+  soit éliminé à son tour ; à la fin du tournoi, la bounty encore portée
+  par le vainqueur lui est définitivement attribuée (Moy Bounty = Mon
+  Bounty ÷ Nb Bounty, sans jamais augmenter Nb Bounty). Un éliminateur
+  valide est obligatoire en PKO dès qu'une bounty est en jeu (PC,
+  téléphone et élimination groupée). Tout est exprimé en points (pts),
+  jamais en euros.
+- **Sauvegarde/restauration sur clé USB** : depuis le Menu principal,
+  deux boutons sauvegardent/restaurent en un clic l'ensemble des
+  données (fichiers `.tournoi`, répertoire, photos, modèles, réglages,
+  fichier de licence) — jamais de suppression des originaux,
+  restauration protégée par une sauvegarde de sécurité automatique et
+  refusée tant qu'un tournoi est ouvert.
+- **Contrôle à distance (téléphone)** : page web (aucune app à
+  installer) pour éliminer un joueur (glisser-déposer), piloter le
+  chronomètre, consulter le plan des tables et les mouvements, gérer les
+  photos, et un Lobby dédié quand plusieurs tournois sont joignables à
+  la fois.
+- **Lobby multi-tournois** : vue d'ensemble de tous les tournois/Sit & Go
+  ouverts (état, joueurs actifs, niveau, temps restant), avec bascule
+  directe vers l'un d'eux ; préférence "Un seul tournoi à la fois" pour
+  limiter le club à un tournoi en cours.
+- **Exports** : joueurs, classement, résultats nominatifs, primes
+  (récapitulatif + historique PKO), synthèse par période (multi-
+  tournois, avec filtre Club et lignes de total) — en CSV, Excel (.xlsx)
+  ou PDF selon les paquets installés.
+- **Licence** : un mécanisme d'activation par machine existe dans le
+  code (`license.py`) mais n'est **pas actif** sur les exécutables
+  actuellement distribués — aucune activation n'est demandée pour
+  l'instant.
 
 ## Sauvegarde
 
 Toutes les actions sont enregistrées immédiatement dans le fichier
-`.tournoi` (base SQLite). Pour faire une sauvegarde, copiez simplement ce
-fichier ailleurs.
+`.tournoi` (base SQLite). Pour une sauvegarde ponctuelle, copiez
+simplement ce fichier ailleurs ; pour une sauvegarde complète (données +
+réglages), utilisez les boutons dédiés du Menu principal (voir
+ci-dessus et le manuel utilisateur, chapitre 17).
 
 ## Structure du code
 
-- `main.py` — interface graphique (Tkinter), tous les onglets, ainsi que
-  la fenêtre "Synthèse par période" (`PeriodSummaryDialog`)
-- `database.py` — accès aux données et logique métier (sièges,
-  rééquilibrage, calculs de gains). Contient aussi, au niveau module
-  (hors classe `Database`), les fonctions de synthèse multi-tournois :
-  `find_tournament_files`, `build_period_summary` et
-  `export_period_summary_csv`, qui parcourent plusieurs fichiers
-  `.tournoi` à la fois
+- `main.py` — interface graphique (Tkinter), tous les onglets et
+  fenêtres, dont le Menu principal et l'écran de sauvegarde/restauration
+- `database.py` — accès aux données et logique métier de chaque tournoi
+  (sièges, rééquilibrage, primes/bounty classique et PKO, calculs de
+  gains). Contient aussi, au niveau module, les fonctions de synthèse
+  multi-tournois (`find_tournament_files`, `build_period_summary`,
+  `export_period_summary_csv`)
+- `backup_restore.py` — sauvegarde/restauration complète (`.tournoi` +
+  dossier `~/.poker_tournament`) sur clé USB ou tout dossier de
+  destination
+- `remote_control.py` — serveur web du contrôle à distance depuis un
+  téléphone (page HTML autonome, aucune dépendance externe)
+- `open_windows.py` — registre des fenêtres/tournois actuellement
+  ouverts (Lobby, unicité du Menu principal, sélection téléphone)
 - `structures.py` — structure de blindes par défaut et grille de gains
   standard
-- `clock_window.py` — fenêtre d'affichage du chronomètre (mode projecteur)
-- `roster.py` — répertoire de joueurs habituels (indépendant des tournois)
-- `tournament_prefs.py` — derniers paramètres utilisés, repris par défaut
-  pour un nouveau tournoi (indépendant des tournois)
+- `clock_window.py` — fenêtre d'affichage du chronomètre (mode
+  projecteur), y compris le bandeau d'élimination
+- `roster.py` — répertoire de joueurs habituels (indépendant des
+  tournois)
+- `tournament_prefs.py` — derniers paramètres utilisés, repris par
+  défaut pour un nouveau tournoi (indépendant des tournois)
 - `player_photos.py` — photos de joueurs, associées au répertoire
-  (indépendant des tournois)
+- `chip_images.py` — images de jetons personnalisées (onglet Blindes)
+- `chip_templates.py` / `blind_templates.py` / `settings_templates.py`
+  — modèles réutilisables de jetons/blindes/réglages
+- `sound_signal.py` — signaux sonores (mouvement de tables, etc.)
+- `export_prefs.py` — préférences d'export (colonnes, format) et
+  colonnes masquées
+- `license.py` — verrou de licence par machine (voir
+  [`LICENCE_ACTIVATION.md`](LICENCE_ACTIVATION.md) — mécanisme présent
+  dans le code mais non activé sur les builds actuels)
+- `version.py` — numéro de version affiché dans l'application
+
+Chaque tournoi/Sit & Go correspond à un seul fichier `.tournoi` (base
+SQLite autonome). Les données indépendantes des tournois (répertoire,
+photos, modèles, réglages, licence, journal de plantage `crash.log`...)
+sont stockées dans `~/.poker_tournament` (`%USERPROFILE%\.poker_tournament`
+sous Windows).

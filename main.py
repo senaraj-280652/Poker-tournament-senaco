@@ -17,6 +17,7 @@ import json
 import csv
 import shutil
 import tempfile
+import uuid
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
@@ -29,7 +30,7 @@ from database import (
     format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
-    BOUNTY_HISTORY_COLUMNS,
+    BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
@@ -44,9 +45,27 @@ import player_photos
 import sound_signal
 import remote_control
 import open_windows
+import backup_restore
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
-from version import APP_NAME, APP_VERSION
+from version import APP_NAME, APP_VERSION, dev_suffix
+
+
+def _app_title_prefix():
+    """"{APP_NAME} v{APP_VERSION}[complément dev]" — préfixe commun à
+    TOUS les titres de fenêtre de premier niveau (demande du
+    2026-09-09) : Menu principal (voir App.__init__) ET fenêtre de
+    tournoi (voir App._update_window_title), pour identifier
+    immédiatement, PENDANT LE DÉVELOPPEMENT, quel commit (et si des
+    modifications locales non commitées s'y ajoutent, voir version.
+    dev_suffix) une fenêtre déjà ouverte fait réellement tourner — sans
+    jamais avoir à toucher APP_VERSION à la main pour ça. En build
+    officielle (PyInstaller), dev_suffix() est vide : le titre reste
+    strictement "{APP_NAME} v{APP_VERSION}", inchangé par ce correctif.
+    Fonction MODULE-LEVEL (pas une méthode) : réutilisable telle quelle,
+    sans construire de fenêtre, y compris dans les tests."""
+    return f"{APP_NAME} v{APP_VERSION}{dev_suffix()}"
+
 
 # Écran de démarrage ("Chargement en cours...", voir
 # windows/poker_tournament.spec) : le module pyi_splash n'existe que
@@ -258,13 +277,282 @@ def spawn_app_process(extra_args=None):
     directement, sans passer par l'écran d'accueil (voir
     App.__init__/open_path, et LobbyDialog qui l'utilise pour "Ouvrir"
     un tournoi de la liste dans sa propre fenêtre). Renvoie l'objet
-    Popen. Lève OSError si le lancement échoue (à l'appelant de gérer)."""
+    Popen. Lève OSError si le lancement échoue (à l'appelant de gérer).
+
+    `stdin=subprocess.DEVNULL` : le nouveau process reçoit un stdin neuf
+    et toujours valide, plutôt que d'hériter du descripteur de fichier 0
+    de SON parent — qui peut déjà être invalide après plusieurs
+    fermetures/ouvertures de fenêtres en chaîne (notamment via "Fin de
+    la partie" depuis le téléphone). Sans ça, l'initialisation de CPython
+    lui-même pouvait échouer dès le tout premier démarrage du nouveau
+    process, AVANT tout code Python : "Fatal Python error:
+    init_sys_streams: can't initialize sys standard streams / OSError:
+    [Errno 9] Bad file descriptor" — le process mourait sans jamais rien
+    afficher, symptôme "Menu principal" qui ne "faisait rien" observé
+    après plusieurs tournois fermés depuis le téléphone (diagnostiqué en
+    capturant réellement stdout/stderr du process mort, voir l'historique
+    git de ce fichier)."""
     extra_args = list(extra_args or [])
     if getattr(sys, "frozen", False):
         # Application empaquetée (PyInstaller) : sys.executable est déjà
         # le programme lui-même, pas besoin de lui repasser main.py.
-        return subprocess.Popen([sys.executable, *extra_args])
-    return subprocess.Popen([sys.executable, os.path.abspath(__file__), *extra_args])
+        return subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL)
+    return subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), *extra_args], stdin=subprocess.DEVNULL,
+    )
+
+
+SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
+
+
+def _single_tournament_pref_enabled():
+    """Préférence globale "Un seul tournoi à la fois" (onglet Paramètres,
+    juste sous "Équilibrage guidé par la grosse blinde") — cochée par
+    défaut, mémorisée indépendamment de chaque tournoi (voir
+    export_prefs, déjà utilisé pour d'autres préférences globales
+    comparables, ex : le délai de "Son prochain changement Blindes").
+    N'affecte que les DEMANDES de lancement d'un nouveau process (voir
+    _other_tournament_is_open/_block_second_tournament_if_needed) —
+    lire cette valeur ne touche à aucun tournoi déjà ouvert."""
+    return export_prefs.load_value(SINGLE_TOURNAMENT_PREF_KEY, True) is not False
+
+
+def _other_tournament_is_open():
+    """True si au moins un tournoi est actuellement ouvert (n'importe
+    lequel — voir plus bas pourquoi jamais d'exclusion de "soi-même"),
+    d'après le registre partagé (open_windows.list_open_paths(), qui
+    ignore déjà proprement les PID morts via _prune — voir sa
+    docstring).
+
+    AUCUNE exclusion d'un chemin "own_path" ici (une version antérieure
+    en prenait un et excluait le tournoi appelant de la comparaison) :
+    chaque appelant (_open_new_window, LobbyDialog._open_selected,
+    new_tournament/new_sng/open_tournament) s'apprête à ouvrir un
+    tournoi SUPPLÉMENTAIRE — la question à se poser est toujours "en
+    existe-t-il déjà au moins un", jamais "en existe-t-il un AUTRE que
+    moi". Exclure sa propre fenêtre était correct pour une tout autre
+    question (voir find_open_pid : "CE chemin précis est-il déjà
+    ouvert ailleurs", utilisé pour basculer vers un tournoi déjà actif),
+    mais faux ici : depuis le DERNIER tournoi restant après la fermeture
+    d'un autre, "Menu principal" avec cette exclusion ignorait ce
+    tournoi restant lui-même et autorisait à tort d'en ouvrir un
+    second — repéré lors d'un test manuel (option cochée APRÈS avoir
+    ouvert plusieurs tournois, puis fermeture de tous sauf un)."""
+    return bool(open_windows.list_open_paths())
+
+
+def _block_second_tournament_if_needed(parent):
+    """Point de contrôle central de la préférence "Un seul tournoi à la
+    fois" : à appeler AVANT tout spawn_app_process() qui lancerait un
+    NOUVEAU tournoi/Sit&Go (jamais avant de basculer vers un tournoi
+    déjà ouvert, voir LobbyDialog._open_selected — ce cas garde son
+    comportement actuel de premier plan, jamais bloqué), ainsi qu'en
+    filet de sécurité au tout début de new_tournament/new_sng/
+    open_tournament (voir _choose_tournament_file) — au cas où un
+    lancement passerait malgré l'état grisé de ces boutons (voir
+    _refresh_launch_buttons_state), ex. une fenêtre restée ouverte
+    depuis avant que la préférence ne soit activée. Renvoie True (et
+    affiche le message d'explication) si le lancement doit être refusé ;
+    False sinon, sans aucun effet de bord. Ne ferme ni ne modifie jamais
+    le tournoi déjà ouvert : une simple vérification avant de créer un
+    nouveau process, rien de plus."""
+    if not _single_tournament_pref_enabled():
+        return False
+    if not _other_tournament_is_open():
+        return False
+    messagebox.showinfo(
+        "Un seul tournoi à la fois",
+        "Un tournoi est déjà ouvert.\n\n"
+        "Désactivez « Un seul tournoi à la fois » dans Paramètres pour "
+        "autoriser plusieurs tournois simultanés.",
+        parent=parent,
+    )
+    return True
+
+
+def _refresh_launch_buttons_state(win, buttons):
+    """Active/désactive `buttons` (les commandes "Nouveau tournoi"/
+    "Sit & Go rapide"/"Ouvrir un tournoi existant" de _choose_tournament_
+    file — jamais "Lobby", qui doit rester accessible pour basculer vers
+    un tournoi DÉJÀ ouvert) selon "Un seul tournoi à la fois" et l'état
+    RÉEL du registre partagé (_other_tournament_is_open — toujours
+    recalculé ici, jamais mémorisé). Se reprogramme elle-même tant que
+    `win` existe (win.after, 1 seconde — assez réactif sans sonder trop
+    souvent) : détecte donc aussi bien la fermeture du dernier tournoi
+    ailleurs (réactive) que l'ouverture d'un premier tournoi (grise), et
+    un changement de la préférence elle-même pendant que cet écran
+    reste affiché, sans dépendre d'un quelconque tick déjà existant
+    (aucun ici : cette fenêtre s'affiche AVANT que _tick ne soit jamais
+    lancé, voir App.__init__). Ne remplace pas _block_second_tournament_
+    if_needed, déjà présent en filet de sécurité au tout début de chaque
+    commande — une simple couche d'interface en plus."""
+    if not win.winfo_exists():
+        return
+    disabled = _single_tournament_pref_enabled() and _other_tournament_is_open()
+    state = "disabled" if disabled else "normal"
+    for btn in buttons:
+        btn.configure(state=state)
+    win.after(1000, lambda: _refresh_launch_buttons_state(win, buttons))
+
+
+# --- Interrupteur général "Calculer les primes" (demande du 2026-09-09) ---
+#
+# Objectif : un seul réglage, valable pour TOUTE la session de
+# l'application (tous les tournois déjà ouverts, pas encore démarrés, ou
+# créés plus tard dans la même session), modifiable depuis les Paramètres
+# de N'IMPORTE LEQUEL de ces tournois tant qu'AUCUN d'entre eux n'a
+# encore démarré son chronomètre, puis définitivement figé pour tous dès
+# que le PREMIER démarre (voir _clock_resume) — et qui se déverrouille de
+# nouveau uniquement une fois TOUS fermés (plus aucune entrée dans
+# open_windows.list_open_paths()).
+#
+# Architecture (2 niveaux, cf. discussion avec l'utilisateur) :
+#   1. Une valeur "proposée" globale, dans export_prefs.json (même
+#      mécanisme, mêmes garanties, que SINGLE_TOURNAMENT_PREF_KEY
+#      ci-dessus) : PRIMES_ENABLED_PROPOSED_KEY. Simple reflet de "ce que
+#      l'utilisateur a coché en dernier" avant tout verrouillage.
+#   2. La valeur réellement utilisée par chaque calcul est TOUJOURS la
+#      copie locale en base SQLite de CE tournoi (`primes_enabled`, voir
+#      Database._primes_enabled) — jamais lue directement depuis
+#      export_prefs par database.py, qui n'a connaissance d'aucune notion
+#      de session.
+# Tant que la session n'est pas verrouillée, main.py maintient ces deux
+# valeurs synchronisées activement (voir _sync_primes_enabled_pref,
+# appelée sans condition à chaque tick de CHAQUE fenêtre ouverte, et une
+# dernière fois juste avant que _clock_resume ne démarre le chrono) :
+# ainsi, AUCUNE copie locale figée à la création d'un tournoi ne peut
+# rester en retard sur un changement fait depuis une autre fenêtre — la
+# convergence est garantie en un peu moins d'une seconde, bien avant
+# qu'aucun tournoi n'ait eu la moindre chance de démarrer entre-temps
+# (démarrer un chronomètre est une action utilisateur explicite, jamais
+# automatique). Le verrouillage lui-même n'est JAMAIS un drapeau
+# persisté à part : il est entièrement DÉRIVÉ, à la demande, de l'état
+# réel (clock_started) des tournois actuellement ouverts d'après le
+# registre partagé — voir _primes_session_locked. Ce choix évite tout
+# risque de drapeau de verrouillage resté bloqué après un plantage/une
+# fermeture brutale (même robustesse que _other_tournament_is_open, qui
+# repose déjà sur ce même registre auto-nettoyé).
+
+PRIMES_ENABLED_PROPOSED_KEY = open_windows.PRIMES_ENABLED_PROPOSED_KEY
+
+
+def _primes_enabled_proposed():
+    """Valeur globale "proposée" pour "Calculer les primes" (voir
+    bloc de commentaires ci-dessus) — cochée par défaut, comme
+    Database.DEFAULT_SETTINGS["primes_enabled"]="1" pour rester
+    cohérent avec la compatibilité des anciens tournois. Ne représente
+    PAS forcément la valeur en vigueur si la session est verrouillée sur
+    une valeur différente d'une session précédente non nettoyée — c'est
+    toujours la copie SQLite de chaque tournoi qui fait foi pour les
+    calculs, jamais cette valeur directement.
+
+    Simple délégation à open_windows.primes_enabled_proposed() (demande
+    du 2026-09-09, point 2, CORRIGÉE après un vrai bug détecté par
+    tests/test_primes_multi_process_real_subprocess.py) : c'est CE
+    module qui porte l'auto-réinitialisation "nouvelle session = ON par
+    défaut" (vérifiée à chaque lecture, pas seulement à l'écriture),
+    car c'est lui qui connaît déjà list_open_paths()."""
+    return open_windows.primes_enabled_proposed()
+
+
+def _set_primes_enabled_proposed(value):
+    """Modifie la valeur "proposée" (case à cocher des Paramètres) — à
+    n'appeler que si `_primes_session_locked()` est faux (voir la case
+    elle-même, désactivée sinon). N'a par elle-même aucun effet sur les
+    tournois déjà ouverts : c'est `_sync_primes_enabled_pref`, rappelée
+    par chaque fenêtre à chaque tick, qui répercute ce changement dans
+    leur copie SQLite locale respective. Délègue à open_windows.
+    set_primes_enabled_proposed (même raison que ci-dessus)."""
+    open_windows.set_primes_enabled_proposed(value)
+
+
+def _primes_session_locked():
+    """True si le PREMIER tournoi de la session ACTUELLE a déjà démarré
+    son chronomètre, tant qu'il reste au moins un tournoi de cette
+    session encore ouvert — voir open_windows.mark_primes_session_
+    started/primes_session_started, qui portent le drapeau réel.
+
+    CORRECTION du 2026-09-09 (relecture utilisateur) : la version
+    précédente ici re-scannait à chaque appel `clock_started` sur
+    chaque tournoi ACTUELLEMENT ouvert, et considérait la session
+    déverrouillée dès qu'AUCUN d'eux n'avait `clock_started=1` — ce qui
+    déverrouillait à tort dès la fermeture du tournoi qui avait démarré,
+    même si un AUTRE tournoi de la même session (jamais démarré,
+    ex. un Sit & Go créé en attendant) restait ouvert. Voir
+    open_windows.primes_session_started : le drapeau "un tournoi de
+    cette session a démarré" est maintenant mémorisé séparément (posé
+    une fois pour toutes par _clock_resume) et ne redevient faux que
+    lorsque list_open_paths() est complètement VIDE (tous les tournois
+    de la session fermés — PID morts déjà exclus par _prune, donc
+    robuste à un plantage), jamais simplement "plus aucun DÉMARRÉ
+    actuellement ouvert"."""
+    return open_windows.primes_session_started()
+
+
+def _sync_primes_enabled_pref(db):
+    """Fait converger la copie SQLite locale de `db` (CE tournoi) vers la
+    valeur globale proposée (`_primes_enabled_proposed`), UNIQUEMENT si
+    ce tournoi précis n'a pas encore démarré son propre chronomètre —
+    une fois démarré, sa valeur est définitivement la sienne (figée,
+    voir le bloc de commentaires plus haut) et ne doit plus jamais être
+    réécrite, y compris si la session reste "non verrouillée" du point
+    de vue d'un AUTRE tournoi pas encore démarré (cas normal : un
+    tournoi démarré verrouille toute la session, mais tant qu'il reste
+    ouvert son propre réglage ne doit évidemment plus bouger).
+    À appeler sans aucune condition préalable (pas seulement si l'onglet
+    Paramètres est affiché) à chaque tick de chaque fenêtre de tournoi,
+    et une dernière fois juste avant que _clock_resume ne démarre
+    effectivement le chrono (resynchronisation défensive de dernière
+    minute, referme toute fenêtre de course résiduelle)."""
+    if db.get_setting_int("clock_started", 0) == 1:
+        return
+    wanted = "1" if _primes_enabled_proposed() else "0"
+    if db.get_setting("primes_enabled", "1") != wanted:
+        db.set_setting("primes_enabled", wanted)
+
+
+def _align_primes_enabled_on_open(db):
+    """Aligne `db.primes_enabled` sur l'état VERROUILLÉ de la session
+    AVANT que ce tournoi ne puisse être utilisé (demande du 2026-09-09,
+    4e relecture utilisateur) : si la session est DÉJÀ verrouillée
+    (open_windows.primes_session_started), ce tournoi — NOUVEAU ou
+    EXISTANT, peu importe sa propre valeur antérieure — doit
+    immédiatement adopter la valeur verrouillée, authoritative pour
+    TOUS les tournois qui rejoignent la session après ce verrouillage.
+    Seule l'activation/désactivation (ce réglage précis) est concernée :
+    les montants propres à CE tournoi (présence, assiduité, classement,
+    bounty, PKO...) ne sont jamais touchés ici, ni son historique.
+
+    À appeler UNE FOIS, juste après open_windows.register(self.db.path)
+    dans App.__init__ (voir plus bas) — donc AVANT _build_tabs()/
+    _build_settings_tab(), pour que la case et le grisement de la
+    section reflètent le bon état dès la toute première image affichée
+    (jamais l'ancien état qui apparaîtrait puis changerait au tick
+    suivant). Cas d'usage typique découvert le 2026-09-09 : App.
+    _new_tournament/_open_tournament ferme la fenêtre actuelle (donc la
+    désenregistre) puis en ouvre une autre DANS LE MÊME PROCESS — si
+    cette fenêtre était la seule ouverte, le registre passe par un état
+    temporairement vide entre les deux, ce qui pouvait faire lire à tort
+    l'ancienne valeur "proposée" (déjà réinitialisée entre-temps, voir
+    _primes_enabled_proposed) au lieu de la valeur RÉELLEMENT verrouillée
+    de la session en cours — cette fonction s'appuie plutôt sur la
+    valeur verrouillée elle-même (open_windows.locked_primes_enabled),
+    mémorisée une seule fois pour de bon au moment du verrouillage
+    (voir App._clock_resume), jamais perdue tant que la session reste
+    active.
+
+    Ne touche jamais un tournoi déjà démarré (sa valeur lui appartient
+    définitivement, comme _sync_primes_enabled_pref) — cas normalement
+    déjà couvert (un tournoi qu'on rouvre alors qu'il a déjà démarré
+    verrouille de toute façon la session sur SA PROPRE valeur, voir
+    App._clock_resume), simple garde de cohérence supplémentaire ici."""
+    if db.get_setting_int("clock_started", 0) == 1:
+        return
+    if not open_windows.primes_session_started():
+        return
+    wanted = "1" if open_windows.locked_primes_enabled() else "0"
+    if db.get_setting("primes_enabled", "1") != wanted:
+        db.set_setting("primes_enabled", wanted)
 
 
 def raise_process_when_ready(widget, pid, attempt=0):
@@ -278,7 +566,22 @@ def raise_process_when_ready(widget, pid, attempt=0):
     et sa fenêtre n'existe pas encore lors des tout premiers essais.
     Échoue silencieusement si l'accès Accessibilité n'est pas accordé
     (macOS) à l'application qui lance ceci (Terminal, IDE...) — la
-    fenêtre reste alors ouverte, juste pas mise en avant automatiquement."""
+    fenêtre reste alors ouverte, juste pas mise en avant automatiquement.
+
+    Si le process a disparu ENTRE deux tentatives (déjà vivant à l'appel
+    précédent, mort depuis — le cas "mort immédiate" est, lui, détecté
+    plus tôt par App._open_new_window), n'appelle plus bring_pid_to_front
+    sur un pid mort et surtout ne reprogramme PAS d'autre tentative :
+    plus jamais "essayer dans le vide puis abandonner sans rien dire"."""
+    try:
+        os.kill(pid, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    except OSError:
+        alive = True  # existe, appartient à un autre utilisateur, etc.
+    if not alive:
+        return
     open_windows.bring_pid_to_front(pid)
     if attempt < 5:
         widget.after(700, lambda: raise_process_when_ready(widget, pid, attempt + 1))
@@ -1855,6 +2158,31 @@ class LobbyDialog(tk.Toplevel):
         )
         self._after_id = None
         self._paths_by_iid = {}
+        # Synchronisation iPhone -> Lobby Mac (voir open_windows.py:
+        # get_phone_selected_pid) : dernier pid déjà appliqué à LA
+        # sélection de CETTE fenêtre, pour ne réagir qu'à un changement
+        # (jamais réimposer la même valeur en boucle à chaque
+        # rafraîchissement — voir _refresh) et ne jamais écraser un choix
+        # manuel du Mac tant que le téléphone n'a pas sélectionné autre
+        # chose.
+        #
+        # Initialisé avec la valeur DÉJÀ mémorisée (et non None) : sans
+        # ça, un phone_selected_pid laissé par un choix téléphone
+        # ANTÉRIEUR (avant même l'ouverture de CETTE fenêtre) est
+        # interprété au tout premier _refresh() comme un nouveau choix
+        # tout juste reçu, et bring_pid_to_front() ramène alors aussitôt
+        # l'ancien tournoi au premier plan — devant ce Lobby qu'on vient
+        # littéralement d'ouvrir (repéré avec AXRaise : le Lobby apparaît
+        # puis disparaît quasi immédiatement, remplacé par le tournoi
+        # déjà ouvert). En partant de la valeur actuelle, ce pid déjà
+        # connu n'est plus vu comme un changement ; un choix téléphone
+        # réellement nouveau (pid différent) continue, lui, à être
+        # détecté et appliqué normalement (voir _refresh).
+        self._last_synced_phone_pid = open_windows.get_phone_selected_pid()
+        # Garde anti-double-ouverture (voir _open_selected) : chemins pour
+        # lesquels un lancement est en cours depuis CETTE fenêtre, ni
+        # encore enregistré (open_windows.register), ni confirmé mort.
+        self._launching_paths = set()
 
         top = ttk.Frame(self)
         top.pack(fill="x", padx=12, pady=10)
@@ -1964,7 +2292,43 @@ class LobbyDialog(tk.Toplevel):
             )
             self._paths_by_iid[iid] = path
 
-        if selected_path:
+        # Synchronisation iPhone -> Lobby Mac : si un téléphone a
+        # sélectionné un tournoi (voir open_windows.set_phone_selected_pid,
+        # appelé par /select_tournament) depuis la dernière fois qu'on l'a
+        # appliqué ICI, aligne la sélection de cette fenêtre dessus —
+        # exactement l'effet d'un clic manuel (tree.selection_set), sans
+        # ouvrir ni fermer quoi que ce soit. Prioritaire sur la ré-
+        # application de l'ancienne sélection ci-dessous. Ne déclenche
+        # jamais de boucle : _last_synced_phone_pid n'est mis à jour que
+        # lorsque ce pid change réellement, donc un choix manuel ultérieur
+        # du Mac n'est jamais écrasé par un rafraîchissement suivant tant
+        # que le téléphone n'a pas sélectionné autre chose. Si le pid ne
+        # correspond plus à aucun tournoi ouvert (déjà fermé entre-temps),
+        # ne sélectionne rien à sa place ni ne ramène rien au premier
+        # plan : la sélection existante ci-dessous reste inchangée.
+        #
+        # Ramène aussi CETTE fenêtre de tournoi au premier plan sur le
+        # Mac (open_windows.bring_pid_to_front — EXACTEMENT la même
+        # fonction, déjà "best-effort"/silencieuse en cas d'échec, que
+        # _open_selected utilise pour "🔀 Basculer vers" un double-clic
+        # manuel) — mais UNE SEULE FOIS au moment où ce nouveau choix est
+        # détecté (même condition que la sélection ci-dessus), jamais à
+        # chaque rafraîchissement (toutes les 4s).
+        applied_from_phone = False
+        phone_pid = open_windows.get_phone_selected_pid()
+        if phone_pid is not None and phone_pid != self._last_synced_phone_pid:
+            self._last_synced_phone_pid = phone_pid
+            target_path = open_windows.find_path_for_pid(phone_pid)
+            if target_path is not None:
+                for iid, p in self._paths_by_iid.items():
+                    if p == target_path:
+                        self.tree.selection_set(iid)
+                        applied_from_phone = True
+                        break
+                if applied_from_phone:
+                    open_windows.bring_pid_to_front(phone_pid)
+
+        if not applied_from_phone and selected_path:
             for iid, p in self._paths_by_iid.items():
                 if p == selected_path:
                     self.tree.selection_set(iid)
@@ -2004,14 +2368,61 @@ class LobbyDialog(tk.Toplevel):
         if existing_pid:
             open_windows.bring_pid_to_front(existing_pid)
             return
+        # "Un seul tournoi à la fois" (Paramètres) : AVANT le lancement
+        # d'un nouveau process, jamais avant le "bring to front" ci-dessus
+        # (qui doit rester possible pour un tournoi déjà ouvert, quel que
+        # soit ce réglage). Compte TOUT tournoi actuellement ouvert, y
+        # compris celui de LA fenêtre qui a ouvert ce Lobby (self.master,
+        # voir App._open_lobby) : on s'apprête ici à en ouvrir un
+        # SUPPLÉMENTAIRE (chemin `path`, pas encore ouvert), donc ce
+        # tournoi-là compte bel et bien déjà comme "un tournoi ouvert" —
+        # voir _other_tournament_is_open.
+        if _block_second_tournament_if_needed(self):
+            return
+        # Deux clics rapprochés sur "🔀 Basculer vers" (ou un double-clic
+        # suivi d'un second) pour un chemin pas encore ouvert : chacun
+        # verrait `existing_pid` à None ci-dessus tant que le process tout
+        # juste lancé par le premier clic n'a pas eu le temps de
+        # s'enregistrer (open_windows.register, voir App.__init__) — sans
+        # garde, le second lancerait SA PROPRE fenêtre sur le même fichier
+        # .tournoi, soit deux process écrivant en même temps dedans (voir
+        # la tooltip de ce bouton). Garde purement logique, pas de délai
+        # arbitraire : tant qu'un lancement pour CE chemin précis est en
+        # cours, les clics suivants sur la même ligne sont ignorés
+        # silencieusement — un "Basculer vers" ultérieur bascule
+        # normalement vers la fenêtre dès qu'elle existe (existing_pid
+        # ci-dessus la retrouve alors).
+        if path in self._launching_paths:
+            return
+        self._launching_paths.add(path)
         try:
             proc = spawn_app_process([path])
         except OSError as e:
+            self._launching_paths.discard(path)
             messagebox.showerror(
                 "Erreur", f"Impossible d'ouvrir ce tournoi :\n{e}", parent=self,
             )
             return
         raise_process_when_ready(self, proc.pid)
+        self._clear_launch_guard_when_resolved(path, proc)
+
+    def _clear_launch_guard_when_resolved(self, path, proc, attempt=0):
+        """Lève la garde posée par _open_selected sur `path` dès que ce
+        lancement est résolu : soit le nouveau process s'est bien
+        enregistré (auquel cas une tentative suivante sur la même ligne
+        le retrouvera normalement via existing_pid), soit il est mort
+        entre-temps (une nouvelle tentative doit alors pouvoir relancer).
+        Mêmes intervalle et nombre d'essais que raise_process_when_ready
+        ci-dessus (700 ms, 5 essais) : le temps qu'un process démarre est
+        le même dans les deux cas. Filet de sécurité au-delà de ces
+        essais (plutôt qu'une attente indéfinie) : ne bloque jamais
+        durablement une ligne, même dans un cas non prévu."""
+        if not self.winfo_exists():
+            return
+        if open_windows.find_open_pid(path) is not None or proc.poll() is not None or attempt >= 5:
+            self._launching_paths.discard(path)
+            return
+        self.after(700, lambda: self._clear_launch_guard_when_resolved(path, proc, attempt + 1))
 
     def _schedule_refresh(self):
         self._after_id = self.after(self.REFRESH_MS, self._auto_refresh)
@@ -2507,7 +2918,7 @@ class PeriodSummaryDialog(ttk.Frame):
         # Gains classement retirées pour la même raison) — la donnée reste
         # calculée normalement (build_period_summary), juste pas affichée.
         cols_t = ("date", "name", "status", "entries", "winner", "bounty")
-        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (€)"]
+        headers_t = ["Date", "Tournoi", "Statut", "Entrées", "Vainqueur", "Primes distribuées (pts)"]
         # height=13 : même hauteur que "Classement des joueurs" ci-dessous
         # (voir players_tree), pour que les deux tableaux soient alignés.
         self.tournaments_tree = ttk.Treeview(top_pane, columns=cols_t, show="headings", height=13)
@@ -3237,10 +3648,13 @@ class PrimesExportDialog(tk.Toplevel):
             w.destroy()
 
         if self.kind_var.get() == "summary":
-            columns, var_map = PRIMES_COLUMNS, self.col_vars_summary
+            # db.primes_columns() (pas PRIMES_COLUMNS directement) : en-tête
+            # "bo_valeur" adapté au mode classique/PKO de CE tournoi, même
+            # source que l'onglet Primes et les exports (voir sa docstring).
+            columns, var_map = self.db.primes_columns(), self.col_vars_summary
             sort_col = self.sort_state.get("column")
             if sort_col:
-                headers_by_key = {k: h for k, h, _ in PRIMES_COLUMNS}
+                headers_by_key = {k: h for k, h, _ in columns}
                 sort_label = headers_by_key.get(sort_col, sort_col)
                 direction = "croissant" if self.sort_state.get("ascending", True) else "décroissant"
                 self.sort_info_lbl.config(text=f"Tri actuel repris à l'export : {sort_label} ({direction}).")
@@ -3415,6 +3829,98 @@ class ActivationDialog(tk.Toplevel):
         self.destroy()
 
 
+class RemoteDeviceRequestWindow(tk.Toplevel):
+    """Petite fenêtre flottante Tkinter (demande du 2026-09-09) :
+    présente UNE demande d'accès au contrôle à distance à la fois
+    (Identifiant/IP, champ Nom, boutons Autoriser/Refuser/Plus tard) —
+    disposition définitivement retenue après plusieurs essais
+    d'intégration dans la grille de Paramètres, tous abandonnés (le
+    dernier ayant élargi la colonne au point de repousser la colonne
+    droite hors écran). Totalement indépendante de la mise en page de
+    Paramètres : ne touche à aucune de ses dimensions, se déplace
+    librement à la souris.
+
+    Une SEULE instance à la fois (voir App._remote_device_popup) : pour
+    passer d'une demande à la suivante, App._refresh_remote_device_popup
+    repeuple CETTE MÊME fenêtre (voir show_request) plutôt que d'en
+    détruire/recréer une — elle reste ainsi exactement à la même
+    position, sans le moindre scintillement. Ne connaît elle-même AUCUNE
+    règle métier (approbation/révocation/anti-bruteforce/tokens...) :
+    se contente d'appeler les callbacks fournis par App, qui seule
+    orchestre open_windows (source de vérité partagée)."""
+
+    def __init__(self, master, on_approve, on_refuse, on_later, on_geometry_changed):
+        super().__init__(master)
+        self._on_approve = on_approve
+        self._on_refuse = on_refuse
+        self._on_later = on_later
+        self._on_geometry_changed = on_geometry_changed
+        self.title("Contrôle à distance")
+        self.resizable(False, False)
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.transient(master)
+        # "Plus tard" ET la croix de fermeture native ont EXACTEMENT le
+        # même effet (voir App._on_remote_device_popup_later, appelé par
+        # les deux) : fermer cette fenêtre ne doit jamais, par un autre
+        # chemin que le bouton "Refuser" explicite, être interprété comme
+        # un refus de la demande.
+        self.protocol("WM_DELETE_WINDOW", self._handle_later)
+        self.bind("<Configure>", self._on_configure)
+
+        ttk.Label(
+            self, text="📱 Nouveau téléphone demande l'accès\nau contrôle à distance",
+            font=("Helvetica", 11, "bold"), justify="left",
+        ).pack(padx=16, pady=(14, 6), anchor="w")
+        self._info_lbl = ttk.Label(self, foreground=MUTED)
+        self._info_lbl.pack(padx=16, anchor="w")
+
+        label_row = ttk.Frame(self)
+        label_row.pack(padx=16, pady=(10, 4), fill="x")
+        ttk.Label(label_row, text="Nom (optionnel) :").pack(side="left")
+        self._label_var = tk.StringVar()
+        ttk.Entry(label_row, textvariable=self._label_var, width=22).pack(side="left", padx=(6, 0))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(padx=16, pady=(8, 14), fill="x")
+        ttk.Button(btn_row, text="✓ Autoriser", command=self._handle_approve).pack(side="left")
+        ttk.Button(btn_row, text="✗ Refuser", command=self._handle_refuse).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Plus tard", command=self._handle_later).pack(side="right")
+
+    def show_request(self, short_id, ip, label_default):
+        """(Re)peuple la fenêtre pour une demande précise — appelée
+        aussi bien à la création qu'à chaque passage à la demande
+        suivante (voir App._refresh_remote_device_popup) : jamais de
+        nouvelle fenêtre créée pour ça, seul le contenu change."""
+        self._info_lbl.config(text=f"Identifiant : {short_id}     Adresse IP : {ip}")
+        self._label_var.set(label_default)
+
+    def get_label(self):
+        return self._label_var.get().strip() or None
+
+    def _handle_approve(self):
+        self._on_approve()
+
+    def _handle_refuse(self):
+        self._on_refuse()
+
+    def _handle_later(self):
+        self._on_later()
+
+    def _on_configure(self, event):
+        # <Configure> se déclenche aussi pour un simple redessin interne
+        # (pas seulement un déplacement) — inoffensif ici : réécrire la
+        # même position ne coûte presque rien, plus simple et robuste
+        # que de tenter de distinguer "vrai déplacement" vs "redessin".
+        if event.widget is self:
+            try:
+                self._on_geometry_changed(self.winfo_x(), self.winfo_y())
+            except tk.TclError:
+                pass
+
+
 class App(tk.Tk):
     def report_callback_exception(self, exc, val, tb):
         """Tkinter appelle ceci pour toute exception levée dans un callback
@@ -3428,11 +3934,27 @@ class App(tk.Tk):
     def __init__(self, open_path=None):
         super().__init__()
         self.withdraw()
-        self.title(f"{APP_NAME}  —  v{APP_VERSION}")
+        # Titre initial (Menu principal, avant tout choix de tournoi —
+        # voir _app_title_prefix, demande du 2026-09-09) : identique au
+        # préfixe utilisé ensuite par _update_window_title pour une
+        # fenêtre de tournoi, pour repérer immédiatement, EN
+        # DÉVELOPPEMENT, quel commit une fenêtre déjà ouverte fait
+        # tourner. Écrasé par _update_window_title dès qu'un tournoi est
+        # choisi (voir _build_header, appelée après _choose_tournament_
+        # file) — ce titre-ci n'est donc visible QUE pendant l'écran
+        # d'accueil "Bienvenue".
+        self.title(_app_title_prefix())
         self.geometry("1200x750")
 
         self.db = None
         self.clock_window = None
+        # "Son prochain changement Blindes" (voir _open_clock_sounds_dialog
+        # / _maybe_play_next_blinds_sound) : level_order du dernier round
+        # pour lequel ce son a déjà été joué, pour ne le jouer qu'une
+        # seule fois par round tant que le compte à rebours reste sous le
+        # délai configuré (comparé à level["level_order"] à chaque appel,
+        # donc redevient pertinent dès que le niveau change).
+        self._next_blinds_sound_played_for_order = None
         # Actions "Élimination"/"Terminé"/"Chronomètre" (raccourcis clavier
         # et contrôle à distance depuis un téléphone, voir
         # _bind_voice_command_shortcuts / remote_control.py) : le thread du
@@ -3456,9 +3978,75 @@ class App(tk.Tk):
         # voir _on_voice_word).
         self._elimination_banner_queue = collections.deque()
         self._elimination_banner_current = None
+        # "Menu principal" (voir _open_new_window) : Popen du process déjà
+        # lancé DEPUIS CETTE fenêtre par un clic précédent, tant qu'il est
+        # encore vivant — None si aucun n'a jamais été lancé, ou si le
+        # dernier lancé s'est depuis terminé. Sert uniquement à empêcher
+        # d'en accumuler plusieurs par des clics répétés ; ne concerne que
+        # CE process-ci (chaque tournoi garde sa propre référence).
+        self._menu_principal_proc = None
+        # Mode Test (demande du 2026-09-09) : outil de test/développement,
+        # PROPRE À CE PROCESS, jamais mémorisé nulle part (ni export_prefs,
+        # ni réglage de tournoi) — décoché à chaque lancement du logiciel,
+        # voir _build_settings_tab (case "Mode Test") et _test_mode_
+        # enabled. Défini ici, avant même le choix d'un fichier de
+        # tournoi, pour que _update_window_title (appelée dès l'écran
+        # d'accueil) puisse toujours le consulter sans crainte d'un
+        # attribut manquant.
+        self.test_mode_var = tk.BooleanVar(value=False)
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
+        # Approbation des téléphones (demande du 2026-09-09 ; disposition
+        # définitivement fixée le même jour, après plusieurs essais
+        # d'intégration dans la grille de Paramètres tous abandonnés :
+        # une fenêtre flottante indépendante, voir RemoteDeviceRequest
+        # Window/_refresh_remote_device_popup) — état PROPRE à ce
+        # process, jamais partagé entre fenêtres (chacune gère sa propre
+        # fenêtre/file, ce qui reste correct : n'importe quel responsable
+        # présent peut traiter la demande depuis N'IMPORTE QUELLE
+        # fenêtre, voir open_windows, la source de vérité partagée).
+        #
+        # _remote_device_snoozed_keys : clés (browser_id, requested_at)
+        # explicitement "Plus tard"-ées — MASQUÉES (fenêtre fermée) tant
+        # que Paramètres n'a pas été quitté puis rouvert (voir _is_
+        # settings_tab_active/_check_remote_device_requests), jamais
+        # définitivement ignorées : la demande reste "pending" côté
+        # serveur, le badge 🔔 de l'onglet reste affiché, et revenir sur
+        # Paramètres la fait réapparaître SANS attendre une nouvelle
+        # tentative du téléphone.
+        self._remote_device_snoozed_keys = set()
+        # Fenêtre flottante actuellement ouverte (RemoteDeviceRequestWindow)
+        # ou None — UNE SEULE à la fois (voir _refresh_remote_device_
+        # popup) : repeuplée en place pour la demande suivante plutôt que
+        # détruite/recréée, pour rester à la même position sans
+        # scintillement.
+        self._remote_device_popup = None
+        # (browser_id, requested_at) actuellement affichée dans cette
+        # fenêtre, ou None — évite de la repeupler pour rien à chaque
+        # sondage si rien n'a changé (même principe que _last_remote_
+        # devices_panel_signature ci-dessous, appliqué ici à une seule
+        # demande plutôt qu'à toute une liste).
+        self._remote_device_popup_current_key = None
+        # browser_id correspondant à _remote_device_popup_current_key —
+        # tenu à jour séparément (jamais reconstruit depuis la clé) pour
+        # que les boutons Autoriser/Refuser de la fenêtre (voir
+        # _on_remote_device_popup_approve/_refuse) sachent quel appareil
+        # cibler sans avoir à rouvrir le registre partagé.
+        self._remote_device_popup_current_browser_id = None
+        # Dernier état connu (onglet Paramètres actif ou non) — détecte
+        # la TRANSITION vers Paramètres (pas seulement "est actif
+        # maintenant") pour ne vider _remote_device_snoozed_keys qu'au
+        # moment où l'utilisateur y REVIENT, jamais en continu tant qu'il
+        # y reste.
+        self._last_settings_tab_active = False
+        # Dernier "instantané" affiché de la liste "Téléphones" de
+        # Paramètres (appareils APPROUVÉS uniquement désormais, voir
+        # _remote_devices_signature/_refresh_remote_devices_panel) :
+        # None tant qu'elle n'a jamais été construite — toute valeur (y
+        # compris un instantané "vide") est traitée comme différente
+        # d'un premier sondage, pour garantir un premier rendu correct.
+        self._last_remote_devices_panel_signature = None
         # Liste des joueurs actifs pour la page "Éliminations" du contrôle
         # à distance — même principe que _remote_control_tournament_name :
         # tenue à jour depuis le thread principal (voir _tick), jamais lue
@@ -3469,12 +4057,57 @@ class App(tk.Tk):
         # principe (tenu à jour depuis _tick, jamais lu/écrit depuis le
         # thread du serveur web).
         self._remote_clock_paused = True
+        # True s'il existe au moins un mouvement en attente dans l'onglet
+        # Mouvements (voir _tick : self.db.count_seat_moves() — EXACTEMENT
+        # la même source que _refresh_moves_tab/self.db.get_seat_moves(),
+        # aucune logique parallèle) — fait clignoter "📋 Afficher
+        # Mouvements" sur le téléphone tant que c'est vrai (voir
+        # remote_control.py, sondé via /clock_state comme _remote_clock_
+        # paused ci-dessus, même principe thread-safe).
+        self._remote_has_pending_moves = False
         # Positionné (côté thread du serveur web, voir _remote_upload_photo)
         # dès qu'une photo vient d'être envoyée depuis le téléphone, pour
         # que _tick rafraîchisse la colonne Photo (Répertoire/Joueurs) sans
         # attendre un changement d'onglet — même principe que les deux
         # attributs juste au-dessus.
         self._remote_photo_uploaded = False
+        # Bouton "Fin de la partie" du contrôle à distance (voir
+        # _remote_end_tournament) : True dès que cette fermeture a été
+        # déclenchée une première fois (par ce téléphone ou un autre,
+        # confirmations quasi simultanées comprises) — empêche tout appel
+        # ultérieur à _on_close()/self.destroy() sur une fenêtre déjà
+        # détruite.
+        self._remote_end_tournament_triggered = False
+        # Rééquilibrage simple : question "quel siège est actuellement
+        # grosse blinde ?" (version TEST, voir database.py:
+        # rebalance_tables / resolve_pending_rebalance) — affichée
+        # uniquement sur les téléphones du contrôle à distance, plus
+        # aucune fenêtre Mac (voir _check_pending_rebalance).
+        # _remote_pending_rebalance : même principe que _remote_clock_
+        # paused ci-dessus — copie de self.db.pending_rebalance tenue à
+        # jour depuis le thread principal (_tick / _check_pending_
+        # rebalance), jamais lue ni écrite depuis le thread du serveur de
+        # contrôle à distance.
+        self._remote_pending_rebalance = None
+        # Résultat de chaque élimination demandée depuis le téléphone
+        # (demande du 2026-09-08) : {request_id: {"ok": bool, "message":
+        # str}}, écrit par _remote_eliminate (thread Tk, via la file
+        # voice_command_queue comme d'habitude) et lu/consommé par
+        # _remote_eliminate_request (thread HTTP du téléphone concerné,
+        # voir sa docstring) — permet au téléphone d'afficher un message
+        # explicite (ex. refus PKO sans éliminateur) au lieu d'un simple
+        # "ok" silencieux. Dict simple, pas de verrou : lecture/écriture
+        # d'une clé à la fois, déjà sûr sous le GIL (même principe que
+        # _remote_pending_rebalance ci-dessus, jamais verrouillé non plus).
+        self._remote_elimination_results = {}
+        # Synchronisation iPhone -> Mac SANS dépendre d'un Lobby ouvert
+        # (voir _check_phone_selected_pid, appelé depuis _tick) : dernier
+        # pid de tournoi déjà traité PAR CETTE fenêtre, même principe et
+        # même nom que LobbyDialog._last_synced_phone_pid (voir son
+        # commentaire) — initialisé avec la valeur déjà mémorisée pour ne
+        # pas se ramener soi-même au premier plan sur un choix téléphone
+        # antérieur au démarrage de cette fenêtre.
+        self._last_synced_phone_pid = open_windows.get_phone_selected_pid()
         self._apply_theme()
 
         # Ferme l'écran de démarrage ("Chargement en cours...") : Tkinter
@@ -3515,6 +4148,13 @@ class App(tk.Tk):
         # déjà ouvert ici et de ramener CETTE fenêtre au premier plan
         # plutôt que d'en ouvrir une deuxième sur le même fichier.
         open_windows.register(self.db.path)
+        # Aligne ce tournoi (nouveau OU existant) sur "Calculer les
+        # primes" VERROUILLÉ de la session, s'il y a lieu (demande du
+        # 2026-09-09, 4e relecture) — AVANT _build_tabs()/_build_
+        # settings_tab() ci-dessous, pour que la case et le grisement de
+        # la section reflètent le bon état dès la toute première image,
+        # jamais l'ancien état affiché puis corrigé au tick suivant.
+        _align_primes_enabled_on_open(self.db)
 
         self.deiconify()
         self._build_header()
@@ -3697,19 +4337,72 @@ class App(tk.Tk):
             if fallback:
                 name = fallback
         tournament_date = format_date_fr(self.db.get_tournament_date()) if self.db else ""
-        title = f"Tournoi : {name} du {tournament_date}" if name else APP_NAME
+        # Préfixe "{APP_NAME} v{APP_VERSION}[complément dev]" (demande du
+        # 2026-09-09, voir _app_title_prefix) : identique à celui du
+        # Menu principal (App.__init__), pour repérer immédiatement, EN
+        # DÉVELOPPEMENT, quel commit (et si des modifications locales
+        # non commitées s'y ajoutent) une fenêtre de tournoi déjà ouverte
+        # fait tourner — jamais besoin de toucher APP_VERSION pour ça.
+        # Sans effet en build officielle (dev_suffix() y est vide).
+        app_prefix = _app_title_prefix()
+        title = f"{app_prefix} — Tournoi : {name} du {tournament_date}" if name else app_prefix
+        # Mode Test (demande du 2026-09-09) : préfixé bien en évidence,
+        # aussi bien dans le titre de la fenêtre (barre de titre/Dock, visible
+        # même onglet Paramètres fermé) que dans le bandeau interne
+        # (header_title_lbl, coloré différemment pour sauter aux yeux) —
+        # pour ne jamais l'oublier activé par erreur avant un vrai tournoi.
+        # Reste le préfixe le PLUS à gauche (donc le plus visible même si
+        # le titre est tronqué), devant même l'identification de version.
+        test_mode_on = self.test_mode_var.get() if hasattr(self, "test_mode_var") else False
+        if test_mode_on:
+            title = f"🧪 MODE TEST — {title}"
         self.title(title)
         if hasattr(self, "header_title_lbl"):
-            self.header_title_lbl.config(
-                text=f"♠ ♥  Tournoi : {name} du {tournament_date}  ♦ ♣" if name
+            header_text = (
+                f"♠ ♥  Tournoi : {name} du {tournament_date}  ♦ ♣" if name
                 else f"♠ ♥  {APP_NAME}  ♦ ♣"
+            )
+            if test_mode_on:
+                header_text = f"🧪 MODE TEST — {header_text}"
+            self.header_title_lbl.config(
+                text=header_text, fg="#ff6b4a" if test_mode_on else GOLD,
             )
 
     def _open_new_window(self):
         """Lance une nouvelle instance indépendante de l'application (autre
         processus, avec son propre écran d'accueil), sans toucher à celle
         déjà ouverte — pour gérer plusieurs tournois/Sit & Go à la fois,
-        chacun dans sa propre fenêtre."""
+        chacun dans sa propre fenêtre. Si ce nouveau process meurt
+        immédiatement (voir spawn_app_process : stdin=subprocess.DEVNULL
+        en corrige la cause la plus courante), le détecte au lieu de
+        continuer vers raise_process_when_ready (qui essaierait de
+        ramener au premier plan un pid déjà mort, puis abandonnerait sans
+        rien dire) — affiche une vraie erreur à la place.
+
+        TOUJOURS lancée, quelle que soit "Un seul tournoi à la fois"
+        (Paramètres) : "Menu principal" n'est PAS lui-même un second
+        tournoi (juste un écran d'accueil, voir _choose_tournament_file)
+        — la préférence ne doit jamais empêcher de l'afficher, seulement
+        ce qu'on peut y faire ensuite. C'est cet écran "Bienvenue" qui
+        grise ses propres boutons "Nouveau tournoi"/"Sit & Go rapide"/
+        "Ouvrir..." selon ce réglage (voir _refresh_launch_buttons_state)
+        et vérifie le garde backend à leur tout début (_block_second_
+        tournament_if_needed, filet de sécurité si jamais un appel
+        contournait cet état grisé) — c'est LÀ, jamais ici, que la
+        protection doit intervenir.
+
+        UNICITÉ (self._menu_principal_proc) : n'en relance PAS un second
+        tant que celui déjà lancé depuis CETTE fenêtre est encore vivant
+        — le ramène simplement au premier plan à la place. Sans cette
+        garde, chaque clic répété créait un nouveau process indépendant,
+        aussi longtemps que l'utilisateur cliquait. Pas de vraie modalité
+        possible ici (grab_set/transient de Tkinter ne s'appliquent qu'à
+        l'intérieur d'un même process — "Menu principal" en est un
+        second, voir spawn_app_process) : la fenêtre tournoi reste
+        techniquement cliquable derrière, seule l'unicité est garantie."""
+        if self._menu_principal_proc is not None and self._menu_principal_proc.poll() is None:
+            open_windows.bring_pid_to_front(self._menu_principal_proc.pid)
+            return
         try:
             proc = spawn_app_process()
         except OSError as e:
@@ -3717,6 +4410,21 @@ class App(tk.Tk):
                 "Erreur", f"Impossible d'ouvrir une nouvelle fenêtre :\n{e}"
             )
             return
+
+        # Laisse un court instant à un process qui planterait dès son tout
+        # premier démarrage (avant même Tkinter) le temps de réellement
+        # quitter, plutôt que de foncer vers raise_process_when_ready.
+        time.sleep(0.3)
+        returncode = proc.poll()
+        if returncode is not None:
+            messagebox.showerror(
+                "Erreur",
+                "La nouvelle fenêtre n'a pas pu s'ouvrir : le nouveau "
+                f"processus s'est arrêté immédiatement (code {returncode}).",
+            )
+            return
+
+        self._menu_principal_proc = proc
         raise_process_when_ready(self, proc.pid)
 
     def _open_lobby(self):
@@ -3729,7 +4437,16 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        win.geometry("480x460")
+        # 480x527 (480x460 avant l'ajout de la zone "Sauvegarde des
+        # données" ; 620 avec séparateur + texte explicatif sous le
+        # titre ; 570 avec seulement le titre, sans séparateur/texte ;
+        # le titre lui-même a été retiré le 2026-09-08 (plus que les 2
+        # boutons, qui remontent naturellement) — 43px de moins, mesuré
+        # via winfo_reqheight() sur les mêmes widgets/polices/paddings)
+        # : sans cet ajustement, ces éléments dépasseraient hors de la
+        # fenêtre (toujours non redimensionnable), ou inversement
+        # laisseraient un espace vide en bas.
+        win.geometry("480x527")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -3757,6 +4474,12 @@ class App(tk.Tk):
         ).pack(pady=(0, 24))
 
         def new_tournament():
+            # Filet de sécurité (voir _block_second_tournament_if_needed) :
+            # ce bouton est normalement déjà grisé dans ce cas (voir
+            # _refresh_launch_buttons_state), ce garde ne devrait donc
+            # jamais se déclencher en usage normal.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau tournoi",
@@ -3808,6 +4531,9 @@ class App(tk.Tk):
             win.destroy()
 
         def new_sng():
+            # Voir le commentaire équivalent dans new_tournament() ci-dessus.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder, day_filename = tournament_day_folder_proposal(is_sng=True)
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau Sit & Go",
@@ -3855,6 +4581,9 @@ class App(tk.Tk):
             win.destroy()
 
         def open_tournament():
+            # Voir le commentaire équivalent dans new_tournament() ci-dessus.
+            if _block_second_tournament_if_needed(win):
+                return
             day_folder = (
                 tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
             ).strip()
@@ -3868,11 +4597,103 @@ class App(tk.Tk):
                 result["is_new"] = False
                 win.destroy()
 
+        def backup_now():
+            """"💾 Sauvegarder sur clé USB" : copie les .tournoi du
+            dossier de tournoi par défaut + tout ~/.poker_tournament
+            vers un sous-dossier horodaté du dossier choisi (voir
+            backup_restore.create_backup — jamais de modification des
+            fichiers d'origine, uniquement des lectures/copies).
+            Disponible même si un tournoi est ouvert ailleurs : ne fait
+            que LIRE ses fichiers, jamais les modifier."""
+            dest = filedialog.askdirectory(
+                title="Choisir la clé USB ou le dossier de destination", parent=win,
+            )
+            if not dest:
+                return
+            try:
+                result_info = backup_restore.create_backup(dest)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Erreur de sauvegarde", str(e), parent=win)
+                return
+            data_note = (
+                "Données de l'application (réglages, joueurs, photos...) incluses."
+                if result_info["poker_tournament_data_included"]
+                else "Aucune donnée d'application (~/.poker_tournament) trouvée à sauvegarder."
+            )
+            messagebox.showinfo(
+                "Sauvegarde terminée avec succès",
+                "Sauvegarde terminée avec succès.\n\n"
+                f"Emplacement : {result_info['backup_dir']}\n"
+                f"Tournois sauvegardés : {result_info['tournament_file_count']}\n"
+                f"{data_note}",
+                parent=win,
+            )
+
+        def restore_now():
+            """"♻️ Restaurer depuis une clé USB" : voir backup_restore.
+            restore_backup — refuse d'abord si un tournoi est ouvert
+            (open_windows.list_open_paths), affiche le contenu du
+            manifeste et exige une confirmation explicite AVANT toute
+            écriture, puis crée automatiquement une sauvegarde de
+            sécurité de l'état actuel avant d'écraser quoi que ce soit."""
+            src = filedialog.askdirectory(
+                title="Sélectionner un dossier de sauvegarde PokerTournament_Backup_...",
+                parent=win,
+            )
+            if not src:
+                return
+            if open_windows.list_open_paths():
+                messagebox.showerror(
+                    "Tournoi(s) actuellement ouvert(s)",
+                    "Au moins un tournoi est actuellement ouvert (ici ou dans "
+                    "une autre fenêtre).\n\nFermez tous les tournois ouverts "
+                    "avant de restaurer une sauvegarde.",
+                    parent=win,
+                )
+                return
+            try:
+                manifest = backup_restore.validate_backup_folder(src)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Sauvegarde invalide", str(e), parent=win)
+                return
+            count = len(manifest.get("tournament_files", []))
+            has_data = manifest.get("poker_tournament_data_included", False)
+            if not messagebox.askyesno(
+                "Confirmer la restauration",
+                f"Sauvegarde du {manifest.get('created_at', '?')}\n"
+                f"Version : {manifest.get('app_version', '?')}\n"
+                f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
+                f"Tournois : {count}\n"
+                "Données de l'application (réglages, joueurs, photos...) : "
+                f"{'oui' if has_data else 'non'}\n\n"
+                "Une sauvegarde de sécurité des données actuelles sera créée "
+                "automatiquement avant toute modification.\n\n"
+                "Confirmer la restauration ?",
+                icon="warning", default="no", parent=win,
+            ):
+                return
+            try:
+                restore_info = backup_restore.restore_backup(src)
+            except backup_restore.BackupError as e:
+                messagebox.showerror("Erreur de restauration", str(e), parent=win)
+                return
+            messagebox.showinfo(
+                "Restauration terminée",
+                "Restauration terminée avec succès.\n\n"
+                f"Tournois restaurés : {restore_info['restored_tournament_files']}\n"
+                f"Données de l'application restaurées : "
+                f"{'oui' if restore_info['restored_data'] else 'non'}\n\n"
+                "Sauvegarde de sécurité de l'état précédent :\n"
+                f"{restore_info['safety_backup_dir']}",
+                parent=win,
+            )
+
         btn_frame = tk.Frame(win, bg=FELT_DARK)
         btn_frame.pack(pady=4)
-        ttk.Button(
+        new_tournament_btn = ttk.Button(
             btn_frame, text="🆕  Nouveau tournoi", command=new_tournament, width=28,
-        ).pack(pady=6)
+        )
+        new_tournament_btn.pack(pady=6)
         sng_btn = ttk.Button(
             btn_frame, text="🚀  Sit & Go rapide", command=new_sng, width=28,
         )
@@ -3885,9 +4706,10 @@ class App(tk.Tk):
             "joueurs choisis ci-après — à ajuster ensuite si besoin dans\n"
             "Paramètres/Gains, comme pour n'importe quel tournoi normal.",
         )
-        ttk.Button(
+        open_tournament_btn = ttk.Button(
             btn_frame, text="📂  Ouvrir un tournoi existant", command=open_tournament, width=28,
-        ).pack(pady=6)
+        )
+        open_tournament_btn.pack(pady=6)
         lobby_btn = ttk.Button(
             btn_frame, text="📋  Lobby (plusieurs tournois)",
             command=lambda: LobbyDialog(win), width=28,
@@ -3901,9 +4723,47 @@ class App(tk.Tk):
             "coup d'œil — double-cliquez pour basculer vers l'un d'eux.\n"
             "N'ouvre ni ne ferme celle-ci.",
         )
+
+        # -- Sauvegarde des données (clé USB) : jamais liée à "Un seul
+        # tournoi à la fois" (aucun rapport avec le lancement d'un
+        # tournoi) — toujours active, jamais grisée. Voir backup_now/
+        # restore_now ci-dessus et backup_restore.py pour la logique.
+        # Packée dans btn_frame (PAS win) : l'ordre d'affichage suit
+        # l'ordre d'empilement des ENFANTS de btn_frame, indépendant de
+        # quand btn_frame lui-même a été empilé dans win — la packer
+        # dans win la ferait apparaître après TOUT btn_frame (donc après
+        # "À propos"), pas entre "Lobby" et les boutons ci-dessous.
+        # Ni séparateur, ni texte explicatif, ni titre (demandes du
+        # 2026-09-08) : uniquement les 2 boutons, avec leurs explications
+        # dans les tooltips ci-dessous — aucun espace réservé à la place
+        # d'un titre, les boutons remontent juste après le bouton Lobby.
+        backup_btn = ttk.Button(
+            btn_frame, text="💾  Sauvegarder sur clé USB", command=backup_now, width=28,
+        )
+        backup_btn.pack(pady=6)
+        Tooltip(
+            backup_btn,
+            "Permet de sauvegarder les tournois, joueurs, photos et\n"
+            "réglages sur une clé USB.",
+        )
+        restore_btn = ttk.Button(
+            btn_frame, text="♻️  Restaurer depuis une clé USB", command=restore_now, width=28,
+        )
+        restore_btn.pack(pady=6)
+        Tooltip(
+            restore_btn,
+            "Permet de restaurer les tournois, joueurs, photos et\n"
+            "réglages depuis une clé USB.",
+        )
+
         ttk.Button(
             btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
         ).pack(pady=6)
+
+        # État initial correct dès le premier affichage (pas seulement au
+        # bout d'une seconde) : voir _refresh_launch_buttons_state, qui
+        # se reprogramme ensuite elle-même tant que `win` reste affichée.
+        _refresh_launch_buttons_state(win, [new_tournament_btn, sng_btn, open_tournament_btn])
 
         self.wait_window(win)
         if not result["path"]:
@@ -3926,6 +4786,21 @@ class App(tk.Tk):
             )
             return False
         if result.get("is_new"):
+            # Interrupteur général "Calculer les primes" (demande du
+            # 2026-09-09) : un tournoi flambant neuf part de la valeur
+            # GLOBALE proposée pour la session en cours (voir
+            # _primes_enabled_proposed), immédiatement — pas seulement
+            # au prochain tick (voir _sync_primes_enabled_pref, qui
+            # prendra ensuite le relais tant que ce tournoi n'a pas
+            # démarré, garantissant qu'il ne puisse jamais rester sur une
+            # valeur devenue périmée entre-temps). Ne fait jamais partie
+            # de `last_settings` ci-dessous (tournament_prefs ne mémorise
+            # que self.settings_vars, qui n'inclut volontairement pas
+            # "primes_enabled" — ce réglage suit une règle de session,
+            # pas la règle habituelle "dernier tournoi utilisé").
+            self.db.set_setting(
+                "primes_enabled", "1" if _primes_enabled_proposed() else "0"
+            )
             last_settings = tournament_prefs.load_last_settings()
             if last_settings:
                 self.db.set_settings(last_settings)
@@ -4156,7 +5031,7 @@ class App(tk.Tk):
         self._build_payouts_tab()
         self._build_settings_tab()
 
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all())
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     # ---------------------------------------------------------------
     # Onglet Joueurs
@@ -4965,27 +5840,111 @@ class App(tk.Tk):
                 "doit toujours en rester au moins un — c'est le vainqueur.",
             )
             return
+        # Primes désactivées (demande du 2026-09-09, précisée le même
+        # jour après relecture utilisateur) : `primes_matter` conditionne
+        # TOUTES les contraintes d'éliminateur liées aux primes/PKO
+        # ci-dessous (élimination groupée bloquée, éliminateur individuel
+        # obligatoire) — si les primes sont désactivées, aucun mécanisme
+        # bounty/PKO n'existe, donc aucun garde ne doit imposer quoi que
+        # ce soit "pour une raison de prime" : ni la case à cocher
+        # groupée, ni le choix individuel d'un éliminateur (l'information
+        # eliminated_by_name reste saisissable normalement si l'utilisateur
+        # choisit d'indiquer un éliminateur, simplement plus jamais
+        # rendue obligatoire par la logique des primes dans ce cas).
+        primes_matter = self.db.primes_enabled()
+        pko_mode = primes_matter and self.db.get_setting_int("pko_mode", 0) == 1
+        test_mode = self._test_mode_enabled()
         if len(ids) == 1:
             p = self.db.get_player(ids[0])
             question = f"Éliminer {p['name']} du tournoi ?"
         else:
+            # Élimination GROUPÉE : jamais d'éliminateur désigné
+            # individuellement (voir eliminator_id=None plus bas), donc un
+            # moyen de contourner l'attribution d'une bounty — bloquée en
+            # fonctionnement normal SEULEMENT si les primes sont activées
+            # (rien à contourner sinon, voir primes_matter ci-dessus) et
+            # que le Mode Test n'est pas actif (demande du 2026-09-09,
+            # facilité d'essai explicitement demandée) : chaque joueur
+            # doit alors être éliminé un par un, avec un éliminateur
+            # obligatoire (voir plus bas).
+            if primes_matter and not test_mode:
+                messagebox.showerror(
+                    "Élimination groupée indisponible",
+                    "Un éliminateur doit obligatoirement être désigné pour "
+                    "chaque élimination (une prime est en jeu) : éliminez "
+                    "ces joueurs un par un.\n\n"
+                    "(Activez « Mode Test » dans Paramètres pour une "
+                    "élimination groupée sans éliminateur, réservée aux "
+                    "essais — ou décochez « Calculer les primes » si les "
+                    "primes ne doivent plus du tout intervenir.)",
+                )
+                return
+            # Mode Test + PKO (demande du 2026-09-09) : la protection
+            # anti-bounty-orpheline de la base (Database.eliminate_player)
+            # serait normalement bloquante ici puisqu'aucun éliminateur
+            # n'est désigné en groupe — c'est exactement la facilité de
+            # test demandée : éliminer en vrac même des joueurs porteurs
+            # d'une bounty PKO, SANS créer de faux éliminateur ni
+            # transférer leur bounty nulle part (elle reste simplement sur
+            # ces joueurs désormais éliminés, jamais relue ailleurs — voir
+            # orphan_bounty_ok plus bas et sa docstring). Simple note
+            # informative ici, plus un blocage : le contournement est le
+            # but recherché en Mode Test.
+            with_bounty = [
+                p["name"] for pid in ids
+                if (p := self.db.get_player(pid)) and p["status"] == "active" and p["bounty"] > 0
+            ] if pko_mode else []
+            bounty_note = (
+                "\n\n⚠️ Mode Test : " + ", ".join(with_bounty) + " porte(nt) une "
+                "bounty PKO qui sera perdue (non attribuée), aucun "
+                "éliminateur n'étant désigné en élimination groupée."
+            ) if with_bounty else ""
             question = (
                 f"Éliminer ces {len(ids)} joueurs du tournoi ?"
                 "\n\n(Élimination groupée : personne ne sera désigné comme "
                 "éliminateur, donc aucun bounty (points) ne sera attribué "
                 "ici. Éliminez ces joueurs un par un si vous voulez "
-                "enregistrer qui élimine qui.)"
+                "enregistrer qui élimine qui.)" + bounty_note
             )
         if not messagebox.askyesno("Confirmer", question):
             return
 
         eliminator_id = None
         if len(ids) == 1:
-            eliminator_id = self._ask_eliminator(exclude_id=ids[0])
+            # Éliminateur obligatoire pour une élimination individuelle
+            # UNIQUEMENT si une attribution de bounty/PKO en dépend
+            # réellement (demande du 2026-09-09, précisée après relecture
+            # utilisateur) : primes activées ET ce joueur précis porte une
+            # bounty > 0 — jamais "toujours obligatoire", et INDÉPENDANT
+            # du Mode Test (qui ne facilite que l'élimination GROUPÉE,
+            # jamais la règle individuelle). Le bouton "Ignorer (pas de
+            # prime)" de _ask_eliminator disparaît de lui-même dès que
+            # mandatory=True (il devient "Annuler l'élimination") ; il
+            # reste disponible normalement si aucune bounty n'est en jeu
+            # (primes désactivées, bounty nulle, ou classique/PKO à 0).
+            mandatory = primes_matter and p["bounty"] > 0
+            eliminator_id = self._ask_eliminator(exclude_id=ids[0], mandatory=mandatory)
+            if mandatory and eliminator_id is None:
+                return  # élimination abandonnée : rien n'est modifié
 
+        # orphan_bounty_ok=True UNIQUEMENT pour l'élimination groupée
+        # (voir Database.eliminate_player) : ce chemin n'est atteignable
+        # que si primes_matter est faux OU si le Mode Test est actif (déjà
+        # vérifié ci-dessus) — jamais pour une élimination individuelle.
+        orphan_bounty_ok = len(ids) > 1
         moved_count = 0
         for pid in ids:
-            moved_count += len(self.db.eliminate_player(pid, eliminated_by_id=eliminator_id))
+            try:
+                moved_count += len(self.db.eliminate_player(
+                    pid, eliminated_by_id=eliminator_id, orphan_bounty_ok=orphan_bounty_ok
+                ))
+            except ValueError as e:
+                # Filet de sécurité (garde-fou équivalent, plus fort, côté
+                # Database.eliminate_player) : ne devrait normalement plus
+                # se produire grâce aux vérifications ci-dessus, mais ne
+                # doit jamais planter ni laisser un état à moitié traité.
+                messagebox.showerror("Élimination refusée", str(e))
+                break
             self._queue_elimination_banner(pid, eliminator_id)
         self._clear_checked()
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
@@ -5005,14 +5964,24 @@ class App(tk.Tk):
         elif moved_count:
             self._trigger_movement_alert()
         self._refresh_all()
+        self._check_pending_rebalance()
 
-    def _ask_eliminator(self, exclude_id):
+    def _ask_eliminator(self, exclude_id, mandatory=False):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
-        compter ses bounties (kills, onglet Primes) et, si un bounty fixe
-        en € est configuré (mécanisme PKO), à le lui attribuer. Ne
-        propose que les joueurs de la MÊME TABLE que l'éliminé : au
-        poker, on ne peut éliminer que quelqu'un assis à sa propre table.
-        Renvoie l'id du joueur choisi, ou None si ignoré/annulé."""
+        compter ses bounties (kills, onglet Primes) et, si une bounty est
+        configurée, à la lui attribuer. Ne propose que les joueurs de la
+        MÊME TABLE que l'éliminé : au poker, on ne peut éliminer que
+        quelqu'un assis à sa propre table. Renvoie l'id du joueur choisi,
+        ou None si ignoré/annulé.
+
+        `mandatory=True` (demande du 2026-09-08, PKO + bounty > 0) : le
+        bouton "Ignorer (pas de prime)" devient "Annuler l'élimination" —
+        un None renvoyé doit alors être compris par l'APPELANT comme
+        "abandonner l'élimination elle-même" (elle ne doit PAS être
+        exécutée sans éliminateur), jamais comme "l'effectuer quand même
+        sans bounty attribuée", pour ne jamais laisser une bounty PKO
+        orpheline (voir aussi le garde-fou équivalent, plus fort, dans
+        Database.eliminate_player)."""
         eliminated = self.db.get_player(exclude_id)
         # list_players() trie par table/siège (pratique pour l'affichage du
         # tableau Joueurs, pas pour retrouver un nom ici) — trié par nom
@@ -5048,11 +6017,11 @@ class App(tk.Tk):
             win, bg=FELT_DARK, fg=GOLD, font=("Helvetica", 12, "bold"),
             text=header_text,
         ).pack(padx=16, pady=(16, 4))
-        tk.Label(
-            win, bg=FELT_DARK, fg=CREAM,
-            text="Qui l'a éliminé(e) ?" if eliminated["bounty"] > 0 else
-                 "(Compte pour son bounty en points, onglet Primes.)",
-        ).pack(padx=16, pady=(0, 10))
+        subtitle = "Qui l'a éliminé(e) ?" if eliminated["bounty"] > 0 else \
+            "(Compte pour son bounty en points, onglet Primes.)"
+        if mandatory:
+            subtitle += "\nObligatoire en mode PKO : une bounty ne doit jamais rester orpheline."
+        tk.Label(win, bg=FELT_DARK, fg=CREAM, text=subtitle, justify="center").pack(padx=16, pady=(0, 10))
 
         names = [p["name"] for p in candidates]
         name_to_id = {p["name"]: p["id"] for p in candidates}
@@ -5070,7 +6039,8 @@ class App(tk.Tk):
 
         btns = ttk.Frame(win)
         btns.pack(pady=(0, 16))
-        ttk.Button(btns, text="Ignorer (pas de prime)", command=skip).pack(side="left", padx=5)
+        skip_label = "Annuler l'élimination" if mandatory else "Ignorer (pas de prime)"
+        ttk.Button(btns, text=skip_label, command=skip).pack(side="left", padx=5)
         ttk.Button(btns, text="Valider", command=confirm).pack(side="left", padx=5)
 
         self.wait_window(win)
@@ -5206,6 +6176,75 @@ class App(tk.Tk):
             self.clock_window.bring_to_front()
 
     # ---------------------------------------------------------------
+    # Rééquilibrage simple : question "quel siège est grosse blinde ?"
+    # (version TEST, voir database.py: rebalance_tables /
+    # resolve_pending_rebalance). Lors d'un simple rééquilibrage entre
+    # tables (pas un cassage de table, inchangé), le choix du joueur à
+    # déplacer n'est plus automatique : on demande quel siège est
+    # actuellement grosse blinde — UNIQUEMENT sur les téléphones du
+    # contrôle à distance (voir remote_control.py, _REBALANCE_WIDGET), le
+    # premier qui répond gagne. Affichée sur le Mac jusqu'à v1.2.37 (petite
+    # fenêtre Tkinter non bloquante) : retirée à la demande explicite de
+    # l'utilisateur (trop envahissante sur les écrans du Mac/projecteur),
+    # le calcul et le stockage de la proposition (self.db.pending_
+    # rebalance) restant, eux, entièrement inchangés — voir
+    # _check_pending_rebalance ci-dessous. Le chronomètre et le reste de
+    # l'appli continuent de tourner normalement tant qu'aucune réponse
+    # n'arrive (jamais de sleep()/wait_window()/boucle d'attente ici, voir
+    # consigne).
+    # ---------------------------------------------------------------
+    def _check_pending_rebalance(self):
+        """Tient à jour _remote_pending_rebalance (copie de self.db.
+        pending_rebalance lue par le thread du serveur de contrôle à
+        distance, voir _start_remote_control_if_enabled et
+        remote_control.py: /rebalance_pending) à partir de l'état courant
+        de self.db.pending_rebalance — SEUL affichage restant de cette
+        proposition, sur les téléphones (voir le commentaire ci-dessus :
+        plus aucune fenêtre Mac depuis ce correctif). Appelée juste après
+        chaque action qui peut déclencher un rééquilibrage (élimination
+        locale ou distante, bouton "Rééquilibrer les tables", changement
+        de "Nombre de sièges par table" dans Paramètres) pour une
+        réaction immédiate côté téléphone, et par sécurité à chaque tick
+        (_tick) : une réponse arrivée par une autre voie doit y être
+        reflétée même si elle n'a pas causé la demande suivante."""
+        if not self.db:
+            return
+        self._remote_pending_rebalance = self.db.pending_rebalance
+
+    def _resolve_pending_rebalance(self, request_id, seat, from_remote):
+        """Traite une réponse à la question "quel siège est grosse
+        blinde ?" — reçue d'un téléphone (POST /rebalance_answer, relayé
+        ici par _poll_voice_queue, from_remote=True), ou déclenchée
+        localement quand la préférence "Équilibrage guidé par la grosse
+        blinde" (Paramètres) est décochée alors qu'une demande est en
+        attente (voir _on_bb_rebalance_prompt_toggle, from_remote=False —
+        aucune fenêtre Mac n'est impliquée dans ce second cas, seulement
+        ce même traitement de réponse). La mutation réelle passe par
+        database.py:resolve_pending_rebalance, qui revalide tout avant
+        d'agir (request_id encore valide, table source toujours active,
+        siège toujours occupé par un joueur actif — voir sa docstring) :
+        ici, on se contente d'enchaîner les mêmes suites qu'une
+        élimination normale (alerte de mouvement, rafraîchissements) sur
+        le résultat qu'elle renvoie."""
+        if not self.db:
+            return
+        moves = self.db.resolve_pending_rebalance(request_id, seat)
+        if moves:
+            if len(self.db.list_players(status="active")) <= 1:
+                if (self.db.get_setting_int("movement_alert_active", 0) == 1
+                        or self.db.count_seat_moves() > 0):
+                    self._finish_movement_alert()
+            else:
+                self._trigger_movement_alert(from_remote=from_remote)
+        self._refresh_all()
+        self._refresh_remote_players_cache()
+        # Le rééquilibrage relancé par resolve_pending_rebalance a pu
+        # poser une NOUVELLE question (écart encore présent ailleurs, ou
+        # table suivante à son tour trop pleine) : l'affiche tout de suite
+        # plutôt que d'attendre le prochain tick.
+        self._check_pending_rebalance()
+
+    # ---------------------------------------------------------------
     # Bandeau d'élimination (écran projecteur + onglet Chronomètre) :
     # affiche "XXX est sorti par YYY / Merci d'avoir participé" (ou "XXX
     # est éliminé" sans éliminateur) pendant une durée réglable, pour
@@ -5239,27 +6278,52 @@ class App(tk.Tk):
         """Termine le bandeau d'élimination actuellement affiché (s'il y
         en a un) et, s'il reste un message dans la file, le fait devenir
         le nouveau bandeau courant avec sa PROPRE échéance complète à
-        partir de MAINTENANT (durée réglée dans Paramètres, voir
-        _build_settings_tab) et joue le son configuré une seule fois.
-        Seul point qui fait avancer la file — appelé (1) depuis
-        _refresh_clock_tab quand l'échéance du bandeau courant est
+        partir de MAINTENANT (durée réglée dans Paramètres — "Durée du
+        bandeau d'élimination (secondes)", self.db.get_setting_int
+        "elimination_banner_seconds" — INDÉPENDANTE de la "Durée (ms)" du
+        son "Son sortie d'un joueur", voir _play_elimination_sound : deux
+        réglages séparés, l'un pour l'AFFICHAGE, l'autre pour le SON,
+        même si aucun son n'est configuré) et joue le son configuré une
+        seule fois. Seul point qui fait avancer la file — appelé (1)
+        depuis _refresh_clock_tab quand l'échéance du bandeau courant est
         dépassée, (2) depuis _on_voice_word("chronometre") pour
         l'écourter manuellement à la demande (bouton "Chronomètre" du
         téléphone ou Ctrl+Maj+C) : cette seconde utilisation ne vide
         JAMAIS le reste de la file (elle ne retire qu'UN SEUL élément,
         le bandeau en cours, jamais rappelé ensuite), les messages
         suivants restent strictement dans leur ordre FIFO. Sans effet
-        (et sans son) s'il n'y a ni bandeau courant ni file en attente."""
+        (et sans son) s'il n'y a ni bandeau courant ni file en attente.
+
+        Chaque bandeau mémorise sa PROPRE échéance ("until", calculée ICI
+        une seule fois à sa création) dans son propre dict, plutôt qu'un
+        minuteur global partagé : si le joueur A est éliminé puis B peu
+        après pendant que le bandeau de A est encore affiché, le job de B
+        est simplement ajouté à la file (_queue_elimination_banner) et ne
+        devient "courant" (avec sa propre échéance à partir de CE
+        moment-là) qu'ici, quand celui de A expire — jamais recalculée
+        après coup ni partagée entre deux bandeaux. Aucun risque qu'une
+        échéance déjà expirée (celle de A) n'efface prématurément B.
+
+        "Durée du bandeau d'élimination" à 0 (voir Paramètres/tooltip) :
+        DÉSACTIVE uniquement l'AFFICHAGE — _elimination_banner_current
+        n'est alors jamais renseigné (seul point lu par _refresh_clock_
+        tab et ClockWindow.refresh pour décider d'afficher quoi que ce
+        soit, voir leurs commentaires), donc aucun bandeau nulle part
+        (onglet Chronomètre ni écran projecteur). Le son (_play_
+        elimination_sound), réglage totalement indépendant, continue lui
+        de jouer normalement à chaque élimination — comportement
+        volontairement inchangé."""
         self._elimination_banner_current = None
         if self._elimination_banner_queue:
             job = self._elimination_banner_queue.popleft()
-            seconds = max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
-            job["until"] = time.time() + seconds
-            self._elimination_banner_current = job
+            seconds = max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
             try:
                 self._play_elimination_sound()
             except Exception:
                 pass
+            if seconds > 0:
+                job["until"] = time.time() + seconds
+                self._elimination_banner_current = job
 
     def _play_elimination_sound(self):
         """Petit son d'attention joué une seule fois, exactement au début
@@ -5359,18 +6423,23 @@ class App(tk.Tk):
         )
         self._refresh_remote_players_cache()
         self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1 if self.db else True
+        self._remote_has_pending_moves = self.db.count_seat_moves() > 0 if self.db else False
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
             get_players=lambda: self._remote_players_cache,
             get_clock_paused=lambda: self._remote_clock_paused,
-            on_eliminate=lambda eliminated_id, eliminator_id: self.voice_command_queue.put(
-                ("eliminate", eliminated_id, eliminator_id)
-            ),
+            get_has_pending_moves=lambda: self._remote_has_pending_moves,
+            on_eliminate=self._remote_eliminate_request,
             on_upload_photo=self._remote_upload_photo,
             get_roster_players=self._remote_get_roster_players,
             get_photo_image=self._remote_get_photo_image,
             on_delete_photo=self._remote_delete_photo,
+            get_pending_rebalance=lambda: self._remote_pending_rebalance,
+            on_rebalance_answer=lambda request_id, seat: self.voice_command_queue.put(
+                ("rebalance_answer", request_id, seat)
+            ),
+            on_end_tournament=lambda: self.voice_command_queue.put(("end_tournament",)),
         )
         try:
             server.start()
@@ -5463,6 +6532,347 @@ class App(tk.Tk):
         else:
             self.remote_control_status_lbl.config(text="")
 
+    @staticmethod
+    def _remote_devices_signature(approved):
+        """Petit "instantané" de la liste "Téléphones" de Paramètres
+        (appareils APPROUVÉS uniquement — les demandes en attente ont
+        leur propre fenêtre flottante, voir RemoteDeviceRequestWindow/
+        _refresh_remote_device_popup, jamais affichées ici pour éviter
+        un doublon) — comparé à chaque sondage périodique (voir
+        _check_remote_device_requests) pour ne reconstruire les widgets
+        QUE si quelque chose a RÉELLEMENT changé depuis le dernier
+        sondage. Correctif du 2026-09-09 (bug signalé après test réel
+        sur Huawei) : appeler _refresh_remote_devices_panel() SANS
+        CONDITION à chaque sondage (~2s) détruisait et recréait TOUS les
+        widgets de la section, un scintillement permanent, y compris
+        LONGTEMPS après qu'une demande ait été traitée, puisque rien
+        n'était jamais lié à un changement réel."""
+        return tuple((d["browser_id"], d.get("label"), d["ip_last_seen"]) for d in approved)
+
+    def _refresh_remote_devices_panel(self, approved=None):
+        """Reconstruit la liste "Téléphones" de Paramètres — UNIQUEMENT
+        les appareils déjà APPROUVÉS (Révoquer/renommer) : les demandes
+        en attente ont leur propre fenêtre flottante (demande du
+        2026-09-09, abandon définitif de toute intégration dans la
+        grille de Paramètres — voir RemoteDeviceRequestWindow), pour ne
+        jamais présenter la même demande à deux endroits. Appelée après
+        chaque action (Révoquer/renommer, ET depuis _on_remote_device_
+        popup_approve : un nouvel appareil approuvé doit apparaître ici
+        immédiatement — TOUJOURS sans argument dans ce cas, relit alors
+        l'état à jour) et depuis _check_remote_device_requests (avec
+        `approved` déjà lu, pour ne pas le relire deux fois pour la même
+        vérification). Ne fait rien si le conteneur n'existe pas encore
+        (onglet Paramètres pas encore construit) ou plus (fenêtre en
+        cours de fermeture) — jamais une exception qui remonterait
+        jusqu'à _tick. Met à jour _last_remote_devices_panel_signature
+        dans tous les cas (y compris ces appels directs), pour que le
+        sondage périodique suivant ne reconstruise pas une seconde fois
+        pour rien juste après."""
+        container = getattr(self, "remote_devices_container", None)
+        if container is None or not container.winfo_exists():
+            return
+        if approved is None:
+            try:
+                approved = open_windows.list_approved_remote_devices()
+            except Exception:
+                return
+        self._last_remote_devices_panel_signature = self._remote_devices_signature(approved)
+
+        for child in container.winfo_children():
+            child.destroy()
+
+        if not approved:
+            ttk.Label(container, text="Aucun téléphone approuvé pour l'instant.", foreground=MUTED).pack(anchor="w")
+            return
+
+        for device in approved:
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=2, anchor="w")
+            ttk.Label(row, text="✓", foreground="#1f6b3a").pack(side="left")
+            label_var = tk.StringVar(value=device.get("label") or device["short_id"])
+            entry = ttk.Entry(row, textvariable=label_var, width=20)
+            entry.pack(side="left", padx=(4, 4))
+            entry.bind(
+                "<FocusOut>",
+                lambda e, bid=device["browser_id"], var=label_var: self._on_rename_remote_device(bid, var),
+            )
+            entry.bind(
+                "<Return>",
+                lambda e, bid=device["browser_id"], var=label_var: self._on_rename_remote_device(bid, var),
+            )
+            ttk.Label(row, text=f"({device['ip_last_seen']})", foreground=MUTED).pack(side="left")
+            ttk.Button(
+                row, text="Révoquer", width=10,
+                command=lambda bid=device["browser_id"]: self._on_revoke_remote_device(bid),
+            ).pack(side="left", padx=(8, 0))
+
+    def _on_revoke_remote_device(self, browser_id):
+        """Bouton "Révoquer" d'un appareil déjà approuvé (voir _refresh_
+        remote_devices_panel) : bascule en "revoked" côté open_windows
+        et invalide IMMÉDIATEMENT tout jeton de session en cours pour
+        cet appareil."""
+        open_windows.revoke_remote_device(browser_id)
+        self._refresh_remote_devices_panel()
+
+    def _on_rename_remote_device(self, browser_id, label_var):
+        label = label_var.get().strip()
+        if label:
+            open_windows.approve_remote_device(browser_id, label=label)
+        self._refresh_remote_devices_panel()
+
+    def _is_settings_tab_active(self):
+        """True si l'onglet Paramètres est actuellement affiché — testé
+        via son libellé RÉEL (voir _update_settings_tab_badge : peut
+        porter le suffixe "🔔", d'où startswith plutôt qu'une égalité
+        stricte). TclError (fenêtre en cours de fermeture) traitée comme
+        "non actif", jamais une exception qui remonterait à _tick."""
+        try:
+            return self.notebook.tab(self.notebook.select(), "text").startswith("Paramètres")
+        except tk.TclError:
+            return False
+
+    def _update_settings_tab_badge(self, has_pending):
+        """🔔 sur l'onglet "Paramètres" tant qu'AU MOINS UNE demande de
+        téléphone est en attente (demande du 2026-09-09, "avertir le
+        responsable même si Paramètres n'est pas ouvert") — reflète
+        TOUJOURS l'ensemble des demandes pending, y compris celles
+        actuellement masquées par "Plus tard" (voir _remote_device_
+        snoozed_keys) : "Plus tard" ne doit JAMAIS faire disparaître ce
+        signal, seulement fermer la fenêtre flottante elle-même."""
+        try:
+            current_label = self.notebook.tab(self.settings_tab, "text")
+        except tk.TclError:
+            return
+        base = current_label[:-2] if current_label.endswith(" 🔔") else current_label
+        new_label = base + (" 🔔" if has_pending else "")
+        if new_label != current_label:
+            try:
+                self.notebook.tab(self.settings_tab, text=new_label)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _is_position_onscreen(x, y, screen_w, screen_h, margin=40):
+        """True si (x, y) — coin haut-gauche mémorisé de la fenêtre
+        flottante — laisse au moins `margin` pixels de cette fenêtre
+        accessibles sur UN écran de résolution (screen_w, screen_h).
+        Volontairement approximatif (Tkinter n'expose pas nativement la
+        géométrie de plusieurs écrans distincts) : le but n'est que
+        d'éviter le cas grossier "fenêtre entièrement hors champ" après
+        un changement d'écran/résolution (demande du 2026-09-09), pas de
+        valider un multi-écran précis — un repli sur la position par
+        défaut est de toute façon totalement inoffensif si ce test est
+        trop prudent."""
+        return -margin <= x <= screen_w - margin and -margin <= y <= screen_h - margin
+
+    def _remote_device_popup_position(self, win):
+        """(x, y) où placer la fenêtre flottante de demande de téléphone
+        (demande du 2026-09-09) : la dernière position mémorisée par
+        l'utilisateur (export_prefs — préférence PERSISTANTE, JAMAIS le
+        fichier de session éphémère remote_control_auth.json, et aucun
+        secret) si elle reste raisonnablement visible à l'écran actuel
+        (voir _is_position_onscreen — se prémunit d'une ancienne
+        position devenue hors écran après un changement de résolution/
+        moniteur), sinon une position par défaut raisonnable près de
+        CETTE fenêtre (Paramètres/fenêtre principale)."""
+        x = export_prefs.load_value("remote_device_popup_x", None)
+        y = export_prefs.load_value("remote_device_popup_y", None)
+        if (
+            isinstance(x, int) and isinstance(y, int)
+            and self._is_position_onscreen(x, y, win.winfo_screenwidth(), win.winfo_screenheight())
+        ):
+            return x, y
+        return (
+            self.winfo_rootx() + max(self.winfo_width() - 300, 20),
+            self.winfo_rooty() + 60,
+        )
+
+    def _save_remote_device_popup_position(self, x, y):
+        """Mémorise la position de la fenêtre flottante (demande du
+        2026-09-09) — export_prefs (préférence PERSISTANTE, survit à un
+        redémarrage complet du logiciel), JAMAIS remote_control_auth.
+        json (fichier de session ÉPHÉMÈRE, effacé à chaque nouvelle
+        session — voir open_windows.py) : rien à voir avec le code/les
+        jetons de la session, uniquement une coordonnée d'écran, aucun
+        secret. Appelée à chaque déplacement (voir RemoteDeviceRequest
+        Window._on_configure) et à la fermeture de la fenêtre."""
+        export_prefs.save_value("remote_device_popup_x", x)
+        export_prefs.save_value("remote_device_popup_y", y)
+
+    def _refresh_remote_device_popup(self, pending=None):
+        """Ouvre/repeuple/masque/ferme la fenêtre flottante de demande de
+        téléphone (demande du 2026-09-09, abandon définitif de toute
+        intégration dans la grille de Paramètres) : présente la PLUS
+        ANCIENNE demande NON masquée par "Plus tard" (voir _remote_
+        device_snoozed_keys) — jamais deux à la fois, jamais la même
+        demande que la section "Téléphones" (voir _refresh_remote_
+        devices_panel, approuvés uniquement).
+
+        VISIBILITÉ (demande du 2026-09-09, correction : "la fenêtre ne
+        doit apparaître au-dessus d'AUCUN autre onglet que Paramètres")
+        — règle appliquée à CHAQUE appel, qu'il vienne du sondage
+        périodique (~2s, voir App._tick/_check_remote_device_requests)
+        ou du changement d'onglet lui-même (voir _on_notebook_tab_
+        changed, <<NotebookTabChanged>>, pour un affichage/masquage
+        IMMÉDIAT au clic, sans attendre le prochain sondage) : VISIBLE
+        SI ET SEULEMENT SI l'onglet Paramètres est actuellement
+        sélectionné ET qu'il existe une telle demande. Sur tout AUTRE
+        onglet, la fenêtre déjà créée est seulement MASQUÉE (`withdraw`,
+        jamais détruite ni recréée) — elle retrouve donc sa position
+        EXACTE, sans le moindre recalcul, dès que Paramètres redevient
+        actif (`deiconify`) ; la demande elle-même n'est ni approuvée,
+        ni révoquée, ni "Plus tard"-ée par ce simple changement d'onglet
+        — seul le badge 🔔 (voir _update_settings_tab_badge, appelé
+        séparément par l'appelant) reste alors le signal visible.
+
+        Une fenêtre déjà EXISTANTE (visible ou masquée) est REPEUPLÉE en
+        place pour la demande suivante plutôt que détruite/recréée
+        (jamais de scintillement, jamais de repositionnement inutile) ;
+        entièrement fermée seulement quand plus aucune demande n'est à
+        montrer."""
+        if pending is None:
+            try:
+                pending = open_windows.list_pending_remote_devices()
+            except Exception:
+                return
+        candidates = sorted(
+            (d for d in pending if (d["browser_id"], d["requested_at"]) not in self._remote_device_snoozed_keys),
+            key=lambda d: d["requested_at"],
+        )
+        current = candidates[0] if candidates else None
+        current_key = (current["browser_id"], current["requested_at"]) if current else None
+
+        if current is None:
+            self._remote_device_popup_current_key = None
+            self._close_remote_device_popup()
+            return
+
+        settings_active = self._is_settings_tab_active()
+        content_changed = current_key != self._remote_device_popup_current_key
+        self._remote_device_popup_current_key = current_key
+        self._remote_device_popup_current_browser_id = current["browser_id"]
+
+        popup = self._remote_device_popup
+        if not settings_active:
+            # Jamais créer ni réafficher la fenêtre sur un autre onglet
+            # que Paramètres — seule une fenêtre déjà existante peut
+            # avoir besoin d'être masquée ici (ex. l'utilisateur vient de
+            # quitter Paramètres pendant qu'elle était affichée).
+            if popup is not None and popup.winfo_exists():
+                try:
+                    popup.withdraw()
+                except tk.TclError:
+                    pass
+            return
+
+        if popup is None or not popup.winfo_exists():
+            popup = RemoteDeviceRequestWindow(
+                self,
+                on_approve=self._on_remote_device_popup_approve,
+                on_refuse=self._on_remote_device_popup_refuse,
+                on_later=self._on_remote_device_popup_later,
+                on_geometry_changed=self._save_remote_device_popup_position,
+            )
+            self._remote_device_popup = popup
+            x, y = self._remote_device_popup_position(popup)
+            popup.geometry(f"+{x}+{y}")
+            content_changed = True  # fenêtre neuve : il faut la peupler, même si `current_key` n'a en fait pas changé
+        if content_changed:
+            popup.show_request(
+                short_id=current["short_id"],
+                ip=current["ip_last_seen"],
+                label_default=current.get("label") or current["short_id"],
+            )
+        try:
+            popup.deiconify()
+        except tk.TclError:
+            pass
+
+    def _close_remote_device_popup(self):
+        popup = self._remote_device_popup
+        self._remote_device_popup = None
+        if popup is not None and popup.winfo_exists():
+            try:
+                self._save_remote_device_popup_position(popup.winfo_x(), popup.winfo_y())
+            except tk.TclError:
+                pass
+            popup.destroy()
+
+    def _on_remote_device_popup_approve(self):
+        label = self._remote_device_popup.get_label() if self._remote_device_popup else None
+        open_windows.approve_remote_device(self._remote_device_popup_current_browser_id, label=label)
+        # Le nouvel appareil approuvé doit apparaître IMMÉDIATEMENT dans
+        # "Téléphones" (voir _refresh_remote_devices_panel), pas
+        # seulement au prochain sondage périodique.
+        self._refresh_remote_devices_panel()
+        self._refresh_remote_device_popup()
+
+    def _on_remote_device_popup_refuse(self):
+        open_windows.revoke_remote_device(self._remote_device_popup_current_browser_id)
+        self._refresh_remote_device_popup()
+
+    def _on_remote_device_popup_later(self):
+        """"Plus tard" (bouton ET fermeture de la fenêtre via sa croix —
+        voir RemoteDeviceRequestWindow — traitées IDENTIQUEMENT) : ferme
+        UNIQUEMENT la fenêtre flottante pour CETTE demande — ne l'approuve
+        ni ne la révoque (le téléphone reste "pending" côté serveur), et
+        ne fait PAS disparaître le badge 🔔 de l'onglet (voir _update_
+        settings_tab_badge, basé sur la liste "pending" complète, jamais
+        filtrée par ce masquage). Redevient visible dès que Paramètres
+        est quitté PUIS rouvert (voir _is_settings_tab_active/_check_
+        remote_device_requests, qui vide _remote_device_snoozed_keys à
+        ce moment précis) — sans avoir besoin d'attendre une nouvelle
+        tentative du téléphone (même browser_id/requested_at)."""
+        if self._remote_device_popup_current_key is not None:
+            self._remote_device_snoozed_keys.add(self._remote_device_popup_current_key)
+        self._close_remote_device_popup()
+        self._remote_device_popup_current_key = None
+        self._refresh_remote_device_popup()
+
+    def _check_remote_device_requests(self):
+        """Sondage périodique (voir App._tick, appelé toutes les
+        quelques secondes seulement, pas à chaque tick) du registre
+        partagé des appareils (open_windows.list_pending_remote_devices/
+        list_approved_remote_devices) — orchestre les trois éléments
+        d'interface concernés par une demande de téléphone (demande du
+        2026-09-09, retour définitif à une fenêtre flottante après
+        abandon de toute intégration dans la grille de Paramètres) :
+
+        1. la fenêtre flottante (voir _refresh_remote_device_popup), qui
+           présente la plus ancienne demande NON masquée par "Plus
+           tard" ;
+        2. le badge 🔔 de l'onglet "Paramètres" (voir _update_settings_
+           tab_badge), reflet FIDÈLE de la liste "pending" complète —
+           jamais affecté par "Plus tard" ;
+        3. la liste "Téléphones" (appareils APPROUVÉS, voir _refresh_
+           remote_devices_panel), reconstruite seulement si son contenu
+           a changé (voir _remote_devices_signature).
+
+        Détecte aussi la TRANSITION vers l'onglet Paramètres (il était
+        affiché autre chose au sondage précédent, il affiche Paramètres
+        maintenant) pour vider _remote_device_snoozed_keys À CE moment
+        précis — jamais en continu tant que l'utilisateur y reste (voir
+        _on_remote_device_popup_later) : revenir sur Paramètres fait
+        ainsi réapparaître une demande "Plus tard"-ée plus tôt, sans
+        attendre une nouvelle tentative du téléphone."""
+        settings_active_now = self._is_settings_tab_active()
+        if settings_active_now and not self._last_settings_tab_active:
+            self._remote_device_snoozed_keys.clear()
+        self._last_settings_tab_active = settings_active_now
+
+        try:
+            pending = open_windows.list_pending_remote_devices()
+            approved = open_windows.list_approved_remote_devices()
+        except Exception:
+            return
+
+        self._update_settings_tab_badge(bool(pending))
+        self._refresh_remote_device_popup(pending=pending)
+
+        signature = self._remote_devices_signature(approved)
+        if signature != getattr(self, "_last_remote_devices_panel_signature", None):
+            self._refresh_remote_devices_panel(approved=approved)
+
     def _poll_voice_queue(self):
         """Relève régulièrement les mots-clés (et éliminations décidées
         depuis la page "Éliminations" du contrôle à distance) déposés par
@@ -5476,29 +6886,81 @@ class App(tk.Tk):
             while True:
                 item = self.voice_command_queue.get_nowait()
                 if isinstance(item, tuple) and item and item[0] == "eliminate":
-                    _, eliminated_id, eliminator_id = item
-                    self._remote_eliminate(eliminated_id, eliminator_id)
+                    _, eliminated_id, eliminator_id, request_id = item
+                    self._remote_eliminate(eliminated_id, eliminator_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
+                    _, request_id, seat = item
+                    self._resolve_pending_rebalance(request_id, seat, from_remote=True)
+                elif isinstance(item, tuple) and item and item[0] == "end_tournament":
+                    self._remote_end_tournament()
+                    # La fenêtre vient d'être détruite (ou l'a déjà été,
+                    # voir _remote_end_tournament_triggered) : n'importe
+                    # quel élément suivant resterait dans la file, JAMAIS
+                    # traité ici — self.db est fermé mais pas remis à
+                    # None, donc les gardes "if not self.db" des autres
+                    # gestionnaires (_on_voice_word, _remote_eliminate...)
+                    # ne les arrêteraient pas et lèveraient
+                    # sqlite3.ProgrammingError. Ne reprogramme pas non
+                    # plus de nouveau passage : inutile, ce process se
+                    # termine de toute façon.
+                    return
                 else:
                     self._on_voice_word(item)
         except queue.Empty:
             pass
         self.after(150, self._poll_voice_queue)
 
-    def _remote_eliminate(self, eliminated_id, eliminator_id):
+    def _remote_eliminate_request(self, eliminated_id, eliminator_id):
+        """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
+        contrôle à distance (voir remote_control.py: on_eliminate, passé
+        tel quel au serveur) — PAS depuis le thread Tk. Génère un
+        request_id, dépose la demande dans voice_command_queue (traitée
+        plus tard par _remote_eliminate, sur le thread Tk, comme toujours
+        pour tout accès à self.db) puis ATTEND (sondage borné, ~150 ms de
+        délai habituel de _poll_voice_queue) le résultat écrit dans
+        self._remote_elimination_results par _remote_eliminate, pour le
+        renvoyer tel quel au téléphone (demande du 2026-09-08 : un refus
+        — ex. bounty PKO orpheline — doit être explicite côté téléphone,
+        jamais silencieux). Renvoie toujours {"ok": bool, "message": str}
+        ; un dépassement du délai (Tk anormalement bloqué) renvoie un
+        message d'échec plutôt que de bloquer indéfiniment le thread HTTP
+        (chaque requête téléphone a son propre thread, voir
+        ThreadingHTTPServer : un dépassement ici n'affecte ni l'UI ni les
+        autres téléphones)."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("eliminate", eliminated_id, eliminator_id, request_id))
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            result = self._remote_elimination_results.pop(request_id, None)
+            if result is not None:
+                return result
+            time.sleep(0.03)
+        return {"ok": False, "message": "Délai dépassé, réessayez."}
+
+    def _remote_eliminate(self, eliminated_id, eliminator_id, request_id=None):
         """Élimination décidée depuis la page "Éliminations" du contrôle
         à distance (glisser un joueur éliminé sur son éliminateur, voir
         remote_control.py) : mêmes garde-fous et suites que
         _eliminate_selected (bounty, rééquilibrage, bandeau de mouvement,
         fin de partie), pour un résultat identique à une élimination faite
-        directement dans l'onglet Joueurs."""
+        directement dans l'onglet Joueurs. Appelé sur le thread Tk (voir
+        _poll_voice_queue), jamais directement depuis le thread HTTP —
+        voir _remote_eliminate_request, qui dépose la demande et attend
+        le résultat écrit ici (self._remote_elimination_results) pour le
+        renvoyer au téléphone."""
+        def refuse(message):
+            if request_id is not None:
+                self._remote_elimination_results[request_id] = {"ok": False, "message": message}
+
         if not self.db:
-            return
+            return refuse("Tournoi non disponible.")
         active = self.db.list_players(status="active")
         active_ids = {p["id"] for p in active}
         if eliminated_id not in active_ids or eliminated_id == eliminator_id:
-            return  # état déjà changé entre-temps (ex : élimination concurrente) ou requête absurde
+            # état déjà changé entre-temps (ex : élimination concurrente) ou requête absurde
+            return refuse("Ce joueur n'est plus disponible (état déjà modifié).")
         if len(active_ids) <= 1:
-            return  # dernier joueur actif : rien à faire, voir _eliminate_selected
+            return refuse("Impossible d'éliminer le dernier joueur actif (le vainqueur).")
         if eliminator_id is not None and eliminator_id not in active_ids:
             eliminator_id = None
         if eliminator_id is not None:
@@ -5510,6 +6972,36 @@ class App(tk.Tk):
             table_by_id = {p["id"]: p["table_id"] for p in active}
             if table_by_id.get(eliminator_id) != table_by_id.get(eliminated_id):
                 eliminator_id = None
+        if eliminator_id is None:
+            # Éliminateur obligatoire UNIQUEMENT si une attribution de
+            # bounty/PKO en dépend réellement (demande du 2026-09-09,
+            # précisée après relecture utilisateur : primes activées ET
+            # ce joueur précis porte une bounty > 0) — jamais "toujours
+            # obligatoire", et INDÉPENDANT du Mode Test (qui ne facilite
+            # que l'élimination GROUPÉE depuis l'onglet Joueurs, un
+            # concept qui n'existe pas ici : le téléphone élimine toujours
+            # UN seul joueur à la fois par glisser-déposer). Primes
+            # désactivées (self.db.primes_enabled() coupe cette
+            # contrainte) : aucune bounty n'étant de toute façon jamais
+            # assignée dans ce cas (voir Database.add_player), rien ne
+            # bloque ici. Dans l'usage normal du téléphone (glisser-
+            # déposer, voir remote_control.py: confirmElimination), ce
+            # cas (bounty en jeu mais sans éliminateur) ne se présente
+            # qu'après une invalidation tardive (joueur/table qui ont
+            # changé entre-temps, voir plus haut) : on refuse et on
+            # invite à réessayer, plutôt que de procéder sans éliminateur
+            # et de rendre la bounty orpheline.
+            eliminated = self.db.get_player(eliminated_id)
+            if self.db.primes_enabled() and eliminated and eliminated["bounty"] > 0:
+                pko_mode = self.db.get_setting_int("pko_mode", 0) == 1
+                message = (
+                    "Élimination impossible : en mode PKO, vous devez "
+                    "désigner le joueur qui a éliminé ce joueur."
+                ) if pko_mode else (
+                    "Élimination impossible : ce joueur porte une prime, "
+                    "vous devez désigner qui l'a éliminé pour l'attribuer."
+                )
+                return refuse(message)
         moves = self.db.eliminate_player(eliminated_id, eliminated_by_id=eliminator_id)
         self._queue_elimination_banner(eliminated_id, eliminator_id)
         # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
@@ -5529,6 +7021,8 @@ class App(tk.Tk):
             self._trigger_movement_alert(from_remote=True)
         self._refresh_all()
         self._refresh_remote_players_cache()
+        if request_id is not None:
+            self._remote_elimination_results[request_id] = {"ok": True, "message": ""}
         # Contrairement à une élimination faite directement dans l'onglet
         # Joueurs (_eliminate_selected) : pas de self.lift()/focus_force()
         # sur la fenêtre PRINCIPALE ici. Une élimination décidée depuis le
@@ -5547,6 +7041,7 @@ class App(tk.Tk):
         # qu'aucun code à nous ne le demande explicitement).
         if self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
+        self._check_pending_rebalance()
 
     def _remote_get_roster_players(self):
         """TOUT le répertoire de joueurs habituels (roster.py), pas
@@ -5633,6 +7128,34 @@ class App(tk.Tk):
         self._remote_photo_uploaded = True
         return True, name
 
+    def _remote_end_tournament(self):
+        """Bouton "Fin de la partie" (tout en bas de la page principale du
+        contrôle à distance, voir remote_control.py) : ferme proprement
+        CE tournoi-ci — ce processus n'en gère jamais qu'un seul à la
+        fois — en réutilisant EXACTEMENT le même chemin que fermer la
+        fenêtre ou "Fichier > Quitter" (_on_close : arrête le contrôle à
+        distance, désinscrit ce tournoi du registre open_windows.py,
+        ferme la base, puis détruit la fenêtre — jamais de
+        os._exit()/kill() ni d'autre raccourci brutal). Ne peut jamais
+        fermer un AUTRE tournoi : remote_control.py a déjà vérifié, avant
+        même de déposer cette demande dans la file d'attente, que le pid
+        envoyé par le téléphone correspond à CE processus précis (voir
+        RemoteControlServer.start, route /end_tournament) — ce module-ci
+        n'a donc besoin d'aucune vérification supplémentaire d'identité.
+
+        Idempotent (voir _remote_end_tournament_triggered, initialisé à
+        False dans __init__) : si cette fermeture a déjà été déclenchée
+        — deux téléphones ayant confirmé presque simultanément, ou une
+        confirmation en double du même téléphone, tous deux déjà déposés
+        dans la file avant que le premier ne soit traité — les appels
+        suivants sont ignorés sans effet, pour ne jamais appeler
+        _on_close()/self.destroy() une seconde fois sur une fenêtre déjà
+        détruite (ce qui lèverait une exception Tcl)."""
+        if self._remote_end_tournament_triggered:
+            return
+        self._remote_end_tournament_triggered = True
+        self._on_close()
+
     def _on_voice_word(self, word):
         """Dispatché pour chaque mot-clé reçu ("elimination"/"terminer"/
         "chronometre", depuis un raccourci clavier ou le contrôle à
@@ -5669,8 +7192,23 @@ class App(tk.Tk):
                 # qu'un mouvement de table est en attente (le responsable
                 # doit d'abord fermer l'alerte avec "Terminé") — sinon le
                 # chrono repartirait alors que des joueurs n'ont pas encore
-                # changé de table.
-                if not alert_active:
+                # changé de table. Même précaution tant qu'une question
+                # "quel siège est grosse blinde ?" est encore SANS RÉPONSE
+                # (voir database.py: pending_rebalance — source de vérité
+                # unique, pas de second booléen redondant) : entre le
+                # moment où l'élimination a révélé un besoin de
+                # rééquilibrage et celui où quelqu'un y répond, le
+                # mouvement lui-même n'a pas encore eu lieu — un mouvement
+                # qui, une fois décidé, redeviendra visible via
+                # movement_alert_active (voir _trigger_movement_alert,
+                # appelé par _resolve_pending_rebalance) et bloquera alors
+                # la reprise par le chemin habituel ci-dessous. Si la
+                # question disparaît sans qu'aucun mouvement n'ait eu lieu
+                # (écart de rééquilibrage résorbé entretemps), plus rien ne
+                # bloque : pending_rebalance redevient None et ce même
+                # raccourci relance normalement, exactement comme avant
+                # l'apparition de cette question.
+                if not alert_active and self.db.pending_rebalance is None:
                     self._voice_resume_clock()
             else:
                 # Hors du contexte "reprendre après une élimination" :
@@ -6048,6 +7586,7 @@ class App(tk.Tk):
         if moves:
             self._trigger_movement_alert()
         self._refresh_all()
+        self._check_pending_rebalance()
 
     def _refresh_tables_tab(self):
         for w in self.tables_inner.winfo_children():
@@ -6285,13 +7824,18 @@ class App(tk.Tk):
         self.primes_tree.tag_configure(
             "totalcol", font=("Helvetica", 9, "bold"), background=GOLD, foreground=TEXT_DARK,
         )
-        TreeHeadingTooltip(self.primes_tree, {
+        # bo_valeur (en-tête ET tooltip) est mutable selon le mode
+        # classique/PKO — voir _refresh_bounty_tab, qui met à jour ces 2
+        # textes dynamiquement à chaque rafraîchissement (self.primes_tree
+        # .heading + self.primes_heading_tooltip.column_texts["bo_valeur"]).
+        # Les valeurs ci-dessous sont celles du mode CLASSIQUE (par défaut).
+        self.primes_heading_tooltip = TreeHeadingTooltip(self.primes_tree, {
             "name": "Nom du joueur.",
             "presence": "Prime de présence : points pour avoir participé à ce\ntournoi (réglage Paramètres, 0 = désactivée).",
             "assiduite": "Prime d'assiduité : points si le joueur était déjà présent\naux N derniers tournois consécutifs (réglages Paramètres).",
             "rang": "Place finale du joueur (1 = vainqueur, un chiffre plus élevé\n= éliminé plus tôt). Vide tant que le joueur est encore en jeu.",
             "cl_montant": "Prime de classement : réglage manuel (Paramètres) s'il est\nnon nul, sinon 100×√N / P (N = nb de joueurs, P = Rang).",
-            "bo_nombre": "Nombre : nombre de joueurs qu'il a éliminés (kills).",
+            "bo_nombre": "Nombre : nombre de joueurs qu'il a éliminés (kills) — jamais\nmodifié par la récupération de sa propre bounty finale (PKO).",
             "bo_valeur": "Valeur : points par bounty — réglage manuel s'il est\nnon nul, sinon 10×√N (N = nombre de joueurs du tournoi).",
             "bo_montant": "Montant = Nombre × Valeur.",
             "total": "Somme de toutes les primes du joueur pour ce tournoi\n(Présence + Assiduité + Classement + Montant Bounty).",
@@ -6344,6 +7888,19 @@ class App(tk.Tk):
                   f"{bounty_val:,} pts".replace(",", " "))
         )
 
+        # bo_valeur : "Val Bounty" (classique, valeur fixe) devient
+        # "Moy Bounty" en PKO (Mon Bounty ÷ Nb Bounty, arrondi — voir
+        # Database.get_bounty_bonuses/primes_columns, même bascule que
+        # dans les exports) — en-tête ET tooltip mis à jour ensemble.
+        self.primes_tree.heading("bo_valeur", text="Moy Bounty" if pko_mode else "Val Bounty")
+        self.primes_heading_tooltip.column_texts["bo_valeur"] = (
+            "Moyenne : Mon Bounty ÷ Nb Bounty, arrondie (mode PKO) —\n"
+            "'-' si Nb Bounty = 0 (rien à diviser)."
+            if pko_mode else
+            "Valeur : points par bounty — réglage manuel s'il est\n"
+            "non nul, sinon 10×√N (N = nombre de joueurs du tournoi)."
+        )
+
         self._update_primes_sort_headings()
         for row in self.primes_tree.get_children():
             self.primes_tree.delete(row)
@@ -6358,15 +7915,27 @@ class App(tk.Tk):
         # "TOTAL" ont un total demandé ; les autres colonnes restent vides
         # sur cette ligne (Nb/Val Bounty n'ont pas de somme pertinente,
         # Rang encore moins).
-        self.primes_tree.insert(
-            "", "end",
-            values=(
-                "TOTAL", "", "", "", "", "", "",
-                f"{sum(r['bo_montant'] for r in primes_rows):,} pts".replace(",", " "),
-                f"{sum(r['total'] for r in primes_rows):,} pts".replace(",", " "),
-            ),
-            tags=("totalcol",),
-        )
+        #
+        # Primes désactivées (demande du 2026-09-09, précisée le même
+        # jour) : le tableau doit être RÉELLEMENT vide, pas seulement
+        # dépourvu de lignes joueurs — cette ligne TOTAL (même à 0 pts)
+        # ne doit donc plus apparaître du tout dans ce cas. primes_rows
+        # est déjà [] ici (voir Database.get_primes_summary), mais on ne
+        # s'appuie pas sur "primes_rows vide" pour décider (un tournoi
+        # sans aucun joueur inscrit, primes activées, aurait aussi
+        # primes_rows == [] et doit, lui, continuer à afficher la ligne
+        # TOTAL à 0 pts comme avant) : c'est bien l'état de la case à
+        # cocher qui décide, jamais une conséquence indirecte.
+        if self.db.primes_enabled():
+            self.primes_tree.insert(
+                "", "end",
+                values=(
+                    "TOTAL", "", "", "", "", "", "",
+                    f"{sum(r['bo_montant'] for r in primes_rows):,} pts".replace(",", " "),
+                    f"{sum(r['total'] for r in primes_rows):,} pts".replace(",", " "),
+                ),
+                tags=("totalcol",),
+            )
 
         for idx, r in enumerate(primes_rows):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
@@ -6392,10 +7961,21 @@ class App(tk.Tk):
             self.bounty_history_tree.delete(row)
         for idx, e in enumerate(self.db.get_bounty_events()):
             tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            # event_type='victory_collect' (voir Database.
+            # _close_out_winner_bounty) : la récupération de sa propre
+            # bounty finale par le vainqueur, PAS une élimination
+            # supplémentaire — marquée distinctement (🏆) pour ne jamais
+            # être confondue avec une vraie élimination dans cet
+            # historique. eliminator_name reste NULL pour ces lignes,
+            # donc déjà affiché "—" ci-dessous, sans traitement à part.
+            eliminated_display = (
+                f"🏆 {e['eliminated_name']} (bounty finale)"
+                if e["event_type"] == "victory_collect" else e["eliminated_name"]
+            )
             self.bounty_history_tree.insert(
                 "", "end",
                 values=(
-                    format_datetime_fr(e["event_time"]), e["eliminated_name"], e["eliminator_name"] or "—",
+                    format_datetime_fr(e["event_time"]), eliminated_display, e["eliminator_name"] or "—",
                     f"{e['amount_won']:,} pts".replace(",", " "),
                     f"{e['added_to_eliminator_bounty']:,} pts".replace(",", " ")
                     if e["added_to_eliminator_bounty"] else "—",
@@ -6599,6 +8179,7 @@ class App(tk.Tk):
         self._clock_sound_buttons = {}
         for key, label in (
             ("sound_break_start_path", "Son début Pause"),
+            ("sound_next_blinds_path", "Son prochain changement Blindes"),
             ("sound_break_end_path", "Son Fin Pause"),
             ("sound_round_end_path", "Son fin Round"),
             ("sound_elimination_path", "Son sortie d'un joueur"),
@@ -6619,6 +8200,17 @@ class App(tk.Tk):
                     "joué à défaut, pour que ça fonctionne sans réglage.\n"
                     "Clic gauche : choisir/remplacer le fichier.\n"
                     "Clic droit : retirer le fichier (revient au bip par défaut).",
+                )
+            elif key == "sound_next_blinds_path":
+                Tooltip(
+                    btn,
+                    "Fichier .wav joué une seule fois, au délai configuré\n"
+                    "ci-contre AVANT qu'un changement RÉEL de blindes (SB/BB\n"
+                    "différentes) ne survienne. Jamais joué pendant une\n"
+                    "pause, ni si le round suivant est une pause, ni si ses\n"
+                    "blindes sont identiques à celles du round en cours.\n"
+                    "Clic gauche : choisir/remplacer le fichier.\n"
+                    "Clic droit : retirer le son configuré.",
                 )
             else:
                 Tooltip(
@@ -6643,6 +8235,28 @@ class App(tk.Tk):
             dur_var.trace_add(
                 "write", lambda *a, k=key, v=dur_var: self._save_clock_sound_duration(k, v)
             )
+
+            if key == "sound_next_blinds_path":
+                # Propre à ce son (voir _maybe_play_next_blinds_sound) :
+                # combien de secondes avant le changement de blindes il
+                # doit se déclencher — 60 par défaut, réglable ici, sans
+                # équivalent sur les 3 autres sons (tous déclenchés à un
+                # instant fixe, jamais "avant" quoi que ce soit).
+                ttk.Label(row, text="  Délai avant fin (s) :").pack(side="left")
+                lead_var = tk.StringVar(
+                    value=export_prefs.load_value(f"{key}_lead_seconds", "60")
+                )
+                lead_entry = ttk.Entry(row, textvariable=lead_var, width=5)
+                lead_entry.pack(side="left", padx=(4, 4))
+                Tooltip(
+                    lead_entry,
+                    "Nombre de secondes avant le changement de blindes\n"
+                    "auquel jouer ce son (60 par défaut). Entier positif.",
+                )
+                lead_var.trace_add(
+                    "write", lambda *a, k=key, v=lead_var: self._save_clock_sound_lead_seconds(k, v)
+                )
+
             ttk.Button(
                 row, text="Test", width=5, command=lambda k=key: self._test_clock_sound(k),
             ).pack(side="left")
@@ -6651,6 +8265,15 @@ class App(tk.Tk):
 
     def _clock_resume(self):
         if self.db.get_setting_int("clock_started", 0) == 0:
+            # Resynchronisation défensive de dernière minute (demande du
+            # 2026-09-09, voir le grand bloc de commentaires près de
+            # _sync_primes_enabled_pref) : ce tournoi est sur le point de
+            # devenir celui qui verrouille "Calculer les primes" pour
+            # TOUTE la session — on s'assure qu'il porte bien la toute
+            # dernière valeur globale proposée avant que ça n'arrive,
+            # pour fermer toute fenêtre de course résiduelle avec le tick
+            # normal (jusqu'à ~1s de délai autrement).
+            _sync_primes_enabled_pref(self.db)
             self.db.set_settings({
                 "clock_started": 1,
                 "level_start_epoch": int(time.time()),
@@ -6661,6 +8284,22 @@ class App(tk.Tk):
                 # projecteur (voir Database.get_stats).
                 "tournament_start_epoch": int(time.time()),
             })
+            # Verrouille "Calculer les primes" pour TOUTE la session,
+            # À LA VALEUR de CE tournoi précis (demande du 2026-09-09,
+            # voir open_windows.mark_primes_session_started/
+            # primes_session_started/locked_primes_enabled et
+            # _primes_session_locked) : posé ici, au moment exact où CE
+            # tournoi démarre — que ce soit le tout premier de la session
+            # ou un suivant (sans effet si la session est déjà
+            # verrouillée : la valeur du tout premier reste seule
+            # autoritative). Reste vrai (et la valeur mémorisée) même
+            # après la fermeture de CE tournoi, tant qu'il reste au moins
+            # un autre tournoi de la session ouvert (voir la docstring de
+            # primes_session_started) — et sert désormais aussi à aligner
+            # tout tournoi (nouveau OU existant) qui rejoindrait la
+            # session après ce verrouillage, voir _align_primes_enabled_
+            # on_open.
+            open_windows.mark_primes_session_started(self.db.get_setting_int("primes_enabled", 1) == 1)
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
             self.db.set_settings({"is_paused": 0, "level_start_epoch": int(time.time()) - self._elapsed_before_pause()})
@@ -6812,6 +8451,10 @@ class App(tk.Tk):
             start = self.db.get_setting_int("level_start_epoch", int(time.time()))
             elapsed = int(time.time()) - start
         remaining = duration - elapsed
+        if (remaining > 0 and not level["is_break"]
+                and self.db.get_setting_int("clock_started", 0) == 1
+                and self.db.get_setting_int("is_paused", 1) == 0):
+            self._maybe_play_next_blinds_sound(level, remaining)
         if remaining <= 0 and self.db.get_setting_int("clock_started", 0) == 1 and self.db.get_setting_int("is_paused", 1) == 0:
             # niveau terminé -> passe automatiquement au suivant
             next_row = self.db.get_next_level()
@@ -6827,6 +8470,53 @@ class App(tk.Tk):
                 remaining = 0
         next_level = self.db.get_next_level()
         return remaining, level, next_level
+
+    def _maybe_play_next_blinds_sound(self, level, remaining):
+        """« Son prochain changement Blindes » (voir _open_clock_sounds_
+        dialog) : joué une seule fois par round, au délai configuré (voir
+        _next_blinds_sound_lead_seconds, 60s par défaut) avant la fin de
+        CE round — mais UNIQUEMENT si un changement RÉEL de blindes est
+        imminent, à la demande explicite de l'utilisateur (à la
+        différence de "Son fin Round", qui se joue quel que soit ce qui
+        suit) :
+        - jamais pendant une pause (l'appelant, _remaining_seconds, exclut
+          déjà level["is_break"] avant même d'appeler ceci) ;
+        - jamais si le round suivant est lui-même une pause (les blindes
+          ne changent pas tout de suite) ;
+        - jamais si les blindes (SB/BB) du round suivant sont identiques
+          à celles du round courant (palier répété dans la structure).
+        self._next_blinds_sound_played_for_order (comparé à
+        level["level_order"]) évite de rejouer à chaque tick tant que
+        `remaining` reste sous le délai — redevient naturellement
+        pertinent dès que le niveau change (nouvel ordre)."""
+        next_level = self.db.get_next_level()
+        if next_level is None or next_level["is_break"]:
+            return
+        if (next_level["small_blind"], next_level["big_blind"]) == (
+                level["small_blind"], level["big_blind"]):
+            return
+        lead = self._next_blinds_sound_lead_seconds()
+        if lead <= 0 or remaining > lead:
+            return
+        if self._next_blinds_sound_played_for_order == level["level_order"]:
+            return
+        self._next_blinds_sound_played_for_order = level["level_order"]
+        self._play_clock_sound("sound_next_blinds_path")
+
+    def _next_blinds_sound_lead_seconds(self):
+        """Délai (s) réglé pour "Son prochain changement Blindes" (champ
+        "Délai avant fin (s)" de _open_clock_sounds_dialog) — 60 par
+        défaut, y compris si le champ est vide/invalide ou à 0 (jamais
+        désactivé silencieusement par une saisie incorrecte)."""
+        raw = export_prefs.load_value("sound_next_blinds_path_lead_seconds", "60")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 60
+        return value if value > 0 else 60
+
+    def _save_clock_sound_lead_seconds(self, setting_key, var):
+        export_prefs.save_value(f"{setting_key}_lead_seconds", var.get())
 
     def _play_level_transition_sounds(self, old_level, new_level):
         """Joue les sons configurés (boutons "Son début Pause"/"Son Fin
@@ -7038,19 +8728,13 @@ class App(tk.Tk):
                 self.blinds_tree.item(str(current_order), tags=("current",))
             self._blinds_tab_current_order = current_order
 
-        # Bandeau d'élimination : état recalculé ici à chaque appel (comme
-        # movement_alert juste en dessous), plutôt que via un self.after()
-        # séparé — voir _advance_elimination_banner, seul point qui fait
-        # avancer la file. "until" est une échéance epoch absolue (pas un
-        # décompte), donc robuste même si _refresh_clock_tab n'a pas
-        # tourné pendant un moment (écran projecteur resté fermé) : le
-        # bandeau en retard est simplement avancé/expiré au tick suivant,
-        # jamais perdu ni dupliqué.
-        if (self._elimination_banner_current is not None
-                and time.time() >= self._elimination_banner_current["until"]):
-            self._advance_elimination_banner()
-        elif self._elimination_banner_current is None and self._elimination_banner_queue:
-            self._advance_elimination_banner()
+        # Bandeau d'élimination : l'échéance ("until", epoch absolue) est
+        # désormais vérifiée/avancée dans _tick() (voir plus bas),
+        # INCONDITIONNELLEMENT à chaque seconde — pas ici, puisque cette
+        # méthode-ci ne tourne que si l'onglet Chronomètre est affiché ou
+        # l'écran projecteur est ouvert (voir _tick). self._elimination_
+        # banner_current est donc déjà à jour au moment où on l'affiche
+        # ci-dessous, une seule source de vérité pour l'avancer.
 
         movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
         if movement_alert and self.db.count_seat_moves() == 0:
@@ -7245,6 +8929,15 @@ class App(tk.Tk):
         canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
         canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
 
+        # Bascule de l'en-tête "Hr de Début" (voir _toggle_blinds_start_
+        # time / _refresh_blinds_tab) : None = colonne affichée depuis
+        # 00:00 (comportement d'origine, purement relatif au début du
+        # tournoi) ; sinon, minutes depuis minuit capturées lors du
+        # dernier clic sur "Hr de Début" en mode "heure réelle" — sert de
+        # base à toute la colonne jusqu'au prochain clic. Volontairement
+        # non persisté (comme blinds_field_width_var l'est, lui) : simple
+        # aperçu de planification, remis à 00:00 à chaque redémarrage.
+        self._blinds_start_now_minutes = None
         self._blind_row_vars = []
         self._refresh_blinds_tab()
 
@@ -7674,6 +9367,20 @@ class App(tk.Tk):
         export_prefs.save_value("blinds_field_width", width)
         self._refresh_blinds_tab()
 
+    def _toggle_blinds_start_time(self):
+        """Clic sur l'en-tête "Hr de Début" (voir _refresh_blinds_tab) :
+        bascule toute la colonne entre l'heure réelle de l'ordinateur (au
+        moment de CE clic, figée jusqu'au prochain clic — pas une horloge
+        qui continue d'avancer) et 00:00. Purement un aperçu de
+        planification : ne touche à rien en base de données, ne modifie
+        aucune donnée du tournoi ni du chronomètre déjà en cours."""
+        if self._blinds_start_now_minutes is None:
+            now = datetime.now()
+            self._blinds_start_now_minutes = now.hour * 60 + now.minute
+        else:
+            self._blinds_start_now_minutes = None
+        self._refresh_blinds_tab()
+
     def _refresh_blinds_tab(self):
         for w in self.blinds_rows_frame.winfo_children():
             w.destroy()
@@ -7682,17 +9389,37 @@ class App(tk.Tk):
         headers = ["Round", "Hr de Début", "Durée (min)", "Petite Blind", "Grosse Blind",
                    "Ante", "Durée Pause (min)", ""]
         for col, h in enumerate(headers):
-            ttk.Label(self.blinds_rows_frame, text=h, font=("Helvetica", 9, "bold"),
-                      foreground=GOLD_DARK).grid(row=0, column=col, padx=6, pady=(0, 6), sticky="w")
+            header_lbl = ttk.Label(self.blinds_rows_frame, text=h, font=("Helvetica", 9, "bold"),
+                                    foreground=GOLD_DARK)
+            header_lbl.grid(row=0, column=col, padx=6, pady=(0, 6), sticky="w")
+            if col == 1:
+                # "Hr de Début" bascule heure réelle <-> 00:00 au clic
+                # (voir _toggle_blinds_start_time) — seul en-tête cliquable
+                # de ce tableau, d'où le curseur main + l'astuce ci-dessous
+                # pour le rendre repérable (rien d'autre ne change dans
+                # cette colonne quand on ne clique pas).
+                header_lbl.configure(cursor="hand2")
+                header_lbl.bind("<Button-1>", lambda e: self._toggle_blinds_start_time())
+                Tooltip(
+                    header_lbl,
+                    "Cliquer pour basculer entre l'heure réelle de\n"
+                    "l'ordinateur (au moment du clic) et 00:00 comme\n"
+                    "point de départ de toute la colonne.",
+                )
 
         rounds = self._blind_rounds_from_db()
         if not rounds:
             rounds = [{"duration": 15, "sb": 25, "bb": 50, "ante": 0, "pause": 0}]
 
-        # Heure de début (temps écoulé depuis le début du tournoi) de chaque
-        # round : 0:00 pour le premier, puis chaque round suivant démarre
-        # à la fin du round précédent + sa pause éventuelle (Durée Pause),
-        # pour refléter le temps réellement écoulé à la table.
+        # Heure de début de chaque round : soit le temps écoulé depuis le
+        # début du tournoi (base 00:00, comportement d'origine), soit
+        # l'heure réelle au moment du dernier clic sur "Hr de Début" +
+        # ce même temps écoulé (voir _blinds_start_now_minutes /
+        # _toggle_blinds_start_time) — dans les deux cas, chaque round
+        # suivant démarre à la fin du round précédent + sa pause
+        # éventuelle (Durée Pause). Modulo 24h : un tournoi qui dépasse
+        # minuit affiche "01:15" plutôt que "25:15".
+        base_minutes = self._blinds_start_now_minutes or 0
         elapsed_minutes = 0
         for i, rnd in enumerate(rounds, start=1):
             row_vars = {
@@ -7704,9 +9431,9 @@ class App(tk.Tk):
             }
             self._blind_row_vars.append(row_vars)
 
-            start_h, start_m = divmod(elapsed_minutes, 60)
+            start_h, start_m = divmod((base_minutes + elapsed_minutes) % (24 * 60), 60)
             ttk.Label(self.blinds_rows_frame, text=str(i)).grid(row=i, column=0, padx=6, pady=2)
-            ttk.Label(self.blinds_rows_frame, text=f"{start_h}:{start_m:02d}").grid(
+            ttk.Label(self.blinds_rows_frame, text=f"{start_h:02d}:{start_m:02d}").grid(
                 row=i, column=1, padx=6, pady=2
             )
             field_width = self.blinds_field_width_var.get()
@@ -8320,6 +10047,40 @@ class App(tk.Tk):
             command=lambda: self._choose_day_folder(day_folder_var),
         ).grid(row=folder_row + 1, column=1, sticky="ew", pady=4, padx=(5, 0))
 
+        # -- Mode Test (demande du 2026-09-09) : outil de test/développement,
+        # PAS un paramètre de tournoi ni une préférence permanente — jamais
+        # lu ni écrit via export_prefs/settings_vars, une simple BooleanVar
+        # en mémoire (voir __init__), décochée à CHAQUE lancement, propre à
+        # CE process (pas partagée entre tournois, contrairement à
+        # "Calculer les primes" ci-dessus : "à chaque lancement du
+        # logiciel", pas "à chaque session"). Assouplit UNIQUEMENT les
+        # facilités d'élimination lors des essais (voir _eliminate_selected/
+        # _remote_eliminate/_test_mode_enabled) — ne change RIEN d'autre au
+        # fonctionnement normal du logiciel. Indicateur "MODE TEST" affiché
+        # dans le titre de la fenêtre tant qu'actif (voir
+        # _update_window_title) pour ne jamais l'oublier activé par erreur.
+        #
+        # (La demande de téléphone en attente n'a plus de panneau intégré
+        # ici : voir RemoteDeviceRequestWindow, une petite fenêtre
+        # flottante totalement indépendante de cette grille — plusieurs
+        # tentatives d'intégration ont toutes été abandonnées, la
+        # dernière ayant élargi cette colonne au point de repousser la
+        # colonne droite hors écran.)
+        test_mode_row = folder_row + 2
+        test_mode_check = ttk.Checkbutton(
+            left, text="Mode Test", variable=self.test_mode_var,
+            command=self._on_test_mode_toggle,
+        )
+        test_mode_check.grid(row=test_mode_row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        Tooltip(
+            test_mode_check,
+            "Outil de test/développement — décoché à chaque lancement,\n"
+            "jamais mémorisé. Assouplit uniquement l'élimination (permet\n"
+            "l'élimination groupée sans désigner d'éliminateur) pour\n"
+            "faciliter les essais ; ne change rien d'autre. « MODE TEST »\n"
+            "s'affiche alors dans le titre de la fenêtre.",
+        )
+
         # Préférence partagée (comme Nom du Club ci-dessus), pas propre à ce
         # tournoi : désactive dans toute l'appli les vérifications "joueur
         # déjà actif dans un autre tournoi du même dossier" (fenêtre
@@ -8339,7 +10100,7 @@ class App(tk.Tk):
             ),
         )
         multi_table_check.grid(
-            row=folder_row + 2, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            row=test_mode_row + 1, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
         Tooltip(
             multi_table_check,
@@ -8355,7 +10116,7 @@ class App(tk.Tk):
         # façon le nom du jour en cours, quel qu'il soit (voir
         # tournament_day_folder_proposal / WEEKDAY_NAMES_FR). Mémorisé
         # globalement (tournament_prefs), comme "Dossier par défaut".
-        days_row = folder_row + 3
+        days_row = test_mode_row + 2
         days_lbl = ttk.Label(
             left, text="Jours de tournoi / Sit & Go",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
@@ -8392,27 +10153,31 @@ class App(tk.Tk):
         # CE tournoi (self.db) mais repris par défaut pour le prochain
         # (tournament_prefs). Un ancien fichier .tournoi sans ce réglage
         # retombe proprement sur 5 (voir get_setting_int ci-dessous et
-        # dans _advance_elimination_banner). Séparée de "Durée (ms)" du
-        # son "Son sortie d'un joueur" (fenêtre "Sons de fin de
-        # Round/Pause...") : deux réglages indépendants, l'un pour la
-        # durée d'AFFICHAGE du bandeau, l'autre pour la durée du SON.
+        # dans _advance_elimination_banner). INDÉPENDANTE de la "Durée
+        # (ms)" du son "Son sortie d'un joueur" (fenêtre "Sons de fin de
+        # Round/Pause...") : deux réglages séparés, l'un pour la durée
+        # d'AFFICHAGE du bandeau, l'autre pour la durée du SON — y compris
+        # si aucun son n'est configuré du tout.
         elim_row = days_row + 2
-        elim_lbl = ttk.Label(left, text="Durée du message d'élimination (secondes) :")
+        elim_lbl = ttk.Label(left, text="Durée du bandeau d'élimination (secondes) :")
         elim_lbl.grid(row=elim_row, column=0, sticky="w", pady=(14, 4))
         Tooltip(
             elim_lbl,
             "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
             "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
-            "élimination — de 1 à 30 secondes, 5 par défaut. Sans lien\n"
-            "avec la « Durée (ms) » du son (fenêtre « Sons de fin de\n"
-            "Round/Pause... ») : deux réglages indépendants. Pris en\n"
-            "compte dès la prochaine élimination, sans redémarrer.",
+            "élimination — de 0 à 30 secondes, 5 par défaut. Indépendante\n"
+            "de la « Durée (ms) » du son « Son sortie d'un joueur »\n"
+            "(fenêtre « Sons de fin de Round/Pause... ») : deux réglages\n"
+            "séparés, même si aucun son n'est configuré. Pris en compte\n"
+            "dès la prochaine élimination, sans redémarrer.\n"
+            "Mettre 0 seconde pour désactiver l'affichage du bandeau\n"
+            "d'élimination (le son, réglage séparé, continue de jouer).",
         )
         elim_seconds_var = tk.IntVar(
-            value=max(1, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
+            value=max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
         )
         elim_spin = ttk.Spinbox(
-            left, from_=1, to=30, width=5, textvariable=elim_seconds_var,
+            left, from_=0, to=30, width=5, textvariable=elim_seconds_var,
             command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),
         )
         elim_spin.grid(row=elim_row, column=1, sticky="w", padx=10, pady=(14, 4))
@@ -8421,6 +10186,17 @@ class App(tk.Tk):
         )
         elim_spin.bind(
             "<FocusOut>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+        # Tooltip propre à la Spinbox elle-même (demande du 2026-09-08) :
+        # jusqu'ici seul le libellé à sa gauche (elim_lbl ci-dessus) avait
+        # un tooltip — un survol direct de la Spinbox (zone de saisie ou
+        # flèches haut/bas, un seul widget ttk.Spinbox donc une seule
+        # zone de survol pour Tkinter) n'affichait rien. Texte volontai-
+        # rement plus court que celui du libellé, qui reste inchangé.
+        Tooltip(
+            elim_spin,
+            "Durée d'affichage du bandeau d'élimination, en secondes. "
+            "Si 0, le bandeau n'est pas affiché.",
         )
 
         # -- Colonne droite : structure de blindes + primes --
@@ -8476,17 +10252,83 @@ class App(tk.Tk):
         ttk.Separator(right, orient="horizontal").grid(
             row=bounty_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
         )
+        # Titre "Primes" + case "Calculer les primes" côte à côte, avec un
+        # simple petit espacement (demande du 2026-09-09) : regroupés
+        # dans une SOUS-FRAME dédiée (pack, pas grid) plutôt que placés
+        # chacun dans une colonne différente de la grille de `right` —
+        # sinon la case se serait retrouvée à l'aplomb de la colonne 1
+        # PARTAGÉE avec les champs larges (Entry(width=25)) de tout le
+        # reste de l'onglet, créant un grand espace vide entre le titre
+        # et la case au lieu d'un petit. Cette sous-frame est ensuite
+        # placée en `columnspan=2` (une seule "cellule" du point de vue
+        # de la grille) : elle ne force donc JAMAIS la colonne 1 à
+        # s'élargir pour elle, et ne décale rien du reste de la section
+        # (montants, PKO...) toujours alignée sur les colonnes 0/1
+        # habituelles juste en dessous.
+        primes_header = ttk.Frame(right)
+        primes_header.grid(
+            row=bounty_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
         primes_title = ttk.Label(
-            right, text="Primes",
+            primes_header, text="Primes",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
         )
-        primes_title.grid(row=bounty_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        primes_title.pack(side="left")
         Tooltip(
             primes_title,
             "4 primes en points, cumulées par joueur dans l'onglet Primes :\n"
             "Présence, Assiduité, Classement et Bounty. Leur somme donne\n"
             "le TOTAL de chaque joueur pour ce tournoi.",
         )
+
+        # -- Interrupteur général "Calculer les primes" (demande du
+        # 2026-09-09, voir le grand bloc de commentaires près de
+        # _sync_primes_enabled_pref, module-level, plus haut dans ce
+        # fichier). Cochée par défaut (comportement historique inchangé,
+        # compatibilité des anciens tournois — voir Database.
+        # DEFAULT_SETTINGS["primes_enabled"]). Décochée : plus AUCUN
+        # calcul de prime/bounty/PKO nulle part (voir Database.
+        # _primes_enabled et tous ses appelants), le tableau Primes reste
+        # simplement vide (jamais de message à la place), et le reste de
+        # la section Primes ci-dessous est grisé (valeurs déjà saisies
+        # conservées intactes pour une réactivation future — voir
+        # _update_primes_section_state). Réglage GLOBAL À LA SESSION (pas
+        # propre à ce tournoi, voir _primes_enabled_proposed) : modifiable
+        # depuis N'IMPORTE LEQUEL des tournois de la session tant
+        # qu'AUCUN d'entre eux n'a démarré son chronomètre, puis
+        # définitivement grisée/verrouillée pour tous dès que le premier
+        # démarre (voir _sync_primes_enabled_checkbox, _primes_session_
+        # locked), jusqu'à ce que tous soient refermés.
+        self.primes_enabled_var = tk.BooleanVar(
+            value=self.db.get_setting_int("primes_enabled", 1) == 1
+        )
+        self.primes_enabled_check = ttk.Checkbutton(
+            primes_header, text="Calculer les primes",
+            variable=self.primes_enabled_var, command=self._on_primes_enabled_toggle,
+        )
+        # padx=(8, 0) : le "seulement un petit espace" demandé, entre le
+        # titre et la case — jamais un grand espace lié à une colonne de
+        # grille partagée (voir le commentaire de primes_header ci-dessus).
+        self.primes_enabled_check.pack(side="left", padx=(8, 0))
+        Tooltip(
+            self.primes_enabled_check,
+            "Cochée (par défaut) : comportement inchangé. Décochée :\n"
+            "désactive complètement le calcul des primes/bounty/PKO pour\n"
+            "TOUS les tournois de la session en cours (déjà ouverts ou\n"
+            "créés plus tard) — le tableau Primes reste vide, rien n'est\n"
+            "calculé ni stampé nulle part ; les montants ci-dessous sont\n"
+            "conservés pour une réactivation ultérieure. Modifiable\n"
+            "uniquement tant qu'aucun tournoi de la session n'a démarré\n"
+            "son chronomètre ; verrouillée ensuite jusqu'à ce que tous\n"
+            "soient refermés.",
+        )
+        if _primes_session_locked():
+            self.primes_enabled_check.configure(state="disabled")
+
+        # Widgets de réglage des montants/PKO ci-dessous : grisés/
+        # réactivés ensemble selon self.primes_enabled_var (voir
+        # _update_primes_section_state), jamais leurs VALEURS effacées.
+        self._primes_section_widgets = []
 
         presence_lbl = ttk.Label(right, text="Montant de la prime de présence (en points) :")
         presence_lbl.grid(row=bounty_start_row + 2, column=0, sticky="w", pady=4)
@@ -8496,10 +10338,10 @@ class App(tk.Tk):
             "soit son résultat. 0 = prime désactivée.",
         )
         attendance_var = tk.StringVar(value=self.db.get_setting("attendance_bonus_points", "0"))
-        ttk.Entry(right, textvariable=attendance_var, width=25).grid(
-            row=bounty_start_row + 2, column=1, pady=4, padx=10
-        )
+        attendance_entry = ttk.Entry(right, textvariable=attendance_var, width=25)
+        attendance_entry.grid(row=bounty_start_row + 2, column=1, pady=4, padx=10)
         self.settings_vars["attendance_bonus_points"] = attendance_var
+        self._primes_section_widgets += [presence_lbl, attendance_entry]
 
         assiduity_lbl = ttk.Label(right, text="Montant de la prime d'assiduité en points :")
         assiduity_lbl.grid(row=bounty_start_row + 3, column=0, sticky="w", pady=4)
@@ -8510,10 +10352,10 @@ class App(tk.Tk):
             "ce tournoi-ci inclus. 0 = prime désactivée.",
         )
         assiduity_var = tk.StringVar(value=self.db.get_setting("assiduity_bonus_points", "0"))
-        ttk.Entry(right, textvariable=assiduity_var, width=25).grid(
-            row=bounty_start_row + 3, column=1, pady=4, padx=10
-        )
+        assiduity_entry = ttk.Entry(right, textvariable=assiduity_var, width=25)
+        assiduity_entry.grid(row=bounty_start_row + 3, column=1, pady=4, padx=10)
         self.settings_vars["assiduity_bonus_points"] = assiduity_var
+        self._primes_section_widgets += [assiduity_lbl, assiduity_entry]
 
         consecutive_lbl = ttk.Label(right, text="Nombre de jours consécutifs :")
         consecutive_lbl.grid(row=bounty_start_row + 4, column=0, sticky="w", pady=4)
@@ -8526,16 +10368,17 @@ class App(tk.Tk):
             "dossier) pour vérifier la chaîne complète.",
         )
         consecutive_var = tk.StringVar(value=self.db.get_setting("assiduity_consecutive_days", "2"))
-        ttk.Entry(right, textvariable=consecutive_var, width=25).grid(
-            row=bounty_start_row + 4, column=1, pady=4, padx=10
-        )
+        consecutive_entry = ttk.Entry(right, textvariable=consecutive_var, width=25)
+        consecutive_entry.grid(row=bounty_start_row + 4, column=1, pady=4, padx=10)
         self.settings_vars["assiduity_consecutive_days"] = consecutive_var
-        ttk.Label(
+        consecutive_note = ttk.Label(
             right,
             text=("0 = pas de prime d'assiduité ; 2 = ce tournoi + le précédent ;\n"
                   "3 = ce tournoi + les 2 précédents ; etc."),
             foreground=MUTED,
-        ).grid(row=bounty_start_row + 5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        )
+        consecutive_note.grid(row=bounty_start_row + 5, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self._primes_section_widgets += [consecutive_lbl, consecutive_entry, consecutive_note]
 
         ranking_lbl = ttk.Label(right, text="Montant de la prime de classement en points :")
         ranking_lbl.grid(row=bounty_start_row + 6, column=0, sticky="w", pady=4)
@@ -8549,10 +10392,10 @@ class App(tk.Tk):
             "vainqueur, tournoi terminé).",
         )
         ranking_var = tk.StringVar(value=self.db.get_setting("ranking_bonus_points", "0"))
-        ttk.Entry(right, textvariable=ranking_var, width=25).grid(
-            row=bounty_start_row + 6, column=1, pady=4, padx=10
-        )
+        ranking_entry = ttk.Entry(right, textvariable=ranking_var, width=25)
+        ranking_entry.grid(row=bounty_start_row + 6, column=1, pady=4, padx=10)
         self.settings_vars["ranking_bonus_points"] = ranking_var
+        self._primes_section_widgets += [ranking_lbl, ranking_entry]
 
         bounty_lbl = ttk.Label(right, text="Montant du bounty en points :")
         bounty_lbl.grid(row=bounty_start_row + 7, column=0, sticky="w", pady=4)
@@ -8566,10 +10409,10 @@ class App(tk.Tk):
             "d'éliminations ce tournoi-ci.",
         )
         bounty_var = tk.StringVar(value=self.db.get_setting("bounty_amount", "0"))
-        ttk.Entry(right, textvariable=bounty_var, width=25).grid(
-            row=bounty_start_row + 7, column=1, pady=4, padx=10
-        )
+        bounty_entry = ttk.Entry(right, textvariable=bounty_var, width=25)
+        bounty_entry.grid(row=bounty_start_row + 7, column=1, pady=4, padx=10)
         self.settings_vars["bounty_amount"] = bounty_var
+        self._primes_section_widgets += [bounty_lbl, bounty_entry]
 
         pko_var = tk.BooleanVar(value=self.db.get_setting_int("pko_mode", 0) == 1)
         pko_check = ttk.Checkbutton(right, text="Mode PKO (prime progressive)", variable=pko_var)
@@ -8583,6 +10426,7 @@ class App(tk.Tk):
             "propre tête pour la suite du tournoi.",
         )
         self.settings_vars["pko_mode"] = pko_var
+        self._primes_section_widgets.append(pko_check)
 
         pko_pct_lbl = ttk.Label(right, text="Part en Perso immédiat en PKO (%) :")
         pko_pct_lbl.grid(row=bounty_start_row + 9, column=0, sticky="w", pady=4)
@@ -8593,18 +10437,27 @@ class App(tk.Tk):
             "propre bounty, à remporter par qui l'éliminera à son tour.",
         )
         pko_pct_var = tk.StringVar(value=self.db.get_setting("pko_cash_percent", "50"))
-        ttk.Entry(right, textvariable=pko_pct_var, width=25).grid(
-            row=bounty_start_row + 9, column=1, pady=4, padx=10
-        )
+        pko_pct_entry = ttk.Entry(right, textvariable=pko_pct_var, width=25)
+        pko_pct_entry.grid(row=bounty_start_row + 9, column=1, pady=4, padx=10)
         self.settings_vars["pko_cash_percent"] = pko_pct_var
+        self._primes_section_widgets += [pko_pct_lbl, pko_pct_entry]
 
-        ttk.Label(
+        primes_note = ttk.Label(
             right,
             text=("Le bounty s'applique aux nouvelles inscriptions/rebuys après "
                   "avoir enregistré. En mode classique, l'éliminateur empoche toute "
                   "la prime en Perso ; en PKO, une partie s'ajoute à sa propre prime."),
             foreground=MUTED, wraplength=340, justify="left",
-        ).grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        )
+        primes_note.grid(row=bounty_start_row + 10, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        self._primes_section_widgets.append(primes_note)
+
+        # État initial (grisé si la case est déjà décochée pour ce
+        # tournoi, ex. réouverture d'un tournoi créé alors que "Calculer
+        # les primes" était décochée, ET/OU si la session est déjà
+        # verrouillée — voir _update_primes_section_state, `locked=None`
+        # recalcule l'état de verrouillage ici automatiquement).
+        self._update_primes_section_state(self.primes_enabled_var.get())
 
         # -- Raccourcis clavier "Élimination"/"Terminé"/"Chronomètre" :
         # toujours actifs, rien à activer. Voir aussi le contrôle à
@@ -8654,14 +10507,49 @@ class App(tk.Tk):
             "juste ouvrir l'adresse affichée dans un navigateur.",
         )
 
+        # Case + "Code : XXXXXX" côte à côte (demande du 2026-09-09,
+        # "sécurisation du contrôle à distance") — MÊME technique que
+        # primes_header plus haut (sous-frame pack, pas grid) : évite le
+        # même écart disgracieux entre les deux qu'aurait provoqué une
+        # colonne de grille partagée avec les champs larges du reste de
+        # l'onglet.
+        remote_check_row = ttk.Frame(right)
+        remote_check_row.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
         self.remote_control_enabled_var = tk.BooleanVar(
             value=export_prefs.load_value("remote_control_enabled", False) is True
         )
         remote_check = ttk.Checkbutton(
-            right, text="Activer le contrôle à distance",
+            remote_check_row, text="Activer le contrôle à distance",
             variable=self.remote_control_enabled_var, command=self._on_remote_control_toggle,
         )
-        remote_check.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        remote_check.pack(side="left")
+
+        # Code à 6 chiffres de la session en cours (demande du
+        # 2026-09-09) : IDENTIQUE pour tous les tournois de cette
+        # session (voir open_windows.remote_session_code) — à
+        # communiquer de vive voix aux responsables dont le téléphone
+        # doit être approuvé ci-dessous. JAMAIS le code de test permanent
+        # 131261, qui ne doit jamais apparaître ici (voir open_windows.
+        # verify_remote_code). Déjà disponible dès la construction de cet
+        # onglet : App.__init__ a déjà enregistré ce tournoi (open_
+        # windows.register) avant d'arriver ici, la session existe donc
+        # forcément — pas besoin de rafraîchir ce libellé à chaque tick.
+        code = open_windows.remote_session_code()
+        self.remote_control_code_lbl = ttk.Label(
+            remote_check_row, text=(f"Code : {code}" if code else ""),
+            foreground=MUTED, font=("Helvetica", 10, "bold"),
+        )
+        self.remote_control_code_lbl.pack(side="left", padx=(14, 0))
+        Tooltip(
+            self.remote_control_code_lbl,
+            "Code à saisir sur le téléphone à la première connexion —\n"
+            "identique pour tous les tournois/Sit & Go ouverts en même\n"
+            "temps que celui-ci, change à chaque nouvelle session (tous\n"
+            "les tournois refermés puis l'application relancée). Le\n"
+            "téléphone devra ensuite être approuvé ci-dessous avant de\n"
+            "pouvoir contrôler quoi que ce soit.",
+        )
 
         self.remote_control_status_lbl = ttk.Label(
             right, foreground=MUTED, justify="left", wraplength=340,
@@ -8670,6 +10558,252 @@ class App(tk.Tk):
             row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
         self._refresh_remote_control_status()
+
+        # -- Téléphones APPROUVÉS (Révoquer/renommer) — demande du
+        # 2026-09-09, revue le même jour ("plus de popup séparée") : les
+        # demandes EN ATTENTE ont leur propre panneau intégré, tout en
+        # haut de la colonne de gauche (voir remote_pending_request_
+        # container, sous "Durée du bandeau d'élimination") — jamais
+        # affichées ici, pour ne jamais présenter la même demande à deux
+        # endroits de Paramètres. Conteneur UNIQUE gridé une seule fois
+        # (columnspan=2), tout son contenu (nombre variable de lignes
+        # selon le nombre de téléphones) empilé à l'intérieur via pack()
+        # — même raison que remote_check_row ci-dessus, mais pour une
+        # hauteur variable plutôt qu'une largeur : jamais besoin de
+        # renuméroter les lignes de grille suivantes (bb_prompt_row...)
+        # quand ce nombre change.
+        remote_devices_title = ttk.Label(
+            right, text="Téléphones autorisés", font=("Helvetica", 10, "bold"), foreground=GOLD,
+        )
+        remote_devices_title.grid(
+            row=remote_start_row + 4, column=0, columnspan=2, sticky="w", pady=(2, 4)
+        )
+        Tooltip(
+            remote_devices_title,
+            "Appareils déjà approuvés — l'approbation reste valable aux\n"
+            "prochaines sessions, contrairement au code, qui change à\n"
+            "chaque fois. Une NOUVELLE demande de téléphone apparaît en\n"
+            "haut de la colonne de gauche (sous « Durée du bandeau\n"
+            "d'élimination »), avec un badge 🔔 sur cet onglet tant\n"
+            "qu'elle n'a pas été traitée.",
+        )
+        self.remote_devices_container = ttk.Frame(right)
+        self.remote_devices_container.grid(
+            row=remote_start_row + 5, column=0, columnspan=2, sticky="ew", pady=(0, 10)
+        )
+        self._refresh_remote_devices_panel()
+
+        # -- Rééquilibrage simple guidé par la grosse blinde (version TEST,
+        # voir database.py: rebalance_tables/_bb_rebalance_prompt_enabled) :
+        # préférence GLOBALE (comme "Activer le contrôle à distance" juste
+        # au-dessus, pas une donnée du tournoi). Fait partie du CONTENU
+        # DÉFILANT de l'onglet, comme le reste des réglages de "right"
+        # (grid, même colonne 0, même sticky="w") : défile avec l'ascenseur
+        # et reste alignée horizontalement avec "Activer le contrôle à
+        # distance" pour la même raison qu'elle — pas de place() ni
+        # d'ancrage indépendant du défilement.
+        #
+        # Libellé/tooltip mis à jour (clé de stockage BB_REBALANCE_PROMPT_
+        # PREF_KEY et comportement INCHANGÉS, pour rester compatible avec
+        # une préférence déjà enregistrée par une version antérieure) :
+        # cette case ne pilote plus l'affichage d'une fenêtre Mac (retirée,
+        # voir _check_pending_rebalance) mais reste le seul interrupteur
+        # entre le mode "guidé" (demande quel siège est BB, affichée sur
+        # les téléphones) et le mode automatique historique
+        # (_legacy_pick_mover, voir database.py: rebalance_tables) — elle
+        # a donc toujours une utilité propre, indépendante de tout
+        # affichage Mac.
+        bb_prompt_row = remote_start_row + 6  # +4/+5 pris par le titre/conteneur "Téléphones" ci-dessus
+        self.bb_rebalance_prompt_var = tk.BooleanVar(
+            value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
+        )
+        bb_prompt_check = ttk.Checkbutton(
+            right, text="Équilibrage guidé par la grosse blinde (demande sur le téléphone)",
+            variable=self.bb_rebalance_prompt_var, command=self._on_bb_rebalance_prompt_toggle,
+        )
+        bb_prompt_check.grid(row=bb_prompt_row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        Tooltip(
+            bb_prompt_check,
+            "Activée (par défaut) : lors d'un simple rééquilibrage entre\n"
+            "tables (pas un cassage de table), demande quel siège est\n"
+            "actuellement grosse blinde — sur tous les téléphones du\n"
+            "contrôle à distance — pour choisir qui se déplace. Rien ne\n"
+            "s'affiche sur ce Mac, seul le calcul/résultat y est appliqué.\n"
+            "Désactivée : aucune demande, l'ancien mécanisme historique\n"
+            "choisit directement, comme \"Continuer sans indiquer la BB\".",
+        )
+
+        # -- "Un seul tournoi à la fois" : préférence GLOBALE (comme la
+        # case juste au-dessus), cochée par défaut. N'empêche jamais de
+        # basculer vers un tournoi déjà ouvert (voir LobbyDialog.
+        # _open_selected) ni ne touche à quoi que ce soit de déjà ouvert
+        # — bloque uniquement la CRÉATION/l'OUVERTURE d'un tournoi ou
+        # Sit&Go supplémentaire (voir _block_second_tournament_if_needed,
+        # appelé depuis App._open_new_window et LobbyDialog._open_
+        # selected — les deux seuls endroits de tout le fichier qui
+        # lancent un nouveau process de tournoi, voir spawn_app_process).
+        single_tournament_row = bb_prompt_row + 1
+        self.single_tournament_var = tk.BooleanVar(
+            value=_single_tournament_pref_enabled()
+        )
+        single_tournament_check = ttk.Checkbutton(
+            right, text="Un seul tournoi à la fois",
+            variable=self.single_tournament_var, command=self._on_single_tournament_toggle,
+        )
+        single_tournament_check.grid(
+            row=single_tournament_row, column=0, columnspan=2, sticky="w", pady=(0, 6)
+        )
+        Tooltip(
+            single_tournament_check,
+            "Activée (par défaut) : interdit d'ouvrir un deuxième tournoi\n"
+            "ou Sit&Go tant qu'un tournoi est déjà ouvert (« Menu\n"
+            "principal », Lobby...) — ne ferme ni ne modifie jamais celui\n"
+            "déjà ouvert, ne fait qu'empêcher d'en lancer un second par\n"
+            "erreur. Désactivée : comportement multi-tournoi habituel,\n"
+            "inchangé.",
+        )
+
+    def _on_single_tournament_toggle(self):
+        export_prefs.save_value(SINGLE_TOURNAMENT_PREF_KEY, self.single_tournament_var.get())
+
+    def _test_mode_enabled(self):
+        """Mode Test (demande du 2026-09-09) : jamais mémorisé, propre à
+        CE process — voir self.test_mode_var (App.__init__) et la case
+        "Mode Test" (_build_settings_tab). Assouplit UNIQUEMENT les
+        facilités d'élimination (_eliminate_selected/_remote_eliminate) :
+        élimination groupée sans désigner d'éliminateur, et éliminateur
+        redevenant facultatif (bouton "Ignorer") pour une élimination
+        individuelle hors PKO+bounty — jamais d'autre effet sur le
+        fonctionnement du logiciel."""
+        return self.test_mode_var.get()
+
+    def _on_test_mode_toggle(self):
+        self._update_window_title()
+
+    def _sync_single_tournament_pref_checkbox(self):
+        """Préférence GLOBALE (voir SINGLE_TOURNAMENT_PREF_KEY) : une
+        SEULE valeur dans export_prefs.json, partagée par tous les
+        process, mais chacun ne la lit qu'UNE fois pour initialiser
+        self.single_tournament_var (voir _build_settings_tab) — sans ce
+        rappel périodique, un tournoi A déjà ouvert continuait d'afficher
+        l'ancien état de la case après qu'un tournoi B l'ait changée
+        (chacun n'ayant sa propre BooleanVar qu'en mémoire locale,
+        jamais relue depuis le disque après le démarrage). Appelé depuis
+        _tick (1x/seconde, comme _check_phone_selected_pid juste
+        au-dessus) plutôt qu'un nouveau mécanisme séparé : relit
+        _single_tournament_pref_enabled() et ne touche la case que si sa
+        valeur diffère réellement (évite tout scintillement/coup d'oeil
+        inutile sur ce widget à chaque tick)."""
+        current = _single_tournament_pref_enabled()
+        if self.single_tournament_var.get() != current:
+            self.single_tournament_var.set(current)
+
+    def _on_primes_enabled_toggle(self):
+        """Case "Calculer les primes" (Paramètres, demande du
+        2026-09-09) : modifiable uniquement tant qu'aucun tournoi de la
+        session n'a démarré son chronomètre — la case est déjà grisée
+        dans ce cas (voir _sync_primes_enabled_checkbox), ce garde n'est
+        qu'un filet de sécurité (ex. clic "en vol" juste au moment où un
+        autre tournoi démarre). Répercute le choix (a) dans la valeur
+        globale "proposée" (export_prefs, voir _set_primes_enabled_
+        proposed), pour que les autres tournois pas encore démarrés
+        convergent au prochain tick (voir _sync_primes_enabled_pref), et
+        (b) tout de suite dans la copie SQLite de CE tournoi précis, sans
+        attendre ce prochain tick, pour que son propre onglet Primes et
+        le grisement de la section réagissent sans délai perceptible."""
+        if _primes_session_locked():
+            current = self.db.get_setting_int("primes_enabled", 1) == 1
+            self.primes_enabled_var.set(current)
+            self.primes_enabled_check.configure(state="disabled")
+            self._update_primes_section_state(current, locked=True)
+            return
+        value = self.primes_enabled_var.get()
+        _set_primes_enabled_proposed(value)
+        self.db.set_setting("primes_enabled", "1" if value else "0")
+        self._update_primes_section_state(value, locked=False)
+        self._refresh_bounty_tab()
+
+    def _update_primes_section_state(self, enabled, locked=None):
+        """Grise (valeurs conservées, jamais effacées) ou réactive tous
+        les widgets de réglage des montants/PKO de la section Primes
+        (voir self._primes_section_widgets, remplie dans _build_settings_
+        tab), selon `enabled` ET `locked` combinés (demande du 2026-09-09,
+        point 2 : "TOUS les paramètres de la section Primes sont
+        verrouillés" dès que la session a démarré — pas seulement la case
+        "Calculer les primes" elle-même) :
+          - avant tout démarrage (locked=False) : modifiables normalement
+            si `enabled`, grisés (valeurs conservées) sinon — comportement
+            déjà en place (point 5 de la demande précédente).
+          - dès que la session est verrouillée (locked=True) : TOUJOURS
+            grisés, même si `enabled` est vrai — un tournoi de la session
+            ne doit plus pouvoir changer un montant/le mode PKO en cours
+            de route, qu'il ait démarré lui-même ou non.
+        `locked=None` (valeur par défaut) : recalculé ici via
+        _primes_session_locked() — permet d'appeler cette méthode avec
+        seulement `enabled` (ex. juste après un changement local qui ne
+        change pas le verrouillage) sans le refaire à chaque appelant.
+        N'agit jamais sur la case "Calculer les primes" elle-même (son
+        propre état "disabled" est géré par ses appelants, voir
+        _sync_primes_enabled_checkbox / _on_primes_enabled_toggle)."""
+        if locked is None:
+            locked = _primes_session_locked()
+        editable = enabled and not locked
+        state = "normal" if editable else "disabled"
+        for widget in getattr(self, "_primes_section_widgets", []):
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass  # widget sans option "state" (ne devrait pas arriver ici)
+
+    def _sync_primes_enabled_checkbox(self):
+        """Appelée depuis _tick (1x/seconde), juste après _sync_primes_
+        enabled_pref (qui vient de faire converger la copie SQLite locale
+        de ce tournoi vers la valeur globale proposée, tant qu'il n'a pas
+        démarré) : reflète cette copie locale dans la case et grise/
+        réactive à la fois la case elle-même ET tout le reste de la
+        section Primes (voir _update_primes_section_state) selon l'état
+        de verrouillage de la SESSION (_primes_session_locked, demande du
+        2026-09-09 : verrouillage global, pas seulement la case) — même
+        principe que _sync_single_tournament_pref_checkbox, pour qu'un
+        tournoi A reflète un changement fait depuis les Paramètres d'un
+        tournoi B, ou le verrouillage causé par le démarrage d'un
+        tournoi C de la même session, sans qu'aucune action ne soit
+        nécessaire sur A."""
+        if self.db is None:
+            return
+        current = self.db.get_setting_int("primes_enabled", 1) == 1
+        if self.primes_enabled_var.get() != current:
+            self.primes_enabled_var.set(current)
+        locked = _primes_session_locked()
+        check_state = "disabled" if locked else "normal"
+        if str(self.primes_enabled_check.cget("state")) != check_state:
+            self.primes_enabled_check.configure(state=check_state)
+        self._update_primes_section_state(current, locked=locked)
+
+    def _on_bb_rebalance_prompt_toggle(self):
+        """Case "Équilibrage guidé par la grosse blinde" (Paramètres) :
+        mémorise le choix (réglage global, comme _on_remote_control_
+        toggle) et prend effet immédiatement, sans redémarrer —
+        database.py relit cette préférence à chaque appel de
+        rebalance_tables() (voir _bb_rebalance_prompt_enabled), donc le
+        PROCHAIN rééquilibrage en tient déjà compte.
+
+        Cas particulier explicitement demandé : si la case est décochée
+        alors qu'une question est actuellement en attente de réponse, on
+        ne l'abandonne pas telle quelle (le mouvement resterait à
+        décider indéfiniment) — on la résout tout de suite avec l'ancien
+        mécanisme historique, exactement comme si "Continuer sans
+        indiquer la BB" avait été cliqué. Passe par
+        _resolve_pending_rebalance (pas un appel direct à la base) :
+        cette demande est ainsi consommée de façon sûre, comme n'importe
+        quelle autre réponse (voir sa docstring et celle de database.py:
+        resolve_pending_rebalance) — aucun risque de double mouvement."""
+        enabled = self.bb_rebalance_prompt_var.get()
+        export_prefs.save_value(BB_REBALANCE_PROMPT_PREF_KEY, enabled)
+        if not enabled and self.db is not None and self.db.pending_rebalance is not None:
+            self._resolve_pending_rebalance(
+                self.db.pending_rebalance["request_id"], None, from_remote=False
+            )
 
     def _test_movement_signal(self):
         try:
@@ -8777,6 +10911,7 @@ class App(tk.Tk):
         self._update_window_title()
         if moves:
             self._trigger_movement_alert()
+        self._check_pending_rebalance()
         return values
 
     def _choose_day_folder(self, day_folder_var):
@@ -8823,9 +10958,11 @@ class App(tk.Tk):
         préférences globales (proposé par défaut au prochain tournoi).
         Une valeur invalide/vide (ex : champ momentanément vidé pendant
         la frappe) est ignorée sans planter — reste alors le dernier
-        réglage valide déjà enregistré, jamais une valeur cassée."""
+        réglage valide déjà enregistré, jamais une valeur cassée. 0 est
+        une valeur valide (désactive l'affichage du bandeau, voir
+        _advance_elimination_banner) — jamais remonté à 1."""
         try:
-            seconds = max(1, min(30, int(var.get())))
+            seconds = max(0, min(30, int(var.get())))
         except (tk.TclError, ValueError):
             return
         self.db.set_settings({"elimination_banner_seconds": seconds})
@@ -9016,32 +11153,187 @@ class App(tk.Tk):
             # sur cet onglet pouvait afficher une liste périmée.
             self.roster_tab._refresh()
 
+    def _on_notebook_tab_changed(self, event):
+        """<<NotebookTabChanged>> — événement virtuel émis par
+        ttk.Notebook chaque fois que l'onglet sélectionné change (clic,
+        clavier, ou self.notebook.select() programmatique), déjà utilisé
+        ici pour rafraîchir le contenu de l'onglet nouvellement affiché
+        (voir _refresh_all, appel PRÉEXISTANT, comportement inchangé).
+
+        Complété le 2026-09-09 ("la fenêtre flottante de demande de
+        téléphone ne doit être visible QUE sur l'onglet Paramètres") :
+        appeler _check_remote_device_requests() ICI, en plus du sondage
+        périodique (~2s, voir _tick), pour que le passage à/depuis
+        Paramètres montre/masque la fenêtre IMMÉDIATEMENT au clic, sans
+        attendre le prochain sondage — _refresh_remote_device_popup,
+        appelée depuis _check_remote_device_requests, décide seule si la
+        fenêtre doit apparaître ou se masquer, quel que soit ce qui a
+        déclenché l'appel (ce changement d'onglet, ou le sondage
+        périodique ci-dessous, qui continue de tourner sans jamais
+        recréer/réafficher la fenêtre sur un autre onglet — voir sa
+        docstring)."""
+        self._refresh_all()
+        self._check_remote_device_requests()
+
     def _tick(self):
         if not self.winfo_exists():
             return
-        current = self.notebook.tab(self.notebook.select(), "text")
-        if current == "Chronomètre" or (self.clock_window is not None and self.clock_window.winfo_exists()):
-            self._refresh_clock_tab()
-        elif current == "Mouvements":
-            self._refresh_moves_tab()
-        if self._remote_photo_uploaded:
-            # Une photo vient d'être envoyée depuis le téléphone (voir
-            # _remote_upload_photo) : rafraîchit la colonne Photo de
-            # l'onglet actuellement affiché, sans attendre que l'utilisateur
-            # change d'onglet et y revienne.
-            self._remote_photo_uploaded = False
-            if current == "Répertoire":
-                self.roster_tab._refresh()
-            elif current == "Joueurs":
-                self._refresh_players_tab()
-        # Tenu à jour ici (thread principal) plutôt que lu directement
-        # depuis le thread du serveur de contrôle à distance — voir
-        # _start_remote_control_if_enabled.
-        if self.remote_control_server is not None and self.db is not None:
-            self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
-            self._refresh_remote_players_cache()
-            self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
-        self._tick_after_id = self.after(1000, self._tick)
+        # Corps de _tick() entièrement protégé (demande du 2026-09-09,
+        # diagnostic du bug de non-propagation de "Calculer les primes"
+        # entre deux fenêtres) : une exception survenue N'IMPORTE OÙ
+        # ci-dessous (bandeau d'élimination, contrôle à distance,
+        # rééquilibrage en attente, sélection téléphone...) ne doit
+        # JAMAIS empêcher la reprogrammation du tick suivant (`finally`
+        # ci-dessous) — sans cette protection, un incident isolé sur
+        # UNE seule fonctionnalité arrêtait silencieusement TOUTE la
+        # boucle périodique de cette fenêtre pour de bon, y compris la
+        # synchronisation des primes (placée plus loin dans cette même
+        # fonction) alors que rien ne le signalait à l'utilisateur.
+        # `except Exception` (jamais un `except:` nu, jamais un simple
+        # `pass`) : laisse passer KeyboardInterrupt/SystemExit, et
+        # consigne l'exception de façon EXPLICITE et exploitable dans
+        # crash.log (voir _log_exception, déjà utilisé par ailleurs
+        # dans ce fichier) — jamais avalée sans trace. Voir aussi
+        # tests/test_tick_never_stops_scheduling.py, qui injecte une
+        # exception avant la synchronisation des primes et vérifie les
+        # trois garanties : trace journalisée, prochain tick programmé,
+        # boucle non interrompue.
+        try:
+            current = self.notebook.tab(self.notebook.select(), "text")
+            # Expiration du bandeau d'élimination : vérifiée ICI,
+            # INCONDITIONNELLEMENT à chaque tick (1x/seconde), plutôt que
+            # seulement dans _refresh_clock_tab() ci-dessous (qui, elle, ne
+            # tourne QUE si l'onglet Chronomètre est affiché ou l'écran
+            # projecteur est ouvert — voir la condition juste en dessous). Un
+            # bandeau doit disparaître à l'heure même si aucun des deux n'est
+            # vrai au moment précis de son échéance (ex : l'écran projecteur
+            # fermé puis rouvert entre-temps) — voir aussi _refresh_clock_tab,
+            # qui n'a plus besoin de repasser dessus (source unique, testé en
+            # conditions réelles : onglet différent, fenêtre projecteur
+            # ouverte plus de 15s, éliminations rapprochées, bouton
+            # "Chronomètre" du téléphone).
+            if (self._elimination_banner_current is not None
+                    and time.time() >= self._elimination_banner_current["until"]):
+                self._advance_elimination_banner()
+            elif self._elimination_banner_current is None and self._elimination_banner_queue:
+                self._advance_elimination_banner()
+            if current == "Chronomètre" or (self.clock_window is not None and self.clock_window.winfo_exists()):
+                self._refresh_clock_tab()
+            elif current == "Mouvements":
+                self._refresh_moves_tab()
+            if self._remote_photo_uploaded:
+                # Une photo vient d'être envoyée depuis le téléphone (voir
+                # _remote_upload_photo) : rafraîchit la colonne Photo de
+                # l'onglet actuellement affiché, sans attendre que l'utilisateur
+                # change d'onglet et y revienne.
+                self._remote_photo_uploaded = False
+                if current == "Répertoire":
+                    self.roster_tab._refresh()
+                elif current == "Joueurs":
+                    self._refresh_players_tab()
+            # Tenu à jour ici (thread principal) plutôt que lu directement
+            # depuis le thread du serveur de contrôle à distance — voir
+            # _start_remote_control_if_enabled.
+            if self.remote_control_server is not None and self.db is not None:
+                self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
+                self._refresh_remote_players_cache()
+                self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+                self._remote_has_pending_moves = self.db.count_seat_moves() > 0
+                self._maybe_reclaim_default_remote_port()
+            # Approbation des téléphones (demande du 2026-09-09) : toutes
+            # les ~2s seulement (pas à chaque tick, voir _check_remote_
+            # device_requests) — un compteur simple plutôt qu'un after()
+            # séparé, pour rester protégé par le même try/except que le
+            # reste de _tick.
+            self._remote_devices_tick_counter = getattr(self, "_remote_devices_tick_counter", 0) + 1
+            if self._remote_devices_tick_counter % 2 == 0:
+                self._check_remote_device_requests()
+            # Filet de sécurité (voir docstring de _check_pending_rebalance) :
+            # garantit qu'une question "grosse blinde" en attente est toujours
+            # affichée/rafraîchie au moins une fois par seconde, même si
+            # l'action qui l'a créée ne l'a pas déjà fait explicitement.
+            self._check_pending_rebalance()
+            self._check_phone_selected_pid()
+            self._sync_single_tournament_pref_checkbox()
+            # Interrupteur général "Calculer les primes" (voir le grand bloc
+            # de commentaires au-dessus de _sync_primes_enabled_pref) :
+            # appelé INCONDITIONNELLEMENT ici, à chaque tick de CHAQUE
+            # fenêtre ouverte (pas seulement si l'onglet Paramètres est
+            # affiché), pour garantir qu'aucun tournoi pas encore démarré ne
+            # puisse rester bloqué sur une ancienne valeur plus d'environ une
+            # seconde après un changement fait depuis une autre fenêtre.
+            if self.db is not None:
+                _sync_primes_enabled_pref(self.db)
+            self._sync_primes_enabled_checkbox()
+        except Exception:
+            _log_exception(*sys.exc_info())
+        finally:
+            # Reprogrammé INCONDITIONNELLEMENT — y compris après une
+            # exception ci-dessus — voir le commentaire au tout début de
+            # cette méthode : c'est LA garantie que cette correction
+            # apporte.
+            self._tick_after_id = self.after(1000, self._tick)
+
+    def _maybe_reclaim_default_remote_port(self):
+        """Corrige la perte de connexion du téléphone après "Fin de la
+        partie" (voir remote_control.py: /end_tournament et JS
+        confirmEndTournament) quand le tournoi fermé tenait le port
+        habituel (8765, remote_control.DEFAULT_PORT) : le téléphone ne
+        parle jamais qu'à ce port précis (pare-feu club), qui disparaît
+        avec le processus qui vient de se fermer — un simple lien "revenir
+        au Lobby" ne servirait donc plus à rien puisque le serveur qui
+        l'aurait servi n'existe plus.
+
+        Appelé depuis _tick sur CHAQUE tournoi encore ouvert (donc sur
+        chacun des éventuels survivants) : si CE tournoi-ci n'est pas déjà
+        sur 8765 et qu'aucun tournoi encore inscrit au registre partagé
+        (voir open_windows.list_remote_tournaments) ne l'occupe non plus,
+        tente de le récupérer (RemoteControlServer.try_reclaim_default_
+        port — sans risque de rester sans port du tout, voir sa
+        docstring). Aucune négociation entre processus : chacun réessaie
+        à son propre tick, le premier qui réussit son bind() l'emporte,
+        les autres réessaieront simplement au tick suivant s'il s'avère
+        que ce n'était pas encore le bon moment. Le téléphone (voir
+        confirmEndTournament, qui retente /lobbylist un court instant
+        après "Fin de la partie") retrouve ainsi ce tournoi tout seul,
+        sans action manuelle."""
+        server = self.remote_control_server
+        if server is None or not server.is_running or server.port == remote_control.DEFAULT_PORT:
+            return
+        if any(t["port"] == remote_control.DEFAULT_PORT for t in open_windows.list_remote_tournaments()):
+            return  # quelqu'un d'autre l'a déjà (ou toujours) — rien à faire ici
+        if server.try_reclaim_default_port() and self.db:
+            open_windows.update_remote_info(
+                self.db.path, server.port, self._remote_control_tournament_name
+            )
+            self._refresh_remote_control_status()
+
+    def _check_phone_selected_pid(self):
+        """Bascule automatiquement CETTE fenêtre au premier plan sur le
+        Mac si un téléphone vient de choisir SON tournoi dans la page
+        "Lobby" du contrôle à distance (voir open_windows.
+        set_phone_selected_pid, appelé par /select_tournament) — appelé
+        depuis _tick (donc actif en continu tant que cette fenêtre de
+        tournoi est ouverte, PAS seulement quand une fenêtre Lobby Mac
+        est ouverte : avant ce correctif, seule LobbyDialog._refresh
+        surveillait phone_selected_pid.json, donc rien ne réagissait au
+        choix du téléphone si aucun Lobby n'était affiché sur le Mac à ce
+        moment-là).
+
+        Même principe et même garde-fou que LobbyDialog._refresh (voir
+        son commentaire) : ne réagit qu'à un CHANGEMENT de pid par
+        rapport au dernier déjà traité ici (_last_synced_phone_pid,
+        jamais ré-appliqué en boucle), et seulement si ce pid est le
+        SIEN — les autres fenêtres de tournoi ouvertes voient le même
+        changement au même moment (chacune sa propre variable
+        _last_synced_phone_pid) mais ne se ramènent pas elles-mêmes au
+        premier plan puisque ce n'est pas leur pid."""
+        phone_pid = open_windows.get_phone_selected_pid()
+        if phone_pid is None or phone_pid == self._last_synced_phone_pid:
+            return
+        self._last_synced_phone_pid = phone_pid
+        if phone_pid == os.getpid():
+            open_windows.bring_pid_to_front(phone_pid)
 
     def _refresh_remote_players_cache(self):
         """Reconstruit self._remote_players_cache (liste de joueurs actifs

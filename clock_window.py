@@ -95,7 +95,7 @@ class ClockWindow(tk.Toplevel):
         self.timer_lbl.pack(pady=(0, 4))
 
         self.blinds_lbl = tk.Label(
-            self, text="", font=("Helvetica", 46, "bold"),
+            self, text="", font=("Helvetica", 92, "bold"),
             # Blanc plutôt que doré : peu visible de loin sur un
             # vidéoprojecteur (contrairement au chrono et au bandeau
             # "Round", déjà blancs/dorés à des tailles plus grandes).
@@ -129,6 +129,13 @@ class ClockWindow(tk.Toplevel):
 
         bottom = tk.Frame(self, bg="#0b1f14")
         bottom.pack(side="bottom", fill="x", pady=8)
+        # Référence gardée (pas seulement une variable locale) : refresh()
+        # s'en sert pour ne jamais laisser le bandeau d'élimination (placé
+        # par place(), donc indépendant de ce pack()) chevaucher ces
+        # informations du bas (Joueurs restants / Tapis moyen / Durée),
+        # notamment en plein écran où _ensure_fits_content ne peut pas
+        # agrandir la fenêtre pour compenser.
+        self.bottom_frame = bottom
 
         # Sous-frame non étirée, centrée dans "bottom" (qui occupe toute
         # la largeur) : les deux labels à l'intérieur restent groupés côte
@@ -223,6 +230,20 @@ class ClockWindow(tk.Toplevel):
         self.bind("<F11>", self._toggle_fullscreen)
         self.bind("<Escape>", self._exit_fullscreen)
         self._fullscreen = False
+        # Calculé une seule fois (pas à chaque refresh()) : voir son usage
+        # juste après place_forget() dans refresh(), pour ne rien changer
+        # sous Windows.
+        self._is_macos_aqua = self.tk.call("tk", "windowingsystem") == "aqua"
+        # "Rustine" anti-fantôme (macOS/Tk-Aqua uniquement, voir son usage
+        # dans refresh()) : un simple Frame de la MÊME couleur que le fond
+        # de cette fenêtre (#0b1f14), jamais affiché pour lui-même — juste
+        # placé exactement là où le bandeau d'élimination vient de
+        # disparaître, pour repeindre cette zone avec du vrai fond. Créé
+        # une seule fois ici, jamais détruit ni retiré ensuite (rester
+        # placé ne coûte rien et n'affiche rien d'anormal, sa couleur étant
+        # strictement celle du fond ; le repositionner par-dessus la
+        # future zone à chaque disparition suffit, voir refresh()).
+        self._banner_ghost_patch = tk.Frame(self, bg="#0b1f14", highlightthickness=0, bd=0)
 
     def _toggle_fullscreen(self, event=None):
         self._fullscreen = not self._fullscreen
@@ -348,27 +369,121 @@ class ClockWindow(tk.Toplevel):
             self._moves_needs_scroll = False
             self._moves_signature = None
             self.movement_alert_frame.place(relx=0.5, rely=0.42, anchor="center")
+            # Toujours au-dessus de _banner_ghost_patch (voir son
+            # commentaire dans __init__ et son usage plus bas) : ce
+            # dernier reste placé en permanence une fois utilisé, sur la
+            # zone du DERNIER bandeau d'élimination disparu, qui peut se
+            # trouver n'importe où — y compris sous ce bandeau rouge.
+            self.movement_alert_frame.tkraise()
             self.elimination_banner_frame.place_forget()
         else:
-            # Bandeau d'élimination : placé EN PREMIER, juste sous les
-            # blindes (comme le bandeau de mouvement auparavant seul à
-            # cet endroit) — voir App._advance_elimination_banner pour la
-            # file/l'échéance, ce module ne fait que l'afficher. Sa
-            # hauteur réelle (une fois placé) sert ensuite de référence
-            # au bandeau de mouvement ci-dessous, pour que les deux ne se
-            # superposent jamais s'ils sont actifs en même temps.
+            # Bandeau d'élimination : placé EN PREMIER, sous "Prochaine
+            # pause" (donc sous les 3 lignes Blindes/Ante, Prochain round
+            # et Prochaine pause — jamais par-dessus l'une d'elles) — voir
+            # App._advance_elimination_banner pour la file/l'échéance, ce
+            # module ne fait que l'afficher. Sa hauteur réelle (une fois
+            # placé) sert ensuite de référence au bandeau de mouvement
+            # ci-dessous, pour que les deux ne se superposent jamais s'ils
+            # sont actifs en même temps.
             self.update_idletasks()
-            base_y = self.blinds_lbl.winfo_y() + self.blinds_lbl.winfo_height() + 10
+            base_y = self.next_break_lbl.winfo_y() + self.next_break_lbl.winfo_height() + 10
             if elimination_banner is not None:
                 self._update_elimination_banner(elimination_banner)
                 self.elimination_banner_frame.place(relx=0.5, y=base_y, anchor="n")
+                # Toujours au-dessus de _banner_ghost_patch (voir __init__
+                # et la branche else ci-dessous) : ce dernier reste placé
+                # en permanence une fois utilisé, à l'emplacement du
+                # DERNIER bandeau disparu — s'il chevauche par coïncidence
+                # celui-ci (nouveau bandeau au même endroit), il ne doit
+                # jamais passer devant.
+                self.elimination_banner_frame.tkraise()
                 self.update_idletasks()
+                # Ne doit jamais chevaucher les informations du bas
+                # (Joueurs restants / Tapis moyen / Durée) : hors plein
+                # écran, _ensure_fits_content (fin de refresh()) agrandit
+                # déjà la fenêtre pour ça (elle inclut la position/hauteur
+                # du bandeau dans son calcul) — laisser faire ELLE plutôt
+                # que remonter le bandeau ici, sans quoi il chevaucherait
+                # au contraire "Prochain round"/"Prochaine pause" (fenêtre
+                # restée à sa taille actuelle au lieu de grandir). En
+                # PLEIN ÉCRAN en revanche (projecteur), la hauteur est
+                # fixe — _ensure_fits_content n'agit pas (voir sa
+                # docstring) — donc seul un repli local, ici, évite le
+                # chevauchement. self.bottom_frame.winfo_y() vaut 0 avant
+                # le tout premier rendu (pack() pas encore résolu) : `> 0`
+                # évite de prendre cette valeur transitoire pour un vrai
+                # plafond et de coller le bandeau tout en haut par erreur.
+                if self._fullscreen:
+                    bottom_y = self.bottom_frame.winfo_y()
+                    if bottom_y > 0:
+                        max_y = bottom_y - self.elimination_banner_frame.winfo_height() - 10
+                        if base_y > max_y:
+                            base_y = max(0, max_y)
+                            self.elimination_banner_frame.place(relx=0.5, y=base_y, anchor="n")
+                            self.update_idletasks()
                 movement_y = (
                     self.elimination_banner_frame.winfo_y()
                     + self.elimination_banner_frame.winfo_height() + 10
                 )
             else:
+                # Géométrie capturée AVANT place_forget() (pas après :
+                # winfo_x/y/width/height ne sont garantis fiables que tant
+                # que le widget est encore mappé) — sert au correctif
+                # anti-fantôme juste en dessous.
+                _ghost_x = self.elimination_banner_frame.winfo_x()
+                _ghost_y = self.elimination_banner_frame.winfo_y()
+                _ghost_w = self.elimination_banner_frame.winfo_width()
+                _ghost_h = self.elimination_banner_frame.winfo_height()
                 self.elimination_banner_frame.place_forget()
+                if self._is_macos_aqua and _ghost_w > 1 and _ghost_h > 1:
+                    # 2e correctif (macOS uniquement, comportement Windows
+                    # inchangé) : la bascule d'opacité imperceptible
+                    # (-alpha 0.999 puis 1.0) testée précédemment n'a PAS
+                    # suffi en conditions réelles (bandeau resté peint plus
+                    # d'une minute) — remplacée ici. Plutôt que d'espérer
+                    # forcer macOS à recomposer la fenêtre ENTIÈRE (ce que
+                    # l'opacité tentait de faire, en vain), on repeint
+                    # DIRECTEMENT la zone exacte que le bandeau occupait :
+                    # place() (ajouter un widget) s'est montré fiable tout
+                    # du long dans ce bug — c'est précisément place_forget()
+                    # (retirer un widget) qui ne provoque pas toujours le
+                    # nouveau rendu attendu sous ce Tk/Tcl-Aqua. On profite
+                    # donc du chemin place() qui fonctionne, plutôt que
+                    # d'essayer de réparer celui qui ne fonctionne pas :
+                    # _banner_ghost_patch (même couleur que le fond de
+                    # cette fenêtre, #0b1f14, jamais visible en tant que
+                    # tel) est placé exactement sur cette zone pour la
+                    # repeindre avec du vrai fond. Reste ensuite en place
+                    # (jamais retiré, voir son commentaire dans __init__) :
+                    # aucun second place_forget() à faire confiance.
+                    # update_idletasks() (suggéré en premier lieu) est fait
+                    # juste après pour que ce nouveau placement soit traité
+                    # tout de suite, sans attendre le prochain tick. Aucun
+                    # withdraw()/deiconify(), aucun changement de focus ni
+                    # de -topmost — rien de tout ça n'a d'effet sur le
+                    # fantôme et aurait, contrairement à ceci, un effet
+                    # visible (clignotement, perte de focus).
+                    try:
+                        self._banner_ghost_patch.place(
+                            x=_ghost_x, y=_ghost_y, width=_ghost_w, height=_ghost_h,
+                        )
+                        # Abaissé explicitement tout au fond de l'ordre
+                        # d'empilement : créé APRÈS movement_alert_frame et
+                        # elimination_banner_frame (donc au-dessus des deux
+                        # par défaut, voir leur ordre de création dans
+                        # __init__), ce patch ne doit JAMAIS recouvrir
+                        # l'un ou l'autre s'ils se trouvent, même en
+                        # partie, sur la même zone — c'est précisément ce
+                        # qui masquait le bandeau rouge "Changement de
+                        # tables en cours" avant ce correctif. Ceinture ET
+                        # bretelles avec les tkraise() sur movement_alert_
+                        # frame/elimination_banner_frame ci-dessus/dessous :
+                        # ni l'ordre de création ni un futur widget ajouté
+                        # ne pourront plus se faire recouvrir par erreur.
+                        self._banner_ghost_patch.lower()
+                        self.update_idletasks()
+                    except tk.TclError:
+                        pass
                 movement_y = base_y
 
             if movement_alert:
@@ -389,6 +504,10 @@ class ClockWindow(tk.Toplevel):
                 self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
                 self._update_movement_moves_table(moves or [])
                 self.movement_alert_frame.place(relx=0.5, y=movement_y, anchor="n")
+                # Voir le commentaire équivalent plus haut ("Partie
+                # terminée") : toujours au-dessus de _banner_ghost_patch,
+                # qui peut se trouver n'importe où sur l'écran.
+                self.movement_alert_frame.tkraise()
             else:
                 self.movement_alert_frame.place_forget()
 
@@ -424,10 +543,20 @@ class ClockWindow(tk.Toplevel):
         # lui aussi positionné par place(), pas pris en compte par
         # winfo_reqheight() tout seul.
         if self.elimination_banner_frame.winfo_ismapped():
+            # + bottom_frame.winfo_height() (Joueurs restants / Tapis
+            # moyen / Durée) EN PLUS du bas du bandeau, pas seulement le
+            # bas du bandeau seul : bottom_frame est packé côté "bottom",
+            # donc déjà compté une fois dans winfo_reqheight() ci-dessus,
+            # mais à sa position NATURELLE (juste après le contenu du
+            # haut, sans le bandeau — placé par place(), indépendant du
+            # pack) ; sans ce terme, la fenêtre ne grandissait que juste
+            # assez pour montrer le bandeau, laissant bottom_frame se
+            # faire recouvrir juste en dessous.
             needed_h = max(
                 needed_h,
                 self.elimination_banner_frame.winfo_y()
-                + self.elimination_banner_frame.winfo_height() + 10,
+                + self.elimination_banner_frame.winfo_height() + 10
+                + self.bottom_frame.winfo_height() + 8,
             )
         current_h = self.winfo_height()
         if needed_h <= current_h:
