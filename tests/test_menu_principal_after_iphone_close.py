@@ -59,7 +59,7 @@ def _post_json(url, payload, timeout=5, cookie=None):
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
-def _select_tournament_cookie(any_entry_port, target_pid, timeout=5):
+def _select_tournament_cookie(any_entry_port, target_pid, auth_cookie=None, timeout=5):
     """Reproduit exactement ce que fait un téléphone qui vient de choisir
     `target_pid` dans le Lobby (voir _handle_select_tournament) : GET
     /select_tournament?pid=... — toujours traité localement quel que soit
@@ -70,13 +70,20 @@ def _select_tournament_cookie(any_entry_port, target_pid, timeout=5):
     résolue via resolve_current_pid (le plus récemment ouvert, voir
     remote_control.py) — correct pour un vrai téléphone qui charge
     d'abord "/", mais ambigu pour ce test qui vise un pid précis
-    directement."""
+    directement.
+
+    `auth_cookie` (voir _authenticate, demande du 2026-09-09) : requis
+    depuis que /select_tournament exige un appareil authentifié/approuvé
+    — sans lui, la requête est redirigée vers /login (302) SANS jamais
+    poser de cookie "selected_pid"."""
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **k):
             return None  # ne PAS suivre le 302 : on veut son Set-Cookie à lui, pas "/"
 
     opener = urllib.request.build_opener(_NoRedirect)
     req = urllib.request.Request(f"http://127.0.0.1:{any_entry_port}/select_tournament?pid={target_pid}")
+    if auth_cookie:
+        req.add_header("Cookie", auth_cookie)
     try:
         resp = opener.open(req, timeout=timeout)
         cookie = resp.headers.get("Set-Cookie")
@@ -90,6 +97,73 @@ def _select_tournament_cookie(any_entry_port, target_pid, timeout=5):
         cookie = e.headers.get("Set-Cookie")
         e.close()
         return cookie
+
+
+def _authenticate(entry_port, register_cleanup, timeout=5):
+    """Authentifie ce test comme un téléphone APPROUVÉ pour la session
+    réelle en cours (demande du 2026-09-09, "sécurisation du contrôle à
+    distance" puis "approbation des téléphones") — nécessaire depuis
+    l'ajout du code à 6 chiffres + approbation par appareil : sans
+    cookies rc_bid/rc_auth valides, /end_tournament (et toute autre
+    route sensible) répond désormais 401. Reproduit le parcours RÉEL
+    d'un téléphone (code correct -> "pending" -> approuvé -> code
+    ressaisi -> jeton de session) — seule l'étape "Autoriser" (un clic
+    sur le Mac en usage normal) est ici un appel direct à open_windows,
+    exactement comme le ferait main.py. `register_cleanup` (typiquement
+    self.addCleanup) révoque l'appareil de test à la fin, pour ne pas
+    laisser une entrée "approuvée" dans le VRAI registre partagé de
+    l'utilisateur (~/.poker_tournament/remote_control_devices.json,
+    volontairement utilisé tel quel par ce fichier — voir sa docstring).
+    Renvoie l'en-tête Cookie combiné (rc_bid + rc_auth) à fournir sur
+    toute requête protégée suivante."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def _cookie_value(headers, name):
+        for line in headers.get_all("Set-Cookie") or []:
+            if line.startswith(name + "="):
+                return line.split(";", 1)[0]
+        return None
+
+    resp = opener.open(urllib.request.Request(f"http://127.0.0.1:{entry_port}/login"), timeout=timeout)
+    rc_bid = _cookie_value(resp.headers, "rc_bid")
+    resp.close()
+    if not rc_bid:
+        raise AssertionError("rc_bid non reçu depuis /login")
+    browser_id = rc_bid.split("=", 1)[1]
+
+    code = open_windows.remote_session_code()
+    if not code:
+        raise AssertionError("aucune session de contrôle à distance active (aucun tournoi ouvert ?)")
+
+    def _authenticate_once():
+        data = json.dumps({"code": code}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{entry_port}/authenticate", data=data, method="POST",
+            headers={"Content-Type": "application/json", "Cookie": rc_bid},
+        )
+        resp = opener.open(req, timeout=timeout)
+        body = json.loads(resp.read().decode("utf-8"))
+        rc_auth = _cookie_value(resp.headers, "rc_auth")
+        resp.close()
+        return body, rc_auth
+
+    body, _ = _authenticate_once()
+    if body != {"ok": True, "status": "pending"}:
+        raise AssertionError(f"/authenticate (1ère fois) inattendu : {body!r}")
+
+    register_cleanup(open_windows.revoke_remote_device, browser_id)
+    if not open_windows.approve_remote_device(browser_id, label="Test intégration (jetable)"):
+        raise AssertionError("approve_remote_device a échoué de façon inattendue")
+
+    body, rc_auth = _authenticate_once()
+    if body != {"ok": True, "status": "approved"} or not rc_auth:
+        raise AssertionError(f"/authenticate (2e fois, après approbation) inattendu : {body!r}, rc_auth={rc_auth!r}")
+
+    return f"{rc_bid}; {rc_auth}"
 
 
 def _pid_alive(pid):
@@ -180,6 +254,13 @@ class MenuPrincipalAfterIphoneCloseTest(unittest.TestCase):
             )
             ports[proc.pid] = port
 
+        # 1bis) Authentification (demande du 2026-09-09, "sécurisation du
+        # contrôle à distance") : UNE SEULE fois, contre n'importe lequel
+        # des 3 ports — l'état d'authentification est partagé entre tous
+        # les processus de la session via open_windows, indépendamment de
+        # celui qui traite telle ou telle requête précise.
+        auth_cookie = _authenticate(ports[procs_paths[0][0].pid], self.addCleanup)
+
         # 2) Ferme 2 des 3 par de VRAIES requêtes /end_tournament (exactement
         # ce que fait le téléphone) — la 3e (survivante) reste ouverte.
         # Sélectionne explicitement chaque cible via /select_tournament
@@ -191,9 +272,10 @@ class MenuPrincipalAfterIphoneCloseTest(unittest.TestCase):
         # vise directement un pid.
         survivor_proc, survivor_path = procs_paths[2]
         for proc, _path in procs_paths[:2]:
-            cookie = _select_tournament_cookie(ports[proc.pid], proc.pid)
+            selection_cookie = _select_tournament_cookie(ports[proc.pid], proc.pid, auth_cookie=auth_cookie)
             status, body = _post_json(
-                f"http://127.0.0.1:{ports[proc.pid]}/end_tournament", {"pid": proc.pid}, cookie=cookie,
+                f"http://127.0.0.1:{ports[proc.pid]}/end_tournament", {"pid": proc.pid},
+                cookie=f"{auth_cookie}; {selection_cookie}",
             )
             self.assertEqual(status, 200)
             self.assertTrue(body["ok"], f"pid={proc.pid} port={ports[proc.pid]} body={body!r}")

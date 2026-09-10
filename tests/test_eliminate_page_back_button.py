@@ -18,6 +18,7 @@ def _render(template):
         tournament_name="Tournoi Test",
         reload_script="",
         rebalance_widget="",
+        auth_redirect_script="",
     )
 
 

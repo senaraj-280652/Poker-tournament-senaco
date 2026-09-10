@@ -45,15 +45,19 @@ def _get_text(url, cookie=None, timeout=5):
         return r.read().decode("utf-8")
 
 
-def _select_tournament_cookie(any_entry_port, target_pid, timeout=5):
+def _select_tournament_cookie(any_entry_port, target_pid, auth_cookie=None, timeout=5):
     """Voir tests/test_menu_principal_after_iphone_close.py — même
-    principe, reproduit ici pour rester un fichier autonome."""
+    principe, reproduit ici pour rester un fichier autonome. `auth_
+    cookie` (voir _authenticate, demande du 2026-09-09) : requis depuis
+    que /select_tournament exige un appareil authentifié/approuvé."""
     class _NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **k):
             return None
 
     opener = urllib.request.build_opener(_NoRedirect)
     req = urllib.request.Request(f"http://127.0.0.1:{any_entry_port}/select_tournament?pid={target_pid}")
+    if auth_cookie:
+        req.add_header("Cookie", auth_cookie)
     try:
         resp = opener.open(req, timeout=timeout)
         cookie = resp.headers.get("Set-Cookie")
@@ -63,6 +67,66 @@ def _select_tournament_cookie(any_entry_port, target_pid, timeout=5):
         cookie = e.headers.get("Set-Cookie")
         e.close()
         return cookie
+
+
+def _authenticate(entry_port, register_cleanup, timeout=5):
+    """Voir tests/test_menu_principal_after_iphone_close.py — même
+    principe (docstring complète là-bas), reproduit ici pour rester un
+    fichier autonome : authentifie ce test comme un téléphone APPROUVÉ
+    pour la session réelle en cours, nécessaire depuis l'ajout du code
+    à 6 chiffres + approbation par appareil (demande du 2026-09-09).
+    `register_cleanup` (typiquement self.addCleanup) révoque l'appareil
+    de test à la fin, pour ne pas laisser une entrée "approuvée" dans le
+    VRAI registre partagé de l'utilisateur. Renvoie l'en-tête Cookie
+    combiné (rc_bid + rc_auth)."""
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirect)
+
+    def _cookie_value(headers, name):
+        for line in headers.get_all("Set-Cookie") or []:
+            if line.startswith(name + "="):
+                return line.split(";", 1)[0]
+        return None
+
+    resp = opener.open(urllib.request.Request(f"http://127.0.0.1:{entry_port}/login"), timeout=timeout)
+    rc_bid = _cookie_value(resp.headers, "rc_bid")
+    resp.close()
+    if not rc_bid:
+        raise AssertionError("rc_bid non reçu depuis /login")
+    browser_id = rc_bid.split("=", 1)[1]
+
+    code = open_windows.remote_session_code()
+    if not code:
+        raise AssertionError("aucune session de contrôle à distance active (aucun tournoi ouvert ?)")
+
+    def _authenticate_once():
+        data = json.dumps({"code": code}).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{entry_port}/authenticate", data=data, method="POST",
+            headers={"Content-Type": "application/json", "Cookie": rc_bid},
+        )
+        resp = opener.open(req, timeout=timeout)
+        body = json.loads(resp.read().decode("utf-8"))
+        rc_auth = _cookie_value(resp.headers, "rc_auth")
+        resp.close()
+        return body, rc_auth
+
+    body, _ = _authenticate_once()
+    if body != {"ok": True, "status": "pending"}:
+        raise AssertionError(f"/authenticate (1ère fois) inattendu : {body!r}")
+
+    register_cleanup(open_windows.revoke_remote_device, browser_id)
+    if not open_windows.approve_remote_device(browser_id, label="Test intégration (jetable)"):
+        raise AssertionError("approve_remote_device a échoué de façon inattendue")
+
+    body, rc_auth = _authenticate_once()
+    if body != {"ok": True, "status": "approved"} or not rc_auth:
+        raise AssertionError(f"/authenticate (2e fois, après approbation) inattendu : {body!r}, rc_auth={rc_auth!r}")
+
+    return f"{rc_bid}; {rc_auth}"
 
 
 def _wait_for_remote_port(path, timeout=15):
@@ -140,10 +204,16 @@ class MainScreenReflectsSelectedTournamentTest(unittest.TestCase):
         pid_b, port_b = self._spawn_tournament("B")
         _pid_c, _port_c = self._spawn_tournament("C")
 
+        # Authentification (demande du 2026-09-09, "sécurisation du
+        # contrôle à distance") : UNE SEULE fois, l'état est partagé
+        # entre tous les processus de la session via open_windows.
+        auth_cookie = _authenticate(port_a, self.addCleanup)
+
         # Sélectionne explicitement B depuis le téléphone (via A, peu
         # importe le port interrogé — voir _handle_select_tournament).
-        cookie = _select_tournament_cookie(port_a, pid_b)
-        self.assertIsNotNone(cookie)
+        selection_cookie = _select_tournament_cookie(port_a, pid_b, auth_cookie=auth_cookie)
+        self.assertIsNotNone(selection_cookie)
+        cookie = f"{auth_cookie}; {selection_cookie}"
 
         # 3) Le nom affiché sur l'écran principal (chargé via le port de
         # A, avec la sélection de B) doit être celui de B, pas de A.
@@ -179,11 +249,13 @@ class MainScreenReflectsSelectedTournamentTest(unittest.TestCase):
         html2 = _get_text(f"http://127.0.0.1:{port_a}/", cookie=cookie)
         self.assertEqual(html, html2)
 
-        # Sans sélection (pas de cookie, peu importe le port interrogé) :
-        # repli sur le plus récemment ouvert (voir resolve_current_pid,
-        # BUG 2) — C ici, ni A (routeur) ni B (dernière sélection
-        # explicite, qui ne doit pas "rester collée" sans cookie).
-        html_no_cookie = _get_text(f"http://127.0.0.1:{port_a}/")
+        # Sans sélection (mais toujours authentifié — seule la sélection
+        # de tournoi est absente ici, pas l'authentification elle-même,
+        # qui reste requise depuis le 2026-09-09) : repli sur le plus
+        # récemment ouvert (voir resolve_current_pid, BUG 2) — C ici, ni
+        # A (routeur) ni B (dernière sélection explicite, qui ne doit
+        # pas "rester collée" sans cookie de sélection).
+        html_no_cookie = _get_text(f"http://127.0.0.1:{port_a}/", cookie=auth_cookie)
         m3 = re.search(r'class="tournoi"[^>]*>([^<]+)<', html_no_cookie)
         self.assertEqual(m3.group(1), "_scratch_C")
 
@@ -191,7 +263,8 @@ class MainScreenReflectsSelectedTournamentTest(unittest.TestCase):
         pid_a, port_a = self._spawn_tournament("A")
         _pid_b, _port_b = self._spawn_tournament("B")  # 2e tournoi : bouton Lobby visible
 
-        html = _get_text(f"http://127.0.0.1:{port_a}/lobbylist")
+        auth_cookie = _authenticate(port_a, self.addCleanup)
+        html = _get_text(f"http://127.0.0.1:{port_a}/lobbylist", cookie=auth_cookie)
         self.assertIn('id="btn-back"', html)
         self.assertIn("<button id=\"btn-back\"", html)  # un vrai bouton, pas juste un <a>
         self.assertIn("window.location.href='/'", html)

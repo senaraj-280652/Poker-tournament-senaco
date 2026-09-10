@@ -38,17 +38,19 @@ Deux familles de tests :
   précisément la logique de garde (le SEUL appel de navigation de tout
   le fichier, et la condition exacte qui le protège), pas seulement la
   présence de texte."""
-import json
 import os
 import socket
 import sys
+import tempfile
 import unittest
-import urllib.request
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import open_windows  # noqa: E402
 import remote_control  # noqa: E402
+from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
 
 def _free_port():
@@ -67,6 +69,7 @@ def _render_main_page():
         app_version="0.0.0-test",
         reload_script="",
         rebalance_widget="",
+        auth_redirect_script="",
         own_pid=4242,
     )
 
@@ -76,11 +79,34 @@ def _render_main_page():
 # process qui répond.
 # ---------------------------------------------------------------------
 class LobbylistOwnPidHeaderTest(unittest.TestCase):
+    """Depuis le durcissement du 2026-09-09, /lobbylist exige un appareil
+    authentifié ET approuvé (voir remote_control._AUTH_PAGE_PATHS) —
+    open_windows redirigé vers un dossier temporaire dédié, jamais
+    ~/.poker_tournament, et un jar déjà authentifié/approuvé (voir
+    _remote_control_auth_test_utils.authenticated_jar) pour chaque
+    requête protégée."""
+
     def setUp(self):
         self.test_port = _free_port()
         patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
         self.addCleanup(patcher.stop)
         patcher.start()
+
+        self._tmp = tempfile.TemporaryDirectory(prefix="reconnect_lobbylist_test_")
+        self.addCleanup(self._tmp.cleanup)
+        registry_path = os.path.join(self._tmp.name, "open_windows.json")
+        remote_dir = os.path.join(self._tmp.name, "remote")
+        os.makedirs(remote_dir, exist_ok=True)
+        for target in (
+            patch.object(open_windows, "_registry_path", return_value=registry_path),
+            patch.object(open_windows, "_remote_control_dir", return_value=remote_dir),
+        ):
+            self.addCleanup(target.stop)
+            target.start()
+        self._session_path = os.path.join(self._tmp.name, "session_marker.tournoi")
+        open_windows.register(self._session_path)
+        self.addCleanup(open_windows.unregister, self._session_path)
+
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_tournament_name=lambda: "Tournoi Test",
@@ -88,14 +114,15 @@ class LobbylistOwnPidHeaderTest(unittest.TestCase):
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.jar = authenticated_jar(f"http://127.0.0.1:{self.test_port}")
 
     def test_lobbylist_expose_le_pid_du_process_qui_repond_vraiment(self):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=[]):
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.test_port}/lobbylist", timeout=2
-            ) as r:
-                self.assertEqual(r.status, 200)
-                self.assertEqual(r.headers.get("X-Own-Pid"), str(os.getpid()))
+            status, _, headers = http_request(
+                f"http://127.0.0.1:{self.test_port}", "GET", "/lobbylist", self.jar
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(headers.get("X-Own-Pid"), str(os.getpid()))
 
     def test_en_tete_toujours_present_meme_avec_des_tournois_listes(self):
         """Non-régression : l'ajout de l'en-tête ne dépend pas du contenu
@@ -104,10 +131,10 @@ class LobbylistOwnPidHeaderTest(unittest.TestCase):
         with patch.object(
             remote_control.open_windows, "list_remote_tournaments", return_value=fake_tournaments
         ):
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{self.test_port}/lobbylist", timeout=2
-            ) as r:
-                self.assertEqual(r.headers.get("X-Own-Pid"), str(os.getpid()))
+            status, _, headers = http_request(
+                f"http://127.0.0.1:{self.test_port}", "GET", "/lobbylist", self.jar
+            )
+            self.assertEqual(headers.get("X-Own-Pid"), str(os.getpid()))
 
 
 # ---------------------------------------------------------------------

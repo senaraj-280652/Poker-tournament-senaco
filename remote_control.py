@@ -51,15 +51,62 @@ dépendance en plus de la bibliothèque standard, sert :
 Rien n'est installé sur le téléphone : juste ouvrir une adresse dans son
 navigateur, sur le wifi du club.
 
-Volontairement sans mot de passe ni compte : l'accès est limité à qui est
-déjà sur le même réseau Wifi local (comme le reste de l'application, qui
-n'a pas non plus de système d'authentification), et les actions
-déclenchées sont les mêmes que celles déjà disponibles au clavier
-(Ctrl+Maj+J/C/T) ou dans l'onglet Joueurs — rien de destructeur, rien qui
-touche aux données du tournoi autrement que par une élimination normale.
+Protégé par un code à 6 chiffres PUIS une approbation par appareil
+(demande du 2026-09-09) : avant ce correctif, l'accès reposait
+uniquement sur le fait d'être déjà sur le même réseau Wifi local.
+Désormais, toute connexion doit d'abord passer par /login puis
+/authenticate (voir Handler._handle_login/_handle_authenticate) et
+indiquer le code de la session en cours (voir open_windows.
+remote_session_code, affiché dans Paramètres à côté de la case "Activer
+le contrôle à distance"), IDENTIQUE pour tous les tournois ouverts
+pendant une même session de l'application. Un code de test permanent
+(131261) est accepté EN PLUS du code de session pour les besoins de
+test — jamais affiché dans l'interface, soumis à la même protection
+anti-force-brute que le code réel (open_windows.record_remote_auth_
+failure/_success), aucune route ni aucun contournement spécifique pour
+lui.
+
+Le code seul ne suffit PAS : un appareil qui ne s'est jamais connecté
+doit en plus être explicitement APPROUVÉ depuis le PC/Mac (Paramètres,
+voir main.py) avant d'accéder à la moindre commande — voir open_windows.
+register_device_attempt/approve_remote_device/verify_device_session.
+Un appareil déjà approuvé lors d'une session précédente retrouve un
+accès immédiat en resaisissant le nouveau code de la session en cours,
+sans réapprobation (voir open_windows.get_or_mint_device_session_
+token) ; une révocation (bouton "Révoquer" dans Paramètres) invalide
+l'accès de cet appareil IMMÉDIATEMENT, même en cours de session.
+
+Une fois authentifié ET approuvé, le téléphone reste autorisé pour
+toute la session (cookies "rc_bid"/"rc_auth", HttpOnly — jamais lus par
+le JavaScript de la page) : il n'a PAS à ressaisir le code à chaque
+page ni en changeant de tournoi depuis le Lobby, mais DOIT s'authentifier
+à nouveau à la session suivante (code et jetons de session régénérés,
+voir open_windows._ensure_remote_session_auth_locked).
+
+Vérification faite CÔTÉ SERVEUR sur CHAQUE route sensible (voir
+_AUTH_EXEMPT_PATHS/_AUTH_PAGE_PATHS et le tout début de do_GET/do_POST
+ci-dessous) — pas seulement sur les pages HTML ou les boutons JS :
+connaître directement l'URL d'une action (ex. /end_tournament) sans
+authentification valide ne suffit pas à l'exécuter. Aucune route HTTP
+ne permet à un téléphone de s'auto-approuver, se révoquer ou modifier
+la liste des appareils : Autoriser/Refuser/Révoquer sont exclusivement
+des actions de l'interface Tkinter locale (voir main.py).
+
+Limite connue et assumée : ce serveur tourne en HTTP simple (pas de
+TLS) sur le Wifi local — code, cookies et jetons y circulent donc EN
+CLAIR sur le réseau. La protection mise en place vise un accès non
+autorisé qui ne serait ni sur le Wifi club ni approuvé, un ancien
+responsable dont le téléphone a été révoqué, et le brute-force du code
+— pas une interception réseau active sur ce même Wifi (HTTPS pourrait
+être traité séparément plus tard). Les actions déclenchées restent les
+mêmes que celles déjà disponibles au clavier (Ctrl+Maj+J/C/T) ou dans
+l'onglet Joueurs — rien de destructeur, rien qui touche aux données du
+tournoi autrement que par une élimination normale.
 """
 import json
 import os
+import re
+import secrets
 import socket
 import threading
 import urllib.error
@@ -91,6 +138,217 @@ _RELOAD_SCRIPT = (
     "  window.location.href = window.location.pathname + '?_r=' + Date.now();\n"
     "}"
 )
+
+# ---------------------------------------------------------------------
+# Authentification (demande du 2026-09-09) : code à 6 chiffres puis
+# approbation par appareil — voir la docstring de ce module et celle,
+# bien plus détaillée, de la section correspondante dans open_windows.py
+# (registre persistant des appareils / fichier éphémère de session).
+# ---------------------------------------------------------------------
+
+# Cookie HttpOnly, jamais lu ni écrit par le JavaScript de la page —
+# identifiant de navigateur (rc_bid, 128 bits, non sensible : ne sert
+# qu'à retrouver un appareil déjà approuvé, voir open_windows.
+# register_device_attempt) et jeton de session par appareil (rc_auth,
+# 256 bits, voir open_windows.get_or_mint_device_session_token).
+_BROWSER_ID_COOKIE_NAME = "rc_bid"
+_AUTH_COOKIE_NAME = "rc_auth"
+
+# Un an : rc_bid identifie l'APPAREIL, pas la session — doit survivre à
+# la fermeture de Safari pour qu'un responsable déjà approuvé n'ait
+# jamais à re-demander une approbation d'une soirée à l'autre (voir
+# open_windows, section "approbation persistante").
+_BROWSER_ID_COOKIE_MAX_AGE = 365 * 24 * 3600
+# 24h : largement plus qu'une soirée de tournoi, mais borné plutôt
+# qu'un cookie de session pur — un responsable qui ferme et rouvre
+# Safari en cours de soirée garde son accès sans ressaisir le code.
+_AUTH_COOKIE_MAX_AGE = 24 * 3600
+
+# Routes accessibles SANS authentification (demande du 2026-09-09) :
+# strictement celles nécessaires pour saisir/vérifier le code et
+# sonder l'état d'une demande d'approbation en attente — TOUT le reste
+# (pages ET actions) exige une session valide ET un appareil approuvé,
+# vérifiés ICI côté serveur (voir do_GET/do_POST), jamais seulement
+# côté page/JS.
+_AUTH_EXEMPT_PATHS = {"/login", "/authenticate", "/auth_status"}
+
+# Routes GET qui correspondent à une VRAIE navigation plein écran
+# (typiquement suivies d'un rendu HTML plein écran par le téléphone) :
+# une requête non authentifiée y répond par une redirection 302 vers
+# /login, plutôt que par un 401 JSON — sans ça, /login recevrait un
+# fetch() en boucle plutôt qu'un affichage utilisable. Tout le reste
+# (endpoints JSON, tout do_POST) répond 401 en JSON — voir
+# _AUTH_REDIRECT_SCRIPT côté client, qui intercepte ce 401 pour
+# rediriger lui-même vers /login.
+_AUTH_PAGE_PATHS = {
+    "/", "/index.html", "/eliminate", "/eliminate.html",
+    "/photos", "/photos.html", "/lobbylist", "/select_tournament",
+}
+
+
+def _parse_cookie(cookie_header, name):
+    """Valeur du cookie `name` dans l'en-tête Cookie brut, ou None —
+    petit utilitaire partagé (identifiant de navigateur, jeton
+    d'authentification...) ; le cookie "selected_pid" garde son
+    analyse propre dans resolve_current_pid, laissée telle quelle pour
+    ne rien changer à un comportement déjà en place et testé."""
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if part.startswith(name + "="):
+            return part.split("=", 1)[1]
+    return None
+
+
+_BROWSER_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+# Injecté en tout début du <script> de chaque page accessible une fois
+# authentifié (voir _PAGE_TEMPLATE/_ELIMINATE_PAGE/_PHOTOS_PAGE) : dès
+# qu'une session serveur devient invalide (nouvelle session côté PC,
+# donc nouveau code/jetons — voir open_windows._ensure_remote_session_
+# auth_locked — OU appareil révoqué entre-temps), toute réponse 401
+# d'un fetch() quelconque de la page renvoie directement au formulaire
+# de code plutôt que de laisser la page continuer à afficher des
+# données obsolètes/vides silencieusement. Une seule interception
+# centrale plutôt que de modifier individuellement chaque .then() de
+# chaque page (il y en a une bonne dizaine, réparties sur 4 templates).
+_AUTH_REDIRECT_SCRIPT = (
+    "(function() {\n"
+    "  var _origFetch = window.fetch;\n"
+    "  window.fetch = function() {\n"
+    "    return _origFetch.apply(this, arguments).then(function(response) {\n"
+    "      if (response.status === 401) {\n"
+    "        window.location.href = '/login';\n"
+    "        throw new Error('auth_required');\n"
+    "      }\n"
+    "      return response;\n"
+    "    });\n"
+    "  };\n"
+    "})();"
+)
+
+_LOGIN_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Code d'accès</title>
+<style>
+  body {
+    margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    text-align: center;
+  }
+  h1 { font-size: 19px; color: #e8c468; margin: 0 0 6px; }
+  p.hint { color: #b9ad8f; font-size: 14px; margin: 0 0 26px; }
+  input {
+    display: block; width: 100%; max-width: 280px; margin: 0 auto 16px;
+    padding: 16px 10px; font-size: 28px; letter-spacing: 6px; text-align: center;
+    border: none; border-radius: 10px; box-sizing: border-box;
+    -webkit-appearance: none;
+  }
+  button {
+    display: block; width: 100%; max-width: 280px; margin: 0 auto;
+    padding: 14px 10px; font-size: 17px; font-weight: 700;
+    border: none; border-radius: 10px; color: #fff; background: #2c6e8a;
+    -webkit-tap-highlight-color: transparent;
+  }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.55; }
+  #msg { min-height: 40px; margin: 18px auto 0; max-width: 280px; color: #d98a5f; font-size: 14px; }
+  #msg.pending { color: #e8c468; }
+</style>
+</head>
+<body>
+  <h1>🔒 Contrôle à distance</h1>
+  <p class="hint" id="hint">Code affiché dans Paramètres, sur le PC</p>
+  <input id="code" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" autofocus>
+  <button id="btn-submit" onclick="submitCode()">Valider</button>
+  <p id="msg"></p>
+<script>
+var pollTimer = null;
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+}
+
+// Sondage de l'état d'une demande en attente (demande du 2026-09-09) :
+// toutes les 2 secondes seulement, jamais plus fréquent — l'iPhone
+// détecte ainsi tout seul le moment où le responsable clique
+// "Autoriser" sur le PC, sans que l'utilisateur ait à recharger la
+// page ou ressaisir le code.
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(function() {
+    fetch('/auth_status').then(function(r) { return r.json(); }).then(function(data) {
+      if (data.status === 'approved') {
+        stopPolling();
+        window.location.href = '/';
+      } else if (data.status === 'refused') {
+        stopPolling();
+        var msg = document.getElementById('msg');
+        msg.className = '';
+        msg.textContent = "Accès refusé par le responsable du tournoi.";
+      }
+    }).catch(function() { /* réseau momentanément indisponible : on retentera */ });
+  }, 2000);
+}
+
+function submitCode() {
+  var input = document.getElementById('code');
+  var btn = document.getElementById('btn-submit');
+  var msg = document.getElementById('msg');
+  var code = input.value.trim();
+  if (!/^[0-9]{6}$/.test(code)) {
+    msg.className = '';
+    msg.textContent = 'Entrez les 6 chiffres du code.';
+    return;
+  }
+  btn.disabled = true;
+  msg.className = '';
+  msg.textContent = '';
+  fetch('/authenticate', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({code: code}),
+  }).then(function(r) {
+    if (r.status === 429) {
+      return r.json().then(function(data) { throw {rateLimited: true, message: data.message}; });
+    }
+    return r.json();
+  }).then(function(data) {
+    btn.disabled = false;
+    if (!data.ok) {
+      msg.className = '';
+      msg.textContent = 'Code incorrect.';
+      input.value = '';
+      input.focus();
+      return;
+    }
+    if (data.status === 'approved') {
+      window.location.href = '/';
+    } else {
+      msg.className = 'pending';
+      msg.textContent = "Code correct. En attente d'autorisation par le responsable du tournoi.";
+      startPolling();
+    }
+  }).catch(function(err) {
+    btn.disabled = false;
+    msg.className = '';
+    if (err && err.rateLimited) {
+      msg.textContent = err.message || 'Trop de tentatives. Réessayez plus tard.';
+    } else {
+      msg.textContent = 'Connexion impossible. Réessayez.';
+    }
+  });
+}
+document.getElementById('code').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') submitCode();
+});
+</script>
+</body>
+</html>
+"""
 
 _PAGE_TEMPLATE = """<!doctype html>
 <html lang="fr">
@@ -215,6 +473,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   </div>
 
 <script>
+{auth_redirect_script}
 var OWN_PID = {own_pid};  // capturé au chargement de cette page — voir /end_tournament et sa docstring côté serveur
 // Nom du tournoi RÉELLEMENT affiché sur CETTE page (voir tournament_name_json
 // côté serveur) — celui du tournoi sélectionné/servi ici, jamais forcément
@@ -521,6 +780,7 @@ _ELIMINATE_PAGE = """<!doctype html>
   <div id="ghost"></div>
 
 <script>
+{auth_redirect_script}
 var players = [];
 var lastSignature = null;
 var pending = null;    // candidat de glissement pas encore confirmé : {{id, label, sub, el, startX, startY, engaged}}
@@ -927,6 +1187,7 @@ _PHOTOS_PAGE = """<!doctype html>
   </div>
 
 <script>
+{auth_redirect_script}
 var players = [];
 var pendingPlayer = null;
 var lastPlayersJSON = null;
@@ -1507,23 +1768,162 @@ class RemoteControlServer:
                 pass  # pas de log console à chaque requête (bruyant)
 
             def _send_html(self, html, extra_headers=None):
+                # extra_headers : liste de (nom, valeur) — PAS un dict,
+                # justement pour pouvoir poser PLUSIEURS "Set-Cookie"
+                # dans la même réponse (ex. rc_bid + rc_auth à la fois,
+                # voir _handle_authenticate) : un dict ne peut porter
+                # qu'une seule valeur par nom d'en-tête.
                 body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 if extra_headers:
-                    for name, value in extra_headers.items():
+                    for name, value in extra_headers:
                         self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
 
-            def _send_json(self, obj, status=200):
+            def _send_json(self, obj, status=200, extra_headers=None):
+                # extra_headers : voir _send_html — même convention
+                # (liste de tuples), nécessaire ici aussi pour poser un
+                # cookie sur une réponse JSON (ex. /authenticate,
+                # /auth_status).
                 body = json.dumps(obj).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                if extra_headers:
+                    for name, value in extra_headers:
+                        self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _client_ip(self):
+                return self.client_address[0]
+
+            def _browser_id(self):
+                """(browser_id, is_new) — identifiant de navigateur
+                (demande du 2026-09-09) : 128 bits aléatoires
+                (secrets.token_hex), SANS aucune donnée personnelle, non
+                dérivé de l'IP, non prévisible — sert uniquement à
+                retrouver un appareil déjà (dés)approuvé (voir
+                open_windows.register_device_attempt) et à clé
+                l'anti-force-brute. `is_new` indique si CETTE réponse
+                doit poser le cookie (absent, ou valeur qui ne
+                ressemble pas à ce que ce serveur génère lui-même — un
+                cookie forgé/tronqué est alors simplement remplacé, pas
+                fait confiance)."""
+                existing = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                if existing and _BROWSER_ID_RE.fullmatch(existing):
+                    return existing, False
+                return secrets.token_hex(16), True
+
+            def _is_authenticated(self):
+                """LA vérification faite avant toute route sensible
+                (voir do_GET/do_POST) : les deux cookies HttpOnly
+                (rc_bid, rc_auth) doivent correspondre à un appareil
+                TOUJOURS approuvé, avec un jeton valide pour la session
+                EN COURS (voir open_windows.verify_device_session, qui
+                vérifie les deux conditions requises)."""
+                browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                token = _parse_cookie(self.headers.get("Cookie", ""), _AUTH_COOKIE_NAME)
+                return open_windows.verify_device_session(browser_id, token)
+
+            def _handle_login(self):
+                browser_id, is_new = self._browser_id()
+                extra_headers = []
+                if is_new:
+                    extra_headers.append((
+                        "Set-Cookie",
+                        f"{_BROWSER_ID_COOKIE_NAME}={browser_id}; Path=/; HttpOnly; "
+                        f"SameSite=Lax; Max-Age={_BROWSER_ID_COOKIE_MAX_AGE}",
+                    ))
+                self._send_html(_LOGIN_PAGE, extra_headers=extra_headers or None)
+
+            def _handle_authenticate(self):
+                """POST /authenticate — SEULE route qui compare un code
+                saisi (demande du 2026-09-09 : 131261 passe forcément
+                par ICI, comme le code réel, jamais de route ni de
+                bypass séparé). Ordre STRICT, chacun avant le suivant :
+                1) anti-bruteforce (avant même de lire le code, pour ne
+                   jamais évaluer un code pendant un blocage actif) ;
+                2) validité du code (échec -> compteur incrémenté,
+                   réponse {"ok": false}, RIEN d'autre) ;
+                3) succès -> compteurs remis à zéro, PUIS seulement :
+                   approbation de l'appareil (voir open_windows.
+                   register_device_attempt) — "approved" délivre
+                   immédiatement un jeton de session (cookie rc_auth),
+                   tout le reste (pending/nouveau/révoqué-redevenu-
+                   pending) renvoie {"ok": true, "status": "pending"}
+                   SANS aucun cookie rc_auth : le code était correct,
+                   mais ça ne suffit plus à donner accès."""
+                browser_id, browser_is_new = self._browser_id()
+                ip = self._client_ip()
+                extra_headers = []
+                if browser_is_new:
+                    extra_headers.append((
+                        "Set-Cookie",
+                        f"{_BROWSER_ID_COOKIE_NAME}={browser_id}; Path=/; HttpOnly; "
+                        f"SameSite=Lax; Max-Age={_BROWSER_ID_COOKIE_MAX_AGE}",
+                    ))
+                blocked, remaining = open_windows.remote_auth_rate_limit_status(browser_id, ip)
+                if blocked:
+                    minutes = int(remaining // 60) + (1 if remaining % 60 else 0)
+                    minutes = max(1, minutes)
+                    self._send_json(
+                        {"ok": False, "message": f"Trop de tentatives. Réessayez dans {minutes} min."},
+                        status=429,
+                        extra_headers=extra_headers or None,
+                    )
+                    return
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    data = json.loads(raw.decode("utf-8"))
+                    code = data.get("code")
+                except (ValueError, TypeError):
+                    code = None
+                if not isinstance(code, str) or not open_windows.verify_remote_code(code):
+                    open_windows.record_remote_auth_failure(browser_id, ip)
+                    self._send_json({"ok": False}, extra_headers=extra_headers or None)
+                    return
+                open_windows.record_remote_auth_success(browser_id, ip)
+                device_status = open_windows.register_device_attempt(browser_id, ip)
+                if device_status == "approved":
+                    token = open_windows.get_or_mint_device_session_token(browser_id)
+                    if token:
+                        extra_headers.append((
+                            "Set-Cookie",
+                            f"{_AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; "
+                            f"SameSite=Lax; Max-Age={_AUTH_COOKIE_MAX_AGE}",
+                        ))
+                    self._send_json({"ok": True, "status": "approved"}, extra_headers=extra_headers or None)
+                else:
+                    self._send_json({"ok": True, "status": "pending"}, extra_headers=extra_headers or None)
+
+            def _handle_auth_status(self):
+                """GET /auth_status — sondé toutes les 2s par /login tant
+                qu'une demande est "pending" (voir _LOGIN_PAGE). Réponse
+                STRICTEMENT limitée à {"status": "..."} (demande du
+                2026-09-09, point 2 : aucune liste, aucun nom, aucune
+                IP, aucun jeton, aucun session_id) — basée uniquement
+                sur le browser_id du cookie courant, jamais sur un
+                paramètre fourni par la requête. Pose le cookie rc_auth
+                (via Set-Cookie, jamais dans le corps JSON) dès que
+                l'approbation est détectée, pour que la redirection vers
+                "/" qui suit trouve déjà une session valide."""
+                browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                status = open_windows.get_device_auth_status(browser_id)
+                extra_headers = []
+                if status == "approved" and browser_id:
+                    token = open_windows.get_or_mint_device_session_token(browser_id)
+                    if token:
+                        extra_headers.append((
+                            "Set-Cookie",
+                            f"{_AUTH_COOKIE_NAME}={token}; Path=/; HttpOnly; "
+                            f"SameSite=Lax; Max-Age={_AUTH_COOKIE_MAX_AGE}",
+                        ))
+                self._send_json({"status": status}, extra_headers=extra_headers or None)
 
             def _proxy(self, target_port):
                 """Relaie telle quelle la requête en cours vers le VRAI
@@ -1612,7 +2012,7 @@ class RemoteControlServer:
                     rows = "\n".join(parts)
                 self._send_html(
                     _LOBBY_PAGE.format(rows=rows, reload_script=_RELOAD_SCRIPT),
-                    extra_headers={"X-Own-Pid": str(own_pid)},
+                    extra_headers=[("X-Own-Pid", str(own_pid))],
                 )
 
             def _handle_select_tournament(self):
@@ -1652,6 +2052,30 @@ class RemoteControlServer:
                 # eux d'utiliser self.path tel quel).
                 path = self.path.split("?", 1)[0]
 
+                # Authentification (demande du 2026-09-09) : traitée
+                # avant TOUT le reste, y compris /lobbylist et le relais
+                # vers un autre tournoi — voir _AUTH_EXEMPT_PATHS/_AUTH_
+                # PAGE_PATHS et la docstring de ce module. /login et
+                # /auth_status doivent rester joignables SANS être
+                # authentifié (c'est justement leur rôle) ; tout le
+                # reste exige une session valide ET un appareil
+                # approuvé (voir Handler._is_authenticated), vérifié ICI
+                # côté serveur, jamais seulement côté page/JS.
+                if path == "/login":
+                    self._handle_login()
+                    return
+                if path == "/auth_status":
+                    self._handle_auth_status()
+                    return
+                if path not in _AUTH_EXEMPT_PATHS and not self._is_authenticated():
+                    if path in _AUTH_PAGE_PATHS:
+                        self.send_response(302)
+                        self.send_header("Location", "/login")
+                        self.end_headers()
+                    else:
+                        self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
+                    return
+
                 # Toujours traitées ICI, jamais relayées vers un autre
                 # tournoi : ce sont les pages qui permettent justement de
                 # choisir/changer de tournoi.
@@ -1688,6 +2112,7 @@ class RemoteControlServer:
                         app_version=version.APP_VERSION,
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                         own_pid=own_pid,
                     ))
                 elif path in ("/eliminate", "/eliminate.html"):
@@ -1695,12 +2120,14 @@ class RemoteControlServer:
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
                 elif path in ("/photos", "/photos.html"):
                     self._send_html(_PHOTOS_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
                 elif path == "/players":
                     self._send_json(get_players())
@@ -1773,12 +2200,27 @@ class RemoteControlServer:
                     self.send_error(404)
 
             def do_POST(self):
+                path = self.path.split("?", 1)[0]
+
+                # /authenticate est la SEULE route POST accessible sans
+                # authentification (voir _AUTH_EXEMPT_PATHS et la
+                # docstring de _handle_authenticate) — jamais relayée
+                # vers un autre tournoi non plus : l'état d'authenti-
+                # fication est de toute façon partagé entre tous les
+                # tournois de la session via open_windows, peu importe
+                # quel processus traite cette requête précise.
+                if path == "/authenticate":
+                    self._handle_authenticate()
+                    return
+                if not self._is_authenticated():
+                    self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
+                    return
+
                 target_port = resolve_proxy_port(self)
                 if target_port is not None:
                     self._proxy(target_port)
                     return
 
-                path = self.path.split("?", 1)[0]
                 if path.startswith("/action/"):
                     action = path[len("/action/"):]
                     if action not in _VALID_ACTIONS:

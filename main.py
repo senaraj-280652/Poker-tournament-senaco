@@ -3829,6 +3829,98 @@ class ActivationDialog(tk.Toplevel):
         self.destroy()
 
 
+class RemoteDeviceRequestWindow(tk.Toplevel):
+    """Petite fenêtre flottante Tkinter (demande du 2026-09-09) :
+    présente UNE demande d'accès au contrôle à distance à la fois
+    (Identifiant/IP, champ Nom, boutons Autoriser/Refuser/Plus tard) —
+    disposition définitivement retenue après plusieurs essais
+    d'intégration dans la grille de Paramètres, tous abandonnés (le
+    dernier ayant élargi la colonne au point de repousser la colonne
+    droite hors écran). Totalement indépendante de la mise en page de
+    Paramètres : ne touche à aucune de ses dimensions, se déplace
+    librement à la souris.
+
+    Une SEULE instance à la fois (voir App._remote_device_popup) : pour
+    passer d'une demande à la suivante, App._refresh_remote_device_popup
+    repeuple CETTE MÊME fenêtre (voir show_request) plutôt que d'en
+    détruire/recréer une — elle reste ainsi exactement à la même
+    position, sans le moindre scintillement. Ne connaît elle-même AUCUNE
+    règle métier (approbation/révocation/anti-bruteforce/tokens...) :
+    se contente d'appeler les callbacks fournis par App, qui seule
+    orchestre open_windows (source de vérité partagée)."""
+
+    def __init__(self, master, on_approve, on_refuse, on_later, on_geometry_changed):
+        super().__init__(master)
+        self._on_approve = on_approve
+        self._on_refuse = on_refuse
+        self._on_later = on_later
+        self._on_geometry_changed = on_geometry_changed
+        self.title("Contrôle à distance")
+        self.resizable(False, False)
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.transient(master)
+        # "Plus tard" ET la croix de fermeture native ont EXACTEMENT le
+        # même effet (voir App._on_remote_device_popup_later, appelé par
+        # les deux) : fermer cette fenêtre ne doit jamais, par un autre
+        # chemin que le bouton "Refuser" explicite, être interprété comme
+        # un refus de la demande.
+        self.protocol("WM_DELETE_WINDOW", self._handle_later)
+        self.bind("<Configure>", self._on_configure)
+
+        ttk.Label(
+            self, text="📱 Nouveau téléphone demande l'accès\nau contrôle à distance",
+            font=("Helvetica", 11, "bold"), justify="left",
+        ).pack(padx=16, pady=(14, 6), anchor="w")
+        self._info_lbl = ttk.Label(self, foreground=MUTED)
+        self._info_lbl.pack(padx=16, anchor="w")
+
+        label_row = ttk.Frame(self)
+        label_row.pack(padx=16, pady=(10, 4), fill="x")
+        ttk.Label(label_row, text="Nom (optionnel) :").pack(side="left")
+        self._label_var = tk.StringVar()
+        ttk.Entry(label_row, textvariable=self._label_var, width=22).pack(side="left", padx=(6, 0))
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(padx=16, pady=(8, 14), fill="x")
+        ttk.Button(btn_row, text="✓ Autoriser", command=self._handle_approve).pack(side="left")
+        ttk.Button(btn_row, text="✗ Refuser", command=self._handle_refuse).pack(side="left", padx=(8, 0))
+        ttk.Button(btn_row, text="Plus tard", command=self._handle_later).pack(side="right")
+
+    def show_request(self, short_id, ip, label_default):
+        """(Re)peuple la fenêtre pour une demande précise — appelée
+        aussi bien à la création qu'à chaque passage à la demande
+        suivante (voir App._refresh_remote_device_popup) : jamais de
+        nouvelle fenêtre créée pour ça, seul le contenu change."""
+        self._info_lbl.config(text=f"Identifiant : {short_id}     Adresse IP : {ip}")
+        self._label_var.set(label_default)
+
+    def get_label(self):
+        return self._label_var.get().strip() or None
+
+    def _handle_approve(self):
+        self._on_approve()
+
+    def _handle_refuse(self):
+        self._on_refuse()
+
+    def _handle_later(self):
+        self._on_later()
+
+    def _on_configure(self, event):
+        # <Configure> se déclenche aussi pour un simple redessin interne
+        # (pas seulement un déplacement) — inoffensif ici : réécrire la
+        # même position ne coûte presque rien, plus simple et robuste
+        # que de tenter de distinguer "vrai déplacement" vs "redessin".
+        if event.widget is self:
+            try:
+                self._on_geometry_changed(self.winfo_x(), self.winfo_y())
+            except tk.TclError:
+                pass
+
+
 class App(tk.Tk):
     def report_callback_exception(self, exc, val, tb):
         """Tkinter appelle ceci pour toute exception levée dans un callback
@@ -3905,6 +3997,56 @@ class App(tk.Tk):
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
+        # Approbation des téléphones (demande du 2026-09-09 ; disposition
+        # définitivement fixée le même jour, après plusieurs essais
+        # d'intégration dans la grille de Paramètres tous abandonnés :
+        # une fenêtre flottante indépendante, voir RemoteDeviceRequest
+        # Window/_refresh_remote_device_popup) — état PROPRE à ce
+        # process, jamais partagé entre fenêtres (chacune gère sa propre
+        # fenêtre/file, ce qui reste correct : n'importe quel responsable
+        # présent peut traiter la demande depuis N'IMPORTE QUELLE
+        # fenêtre, voir open_windows, la source de vérité partagée).
+        #
+        # _remote_device_snoozed_keys : clés (browser_id, requested_at)
+        # explicitement "Plus tard"-ées — MASQUÉES (fenêtre fermée) tant
+        # que Paramètres n'a pas été quitté puis rouvert (voir _is_
+        # settings_tab_active/_check_remote_device_requests), jamais
+        # définitivement ignorées : la demande reste "pending" côté
+        # serveur, le badge 🔔 de l'onglet reste affiché, et revenir sur
+        # Paramètres la fait réapparaître SANS attendre une nouvelle
+        # tentative du téléphone.
+        self._remote_device_snoozed_keys = set()
+        # Fenêtre flottante actuellement ouverte (RemoteDeviceRequestWindow)
+        # ou None — UNE SEULE à la fois (voir _refresh_remote_device_
+        # popup) : repeuplée en place pour la demande suivante plutôt que
+        # détruite/recréée, pour rester à la même position sans
+        # scintillement.
+        self._remote_device_popup = None
+        # (browser_id, requested_at) actuellement affichée dans cette
+        # fenêtre, ou None — évite de la repeupler pour rien à chaque
+        # sondage si rien n'a changé (même principe que _last_remote_
+        # devices_panel_signature ci-dessous, appliqué ici à une seule
+        # demande plutôt qu'à toute une liste).
+        self._remote_device_popup_current_key = None
+        # browser_id correspondant à _remote_device_popup_current_key —
+        # tenu à jour séparément (jamais reconstruit depuis la clé) pour
+        # que les boutons Autoriser/Refuser de la fenêtre (voir
+        # _on_remote_device_popup_approve/_refuse) sachent quel appareil
+        # cibler sans avoir à rouvrir le registre partagé.
+        self._remote_device_popup_current_browser_id = None
+        # Dernier état connu (onglet Paramètres actif ou non) — détecte
+        # la TRANSITION vers Paramètres (pas seulement "est actif
+        # maintenant") pour ne vider _remote_device_snoozed_keys qu'au
+        # moment où l'utilisateur y REVIENT, jamais en continu tant qu'il
+        # y reste.
+        self._last_settings_tab_active = False
+        # Dernier "instantané" affiché de la liste "Téléphones" de
+        # Paramètres (appareils APPROUVÉS uniquement désormais, voir
+        # _remote_devices_signature/_refresh_remote_devices_panel) :
+        # None tant qu'elle n'a jamais été construite — toute valeur (y
+        # compris un instantané "vide") est traitée comme différente
+        # d'un premier sondage, pour garantir un premier rendu correct.
+        self._last_remote_devices_panel_signature = None
         # Liste des joueurs actifs pour la page "Éliminations" du contrôle
         # à distance — même principe que _remote_control_tournament_name :
         # tenue à jour depuis le thread principal (voir _tick), jamais lue
@@ -4889,7 +5031,7 @@ class App(tk.Tk):
         self._build_payouts_tab()
         self._build_settings_tab()
 
-        self.notebook.bind("<<NotebookTabChanged>>", lambda e: self._refresh_all())
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
     # ---------------------------------------------------------------
     # Onglet Joueurs
@@ -6389,6 +6531,347 @@ class App(tk.Tk):
             self.remote_control_status_lbl.config(text=text)
         else:
             self.remote_control_status_lbl.config(text="")
+
+    @staticmethod
+    def _remote_devices_signature(approved):
+        """Petit "instantané" de la liste "Téléphones" de Paramètres
+        (appareils APPROUVÉS uniquement — les demandes en attente ont
+        leur propre fenêtre flottante, voir RemoteDeviceRequestWindow/
+        _refresh_remote_device_popup, jamais affichées ici pour éviter
+        un doublon) — comparé à chaque sondage périodique (voir
+        _check_remote_device_requests) pour ne reconstruire les widgets
+        QUE si quelque chose a RÉELLEMENT changé depuis le dernier
+        sondage. Correctif du 2026-09-09 (bug signalé après test réel
+        sur Huawei) : appeler _refresh_remote_devices_panel() SANS
+        CONDITION à chaque sondage (~2s) détruisait et recréait TOUS les
+        widgets de la section, un scintillement permanent, y compris
+        LONGTEMPS après qu'une demande ait été traitée, puisque rien
+        n'était jamais lié à un changement réel."""
+        return tuple((d["browser_id"], d.get("label"), d["ip_last_seen"]) for d in approved)
+
+    def _refresh_remote_devices_panel(self, approved=None):
+        """Reconstruit la liste "Téléphones" de Paramètres — UNIQUEMENT
+        les appareils déjà APPROUVÉS (Révoquer/renommer) : les demandes
+        en attente ont leur propre fenêtre flottante (demande du
+        2026-09-09, abandon définitif de toute intégration dans la
+        grille de Paramètres — voir RemoteDeviceRequestWindow), pour ne
+        jamais présenter la même demande à deux endroits. Appelée après
+        chaque action (Révoquer/renommer, ET depuis _on_remote_device_
+        popup_approve : un nouvel appareil approuvé doit apparaître ici
+        immédiatement — TOUJOURS sans argument dans ce cas, relit alors
+        l'état à jour) et depuis _check_remote_device_requests (avec
+        `approved` déjà lu, pour ne pas le relire deux fois pour la même
+        vérification). Ne fait rien si le conteneur n'existe pas encore
+        (onglet Paramètres pas encore construit) ou plus (fenêtre en
+        cours de fermeture) — jamais une exception qui remonterait
+        jusqu'à _tick. Met à jour _last_remote_devices_panel_signature
+        dans tous les cas (y compris ces appels directs), pour que le
+        sondage périodique suivant ne reconstruise pas une seconde fois
+        pour rien juste après."""
+        container = getattr(self, "remote_devices_container", None)
+        if container is None or not container.winfo_exists():
+            return
+        if approved is None:
+            try:
+                approved = open_windows.list_approved_remote_devices()
+            except Exception:
+                return
+        self._last_remote_devices_panel_signature = self._remote_devices_signature(approved)
+
+        for child in container.winfo_children():
+            child.destroy()
+
+        if not approved:
+            ttk.Label(container, text="Aucun téléphone approuvé pour l'instant.", foreground=MUTED).pack(anchor="w")
+            return
+
+        for device in approved:
+            row = ttk.Frame(container)
+            row.pack(fill="x", pady=2, anchor="w")
+            ttk.Label(row, text="✓", foreground="#1f6b3a").pack(side="left")
+            label_var = tk.StringVar(value=device.get("label") or device["short_id"])
+            entry = ttk.Entry(row, textvariable=label_var, width=20)
+            entry.pack(side="left", padx=(4, 4))
+            entry.bind(
+                "<FocusOut>",
+                lambda e, bid=device["browser_id"], var=label_var: self._on_rename_remote_device(bid, var),
+            )
+            entry.bind(
+                "<Return>",
+                lambda e, bid=device["browser_id"], var=label_var: self._on_rename_remote_device(bid, var),
+            )
+            ttk.Label(row, text=f"({device['ip_last_seen']})", foreground=MUTED).pack(side="left")
+            ttk.Button(
+                row, text="Révoquer", width=10,
+                command=lambda bid=device["browser_id"]: self._on_revoke_remote_device(bid),
+            ).pack(side="left", padx=(8, 0))
+
+    def _on_revoke_remote_device(self, browser_id):
+        """Bouton "Révoquer" d'un appareil déjà approuvé (voir _refresh_
+        remote_devices_panel) : bascule en "revoked" côté open_windows
+        et invalide IMMÉDIATEMENT tout jeton de session en cours pour
+        cet appareil."""
+        open_windows.revoke_remote_device(browser_id)
+        self._refresh_remote_devices_panel()
+
+    def _on_rename_remote_device(self, browser_id, label_var):
+        label = label_var.get().strip()
+        if label:
+            open_windows.approve_remote_device(browser_id, label=label)
+        self._refresh_remote_devices_panel()
+
+    def _is_settings_tab_active(self):
+        """True si l'onglet Paramètres est actuellement affiché — testé
+        via son libellé RÉEL (voir _update_settings_tab_badge : peut
+        porter le suffixe "🔔", d'où startswith plutôt qu'une égalité
+        stricte). TclError (fenêtre en cours de fermeture) traitée comme
+        "non actif", jamais une exception qui remonterait à _tick."""
+        try:
+            return self.notebook.tab(self.notebook.select(), "text").startswith("Paramètres")
+        except tk.TclError:
+            return False
+
+    def _update_settings_tab_badge(self, has_pending):
+        """🔔 sur l'onglet "Paramètres" tant qu'AU MOINS UNE demande de
+        téléphone est en attente (demande du 2026-09-09, "avertir le
+        responsable même si Paramètres n'est pas ouvert") — reflète
+        TOUJOURS l'ensemble des demandes pending, y compris celles
+        actuellement masquées par "Plus tard" (voir _remote_device_
+        snoozed_keys) : "Plus tard" ne doit JAMAIS faire disparaître ce
+        signal, seulement fermer la fenêtre flottante elle-même."""
+        try:
+            current_label = self.notebook.tab(self.settings_tab, "text")
+        except tk.TclError:
+            return
+        base = current_label[:-2] if current_label.endswith(" 🔔") else current_label
+        new_label = base + (" 🔔" if has_pending else "")
+        if new_label != current_label:
+            try:
+                self.notebook.tab(self.settings_tab, text=new_label)
+            except tk.TclError:
+                pass
+
+    @staticmethod
+    def _is_position_onscreen(x, y, screen_w, screen_h, margin=40):
+        """True si (x, y) — coin haut-gauche mémorisé de la fenêtre
+        flottante — laisse au moins `margin` pixels de cette fenêtre
+        accessibles sur UN écran de résolution (screen_w, screen_h).
+        Volontairement approximatif (Tkinter n'expose pas nativement la
+        géométrie de plusieurs écrans distincts) : le but n'est que
+        d'éviter le cas grossier "fenêtre entièrement hors champ" après
+        un changement d'écran/résolution (demande du 2026-09-09), pas de
+        valider un multi-écran précis — un repli sur la position par
+        défaut est de toute façon totalement inoffensif si ce test est
+        trop prudent."""
+        return -margin <= x <= screen_w - margin and -margin <= y <= screen_h - margin
+
+    def _remote_device_popup_position(self, win):
+        """(x, y) où placer la fenêtre flottante de demande de téléphone
+        (demande du 2026-09-09) : la dernière position mémorisée par
+        l'utilisateur (export_prefs — préférence PERSISTANTE, JAMAIS le
+        fichier de session éphémère remote_control_auth.json, et aucun
+        secret) si elle reste raisonnablement visible à l'écran actuel
+        (voir _is_position_onscreen — se prémunit d'une ancienne
+        position devenue hors écran après un changement de résolution/
+        moniteur), sinon une position par défaut raisonnable près de
+        CETTE fenêtre (Paramètres/fenêtre principale)."""
+        x = export_prefs.load_value("remote_device_popup_x", None)
+        y = export_prefs.load_value("remote_device_popup_y", None)
+        if (
+            isinstance(x, int) and isinstance(y, int)
+            and self._is_position_onscreen(x, y, win.winfo_screenwidth(), win.winfo_screenheight())
+        ):
+            return x, y
+        return (
+            self.winfo_rootx() + max(self.winfo_width() - 300, 20),
+            self.winfo_rooty() + 60,
+        )
+
+    def _save_remote_device_popup_position(self, x, y):
+        """Mémorise la position de la fenêtre flottante (demande du
+        2026-09-09) — export_prefs (préférence PERSISTANTE, survit à un
+        redémarrage complet du logiciel), JAMAIS remote_control_auth.
+        json (fichier de session ÉPHÉMÈRE, effacé à chaque nouvelle
+        session — voir open_windows.py) : rien à voir avec le code/les
+        jetons de la session, uniquement une coordonnée d'écran, aucun
+        secret. Appelée à chaque déplacement (voir RemoteDeviceRequest
+        Window._on_configure) et à la fermeture de la fenêtre."""
+        export_prefs.save_value("remote_device_popup_x", x)
+        export_prefs.save_value("remote_device_popup_y", y)
+
+    def _refresh_remote_device_popup(self, pending=None):
+        """Ouvre/repeuple/masque/ferme la fenêtre flottante de demande de
+        téléphone (demande du 2026-09-09, abandon définitif de toute
+        intégration dans la grille de Paramètres) : présente la PLUS
+        ANCIENNE demande NON masquée par "Plus tard" (voir _remote_
+        device_snoozed_keys) — jamais deux à la fois, jamais la même
+        demande que la section "Téléphones" (voir _refresh_remote_
+        devices_panel, approuvés uniquement).
+
+        VISIBILITÉ (demande du 2026-09-09, correction : "la fenêtre ne
+        doit apparaître au-dessus d'AUCUN autre onglet que Paramètres")
+        — règle appliquée à CHAQUE appel, qu'il vienne du sondage
+        périodique (~2s, voir App._tick/_check_remote_device_requests)
+        ou du changement d'onglet lui-même (voir _on_notebook_tab_
+        changed, <<NotebookTabChanged>>, pour un affichage/masquage
+        IMMÉDIAT au clic, sans attendre le prochain sondage) : VISIBLE
+        SI ET SEULEMENT SI l'onglet Paramètres est actuellement
+        sélectionné ET qu'il existe une telle demande. Sur tout AUTRE
+        onglet, la fenêtre déjà créée est seulement MASQUÉE (`withdraw`,
+        jamais détruite ni recréée) — elle retrouve donc sa position
+        EXACTE, sans le moindre recalcul, dès que Paramètres redevient
+        actif (`deiconify`) ; la demande elle-même n'est ni approuvée,
+        ni révoquée, ni "Plus tard"-ée par ce simple changement d'onglet
+        — seul le badge 🔔 (voir _update_settings_tab_badge, appelé
+        séparément par l'appelant) reste alors le signal visible.
+
+        Une fenêtre déjà EXISTANTE (visible ou masquée) est REPEUPLÉE en
+        place pour la demande suivante plutôt que détruite/recréée
+        (jamais de scintillement, jamais de repositionnement inutile) ;
+        entièrement fermée seulement quand plus aucune demande n'est à
+        montrer."""
+        if pending is None:
+            try:
+                pending = open_windows.list_pending_remote_devices()
+            except Exception:
+                return
+        candidates = sorted(
+            (d for d in pending if (d["browser_id"], d["requested_at"]) not in self._remote_device_snoozed_keys),
+            key=lambda d: d["requested_at"],
+        )
+        current = candidates[0] if candidates else None
+        current_key = (current["browser_id"], current["requested_at"]) if current else None
+
+        if current is None:
+            self._remote_device_popup_current_key = None
+            self._close_remote_device_popup()
+            return
+
+        settings_active = self._is_settings_tab_active()
+        content_changed = current_key != self._remote_device_popup_current_key
+        self._remote_device_popup_current_key = current_key
+        self._remote_device_popup_current_browser_id = current["browser_id"]
+
+        popup = self._remote_device_popup
+        if not settings_active:
+            # Jamais créer ni réafficher la fenêtre sur un autre onglet
+            # que Paramètres — seule une fenêtre déjà existante peut
+            # avoir besoin d'être masquée ici (ex. l'utilisateur vient de
+            # quitter Paramètres pendant qu'elle était affichée).
+            if popup is not None and popup.winfo_exists():
+                try:
+                    popup.withdraw()
+                except tk.TclError:
+                    pass
+            return
+
+        if popup is None or not popup.winfo_exists():
+            popup = RemoteDeviceRequestWindow(
+                self,
+                on_approve=self._on_remote_device_popup_approve,
+                on_refuse=self._on_remote_device_popup_refuse,
+                on_later=self._on_remote_device_popup_later,
+                on_geometry_changed=self._save_remote_device_popup_position,
+            )
+            self._remote_device_popup = popup
+            x, y = self._remote_device_popup_position(popup)
+            popup.geometry(f"+{x}+{y}")
+            content_changed = True  # fenêtre neuve : il faut la peupler, même si `current_key` n'a en fait pas changé
+        if content_changed:
+            popup.show_request(
+                short_id=current["short_id"],
+                ip=current["ip_last_seen"],
+                label_default=current.get("label") or current["short_id"],
+            )
+        try:
+            popup.deiconify()
+        except tk.TclError:
+            pass
+
+    def _close_remote_device_popup(self):
+        popup = self._remote_device_popup
+        self._remote_device_popup = None
+        if popup is not None and popup.winfo_exists():
+            try:
+                self._save_remote_device_popup_position(popup.winfo_x(), popup.winfo_y())
+            except tk.TclError:
+                pass
+            popup.destroy()
+
+    def _on_remote_device_popup_approve(self):
+        label = self._remote_device_popup.get_label() if self._remote_device_popup else None
+        open_windows.approve_remote_device(self._remote_device_popup_current_browser_id, label=label)
+        # Le nouvel appareil approuvé doit apparaître IMMÉDIATEMENT dans
+        # "Téléphones" (voir _refresh_remote_devices_panel), pas
+        # seulement au prochain sondage périodique.
+        self._refresh_remote_devices_panel()
+        self._refresh_remote_device_popup()
+
+    def _on_remote_device_popup_refuse(self):
+        open_windows.revoke_remote_device(self._remote_device_popup_current_browser_id)
+        self._refresh_remote_device_popup()
+
+    def _on_remote_device_popup_later(self):
+        """"Plus tard" (bouton ET fermeture de la fenêtre via sa croix —
+        voir RemoteDeviceRequestWindow — traitées IDENTIQUEMENT) : ferme
+        UNIQUEMENT la fenêtre flottante pour CETTE demande — ne l'approuve
+        ni ne la révoque (le téléphone reste "pending" côté serveur), et
+        ne fait PAS disparaître le badge 🔔 de l'onglet (voir _update_
+        settings_tab_badge, basé sur la liste "pending" complète, jamais
+        filtrée par ce masquage). Redevient visible dès que Paramètres
+        est quitté PUIS rouvert (voir _is_settings_tab_active/_check_
+        remote_device_requests, qui vide _remote_device_snoozed_keys à
+        ce moment précis) — sans avoir besoin d'attendre une nouvelle
+        tentative du téléphone (même browser_id/requested_at)."""
+        if self._remote_device_popup_current_key is not None:
+            self._remote_device_snoozed_keys.add(self._remote_device_popup_current_key)
+        self._close_remote_device_popup()
+        self._remote_device_popup_current_key = None
+        self._refresh_remote_device_popup()
+
+    def _check_remote_device_requests(self):
+        """Sondage périodique (voir App._tick, appelé toutes les
+        quelques secondes seulement, pas à chaque tick) du registre
+        partagé des appareils (open_windows.list_pending_remote_devices/
+        list_approved_remote_devices) — orchestre les trois éléments
+        d'interface concernés par une demande de téléphone (demande du
+        2026-09-09, retour définitif à une fenêtre flottante après
+        abandon de toute intégration dans la grille de Paramètres) :
+
+        1. la fenêtre flottante (voir _refresh_remote_device_popup), qui
+           présente la plus ancienne demande NON masquée par "Plus
+           tard" ;
+        2. le badge 🔔 de l'onglet "Paramètres" (voir _update_settings_
+           tab_badge), reflet FIDÈLE de la liste "pending" complète —
+           jamais affecté par "Plus tard" ;
+        3. la liste "Téléphones" (appareils APPROUVÉS, voir _refresh_
+           remote_devices_panel), reconstruite seulement si son contenu
+           a changé (voir _remote_devices_signature).
+
+        Détecte aussi la TRANSITION vers l'onglet Paramètres (il était
+        affiché autre chose au sondage précédent, il affiche Paramètres
+        maintenant) pour vider _remote_device_snoozed_keys À CE moment
+        précis — jamais en continu tant que l'utilisateur y reste (voir
+        _on_remote_device_popup_later) : revenir sur Paramètres fait
+        ainsi réapparaître une demande "Plus tard"-ée plus tôt, sans
+        attendre une nouvelle tentative du téléphone."""
+        settings_active_now = self._is_settings_tab_active()
+        if settings_active_now and not self._last_settings_tab_active:
+            self._remote_device_snoozed_keys.clear()
+        self._last_settings_tab_active = settings_active_now
+
+        try:
+            pending = open_windows.list_pending_remote_devices()
+            approved = open_windows.list_approved_remote_devices()
+        except Exception:
+            return
+
+        self._update_settings_tab_badge(bool(pending))
+        self._refresh_remote_device_popup(pending=pending)
+
+        signature = self._remote_devices_signature(approved)
+        if signature != getattr(self, "_last_remote_devices_panel_signature", None):
+            self._refresh_remote_devices_panel(approved=approved)
 
     def _poll_voice_queue(self):
         """Relève régulièrement les mots-clés (et éliminations décidées
@@ -9576,6 +10059,13 @@ class App(tk.Tk):
         # fonctionnement normal du logiciel. Indicateur "MODE TEST" affiché
         # dans le titre de la fenêtre tant qu'actif (voir
         # _update_window_title) pour ne jamais l'oublier activé par erreur.
+        #
+        # (La demande de téléphone en attente n'a plus de panneau intégré
+        # ici : voir RemoteDeviceRequestWindow, une petite fenêtre
+        # flottante totalement indépendante de cette grille — plusieurs
+        # tentatives d'intégration ont toutes été abandonnées, la
+        # dernière ayant élargi cette colonne au point de repousser la
+        # colonne droite hors écran.)
         test_mode_row = folder_row + 2
         test_mode_check = ttk.Checkbutton(
             left, text="Mode Test", variable=self.test_mode_var,
@@ -10017,14 +10507,49 @@ class App(tk.Tk):
             "juste ouvrir l'adresse affichée dans un navigateur.",
         )
 
+        # Case + "Code : XXXXXX" côte à côte (demande du 2026-09-09,
+        # "sécurisation du contrôle à distance") — MÊME technique que
+        # primes_header plus haut (sous-frame pack, pas grid) : évite le
+        # même écart disgracieux entre les deux qu'aurait provoqué une
+        # colonne de grille partagée avec les champs larges du reste de
+        # l'onglet.
+        remote_check_row = ttk.Frame(right)
+        remote_check_row.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
         self.remote_control_enabled_var = tk.BooleanVar(
             value=export_prefs.load_value("remote_control_enabled", False) is True
         )
         remote_check = ttk.Checkbutton(
-            right, text="Activer le contrôle à distance",
+            remote_check_row, text="Activer le contrôle à distance",
             variable=self.remote_control_enabled_var, command=self._on_remote_control_toggle,
         )
-        remote_check.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        remote_check.pack(side="left")
+
+        # Code à 6 chiffres de la session en cours (demande du
+        # 2026-09-09) : IDENTIQUE pour tous les tournois de cette
+        # session (voir open_windows.remote_session_code) — à
+        # communiquer de vive voix aux responsables dont le téléphone
+        # doit être approuvé ci-dessous. JAMAIS le code de test permanent
+        # 131261, qui ne doit jamais apparaître ici (voir open_windows.
+        # verify_remote_code). Déjà disponible dès la construction de cet
+        # onglet : App.__init__ a déjà enregistré ce tournoi (open_
+        # windows.register) avant d'arriver ici, la session existe donc
+        # forcément — pas besoin de rafraîchir ce libellé à chaque tick.
+        code = open_windows.remote_session_code()
+        self.remote_control_code_lbl = ttk.Label(
+            remote_check_row, text=(f"Code : {code}" if code else ""),
+            foreground=MUTED, font=("Helvetica", 10, "bold"),
+        )
+        self.remote_control_code_lbl.pack(side="left", padx=(14, 0))
+        Tooltip(
+            self.remote_control_code_lbl,
+            "Code à saisir sur le téléphone à la première connexion —\n"
+            "identique pour tous les tournois/Sit & Go ouverts en même\n"
+            "temps que celui-ci, change à chaque nouvelle session (tous\n"
+            "les tournois refermés puis l'application relancée). Le\n"
+            "téléphone devra ensuite être approuvé ci-dessous avant de\n"
+            "pouvoir contrôler quoi que ce soit.",
+        )
 
         self.remote_control_status_lbl = ttk.Label(
             right, foreground=MUTED, justify="left", wraplength=340,
@@ -10033,6 +10558,40 @@ class App(tk.Tk):
             row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
         )
         self._refresh_remote_control_status()
+
+        # -- Téléphones APPROUVÉS (Révoquer/renommer) — demande du
+        # 2026-09-09, revue le même jour ("plus de popup séparée") : les
+        # demandes EN ATTENTE ont leur propre panneau intégré, tout en
+        # haut de la colonne de gauche (voir remote_pending_request_
+        # container, sous "Durée du bandeau d'élimination") — jamais
+        # affichées ici, pour ne jamais présenter la même demande à deux
+        # endroits de Paramètres. Conteneur UNIQUE gridé une seule fois
+        # (columnspan=2), tout son contenu (nombre variable de lignes
+        # selon le nombre de téléphones) empilé à l'intérieur via pack()
+        # — même raison que remote_check_row ci-dessus, mais pour une
+        # hauteur variable plutôt qu'une largeur : jamais besoin de
+        # renuméroter les lignes de grille suivantes (bb_prompt_row...)
+        # quand ce nombre change.
+        remote_devices_title = ttk.Label(
+            right, text="Téléphones autorisés", font=("Helvetica", 10, "bold"), foreground=GOLD,
+        )
+        remote_devices_title.grid(
+            row=remote_start_row + 4, column=0, columnspan=2, sticky="w", pady=(2, 4)
+        )
+        Tooltip(
+            remote_devices_title,
+            "Appareils déjà approuvés — l'approbation reste valable aux\n"
+            "prochaines sessions, contrairement au code, qui change à\n"
+            "chaque fois. Une NOUVELLE demande de téléphone apparaît en\n"
+            "haut de la colonne de gauche (sous « Durée du bandeau\n"
+            "d'élimination »), avec un badge 🔔 sur cet onglet tant\n"
+            "qu'elle n'a pas été traitée.",
+        )
+        self.remote_devices_container = ttk.Frame(right)
+        self.remote_devices_container.grid(
+            row=remote_start_row + 5, column=0, columnspan=2, sticky="ew", pady=(0, 10)
+        )
+        self._refresh_remote_devices_panel()
 
         # -- Rééquilibrage simple guidé par la grosse blinde (version TEST,
         # voir database.py: rebalance_tables/_bb_rebalance_prompt_enabled) :
@@ -10054,7 +10613,7 @@ class App(tk.Tk):
         # (_legacy_pick_mover, voir database.py: rebalance_tables) — elle
         # a donc toujours une utilité propre, indépendante de tout
         # affichage Mac.
-        bb_prompt_row = remote_start_row + 4
+        bb_prompt_row = remote_start_row + 6  # +4/+5 pris par le titre/conteneur "Téléphones" ci-dessus
         self.bb_rebalance_prompt_var = tk.BooleanVar(
             value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
         )
@@ -10594,6 +11153,28 @@ class App(tk.Tk):
             # sur cet onglet pouvait afficher une liste périmée.
             self.roster_tab._refresh()
 
+    def _on_notebook_tab_changed(self, event):
+        """<<NotebookTabChanged>> — événement virtuel émis par
+        ttk.Notebook chaque fois que l'onglet sélectionné change (clic,
+        clavier, ou self.notebook.select() programmatique), déjà utilisé
+        ici pour rafraîchir le contenu de l'onglet nouvellement affiché
+        (voir _refresh_all, appel PRÉEXISTANT, comportement inchangé).
+
+        Complété le 2026-09-09 ("la fenêtre flottante de demande de
+        téléphone ne doit être visible QUE sur l'onglet Paramètres") :
+        appeler _check_remote_device_requests() ICI, en plus du sondage
+        périodique (~2s, voir _tick), pour que le passage à/depuis
+        Paramètres montre/masque la fenêtre IMMÉDIATEMENT au clic, sans
+        attendre le prochain sondage — _refresh_remote_device_popup,
+        appelée depuis _check_remote_device_requests, décide seule si la
+        fenêtre doit apparaître ou se masquer, quel que soit ce qui a
+        déclenché l'appel (ce changement d'onglet, ou le sondage
+        périodique ci-dessous, qui continue de tourner sans jamais
+        recréer/réafficher la fenêtre sur un autre onglet — voir sa
+        docstring)."""
+        self._refresh_all()
+        self._check_remote_device_requests()
+
     def _tick(self):
         if not self.winfo_exists():
             return
@@ -10659,6 +11240,14 @@ class App(tk.Tk):
                 self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
                 self._remote_has_pending_moves = self.db.count_seat_moves() > 0
                 self._maybe_reclaim_default_remote_port()
+            # Approbation des téléphones (demande du 2026-09-09) : toutes
+            # les ~2s seulement (pas à chaque tick, voir _check_remote_
+            # device_requests) — un compteur simple plutôt qu'un after()
+            # séparé, pour rester protégé par le même try/except que le
+            # reste de _tick.
+            self._remote_devices_tick_counter = getattr(self, "_remote_devices_tick_counter", 0) + 1
+            if self._remote_devices_tick_counter % 2 == 0:
+                self._check_remote_device_requests()
             # Filet de sécurité (voir docstring de _check_pending_rebalance) :
             # garantit qu'une question "grosse blinde" en attente est toujours
             # affichée/rafraîchie au moins une fois par seconde, même si

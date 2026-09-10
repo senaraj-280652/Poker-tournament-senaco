@@ -19,14 +19,18 @@ import json
 import os
 import socket
 import sys
+import tempfile
 import unittest
 import urllib.error
 import urllib.request
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import open_windows  # noqa: E402
 import remote_control  # noqa: E402
+from _remote_control_auth_test_utils import authenticated_jar  # noqa: E402
 
 
 def _free_port():
@@ -37,10 +41,21 @@ def _free_port():
     return port
 
 
-def _get_text(url, cookie=None):
+def _get_text(url, jar=None, extra_cookie=None):
+    """extra_cookie : voir LobbyListMarksCorrectTournamentTest — les
+    tests de sélection ont besoin d'ajouter leur PROPRE cookie
+    "selected_pid" en plus des cookies d'authentification déjà acquis
+    (voir setUp: self.jar), un http.cookiejar seul ne suffit pas ici
+    puisque ce cookie de test n'a jamais été POSÉ par une vraie réponse
+    du serveur — combiné à la main dans l'en-tête Cookie."""
     req = urllib.request.Request(url)
-    if cookie:
-        req.add_header("Cookie", cookie)
+    cookie_parts = []
+    if jar is not None:
+        cookie_parts.append("; ".join(f"{c.name}={c.value}" for c in jar))
+    if extra_cookie:
+        cookie_parts.append(extra_cookie)
+    if cookie_parts:
+        req.add_header("Cookie", "; ".join(cookie_parts))
     with urllib.request.urlopen(req, timeout=3) as r:
         return r.read().decode("utf-8")
 
@@ -110,16 +125,39 @@ class ResolveCurrentPidTest(unittest.TestCase):
 
 
 class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
+    """Depuis le durcissement du 2026-09-09, /lobbylist exige un appareil
+    authentifié ET approuvé — open_windows redirigé vers un dossier
+    temporaire dédié (jamais ~/.poker_tournament), self.jar déjà
+    authentifié/approuvé (voir _remote_control_auth_test_utils.
+    authenticated_jar) pour chaque requête protégée."""
+
     def setUp(self):
         self.test_port = _free_port()
         patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
         self.addCleanup(patcher.stop)
         patcher.start()
+
+        self._tmp = tempfile.TemporaryDirectory(prefix="lobby_current_tournament_test_")
+        self.addCleanup(self._tmp.cleanup)
+        registry_path = os.path.join(self._tmp.name, "open_windows.json")
+        remote_dir = os.path.join(self._tmp.name, "remote")
+        os.makedirs(remote_dir, exist_ok=True)
+        for target in (
+            patch.object(open_windows, "_registry_path", return_value=registry_path),
+            patch.object(open_windows, "_remote_control_dir", return_value=remote_dir),
+        ):
+            self.addCleanup(target.stop)
+            target.start()
+        self._session_path = os.path.join(self._tmp.name, "session_marker.tournoi")
+        open_windows.register(self._session_path)
+        self.addCleanup(open_windows.unregister, self._session_path)
+
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None, get_tournament_name=lambda: "tournoi20", port=self.test_port,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.jar = authenticated_jar(f"http://127.0.0.1:{self.test_port}")
         self.own_pid = os.getpid()
         self.live = [
             {"pid": self.own_pid, "port": self.test_port, "name": "tournoi20", "registered_at": 1},
@@ -129,7 +167,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
 
     def test_lobbylist_marque_le_plus_recent_pas_le_routeur(self):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
-            html = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist")
+            html = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
         self.assertIn("tournoi18 (celui-ci)", html)
         self.assertNotIn("tournoi20 (celui-ci)", html)
         self.assertNotIn("tournoi19 (celui-ci)", html)
@@ -139,8 +177,8 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
         deux appels consécutifs, sans qu'aucun select_tournament n'ait eu
         lieu entre les deux, doivent donner EXACTEMENT le même résultat."""
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
-            html1 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist")
-            html2 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist")
+            html1 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
+            html2 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
         self.assertEqual(html1, html2)
         self.assertIn("tournoi18 (celui-ci)", html2)
 
@@ -149,7 +187,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
             html = _get_text(
                 f"http://127.0.0.1:{self.test_port}/lobbylist",
-                cookie=f"selected_pid={dead_pid}",
+                jar=self.jar, extra_cookie=f"selected_pid={dead_pid}",
             )
         self.assertIn("tournoi18 (celui-ci)", html)
 
@@ -157,7 +195,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
             html = _get_text(
                 f"http://127.0.0.1:{self.test_port}/lobbylist",
-                cookie=f"selected_pid={self.own_pid + 1000}",  # tournoi19
+                jar=self.jar, extra_cookie=f"selected_pid={self.own_pid + 1000}",  # tournoi19
             )
         self.assertIn("tournoi19 (celui-ci)", html)
         self.assertNotIn("tournoi18 (celui-ci)", html)

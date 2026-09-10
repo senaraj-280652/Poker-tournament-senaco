@@ -102,6 +102,7 @@ class TickNeverStopsSchedulingTest(unittest.TestCase):
         self.win._maybe_reclaim_default_remote_port = lambda: None
         self.win._check_pending_rebalance = lambda: None
         self.win._check_phone_selected_pid = lambda: None
+        self.win._check_remote_device_requests = lambda: None
         self.win._sync_single_tournament_pref_checkbox = lambda: None
 
         # Case + section Primes RÉELLES (comme dans _build_settings_tab) :
