@@ -1,0 +1,73 @@
+name: Build Windows .msi (TEST)
+
+# Compile la version « TEST » du Gestionnaire de Tournoi de Poker — une
+# installation totalement séparée de la ligne de production, destinée à
+# cohabiter sur un même poste avec une version déjà installée (voir
+# windows/README.md, section « Version de TEST », et main.py:
+# _is_test_build). Copie volontairement indépendante de build-msi.yml
+# (le workflow de production) : PAS générée à partir de lui, PAS
+# maintenue en le modifiant — toute correction commune (ex. version de
+# l'outil WiX) doit être reportée à la main dans les deux fichiers.
+#
+# Différences intentionnelles avec build-msi.yml, TOUTES nécessaires à la
+# sécurité de cette ligne TEST :
+#   - déclenchement MANUEL UNIQUEMENT (workflow_dispatch) : aucun tag,
+#     aucun push, aucune branche ne déclenche jamais ce workflow ;
+#   - construit windows/poker_tournament-test.spec (PAS poker_tournament.
+#     spec) puis windows/app-test.wxs (PAS app.wxs) ;
+#   - AUCUNE étape d'injection de LICENSE_SECRET : la protection/licence
+#     reste inactive dans ce build, quel que soit l'état du secret de
+#     dépôt LICENSE_SECRET (il n'est même pas référencé ici) ;
+#   - publication en Artifact GitHub Actions UNIQUEMENT — jamais de
+#     Release GitHub, jamais de tag créé.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-msi-test:
+    runs-on: windows-latest
+    # Lecture seule : contrairement à build-msi.yml, ce workflow ne
+    # publie aucune Release (softprops/action-gh-release, qui a besoin de
+    # "contents: write") — juste un Artifact, qui ne demande rien de plus
+    # que les permissions par défaut du GITHUB_TOKEN.
+    permissions:
+      contents: read
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Installation des dépendances Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r windows/requirements.txt
+
+      # Volontairement AUCUNE étape d'injection de _license_secret.py ici
+      # (contrairement à build-msi.yml) : ce build TEST ne doit jamais
+      # demander d'activation, et license.py ne doit subir aucun effet de
+      # ce workflow. Sans _license_secret.py, license.py: SECRET reste
+      # None et is_licensed() renvoie toujours Vrai (voir license.py).
+
+      - name: Génération de PokerTournamentTest.exe (PyInstaller, spec TEST)
+        run: |
+          pyinstaller windows/poker_tournament-test.spec --distpath windows/dist --workpath windows/build --noconfirm
+
+      - name: Installation de l'outil WiX
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add WixToolset.UI.wixext/5.0.2 --global
+
+      - name: Génération de PokerTournament-TEST.msi (WiX, installateur TEST)
+        run: |
+          wix build windows/app-test.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-TEST.msi
+
+      - name: Publication de l'artifact (TEST uniquement — aucune Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokerTournament-TEST
+          path: windows/dist/PokerTournament-TEST.msi
+          if-no-files-found: error

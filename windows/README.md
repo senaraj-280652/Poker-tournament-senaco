@@ -72,8 +72,11 @@ comme sur macOS.
 | `requirements.txt` | Dépendances Python nécessaires au build |
 | `app.wxs` | Description de l'installateur (WiX Toolset) |
 | `License.rtf` | Texte affiché sur l'écran de licence de l'installateur |
-| `build.ps1` | Script tout-en-un (exe → msi) |
+| `build.ps1` | Script tout-en-un (exe → msi) — build de PRODUCTION uniquement |
 | `dist/` *(généré)* | Contient `PokerTournament/` (exe + `_internal/`) puis `PokerTournament-16.msi` |
+| `poker_tournament-test.spec` | Variante PyInstaller pour la version de TEST (voir section dédiée ci-dessous) |
+| `app-test.wxs` | Installateur WiX de la version de TEST (voir section dédiée ci-dessous) |
+| `assets/TEST_BUILD_MARKER` | Marqueur embarqué UNIQUEMENT par `poker_tournament-test.spec` (voir `main.py: _is_test_build`) |
 
 ## Changer le numéro de version
 
@@ -81,6 +84,60 @@ Modifiez `Version="1.0.0"` dans [`app.wxs`](app.wxs) avant de
 reconstruire. Conservez le même `UpgradeCode` d'une version à l'autre :
 c'est lui qui permet à une mise à jour de remplacer proprement une
 installation précédente.
+
+## Version de TEST (cohabitation avec une installation déjà en place)
+
+Demande du 2026-09-12 : comparer le code de développement en cours à une
+version déjà installée sur le même poste (ex. la v1.2.38 sur le HP du
+club), **sans jamais toucher à cette installation** — ni la remplacer, ni
+la modifier, ni la désinstaller par erreur.
+
+Deux fichiers dédiés, à ne JAMAIS fusionner avec ceux de production
+(des copies volontairement indépendantes, pas générées l'une à partir de
+l'autre — toute correction commune doit être reportée à la main dans les
+deux) :
+
+- [`poker_tournament-test.spec`](poker_tournament-test.spec) — comme
+  `poker_tournament.spec`, mais `name="PokerTournamentTest"` (sortie dans
+  `dist/PokerTournamentTest/`, jamais `dist/PokerTournament/`) et un
+  fichier `datas` supplémentaire, `assets/TEST_BUILD_MARKER` — seule
+  différence FONCTIONNELLE avec la production.
+- [`app-test.wxs`](app-test.wxs) — comme `app.wxs`, mais avec un
+  `UpgradeCode` DIFFÉRENT (ligne de produit totalement indépendante :
+  aucune relation d'upgrade possible avec la production, dans aucun des
+  deux sens), un `Package Name`, un dossier d'installation, des
+  raccourcis (« Poker Senaco TEST ») et une clé de registre WiX propres.
+  Le dossier d'installation différant, WiX calcule des GUID de composants
+  différents de ceux de la production (`Guid="*"` est dérivé du chemin
+  cible) : aucun composant partagé, donc aucun risque qu'une
+  désinstallation de l'une des deux lignes touche un fichier de l'autre.
+
+`main.py: _is_test_build()` détecte la présence de
+`TEST_BUILD_MARKER` à côté de l'exécutable (absent de tout build de
+production) et préfixe alors le titre de fenêtre et « À propos » de
+`[TEST]` — sans toucher `version.py` (`APP_VERSION` inchangé) ni
+`license.py`.
+
+Build local (PowerShell, sur le poste où comparer les deux) :
+
+```powershell
+pyinstaller windows\poker_tournament-test.spec --distpath windows\dist --workpath windows\build --noconfirm
+wix build windows\app-test.wxs -arch x64 -ext WixToolset.UI.wixext `
+    -d Dist=windows\dist -out windows\dist\PokerTournament-TEST.msi
+```
+
+(N'injectez PAS `_license_secret.py` pour ce build : sans lui, l'exécutable
+démarre sans jamais demander d'activation — inutile pour un test, et ça
+évite de toucher à quoi que ce soit lié à la licence.)
+
+**Important, données partagées** : `%USERPROFILE%\.poker_tournament`
+(répertoire de joueurs, réglages, modèles, licence...) est **partagé**
+entre TOUTE installation sur le même compte Windows, quel que soit son
+dossier `Program Files` — ce n'est PAS séparé par ce mécanisme. Pour
+comparer les deux versions sans risque : utilisez des fichiers `.tournoi`
+de test dédiés, et n'utilisez JAMAIS « ♻️ Restaurer depuis une clé USB »
+depuis la version de TEST (ça écraserait les données réellement utilisées
+par la version installée).
 
 ## Comment Claude (l'assistant IA) génère et livre ce .msi
 

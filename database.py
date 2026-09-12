@@ -197,7 +197,16 @@ CREATE TABLE IF NOT EXISTS seat_moves (
     old_seat INTEGER,
     new_table_name TEXT,
     new_seat INTEGER,
-    moved_at TEXT NOT NULL
+    moved_at TEXT NOT NULL,
+    -- Raison du déplacement (demande du 2026-09-10, architecture de
+    -- rééquilibrage) : voir MOVE_REASON_* plus bas — permet à l'onglet
+    -- Mouvements d'expliquer POURQUOI un joueur a été déplacé
+    -- (contrainte de capacité, fusion de table, équilibrage automatique,
+    -- ou choix guidé par la grosse blinde). Chaîne vide pour tout
+    -- mouvement archivé par une version antérieure à cette colonne (voir
+    -- _migrate) : affiché comme "Équilibrage" générique, jamais une
+    -- valeur inventée a posteriori.
+    reason TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS bounty_events (
@@ -254,19 +263,60 @@ DEFAULT_SETTINGS = {
 }
 
 
-def ranking_points(place, n_players, flat_value=0):
+# Système de points de classement (demande du 2026-09-10, remplace le
+# champ "Montant de la prime de classement en points"/ranking_bonus_points
+# — voir Database.resolve_ranking_formula pour la règle de compatibilité
+# qui préserve exactement les anciens fichiers). Un seul réglage PAR
+# TOURNOI (ranking_formula), jamais dans PERSISTED_KEYS (voir
+# tournament_prefs.py) : chaque tournoi garde son propre choix, jamais
+# hérité du précédent.
+RANKING_FORMULA_NONE = "none"
+RANKING_FORMULA_CURRENT = "current"
+RANKING_FORMULA_PROGRESSIVE = "progressive"
+RANKING_FORMULA_SITNGO_CPC = "sitngo_cpc"
+
+# Libellés affichés dans la liste déroulante de l'onglet Paramètres (voir
+# main.py: _build_settings_tab) — ordre exact demandé : Aucun, Classique,
+# Progressive, Sit & Go CPC. dict Python : ordre d'insertion préservé
+# (garanti depuis Python 3.7), donc .values() respecte cet ordre.
+RANKING_FORMULA_LABELS = {
+    RANKING_FORMULA_NONE: "Aucun",
+    RANKING_FORMULA_CURRENT: "Classique",
+    RANKING_FORMULA_PROGRESSIVE: "Progressive",
+    RANKING_FORMULA_SITNGO_CPC: "Sit & Go CPC",
+}
+
+
+def ranking_points(place, n_players, formula=RANKING_FORMULA_NONE):
     """Valeur en points de la prime de classement pour un rang `place`
-    parmi `n_players` joueurs au total dans le tournoi. Si `flat_value`
-    (réglage manuel, non nul) est fourni, il est utilisé tel quel pour
-    tout le monde ; sinon on applique la formule 100×√N/P, pensée pour ne
-    pas distribuer une masse de points disproportionnée sur les petites
-    tables (elle grandit avec le nombre de joueurs et décroît avec un
-    rang moins bon)."""
-    if flat_value:
-        return flat_value
+    parmi `n_players` joueurs au total. `formula` : une des 4 valeurs de
+    RANKING_FORMULA_LABELS —
+    - "none" : aucun point (0), quel que soit le rang ;
+    - "current" ("Classique") : 100×√N/P — favorise les premières places ;
+    - "progressive" : 100×√N/√P — récompense davantage la régularité,
+      écart entre les premières places plus faible que "Classique" ;
+    - "sitngo_cpc" : 1000 + 100×(N+1) - 200×P — chaque joueur apporte
+      1000 points au total distribué, places espacées de 200 points
+      (ex. N=7 : 1600/1400/1200/1000/800/600/400, somme = 7000 = N×1000).
+
+    Remplace, depuis le 2026-09-10, l'ancien paramètre `flat_value`
+    (valeur fixe manuelle, réglage ranking_bonus_points) — voir
+    Database.resolve_ranking_formula pour la règle de compatibilité qui
+    préserve EXACTEMENT le comportement des anciens fichiers utilisant
+    encore ce réglage (jamais recalculé par une formule ici : la valeur
+    fixe historique est appliquée directement par l'appelant, sans
+    passer par cette fonction — voir get_ranking_bonuses)."""
     if not place or place <= 0 or n_players <= 0:
         return 0
-    return round(100 * math.sqrt(n_players) / place)
+    if formula == RANKING_FORMULA_CURRENT:
+        return round(100 * math.sqrt(n_players) / place)
+    if formula == RANKING_FORMULA_PROGRESSIVE:
+        return round(100 * math.sqrt(n_players) / math.sqrt(place))
+    if formula == RANKING_FORMULA_SITNGO_CPC:
+        # Arithmétique entière exacte (pas de round() nécessaire ni
+        # souhaitable : 100×(N+1) et 200×P sont toujours des entiers).
+        return 1000 + 100 * (n_players + 1) - 200 * place
+    return 0  # "none", ou toute valeur inconnue/future : aucun point.
 
 
 def bounty_unit_value(n_players, flat_value=0):
@@ -290,6 +340,66 @@ def bounty_unit_value(n_players, flat_value=0):
 # vrai tournoi ne scinde jamais les tout derniers joueurs entre deux
 # tables alors qu'ils tiendraient sur une seule table finale.
 FINAL_TABLE_MAX_SEATS = 10
+
+# Raisons possibles d'un déplacement de joueur (colonne seat_moves.reason,
+# voir rebalance_tables/resolve_pending_rebalance) — architecture de
+# rééquilibrage validée le 2026-09-10, qui distingue strictement trois
+# notions : capacité normale (jamais négociable), exception de vraie
+# table finale (voir FINAL_TABLE_MAX_SEATS ci-dessus, ne produit pas de
+# déplacement en tant que telle), et équilibrage sportif (grosse blinde
+# ou automatique). Chaque déplacement réellement effectué porte
+# EXACTEMENT une de ces raisons, jamais plusieurs à la fois (voir
+# rebalance_tables : la dernière raison qui s'applique à un joueur donné
+# gagne si plusieurs mécanismes le déplacent au cours du même appel —
+# c'est la raison de son emplacement FINAL qui est affichée, pas
+# l'historique intermédiaire de cet appel).
+MOVE_REASON_STRUCTURAL = "structurel"        # mise en conformité obligatoire de capacité (siège le plus élevé)
+MOVE_REASON_TABLE_CLOSURE = "fermeture_table"  # fusion/fermeture de table (cassage, répartition aléatoire)
+MOVE_REASON_AUTO_BALANCE = "equilibrage_auto"  # équilibrage historique automatique (guidage BB désactivé, ou Phase 1)
+MOVE_REASON_BB_GUIDED = "equilibrage_bb"      # réponse "quel siège est la grosse blinde" reçue
+MOVE_REASON_BB_SKIPPED = "continuer_sans_bb"  # "Continuer sans indiquer la BB" (téléphone ou bouton Mac)
+
+# Libellés humains (français), utilisés par main.py (onglet Mouvements) —
+# regroupés ici plutôt que dans main.py pour rester à côté des constantes
+# qu'ils décrivent. Chaîne vide (mouvement archivé avant l'ajout de cette
+# colonne, voir _migrate) -> repli générique "Équilibrage".
+MOVE_REASON_LABELS = {
+    MOVE_REASON_STRUCTURAL: "Structurel (capacité)",
+    MOVE_REASON_TABLE_CLOSURE: "Fusion/fermeture de table",
+    MOVE_REASON_AUTO_BALANCE: "Équilibrage automatique",
+    MOVE_REASON_BB_GUIDED: "Grosse blinde (guidé)",
+    MOVE_REASON_BB_SKIPPED: "Continuer sans indiquer la BB",
+    "": "Équilibrage",
+}
+
+
+def _defensive_integrity_log_path():
+    d = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "crash.log")
+
+
+def _log_defensive_relocation(message):
+    """Trace, dans le même journal que les plantages (~/.poker_tournament/
+    crash.log, voir main.py: _log_exception/_crash_log_path — jamais
+    importé depuis ici pour éviter une dépendance circulaire database.py
+    <-> main.py, d'où cette petite fonction autonome qui écrit au même
+    endroit), qu'une routine défensive a dû intervenir alors qu'elle ne
+    devrait normalement jamais avoir à le faire (voir rebalance_tables,
+    passe défensive finale) — demande explicite du 2026-09-10 : "si elle
+    doit intervenir alors qu'elle ne devrait normalement pas, prévoir au
+    minimum une trace". Ne lève jamais d'exception elle-même (best-effort,
+    comme _log_exception)."""
+    try:
+        with open(_defensive_integrity_log_path(), "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+            f.write(
+                "[rebalance_tables] Passe défensive de capacité déclenchée "
+                "(ne devrait normalement jamais arriver) : " + message + "\n"
+            )
+    except OSError:
+        pass
 
 # Préférence GLOBALE (voir export_prefs.py — même mécanisme que
 # "remote_control_enabled", partagée par tous les tournois/Sit & Go de
@@ -364,6 +474,9 @@ class Database:
             self.conn.execute(
                 "ALTER TABLE bounty_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'elimination'"
             )
+        seat_moves_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(seat_moves)")}
+        if "reason" not in seat_moves_cols:
+            self.conn.execute("ALTER TABLE seat_moves ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -449,10 +562,45 @@ class Database:
         """Applique un nouveau nombre de sièges par table à TOUTES les
         tables existantes (actives ou fermées), pour que le changement du
         paramètre prenne effet immédiatement, y compris en cours de
-        tournoi. À appeler suivi d'un rebalance_tables()."""
+        tournoi. À appeler suivi d'un rebalance_tables().
+
+        N'EST PAS elle-même responsable de refuser un changement laissant
+        une table en surcapacité (voir tables_over_capacity juste en
+        dessous, et App._collect_and_save_all_settings dans main.py qui
+        décide en amont s'il faut appeler cette méthode) : cette fonction
+        reste un simple UPDATE inconditionnel, comme avant."""
         new_max = max(2, int(new_max))
         self.conn.execute("UPDATE tables_pk SET max_seats=?", (new_max,))
         self.conn.commit()
+
+    def tables_over_capacity(self, new_max):
+        """Renvoie la liste des tables ACTIVES dont l'occupation réelle
+        (joueurs actifs assis) dépasserait STRICTEMENT `new_max` — sans
+        rien modifier. Utilisé par App._collect_and_save_all_settings
+        (main.py) pour refuser un changement de "Nombre de sièges par
+        table" en cours de tournoi (clock_started == 1) qui laisserait
+        sinon une table durablement au-dessus de sa capacité (ex : 9
+        joueurs pour max_seats=8) — PHASE 2 de l'architecture de
+        rééquilibrage validée le 2026-09-10 : refus ciblé de l'application
+        du réglage plutôt que déplacement automatique d'un joueur choisi
+        arbitrairement (siège le plus haut) pour y faire de la place.
+        Avant le premier démarrage (clock_started == 0), cette méthode
+        n'est volontairement PAS consultée par main.py : la réorganisation
+        automatique complète reste autorisée (voir rebalance_tables,
+        PHASE 1).
+
+        Chaque élément de la liste renvoyée : {"name": <nom de la
+        table>, "count": <nombre de joueurs actifs qui y sont assis>}."""
+        new_max = int(new_max)
+        over = []
+        for t in self.list_tables():
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            if occ > new_max:
+                over.append({"name": t["name"], "count": occ})
+        return over
 
     def _table_display_number(self, table_row):
         """Numéro affiché d'une table (ex : 9 pour "Table 9"), utilisé pour
@@ -933,6 +1081,66 @@ class Database:
         )
         self.conn.commit()
 
+    def _relocate_excess_players(self, table_id, target_max_seats, move_reasons, reason):
+        """Déplace, un par un, le joueur au SIÈGE LE PLUS ÉLEVÉ de
+        `table_id` vers la table active la moins pleine ayant de la place
+        (jamais `table_id` lui-même — voir _move_player_to_least_full_
+        table), jusqu'à ce que son occupation soit ≤ `target_max_seats`.
+
+        Cœur de la garantie "aucune table normale ne dépasse jamais sa
+        capacité" (architecture validée le 2026-09-10) : appelée
+        AVANT toute écriture qui abaisserait tables_pk.max_seats en
+        dessous de l'occupation actuelle (voir rebalance_tables) — jamais
+        l'inverse, pour qu'il n'existe jamais d'état, même transitoire,
+        où une table est enregistrée à une capacité inférieure à son
+        occupation réelle.
+
+        Règle de choix déterministe, jamais liée au guidage par la grosse
+        blinde (ce mouvement doit pouvoir s'exécuter immédiatement et de
+        façon synchrone — une réponse de téléphone est par nature
+        asynchrone, incompatible avec la garantie de validité permanente,
+        voir la docstring de rebalance_tables) : toujours le siège le
+        plus élevé en premier.
+
+        `move_reasons` : dict {player_id: raison} partagé avec l'appelant
+        (voir MOVE_REASON_* et rebalance_tables) — mis à jour ici pour
+        que le mouvement soit correctement étiqueté dans l'historique.
+
+        Filet de sécurité anti-boucle infinie : si un déplacement ne
+        change rien (aucune autre table active n'a de place, ce qui ne
+        devrait normalement jamais arriver puisque le nombre de tables
+        nécessaires est calculé en amont pour accueillir tout le monde),
+        journalise via _log_defensive_relocation et s'arrête plutôt que
+        de boucler indéfiniment — jamais un `while True` sans garde-fou
+        sur des données venant d'un fichier .tournoi potentiellement
+        déjà incohérent (voir check_table_integrity)."""
+        for _ in range(200):  # garde-fou anti boucle infinie, comme ailleurs dans ce fichier
+            occupants = self.conn.execute(
+                "SELECT id FROM players WHERE table_id=? AND status='active' ORDER BY seat DESC",
+                (table_id,),
+            ).fetchall()
+            if len(occupants) <= target_max_seats:
+                return
+            mover_id = occupants[0]["id"]
+            before_table_id = table_id
+            self._move_player_to_least_full_table(mover_id, exclude_table_id=table_id)
+            after_table_id = self.conn.execute(
+                "SELECT table_id FROM players WHERE id=?", (mover_id,)
+            ).fetchone()["table_id"]
+            if after_table_id == before_table_id:
+                # _move_player_to_least_full_table n'a rien pu faire
+                # (aucune autre table avec de la place) : ne devrait
+                # jamais arriver si n_tables_needed a été calculé
+                # correctement en amont. On s'arrête plutôt que de
+                # boucler indéfiniment sur le même joueur.
+                _log_defensive_relocation(
+                    f"table_id={table_id} reste à {len(occupants)} joueurs "
+                    f"(cible {target_max_seats}) : aucune autre table active "
+                    f"n'a de place pour le siège le plus élevé (player_id={mover_id})."
+                )
+                return
+            move_reasons[mover_id] = reason
+
     def rebalance_tables(self, record_moves=False):
         """Rééquilibre les tables actives : comble les sièges vides en déplaçant
         des joueurs des tables les plus pleines, et ferme les tables devenues
@@ -959,6 +1167,16 @@ class Database:
             return []
 
         before_state = {p["id"]: (p["table_id"], p["seat"]) for p in active_players}
+        # Raison du déplacement, par player_id (voir MOVE_REASON_*) —
+        # renseignée par chaque mécanisme de cette fonction au fur et à
+        # mesure qu'il déplace réellement quelqu'un ; utilisée à la toute
+        # fin pour étiqueter chaque mouvement dans l'historique (onglet
+        # Mouvements). Si un même joueur est déplacé plusieurs fois au
+        # cours de CET appel (ex : mise en conformité PUIS équilibrage
+        # sportif), seule la DERNIÈRE raison est conservée — c'est
+        # l'explication de son emplacement final qui est affichée, pas
+        # l'historique intermédiaire de cet appel.
+        move_reasons = {}
 
         max_seats = self.get_setting_int("max_seats_per_table", 9)
         min_players = self.get_setting_int("min_players_per_table", 4)
@@ -1014,6 +1232,29 @@ class Database:
             # élargie garderait pour toujours une capacité différente des
             # autres, sans raison apparente une fois la fusion plus
             # nécessaire.
+            #
+            # SÉQUENCE ATOMIQUE (architecture validée le 2026-09-10,
+            # correctif du dépassement de capacité persistant — voir
+            # diagnostic "Table 1 : 9/10 joueurs, max_seats=8") : on
+            # déplace D'ABORD tout joueur excédentaire de chaque table
+            # dont la capacité va être abaissée, et SEULEMENT ENSUITE on
+            # écrit la nouvelle valeur de max_seats — jamais l'inverse.
+            # Sans cet ordre, une table pouvait rester enregistrée à une
+            # capacité inférieure à son occupation réelle (ex : 10
+            # joueurs sur une table repassée à max_seats=8) de façon
+            # PERMANENTE, la seule mécanique censée la résorber ensuite
+            # (l'ancienne boucle "de correction de dépassement", plus
+            # bas) ne sachant jamais déplacer quelqu'un vers une AUTRE
+            # table. _relocate_excess_players() est déterministe (siège
+            # le plus élevé, voir sa docstring) : ce premier mouvement de
+            # mise en conformité ne peut jamais dépendre d'une réponse de
+            # la grosse blinde, par nature asynchrone — incompatible avec
+            # la garantie "jamais de surcapacité, même transitoire".
+            for t in tables:
+                if t["max_seats"] > max_seats:
+                    self._relocate_excess_players(
+                        t["id"], max_seats, move_reasons, MOVE_REASON_STRUCTURAL
+                    )
             self.conn.execute("UPDATE tables_pk SET max_seats=?", (max_seats,))
             self.conn.commit()
             tables = list(self.list_tables())
@@ -1078,6 +1319,7 @@ class Database:
             random.shuffle(players_to_move)
             for p in players_to_move:
                 self._seat_player(p["id"])
+                move_reasons[p["id"]] = MOVE_REASON_TABLE_CLOSURE
 
         # Ré-équilibre : si la table la plus pleine et la moins pleine ont
         # un écart >= 2, un joueur doit passer de l'une à l'autre.
@@ -1168,7 +1410,22 @@ class Database:
                         self.pending_rebalance["seats"] = occupied_seats
 
         if self.pending_rebalance is None:
-            if self._bb_rebalance_prompt_enabled():
+            # PHASE 1 (mise en place initiale, voir clock_started et
+            # DEFAULT_SETTINGS) : avant le tout premier démarrage du
+            # chronomètre, il n'y a encore aucune intervention possible
+            # des téléphones (créations de tables/inscriptions
+            # successives) — le guidage par la grosse blinde ne doit
+            # JAMAIS être proposé à ce stade, même si la préférence
+            # "Équilibrage guidé par la grosse blinde" est activée
+            # (valeur par défaut). On force donc le mécanisme historique
+            # automatique (branche `else` ci-dessous) tant que
+            # clock_started vaut 0 — demande explicite du 2026-09-10.
+            # clock_started ne repasse jamais de 1 à 0 pour un même
+            # fichier (voir set_settings appelé par App au premier
+            # démarrage), donc aucun pending_rebalance ne peut avoir été
+            # créé avant que cette condition ne devienne vraie.
+            guided = self._bb_rebalance_prompt_enabled() and self.get_setting_int("clock_started", 0) == 1
+            if guided:
                 need = self._detect_simple_rebalance_need()
                 if need is not None:
                     source_table, occupied_seats = need
@@ -1195,15 +1452,17 @@ class Database:
                         "created_at": time.time(),
                     }
             else:
-                # Préférence "Afficher la fenêtre d'équilibrage guidé par
-                # la grosse blinde" désactivée (voir Paramètres) : jamais
-                # de question posée, jamais de pending_rebalance créé — le
-                # mécanisme historique choisit directement qui bouge
-                # (_legacy_pick_mover, EXACTEMENT comme "Continuer sans
-                # indiquer la BB"), en boucle tant qu'un écart persiste —
-                # repris ici du mécanisme d'origine (avant cette version
-                # TEST) pour résoudre tous les mouvements nécessaires en un
-                # seul appel, sans dépendre d'un enchaînement de réponses.
+                # Soit la préférence "Équilibrage guidé par la grosse
+                # blinde" est désactivée (voir Paramètres), soit on est
+                # encore en PHASE 1 (clock_started == 0, voir ci-dessus) :
+                # dans les deux cas, jamais de question posée, jamais de
+                # pending_rebalance créé — le mécanisme historique choisit
+                # directement qui bouge (_legacy_pick_mover, EXACTEMENT
+                # comme "Continuer sans indiquer la BB"), en boucle tant
+                # qu'un écart persiste — repris ici du mécanisme d'origine
+                # (avant cette version TEST) pour résoudre tous les
+                # mouvements nécessaires en un seul appel, sans dépendre
+                # d'un enchaînement de réponses.
                 for _ in range(200):  # garde-fou anti boucle infinie
                     need = self._detect_simple_rebalance_need()
                     if need is None:
@@ -1213,21 +1472,44 @@ class Database:
                     if mover_id is None:
                         break
                     self._move_player_to_least_full_table(mover_id, exclude_table_id=source_table["id"])
+                    move_reasons[mover_id] = MOVE_REASON_AUTO_BALANCE
 
-        # NE comble PAS les sièges laissés vides par un joueur éliminé (ou
-        # déplacé ailleurs) à une table par ailleurs inchangée : au poker,
-        # les autres joueurs restent physiquement assis là où ils sont,
-        # personne ne se déplace juste pour "combler un trou" — même
-        # l'éliminateur, resté à sa place, se retrouvait pourtant avec un
-        # nouveau numéro de siège à chaque élimination à sa table, sans
-        # aucun mouvement annoncé (le changement de SIÈGE seul, sans
-        # changement de TABLE, n'est jamais compté comme un "mouvement" —
-        # voir plus bas — donc personne n'était prévenu). On ne réassigne
-        # ici que les sièges qui dépassent le nombre de places actuel de la
-        # table (ex : réduction du nombre de sièges par table en cours de
-        # tournoi) : un vrai cas de contrainte violée, pas juste "il y a un
-        # trou".
+        # Passe défensive finale (architecture validée le 2026-09-10) —
+        # DEUX cas bien distincts, jamais confondus :
+        #
+        # 1. Occupation réellement au-dessus de max_seats (violation
+        #    structurelle) : ne devrait JAMAIS arriver ici — la séquence
+        #    atomique plus haut (voir MOVE_REASON_STRUCTURAL) est censée
+        #    garantir cet invariant EN AMONT. Ce n'est donc qu'un filet
+        #    de sécurité générique (voir sa docstring pour la raison de
+        #    ne pas s'appuyer sur lui comme mécanisme principal) : s'il
+        #    doit intervenir, c'est le signe d'un chemin non couvert
+        #    ailleurs — jamais silencieux, toujours journalisé (voir
+        #    _log_defensive_relocation).
+        # 2. Occupation DÉJÀ dans la limite, mais un numéro de SIÈGE
+        #    dépasse encore max_seats (ex : juste après une réduction du
+        #    nombre de sièges par table, avec de la place ailleurs sur
+        #    CETTE MÊME table) : cas normal et attendu, pas un bug — on
+        #    recompacte simplement le numéro de siège au sein de la même
+        #    table (comportement d'origine, inchangé). Ceci n'est jamais
+        #    compté comme un "mouvement" (pas de changement de TABLE, voir
+        #    plus bas) : au poker, personne ne se déplace juste pour
+        #    combler un trou.
         for t in self.list_tables():
+            occ_count = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            if occ_count > t["max_seats"]:
+                _log_defensive_relocation(
+                    f"{t['name']} (id={t['id']}) a {occ_count} joueurs actifs pour "
+                    f"max_seats={t['max_seats']} en fin de rebalance_tables() — "
+                    f"la séquence atomique en amont aurait dû empêcher cet état."
+                )
+                self._relocate_excess_players(
+                    t["id"], t["max_seats"], move_reasons, MOVE_REASON_STRUCTURAL
+                )
+
             occupants = self.conn.execute(
                 "SELECT id, seat FROM players WHERE table_id=? AND status='active' "
                 "ORDER BY seat",
@@ -1270,6 +1552,13 @@ class Database:
                 continue
             old_table_name = table_names.get(old_table_id)
             new_table_name = table_names.get(new_table_id)
+            # Raison affichée dans l'onglet Mouvements (voir MOVE_REASON_*
+            # et move_reasons plus haut) : celle du mécanisme qui a
+            # DÉTERMINÉ l'emplacement final de ce joueur pour cet appel —
+            # repli sur l'équilibrage automatique si, pour une raison
+            # inattendue, aucun mécanisme ne l'a explicitement étiqueté
+            # (ne devrait pas arriver, chaque chemin de cette fonction
+            # étiquette désormais ses propres mouvements).
             move = {
                 "player_name": p["name"],
                 "old_table_name": old_table_name,
@@ -1277,6 +1566,7 @@ class Database:
                 "new_table_name": new_table_name,
                 "new_seat": new_seat,
                 "moved_at": now,
+                "reason": move_reasons.get(p["id"], MOVE_REASON_AUTO_BALANCE),
             }
             moves.append(move)
         if moves and record_moves:
@@ -1287,12 +1577,48 @@ class Database:
             for move in moves:
                 self.conn.execute(
                     "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
-                    "new_table_name, new_seat, moved_at) VALUES (?,?,?,?,?,?)",
+                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
                     (move["player_name"], move["old_table_name"], move["old_seat"],
-                     move["new_table_name"], move["new_seat"], move["moved_at"]),
+                     move["new_table_name"], move["new_seat"], move["moved_at"],
+                     move["reason"]),
                 )
             self.conn.commit()
         return moves
+
+    def check_table_integrity(self):
+        """Détection SEULE, en lecture seule, d'un fichier .tournoi déjà
+        incohérent au sens de la capacité des tables (architecture
+        validée le 2026-09-10) — ne modifie RIEN, ne déplace personne :
+        appelée une fois à l'ouverture du fichier (voir App.__init__
+        dans main.py, juste après _align_primes_enabled_on_open) pour
+        avertir le responsable plutôt que de réparer automatiquement un
+        ancien fichier (demande explicite : "détection + avertissement
+        seulement, aucune réparation automatique pour l'instant").
+
+        Un seul invariant vérifié ici : occupation réelle d'une table
+        active > tables_pk.max_seats de CETTE table (pas la valeur
+        globale "Nombre de sièges par table" — une vraie table finale a
+        légitimement son propre max_seats relevé jusqu'à 10, voir
+        FINAL_TABLE_MAX_SEATS, ce qui n'est jamais un problème). Le cas
+        d'un simple numéro de siège isolé dépassant max_seats SANS
+        dépassement d'occupation n'est volontairement PAS remonté ici :
+        inoffensif (voir la passe défensive de rebalance_tables, qui le
+        recompacte silencieusement dès le prochain rééquilibrage), pas
+        une incohérence à signaler à l'utilisateur.
+
+        Renvoie une liste de dicts {table_name, occupation, max_seats} —
+        vide si le fichier est cohérent."""
+        problems = []
+        for t in self.list_tables():
+            occ = self.conn.execute(
+                "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
+                (t["id"],),
+            ).fetchone()["c"]
+            if occ > t["max_seats"]:
+                problems.append({
+                    "table_name": t["name"], "occupation": occ, "max_seats": t["max_seats"],
+                })
+        return problems
 
     # ---------- rééquilibrage simple : question "grosse blinde" (TEST) ----------
     def _bb_rebalance_prompt_enabled(self):
@@ -1321,7 +1647,20 @@ class Database:
         posée — voir sa docstring) : les deux doivent s'accorder sur la
         même notion de "toujours nécessaire", sans quoi une réponse
         pourrait être acceptée ou refusée de façon incohérente selon qui
-        appelle."""
+        appelle.
+
+        GARDE DE SÉPARATION DES NOTIONS (architecture validée le
+        2026-09-10, voir MOVE_REASON_*) : une table déjà EN SURCAPACITÉ
+        par rapport à SA PROPRE tables_pk.max_seats n'est jamais
+        considérée ici comme candidate à l'équilibrage SPORTIF — ce n'est
+        pas un simple écart de remplissage, c'est une violation
+        structurelle, qui ne doit jamais être proposée au guidage par la
+        grosse blinde (jamais de question posée pour ça, jamais de
+        dépendance à une réponse humaine). Sa résorption relève
+        exclusivement de _relocate_excess_players(), déjà exécutée en
+        amont dans rebalance_tables() ; si elle subsistait malgré tout
+        (ne devrait jamais arriver), la passe défensive finale de
+        rebalance_tables() la rattrape, jamais ce détecteur-ci."""
         tables = list(self.list_tables())
         if len(tables) < 2:
             return None
@@ -1331,7 +1670,13 @@ class Database:
                 "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
                 (t["id"],),
             ).fetchone()["c"]
+            if occ > t["max_seats"]:
+                # Violation structurelle, pas un candidat à l'équilibrage
+                # sportif (voir docstring ci-dessus) — ignorée ici.
+                continue
             counts.append((occ, t))
+        if len(counts) < 2:
+            return None
         counts.sort(key=lambda x: x[0])
         smallest_count, smallest_table = counts[0]
         largest_count, largest_table = counts[-1]
@@ -1591,6 +1936,14 @@ class Database:
                     "new_table_name": table_names.get(mover_after["table_id"]),
                     "new_seat": mover_after["seat"],
                     "moved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    # Raison (voir MOVE_REASON_*) : réponse effective d'un
+                    # siège -> équilibrage guidé par la grosse blinde ;
+                    # seat=None ("Continuer sans indiquer la BB") -> choix
+                    # explicite et délibéré du responsable, distingué
+                    # textuellement dans l'historique de l'équilibrage
+                    # automatique de la Phase 1/guidage désactivé, bien
+                    # que le même _legacy_pick_mover soit réutilisé.
+                    "reason": MOVE_REASON_BB_GUIDED if seat is not None else MOVE_REASON_BB_SKIPPED,
                 }
 
         # Reprend le rééquilibrage sur l'état courant (peut fermer
@@ -1610,9 +1963,10 @@ class Database:
             for move in moves:
                 self.conn.execute(
                     "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
-                    "new_table_name, new_seat, moved_at) VALUES (?,?,?,?,?,?)",
+                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
                     (move["player_name"], move["old_table_name"], move["old_seat"],
-                     move["new_table_name"], move["new_seat"], move["moved_at"]),
+                     move["new_table_name"], move["new_seat"], move["moved_at"],
+                     move.get("reason", MOVE_REASON_AUTO_BALANCE)),
                 )
             self.conn.commit()
         return moves
@@ -1723,6 +2077,48 @@ class Database:
         result.sort(key=lambda r: r["name"].casefold())
         return result
 
+    def resolve_ranking_formula(self):
+        """Résout le réglage EFFECTIF de formule de classement pour CE
+        tournoi (voir RANKING_FORMULA_*) — règle de compatibilité avec
+        l'ancien réglage ranking_bonus_points, validée le 2026-09-10
+        (l'utilisateur a explicitement choisi de PRÉSERVER les résultats
+        historiques réels plutôt que d'appliquer littéralement "vide/0 =
+        Aucun", qui aurait rétroactivement mis à zéro les points de
+        classement de tout ancien tournoi n'ayant jamais touché ce champ) :
+
+        1. `ranking_formula` déjà présent (l'une des 4 valeurs de
+           RANKING_FORMULA_LABELS, y compris "none") : utilisé tel quel.
+           C'est le cas de tout NOUVEAU tournoi (stampé "none" dès sa
+           création, voir App._choose_tournament_file) et de tout
+           tournoi déjà explicitement configuré via la nouvelle liste
+           déroulante.
+        2. `ranking_formula` ABSENT et `ranking_bonus_points` > 0 :
+           ancien réglage "valeur fixe" — préservé EXACTEMENT, pour
+           toujours (2e élément du tuple renvoyé, non None) : c'était
+           déjà le comportement historique de ranking_points() (`if
+           flat_value: return flat_value`, prioritaire sur toute
+           formule) — jamais recalculé, jamais remplacé silencieusement
+           par une formule.
+        3. `ranking_formula` ABSENT et `ranking_bonus_points` absent ou
+           à 0 : c'est très précisément le comportement historique de
+           TOUJOURS (0 est faux en Python — l'ancien `if flat_value:
+           ...` ne s'exécutait jamais, la formule 100×√N/P s'appliquait
+           déjà) — résolu à "current" (Classique), JAMAIS "none", pour
+           ne rien changer rétroactivement.
+
+        Renvoie (formula, legacy_flat_value) : `formula` est toujours
+        l'une des 4 valeurs de RANKING_FORMULA_LABELS ; `legacy_flat_value`
+        est None sauf dans le cas 2 ci-dessus, où il prime absolument sur
+        `formula` (voir get_ranking_bonuses — jamais les deux appliqués
+        à la fois)."""
+        stored = self.get_setting("ranking_formula")
+        if stored in RANKING_FORMULA_LABELS:
+            return stored, None
+        legacy_flat_value = self.get_setting_int("ranking_bonus_points", 0)
+        if legacy_flat_value > 0:
+            return RANKING_FORMULA_CURRENT, legacy_flat_value
+        return RANKING_FORMULA_CURRENT, None
+
     def get_ranking_bonuses(self):
         """Calcule la prime de classement (en points) de chaque joueur dont
         le rang est déjà connu : un joueur éliminé (place déjà attribuée),
@@ -1732,10 +2128,16 @@ class Database:
         de ligne. Renvoie une liste de dicts {name, place, nombre, valeur,
         montant} (montant = nombre × valeur), triée par rang croissant ;
         liste vide si `_primes_enabled` est faux (interrupteur général,
-        demande du 2026-09-09 — court-circuit à la source)."""
+        demande du 2026-09-09 — court-circuit à la source).
+
+        Utilise resolve_ranking_formula() (voir sa docstring pour la
+        règle de compatibilité complète avec l'ancien ranking_bonus_points)
+        — SEUL point d'appel de ranking_points() dans tout le fichier :
+        onglet Primes, exports CSV/XLSX/PDF et synthèse multi-tournois en
+        découlent tous automatiquement via get_primes_summary()."""
         if not self._primes_enabled():
             return []
-        flat_value = self.get_setting_int("ranking_bonus_points", 0)
+        formula, legacy_flat_value = self.resolve_ranking_formula()
         n_players = self.get_stats()["total_players_ever"]
         all_players = self.list_players()
         active = [p for p in all_players if p["status"] == "active"]
@@ -1750,7 +2152,10 @@ class Database:
                 place = 1
             if place is None:
                 continue
-            valeur = ranking_points(place, n_players, flat_value)
+            # legacy_flat_value (ancien réglage "valeur fixe") prime
+            # absolument sur la formule si présent — voir
+            # resolve_ranking_formula, cas 2.
+            valeur = legacy_flat_value if legacy_flat_value is not None else ranking_points(place, n_players, formula)
             result.append({
                 "name": p["name"], "place": place,
                 "nombre": 1, "valeur": valeur, "montant": valeur,
@@ -2069,6 +2474,18 @@ class Database:
         for key, label in SETTINGS_PRINT_FIELDS:
             if key == "club_name":
                 value = club_name or ""
+            elif key == "ranking_formula":
+                # Valeur RÉSOLUE (voir resolve_ranking_formula), pas la
+                # ligne brute "settings" : un ancien fichier n'a souvent
+                # aucune ligne "ranking_formula" du tout, alors qu'un
+                # système de points s'applique bel et bien (compatibilité
+                # avec ranking_bonus_points, voir sa docstring) — un
+                # print qui afficherait "vide" ici serait trompeur.
+                formula, legacy_flat_value = self.resolve_ranking_formula()
+                if legacy_flat_value is not None:
+                    value = f"Valeur fixe historique ({legacy_flat_value} points)"
+                else:
+                    value = RANKING_FORMULA_LABELS.get(formula, formula)
             else:
                 value = self.get_setting(key, "")
                 if key == "pko_mode":
@@ -3244,7 +3661,7 @@ SETTINGS_PRINT_FIELDS = [
     ("attendance_bonus_points", "Prime de présence (points)"),
     ("assiduity_bonus_points", "Prime d'assiduité (points)"),
     ("assiduity_consecutive_days", "Nombre de jours consécutifs (assiduité)"),
-    ("ranking_bonus_points", "Prime de classement (points)"),
+    ("ranking_formula", "Système de points distribués (classement)"),
     ("bounty_amount", "Montant du bounty (points)"),
     ("pko_mode", "Mode PKO (prime progressive)"),
     ("pko_cash_percent", "Part en Perso immédiat en PKO (%)"),

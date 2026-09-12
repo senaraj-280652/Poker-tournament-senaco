@@ -1,0 +1,12 @@
+Ce fichier n'est lu par le logiciel que pour vérifier sa PRÉSENCE
+(os.path.exists) — son contenu n'a aucune importance et n'est jamais lu.
+
+Sa seule présence dans le bundle d'un exécutable compilé indique à
+main.py (voir _is_test_build) qu'il s'agit d'une build « TEST », destinée
+à cohabiter avec une installation de production sur le même poste — voir
+windows/poker_tournament-test.spec (seul spec qui l'embarque) et
+windows/README.md, section « Version de TEST ».
+
+Ne JAMAIS référencer ce fichier depuis windows/poker_tournament.spec (le
+spec de production) : sa présence y ferait croire à tort à l'application
+qu'elle tourne en version de TEST.

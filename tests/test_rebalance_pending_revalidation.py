@@ -65,7 +65,15 @@ class _TwoTablesTestCase(unittest.TestCase):
 
         self.db = database.Database(":memory:")
         self.addCleanup(self.db.conn.close)
-        self.db.set_settings({"max_seats_per_table": 9, "min_players_per_table": 1})
+        # clock_started=1 : ces tests couvrent le guidage par la grosse
+        # blinde EN COURS DE TOURNOI (PHASE 3, voir database.py:
+        # rebalance_tables) — le guidage est désormais désactivé tant que
+        # clock_started vaut 0 (PHASE 1, mise en place initiale, demande
+        # du 2026-09-10), quelle que soit la préférence "Équilibrage
+        # guidé par la grosse blinde" mockée ci-dessus.
+        self.db.set_settings({
+            "max_seats_per_table": 9, "min_players_per_table": 1, "clock_started": 1,
+        })
 
         self.t1_id = self.db.list_tables()[0]["id"]  # "Table 1", créée par _init_defaults
         self.t2_id = self.db.add_table("Table 2")

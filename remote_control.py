@@ -123,7 +123,7 @@ DEFAULT_PORT = 8765
 # liste est refusé.
 _VALID_ACTIONS = {
     "elimination", "chronometre", "terminer",
-    "tables", "mouvements", "toggle_pause", "niveau_suivant",
+    "tables", "mouvements", "toggle_pause", "niveau_precedent", "niveau_suivant",
     "tables_zoom_moins", "tables_zoom_plus",
 }
 
@@ -396,7 +396,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   #btn-mouvements.blink {{
     animation: btn-mouvements-blink 1.4s ease-in-out infinite;
   }}
-  #btn-niveau-suivant {{ background: #2c6e8a; }}
+  #btn-niveau-precedent, #btn-niveau-suivant {{ background: #2c6e8a; }}
   #btn-photos {{ background: #6e2c6e; }}
   /* Ligne Chronomètre + petit bouton ON/OFF de pause à sa droite : les
      deux se partagent la largeur habituelle des boutons plutôt que
@@ -462,6 +462,7 @@ _PAGE_TEMPLATE = """<!doctype html>
     <button id="btn-chronometre" onclick="sendAction('chronometre', this)">▶ Chronomètre</button>
     <button id="btn-pause-toggle" onclick="togglePause()" title="Met en pause / relance le chrono">OFF</button>
   </div>
+  <button id="btn-niveau-precedent" onclick="sendAction('niveau_precedent', this)">⏮ Niveau Précédent</button>
   <button id="btn-niveau-suivant" onclick="sendAction('niveau_suivant', this)">⏭ Niveau Suivant</button>
   <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Joueurs</button>
   <button id="btn-photos" onclick="window.location.href='/photos'">📷 Photos des joueurs</button>
@@ -1642,8 +1643,8 @@ class RemoteControlServer:
 
     - `on_word(action)` : une des actions simples ("elimination" /
       "chronometre" / "terminer" / "tables" / "mouvements" /
-      "toggle_pause" / "niveau_suivant" / "tables_zoom_moins" /
-      "tables_zoom_plus").
+      "toggle_pause" / "niveau_precedent" / "niveau_suivant" /
+      "tables_zoom_moins" / "tables_zoom_plus").
     - `get_players()` : renvoie la liste des joueurs actifs à afficher sur
       la page Éliminations — liste de dicts {id, name, table, seat,
       has_photo}.

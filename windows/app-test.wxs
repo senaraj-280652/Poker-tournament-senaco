@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Projet WiX Toolset (v5) — installateur .msi de la version « TEST »
+  (demande du 2026-09-12) : permet de comparer le code de développement
+  actuel à la v1.2.38 installée sur un même poste, SANS jamais la
+  remplacer, la modifier ni la désinstaller. Voir windows/README.md,
+  section « Version de TEST ».
+
+  Copie de windows/app.wxs avec les différences suivantes, TOUTES
+  nécessaires à une cohabitation sûre (voir le diagnostic du 2026-09-12) :
+    - UpgradeCode DIFFÉRENT (ligne de produit totalement indépendante :
+      aucune relation de mise à jour possible avec la production, dans
+      AUCUN des deux sens, quel que soit le numéro de Version de l'une ou
+      l'autre) ;
+    - Package Name distinct ;
+    - dossier d'installation distinct (Program Files\...(TEST)\) ;
+    - raccourcis Bureau/Menu Démarrer distincts, avec un libellé
+      "Poker Senaco TEST" sans ambiguïté possible avec "Poker Senaco" ;
+    - clé de registre WiX distincte (HKCU\Software\PokerTournamentTest) ;
+    - source de l'exécutable : windows/dist/PokerTournamentTest/ (voir
+      poker_tournament-test.spec), jamais windows/dist/PokerTournament/.
+  Le dossier d'installation étant différent, WiX calcule pour chaque
+  Component un GUID différent de celui de la production (Guid="*" est
+  dérivé du chemin cible, pas seulement de l'Id du composant) : aucun
+  composant partagé, donc aucun risque qu'une désinstallation de l'une
+  des deux lignes supprime un fichier appartenant à l'autre.
+
+  Toute correction apportée ici qui ne concerne PAS la cohabitation
+  (licence, écran d'installation...) doit être reportée manuellement dans
+  windows/app.wxs si elle s'applique aussi à la production, et
+  réciproquement — les deux fichiers ne sont PAS générés l'un à partir de
+  l'autre.
+
+  Construction manuelle (depuis la racine du dépôt, une fois
+  windows/dist/PokerTournamentTest/ généré par PyInstaller à partir de
+  windows/poker_tournament-test.spec) :
+    wix build windows\app-test.wxs -arch x64 -ext WixToolset.UI.wixext ^
+        -d Dist=windows\dist -out windows\dist\PokerTournament-TEST.msi
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <?ifndef Dist?>
+  <?define Dist = "windows/dist" ?>
+  <?endif?>
+
+  <Package Name="Gestionnaire de Tournoi de Poker (TEST)"
+           Manufacturer="Raj Juganaikloo"
+           Version="1.2.38"
+           UpgradeCode="F9D8136D-B0DB-4ADE-B7A5-8A3456973215"
+           Language="1036"
+           Compressed="yes"
+           InstallerVersion="500">
+    <!-- UpgradeCode généré le 2026-09-12 via
+         `python3 -c "import uuid; print(uuid.uuid4())"`, DIFFÉRENT de
+         celui de la production (B0D02965-BECE-4162-856C-144E0675F6AE,
+         voir app.wxs) — c'est ce qui garantit qu'aucune des deux lignes
+         ne peut jamais déclencher une mise à jour/suppression de
+         l'autre, quel que soit le numéro de Version de chacune. À
+         conserver identique d'un build TEST à l'autre (sinon chaque
+         nouveau build TEST s'installerait à côté du précédent au lieu de
+         le remplacer proprement). -->
+
+    <SummaryInformation Description="Installateur - Gestionnaire de Tournoi de Poker (TEST)" />
+
+    <MajorUpgrade
+        DowngradeErrorMessage="Une version plus récente de Poker Senaco TEST est déjà installée." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIconTest.ico" SourceFile="windows\assets\app_icon.ico" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Gestionnaire de Tournoi de Poker (TEST)">
+        <Component Id="MainExecutable" Guid="*">
+          <File Id="PokerTournamentTestEXE"
+                Source="$(var.Dist)/PokerTournamentTest/PokerTournamentTest.exe"
+                KeyPath="yes" />
+        </Component>
+        <Directory Id="INTERNALDIR" Name="_internal" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Harvesting de _internal\ — voir le commentaire détaillé (piège
+         Files/@Include résolu relativement à windows/, pas à la racine
+         du dépôt) dans app.wxs : même remarque ici, motif écrit relatif
+         à windows/ sans le préfixe "windows/". -->
+    <ComponentGroup Id="AppFiles" Directory="INTERNALDIR">
+      <Files Include="dist/PokerTournamentTest/_internal/**" />
+    </ComponentGroup>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Gestionnaire de Tournoi de Poker (TEST)">
+        <Component Id="ApplicationShortcut" Guid="*">
+          <Shortcut Id="ApplicationStartMenuShortcut"
+                    Name="Poker Senaco TEST"
+                    Description="Gestionnaire de tournoi de poker multi-tables — VERSION DE TEST"
+                    Target="[#PokerTournamentTestEXE]"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="AppIconTest.ico"
+                    IconIndex="0" />
+          <RemoveFolder Id="CleanUpProgramMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+          <RegistryValue Root="HKCU"
+                          Key="Software\PokerTournamentTest"
+                          Name="StartMenuShortcutInstalled"
+                          Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="ApplicationDesktopShortcut"
+                  Name="Poker Senaco TEST"
+                  Description="Gestionnaire de tournoi de poker multi-tables — VERSION DE TEST"
+                  Target="[#PokerTournamentTestEXE]"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="AppIconTest.ico"
+                  IconIndex="0" />
+        <RegistryValue Root="HKCU"
+                        Key="Software\PokerTournamentTest"
+                        Name="DesktopShortcutInstalled"
+                        Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Gestionnaire de Tournoi de Poker (TEST)" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <ui:WixUI Id="WixUI_InstallDir" />
+    <WixVariable Id="WixUILicenseRtf" Value="windows\License.rtf" />
+
+  </Package>
+</Wix>

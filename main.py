@@ -15,6 +15,7 @@ import collections
 import time
 import json
 import csv
+import io
 import shutil
 import tempfile
 import uuid
@@ -30,7 +31,9 @@ from database import (
     format_date_fr, format_datetime_fr,
     PERIOD_TOURNAMENT_COLUMNS, PERIOD_PLAYER_COLUMNS,
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
-    BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY,
+    BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY, MOVE_REASON_LABELS,
+    RANKING_FORMULA_NONE, RANKING_FORMULA_CURRENT, RANKING_FORMULA_PROGRESSIVE,
+    RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
@@ -51,20 +54,131 @@ import license as licensing
 from version import APP_NAME, APP_VERSION, dev_suffix
 
 
+# Nom du fichier-marqueur qui identifie un exécutable compilé pour la
+# ligne « TEST » (cohabitation avec une installation de production sur le
+# même poste, demande du 2026-09-12 — voir windows/README.md, section
+# "Version de TEST"). Embarqué UNIQUEMENT par windows/poker_tournament-
+# test.spec (datas), JAMAIS par windows/poker_tournament.spec (le spec de
+# production ne le référence nulle part) : un build de production normal
+# ne peut donc jamais l'embarquer, même par erreur de fusion de branche,
+# sans une modification explicite de CE spec-ci. Ne touche ni version.py
+# (APP_VERSION reste inchangé) ni license.py (aucun rapport avec la
+# licence) — seul l'AFFICHAGE (titre de fenêtre, "À propos") en tient
+# compte, voir _is_test_build ci-dessous.
+_TEST_BUILD_MARKER_FILENAME = "TEST_BUILD_MARKER"
+
+
+def _is_test_build():
+    """Vrai uniquement pour un exécutable compilé à partir de windows/
+    poker_tournament-test.spec (voir _TEST_BUILD_MARKER_FILENAME
+    ci-dessus) : ce spec embarque un petit fichier marqueur
+    (windows/assets/TEST_BUILD_MARKER) à la racine du bundle, absent du
+    spec de production. Même repli sys._MEIPASS / dossier du fichier
+    source que help_browser._data_dir() pour fonctionner identiquement en
+    build compilée (onedir, _MEIPASS pointe vers _internal/) et en
+    lancement depuis les sources.
+
+    En lancement depuis les sources (python main.py), le dossier vérifié
+    est celui de main.py lui-même (racine du dépôt) — PAS windows/assets/
+    — donc ce marqueur n'y est jamais trouvé : aucun effet sur le
+    développement courant, uniquement sur un exécutable réellement
+    compilé avec ce spec dédié. Fonction MODULE-LEVEL (pas une méthode),
+    volontairement peu coûteuse (un seul appel os.path.exists) : appelée
+    à chaque rafraîchissement de titre, jamais mise en cache (le marqueur
+    ne peut de toute façon pas changer en cours d'exécution)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
+
+
 def _app_title_prefix():
-    """"{APP_NAME} v{APP_VERSION}[complément dev]" — préfixe commun à
-    TOUS les titres de fenêtre de premier niveau (demande du
+    """"[TEST] {APP_NAME} v{APP_VERSION}[complément dev]" — préfixe
+    commun à TOUS les titres de fenêtre de premier niveau (demande du
     2026-09-09) : Menu principal (voir App.__init__) ET fenêtre de
     tournoi (voir App._update_window_title), pour identifier
     immédiatement, PENDANT LE DÉVELOPPEMENT, quel commit (et si des
     modifications locales non commitées s'y ajoutent, voir version.
     dev_suffix) une fenêtre déjà ouverte fait réellement tourner — sans
     jamais avoir à toucher APP_VERSION à la main pour ça. En build
-    officielle (PyInstaller), dev_suffix() est vide : le titre reste
-    strictement "{APP_NAME} v{APP_VERSION}", inchangé par ce correctif.
-    Fonction MODULE-LEVEL (pas une méthode) : réutilisable telle quelle,
-    sans construire de fenêtre, y compris dans les tests."""
-    return f"{APP_NAME} v{APP_VERSION}{dev_suffix()}"
+    officielle (PyInstaller) de PRODUCTION, dev_suffix() est vide : le
+    titre reste strictement "{APP_NAME} v{APP_VERSION}", inchangé par ce
+    correctif. Le préfixe "[TEST] " (voir _is_test_build, demande du
+    2026-09-12) s'ajoute, lui, uniquement pour un exécutable compilé avec
+    windows/poker_tournament-test.spec — cohabite sans conflit avec
+    dev_suffix() (les deux peuvent apparaître ensemble en théorie, mais
+    en pratique un build "-test.spec" est toujours une build PyInstaller
+    figée, donc dev_suffix() y est de toute façon vide). Fonction
+    MODULE-LEVEL (pas une méthode) : réutilisable telle quelle, sans
+    construire de fenêtre, y compris dans les tests."""
+    prefix = f"{APP_NAME} v{APP_VERSION}{dev_suffix()}"
+    if _is_test_build():
+        prefix = f"[TEST] {prefix}"
+    return prefix
+
+
+def _format_players_count(n):
+    """"1 joueur" au singulier, "N joueurs" au pluriel (y compris pour 0)
+    — utilisé par l'onglet Tables (voir App._refresh_tables_tab, demande
+    du 2026-09-10 : nombre de joueurs affiché dans le titre de chaque
+    table et en total). Fonction MODULE-LEVEL (pas une méthode) :
+    réutilisable telle quelle, sans construire de fenêtre, y compris
+    dans les tests."""
+    return f"{n} joueur" if n == 1 else f"{n} joueurs"
+
+
+# Encodages essayés dans l'ordre pour décoder un CSV importé (Répertoire >
+# Importer CSV, voir RosterManagerDialog._import_csv et _decode_csv_bytes
+# ci-dessous) — demande du 2026-09-12. "utf-8-sig" couvre à la fois l'UTF-8
+# simple et l'UTF-8 avec BOM ; "cp1252" (Windows-1252/ANSI) couvre les
+# fichiers exportés par Excel sous Windows sans passer par UTF-8 (ex.
+# "Jérome M" avec un é encodé en 0xE9, qui faisait échouer l'ouverture
+# forcée en "utf-8-sig" d'avant ce correctif). Liste MODULE-LEVEL : reste
+# patchable isolément dans les tests (voir tests/test_import_csv_encoding.
+# py) pour simuler un fichier dans un troisième encodage non supporté —
+# impossible à obtenir avec de vrais octets, puisque cp1252 associe un
+# caractère à CHAQUE octet possible et ne peut donc jamais lui-même
+# échouer.
+IMPORT_CSV_ENCODINGS = ("utf-8-sig", "cp1252")
+
+
+def _decode_csv_bytes(raw):
+    """Décode `raw` (bytes lus depuis un fichier CSV importé) en essayant
+    successivement IMPORT_CSV_ENCODINGS. Lève l'UnicodeDecodeError du
+    DERNIER essai si aucun ne convient — voir RosterManagerDialog.
+    _import_csv pour l'affichage du message à l'utilisateur dans ce cas.
+    Fonction MODULE-LEVEL (pas une méthode) : testable isolément, sans
+    construire de fenêtre."""
+    last_error = None
+    for encoding in IMPORT_CSV_ENCODINGS:
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError as e:
+            last_error = e
+    raise last_error
+
+
+# Textes COURTS affichés en permanence sous la Combobox "Système de
+# points distribués" (onglet Paramètres), mis à jour immédiatement à
+# chaque changement de sélection — voir _on_ranking_formula_display_
+# changed dans _build_ranking_formula_widget. Contenu exact demandé.
+# Les explications complètes de chaque formule (autrefois dans un
+# popup d'aide "ⓘ", retiré le 2026-09-12 — voir la docstring de
+# _build_ranking_formula_widget) vivent désormais dans le manuel
+# utilisateur (MANUEL_UTILISATEUR_TOURNOI_CPC.docx, chapitre "Onglet
+# Paramètres" / section Primes en détail).
+RANKING_FORMULA_SHORT_TEXTS = {
+    RANKING_FORMULA_NONE: "Aucun point attribué selon le classement.",
+    RANKING_FORMULA_CURRENT: "100 × √N / P",
+    RANKING_FORMULA_PROGRESSIVE: "100 × √N / √P",
+    RANKING_FORMULA_SITNGO_CPC: "1000 + 100(N+1) - 200P",
+}
+# Placeholder affiché (jamais une des 4 vraies valeurs) quand ce tournoi
+# utilise encore l'ancien réglage "valeur fixe" (ranking_bonus_points,
+# voir Database.resolve_ranking_formula) sans qu'aucun choix explicite
+# n'ait encore été fait dans la nouvelle liste : tant que ce placeholder
+# reste affiché, _collect_and_save_all_settings n'écrit RIEN dans
+# ranking_formula (voir plus bas), pour ne jamais remplacer
+# silencieusement la valeur fixe historique par une formule.
+RANKING_FORMULA_LEGACY_PLACEHOLDER = "(valeur fixe historique — voir ci-dessous)"
 
 
 # Écran de démarrage ("Chargement en cours...", voir
@@ -1995,17 +2109,47 @@ class RosterManagerDialog(ttk.Frame):
         if not path:
             return
         try:
-            with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                sample = f.read(4096)
-                f.seek(0)
-                try:
-                    dialect = csv.Sniffer().sniff(sample, delimiters=";,")
-                except csv.Error:
-                    dialect = csv.excel
-                    dialect.delimiter = ";"
-                rows = list(csv.reader(f, dialect))
+            with open(path, "rb") as f:
+                raw = f.read()
         except OSError as e:
             messagebox.showerror("Erreur", f"Impossible de lire ce fichier :\n{e}", parent=self)
+            return
+
+        # Décodage du texte via IMPORT_CSV_ENCODINGS (UTF-8/UTF-8 avec BOM,
+        # puis repli Windows-1252/ANSI — voir _decode_csv_bytes ci-dessus
+        # pour le détail). Avant ce correctif du 2026-09-12, l'ouverture
+        # forçait "utf-8-sig" sans repli et UnicodeDecodeError (sous-classe
+        # de ValueError, PAS de OSError) n'était pas rattrapée ici : elle
+        # remontait jusqu'à Tkinter, qui l'avalait silencieusement (voir
+        # App.report_callback_exception) — le bouton semblait "ne rien
+        # faire" sur un CSV non-UTF-8, sans aucun message.
+        try:
+            text = _decode_csv_bytes(raw)
+        except UnicodeDecodeError as e:
+            messagebox.showerror(
+                "Erreur",
+                "Encodage de fichier non reconnu (ni UTF-8, ni Windows-1252/"
+                f"ANSI) :\n{e}",
+                parent=self,
+            )
+            return
+
+        try:
+            sample = text[:4096]
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+            except csv.Error:
+                dialect = csv.excel
+                dialect.delimiter = ";"
+            # newline="" (comme pour un fichier ouvert normalement, voir la
+            # doc du module csv) : préserve les fins de ligne telles quelles,
+            # pour un découpage des lignes identique à l'ancien code qui
+            # lisait directement depuis le fichier.
+            rows = list(csv.reader(io.StringIO(text, newline=""), dialect))
+        except csv.Error as e:
+            messagebox.showerror(
+                "Erreur", f"Ce fichier ne semble pas être un CSV valide :\n{e}", parent=self,
+            )
             return
 
         # Ignore une éventuelle ligne d'en-tête (NOM / CLUB, ou variantes).
@@ -4155,8 +4299,15 @@ class App(tk.Tk):
         # la section reflètent le bon état dès la toute première image,
         # jamais l'ancien état affiché puis corrigé au tick suivant.
         _align_primes_enabled_on_open(self.db)
-
+        # Détection SEULE (aucune réparation automatique, demande
+        # explicite du 2026-09-10) d'une incohérence de capacité déjà
+        # présente dans le fichier ouvert — ex. un ancien fichier créé
+        # avant le correctif de l'architecture de rééquilibrage. Après
+        # deiconify() pour que la fenêtre soit déjà visible derrière
+        # l'avertissement, plutôt qu'un dialogue sans fenêtre parente
+        # affichée.
         self.deiconify()
+        self._warn_if_table_integrity_issue()
         self._build_header()
         self._build_menu()
         self._build_tabs()
@@ -4818,6 +4969,16 @@ class App(tk.Tk):
             if guessed_name:
                 self.db.set_settings({"tournament_name": guessed_name})
             self.db.set_settings({"tournament_date": time.strftime("%Y-%m-%d")})
+            # Système de points distribués (demande du 2026-09-10) :
+            # stampé "none" ("Aucun") explicitement dès la création — PAS
+            # via DEFAULT_SETTINGS/_init_defaults (voir sa docstring),
+            # justement pour qu'un tournoi flambant neuf soit TOUJOURS
+            # distinguable sans ambiguïté d'un ancien fichier antérieur à
+            # cette fonctionnalité (qui, lui, n'aura jamais cette clé) —
+            # voir Database.resolve_ranking_formula. Jamais dans
+            # `last_settings`/PERSISTED_KEYS (voir tournament_prefs.py) :
+            # ce choix ne doit jamais être hérité d'un tournoi précédent.
+            self.db.set_settings({"ranking_formula": RANKING_FORMULA_NONE})
         self._update_window_title()
         if result.get("is_new") and result.get("selected_players"):
             for name in self._filter_active_conflicts(result["selected_players"]):
@@ -4940,8 +5101,15 @@ class App(tk.Tk):
         HelpBrowser.open_at(self, chapter_title=chapter)
 
     def _show_about(self, parent=None):
+        # "[TEST] " (demande du 2026-09-12, voir _is_test_build) : visible
+        # dès la première ligne de "À propos", en plus du titre de
+        # fenêtre (_app_title_prefix) — pour qu'une fenêtre de la version
+        # de TEST ne puisse jamais être confondue avec la v1.2.38 installée
+        # à côté, même une fois "À propos" ouvert en plein écran sans le
+        # reste de la fenêtre visible.
+        name_line = f"[TEST] {APP_NAME}" if _is_test_build() else APP_NAME
         lines = [
-            APP_NAME,
+            name_line,
             f"Version {APP_VERSION}",
             "",
             "Développé par Sena Raj Juganaikloo, membre de Chemillé Poker Club",
@@ -6198,18 +6366,70 @@ class App(tk.Tk):
         pending_rebalance lue par le thread du serveur de contrôle à
         distance, voir _start_remote_control_if_enabled et
         remote_control.py: /rebalance_pending) à partir de l'état courant
-        de self.db.pending_rebalance — SEUL affichage restant de cette
-        proposition, sur les téléphones (voir le commentaire ci-dessus :
-        plus aucune fenêtre Mac depuis ce correctif). Appelée juste après
-        chaque action qui peut déclencher un rééquilibrage (élimination
-        locale ou distante, bouton "Rééquilibrer les tables", changement
-        de "Nombre de sièges par table" dans Paramètres) pour une
-        réaction immédiate côté téléphone, et par sécurité à chaque tick
-        (_tick) : une réponse arrivée par une autre voie doit y être
-        reflétée même si elle n'a pas causé la demande suivante."""
+        de self.db.pending_rebalance, ET l'indication discrète de l'onglet
+        Tables (voir _update_pending_rebalance_badge — PHASE 3 de
+        l'architecture validée le 2026-09-10 : toujours aucune fenêtre
+        intrusive sur le Mac, mais plus le silence total d'avant cette
+        version, qui ne laissait voir l'attente que sur les téléphones).
+        Appelée juste après chaque action qui peut déclencher un
+        rééquilibrage (élimination locale ou distante, bouton
+        "Rééquilibrer les tables", changement de "Nombre de sièges par
+        table" dans Paramètres) pour une réaction immédiate, et par
+        sécurité à chaque tick (_tick) : une réponse arrivée par une autre
+        voie doit y être reflétée même si elle n'a pas causé la demande
+        suivante."""
         if not self.db:
             return
         self._remote_pending_rebalance = self.db.pending_rebalance
+        self._update_pending_rebalance_badge()
+
+    def _update_pending_rebalance_badge(self):
+        """Affiche/masque, dans le bandeau du haut de l'onglet Tables,
+        l'indication discrète qu'un rééquilibrage attend une réponse
+        "grosse blinde" (voir _build_tables_tab et database.py:
+        pending_rebalance) — disparaît dès que la demande est résolue,
+        d'où qu'elle le soit (téléphone ou le bouton "Continuer sans
+        indiquer la BB" ci-dessous). Ne fait rien si l'onglet Tables n'est
+        pas encore construit (tout début de App.__init__, avant
+        _build_tabs)."""
+        frame = getattr(self, "_pending_rebalance_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        pending = self.db.pending_rebalance if self.db else None
+        if pending is None:
+            frame.pack_forget()
+            return
+        self._pending_rebalance_label.configure(
+            text=f"⏳ {pending['table_name']} : rééquilibrage en attente de la grosse blinde"
+        )
+        # winfo_manager() (pas winfo_ismapped()) : reflète si ce frame est
+        # actuellement sous gestion pack, indépendamment de la visibilité
+        # réelle à l'écran (fenêtre minimisée/pas encore déiconifiée) —
+        # winfo_ismapped() renverrait toujours faux dans ces cas-là et
+        # provoquerait un pack() répété à chaque appel (harmless en
+        # pratique, mais inutile).
+        if frame.winfo_manager() != "pack":
+            frame.pack(side="left", padx=(15, 3))
+
+    def _continue_pending_rebalance_without_bb(self):
+        """Bouton "Continuer sans indiquer la BB" de l'onglet Tables (voir
+        _build_tables_tab/_update_pending_rebalance_badge) — POINT À
+        ÉTUDIER de la demande du 2026-09-10 : permet au responsable de
+        débloquer CE rééquilibrage précis depuis le Mac, sans téléphone,
+        en utilisant exactement le même mécanisme que la réponse
+        équivalente envoyée depuis un téléphone (seat=None, voir
+        database.py: resolve_pending_rebalance, règle 5) — donc le même
+        traitement que _on_bb_rebalance_prompt_toggle, à une différence
+        près et volontaire : ce bouton ne touche PAS à la préférence
+        globale "Équilibrage guidé par la grosse blinde" (self.
+        bb_rebalance_prompt_var reste inchangée), donc le PROCHAIN
+        rééquilibrage reposera de nouveau la question normalement — ce
+        bouton ne résout QUE la demande actuellement affichée."""
+        if not self.db or self.db.pending_rebalance is None:
+            return
+        self._resolve_pending_rebalance(
+            self.db.pending_rebalance["request_id"], None, from_remote=False
+        )
 
     def _resolve_pending_rebalance(self, request_id, seat, from_remote):
         """Traite une réponse à la question "quel siège est grosse
@@ -7260,6 +7480,20 @@ class App(tk.Tk):
             else:
                 self._clock_pause()
             self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
+        elif word == "niveau_precedent":
+            # Bouton "Niveau Précédent" du téléphone (demande du
+            # 2026-09-11 : présent côté Mac depuis un moment, jamais
+            # câblé côté contrôle à distance) : équivalent exact du
+            # bouton du même nom dans l'onglet Chronomètre —
+            # _clock_prev_level() réutilise _go_to_level(), donc la
+            # MÊME logique centrale que "Niveau Suivant"/le tableau de
+            # structure (bornage au niveau 1 inclus, redémarrage du
+            # chrono à la durée pleine du niveau ciblé — pause ou pas —
+            # et rafraîchissement immédiat de l'affichage Mac déjà
+            # garantis par cette fonction, aucune logique dupliquée
+            # ici). Discret, comme "toggle_pause"/"niveau_suivant" (ne
+            # remonte aucune fenêtre).
+            self._clock_prev_level()
         elif word == "niveau_suivant":
             # Bouton "Niveau Suivant" du téléphone : équivalent exact du
             # bouton du même nom dans l'onglet Chronomètre — discret,
@@ -7502,6 +7736,33 @@ class App(tk.Tk):
     TABLES_ZOOM_MAX = 3.0
     TABLES_ZOOM_STEP = 0.2
 
+    def _warn_if_table_integrity_issue(self):
+        """Avertit (une fois, à l'ouverture) si ce fichier .tournoi
+        contient déjà une table en surcapacité (voir Database.
+        check_table_integrity — lecture seule) — typiquement un ancien
+        fichier créé avant le correctif de l'architecture de
+        rééquilibrage du 2026-09-10. Ne modifie RIEN, ne déplace
+        personne : demande explicite "détection + avertissement
+        seulement, aucune réparation automatique pour l'instant"."""
+        if not self.db:
+            return
+        problems = self.db.check_table_integrity()
+        if not problems:
+            return
+        lines = [
+            f"{p['table_name']} : {p['occupation']} joueurs pour {p['max_seats']} sièges"
+            for p in problems
+        ]
+        messagebox.showwarning(
+            "Tables en surcapacité détectées",
+            "Ce fichier de tournoi contient au moins une table dont "
+            "l'occupation dépasse sa capacité configurée :\n\n"
+            + "\n".join(lines) + "\n\n"
+            "Cet état n'a PAS été corrigé automatiquement. Un "
+            "rééquilibrage manuel (bouton \"Rééquilibrer les tables\", "
+            "onglet Tables) peut être nécessaire.",
+        )
+
     def _build_tables_tab(self):
         self._tables_zoom = export_prefs.load_value("tables_zoom", 1.0)
 
@@ -7522,6 +7783,51 @@ class App(tk.Tk):
         ttk.Button(
             top, text="🔍+ Zoom", width=9, command=lambda: self._tables_zoom_by(self.TABLES_ZOOM_STEP),
         ).pack(side="left", padx=3)
+
+        # -- Indication discrète "rééquilibrage en attente de la grosse
+        # blinde" (PHASE 3 de l'architecture validée le 2026-09-10, voir
+        # database.py: pending_rebalance) : SEUL affichage Mac de cette
+        # attente (aucune fenêtre intrusive, voir _check_pending_
+        # rebalance) — un simple libellé + un bouton "Continuer sans
+        # indiquer la BB" équivalent au choix déjà disponible sur les
+        # téléphones (remote_control.py: _REBALANCE_WIDGET), pour que le
+        # responsable puisse trancher CE mouvement précis depuis le Mac
+        # sans devoir décocher la préférence globale d'équilibrage guidé
+        # (contrairement à _on_bb_rebalance_prompt_toggle). Caché par
+        # défaut ; affiché/masqué par _update_pending_rebalance_badge,
+        # appelée depuis _check_pending_rebalance (donc à chaque tick et
+        # après toute action de rééquilibrage).
+        self._pending_rebalance_frame = ttk.Frame(top)
+        self._pending_rebalance_label = ttk.Label(
+            self._pending_rebalance_frame, text="", foreground="#8a6d00",
+        )
+        self._pending_rebalance_label.pack(side="left", padx=(0, 6))
+        pending_rebalance_continue_btn = ttk.Button(
+            self._pending_rebalance_frame, text="Continuer sans indiquer la BB",
+            command=self._continue_pending_rebalance_without_bb,
+        )
+        pending_rebalance_continue_btn.pack(side="left")
+        Tooltip(
+            pending_rebalance_continue_btn,
+            "Résout ce rééquilibrage précis sans attendre de réponse d'un\n"
+            "téléphone, exactement comme si \"Continuer sans indiquer la\n"
+            "BB\" avait été répondu sur un téléphone du contrôle à\n"
+            "distance. La préférence \"Équilibrage guidé par la grosse\n"
+            "blinde\" n'est pas modifiée : le prochain rééquilibrage posera\n"
+            "de nouveau la question normalement.",
+        )
+        self._pending_rebalance_frame.pack_forget()
+
+        # -- Total de joueurs actuellement répartis dans les tables
+        # (demande du 2026-09-10, amélioration d'affichage uniquement —
+        # aucun changement de la logique des tables/du rééquilibrage) :
+        # discret, à l'opposé (droite) des boutons d'action de ce même
+        # bandeau. Mis à jour par _refresh_tables_tab, à partir du même
+        # décompte que celui utilisé pour le titre de chaque table (voir
+        # plus bas) — garantit que ce total correspond toujours
+        # exactement à la somme des nombres affichés par table.
+        self._tables_total_label = ttk.Label(top, text="", foreground=GOLD_DARK)
+        self._tables_total_label.pack(side="right", padx=(3, 0))
 
         scroll_container = ttk.Frame(self.tables_tab)
         scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -7638,13 +7944,25 @@ class App(tk.Tk):
         row_pady = max(1, round(2 * zoom))
 
         cols = 3
+        total_players = 0
         for idx, t in enumerate(tables):
+            plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["_display_seat"] or 0)
+            # Nombre de joueurs affiché dans le titre (demande du
+            # 2026-09-10, amélioration d'affichage uniquement) : compté
+            # sur `plist`, PAS sur une nouvelle requête à la base — c'est
+            # exactement la liste déjà utilisée ci-dessous pour peupler
+            # cette table (y compris le "gel" sur l'ancienne table/siège
+            # pendant une alerte de mouvement en attente, voir
+            # pending_old_by_name plus haut), donc ce nombre correspond
+            # TOUJOURS exactement aux sièges effectivement listés dans le
+            # cadre, jamais en avance ou en retard d'un rafraîchissement.
+            total_players += len(plist)
             frame = tk.LabelFrame(
-                self.tables_inner, text=t["name"], font=title_font,
+                self.tables_inner, text=f"{t['name']} — {_format_players_count(len(plist))}",
+                font=title_font,
                 bg=FELT, fg=GOLD, bd=1, relief="groove", highlightbackground=GOLD_DARK,
             )
             frame.grid(row=idx // cols, column=idx % cols, padx=grid_pad, pady=grid_pad, sticky="n")
-            plist = sorted(players_by_table.get(t["id"], []), key=lambda p: p["_display_seat"] or 0)
             if not plist:
                 tk.Label(frame, text="(vide)", font=row_font, bg=FELT, fg=CREAM).pack(
                     padx=row_padx, pady=row_pady + 4
@@ -7654,6 +7972,9 @@ class App(tk.Tk):
                     frame, text=f"Siège {p['_display_seat']} — {p['name']}",
                     font=row_font, bg=FELT, fg=CREAM,
                 ).pack(anchor="w", padx=row_padx, pady=row_pady)
+
+        if hasattr(self, "_tables_total_label"):
+            self._tables_total_label.configure(text=f"Total : {_format_players_count(total_players)}")
 
         # Repart du haut à chaque rafraîchissement (rééquilibrage,
         # élimination...) plutôt que de rester sur une position de
@@ -7743,13 +8064,22 @@ class App(tk.Tk):
             "voix haute.",
         )
 
-        cols = ("time", "player", "old_table", "old_seat", "new_table", "new_seat")
-        headers = ["Heure", "Joueur", "Ancienne table", "Ancien siège", "Nouvelle table", "Nouveau siège"]
+        # Colonne "Raison" (demande du 2026-09-10, architecture de
+        # rééquilibrage) : l'utilisateur doit pouvoir comprendre POURQUOI
+        # un joueur a été déplacé (contrainte de capacité, fusion de
+        # table, équilibrage automatique, ou choix guidé par la grosse
+        # blinde) — voir database.py: MOVE_REASON_LABELS.
+        cols = ("time", "player", "old_table", "old_seat", "new_table", "new_seat", "reason")
+        headers = [
+            "Heure", "Joueur", "Ancienne table", "Ancien siège", "Nouvelle table",
+            "Nouveau siège", "Raison",
+        ]
         self.moves_tree = ttk.Treeview(self.moves_tab, columns=cols, show="headings", height=20)
         for c, h in zip(cols, headers):
             self.moves_tree.heading(c, text=h)
             self.moves_tree.column(c, width=130, anchor="center")
         self.moves_tree.column("player", width=180, anchor="w")
+        self.moves_tree.column("reason", width=170, anchor="w")
         self.moves_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def _refresh_moves_tab(self):
@@ -7769,6 +8099,11 @@ class App(tk.Tk):
                 row_tag = "recent"
             else:
                 row_tag = "evenrow" if idx % 2 == 0 else "oddrow"
+            # m["reason"] : absent ("" via ALTER TABLE ... DEFAULT '')
+            # pour tout mouvement archivé avant l'ajout de cette colonne
+            # (voir database.py: _migrate) -> repli générique "Équilibrage"
+            # via MOVE_REASON_LABELS.get, jamais une raison inventée.
+            reason_label = MOVE_REASON_LABELS.get(m["reason"] or "", MOVE_REASON_LABELS[""])
             self.moves_tree.insert(
                 "", "end",
                 values=(
@@ -7778,6 +8113,7 @@ class App(tk.Tk):
                     m["old_seat"] or "—",
                     m["new_table_name"] or "—",
                     m["new_seat"] or "—",
+                    reason_label,
                 ),
                 tags=(row_tag,),
             )
@@ -9774,6 +10110,135 @@ class App(tk.Tk):
     def _on_classement_scroll_toggle(self):
         export_prefs.save_value("classement_autoscroll_enabled", self.classement_scroll_var.get())
 
+    def _build_ranking_formula_widget(self, parent, row):
+        """Construit le bloc "Système de points distribués" de l'onglet
+        Paramètres (demande du 2026-09-10) — remplace l'ancien champ
+        "Montant de la prime de classement en points" (réglage
+        ranking_bonus_points, désormais conservé uniquement pour la
+        compatibilité des anciens fichiers, voir Database.resolve_
+        ranking_formula). Extrait de _build_settings_tab dans sa propre
+        méthode pour rester testable isolément (voir tests/test_ranking_
+        formula_widget.py).
+
+        Comportement :
+        - Combobox en lecture seule (state="readonly" : empêche toute
+          saisie libre, donc toute valeur interne inconnue) ;
+        - texte COURT discret sous la Combobox (RANKING_FORMULA_SHORT_
+          TEXTS), mis à jour IMMÉDIATEMENT à chaque changement de
+          sélection, y compris la toute première fois affichée.
+
+        Un bouton d'aide "ⓘ" a été essayé le 2026-09-11 (popup complet
+        au clic) puis DÉFINITIVEMENT retiré le 2026-09-12 : positionné
+        via place() à gauche du Combobox pour ne pas déplacer ce
+        dernier, il s'est avéré invisible dans l'interface réelle
+        (mélanger place() avec les widgets pack()/grid() voisins, dans
+        une zone qui se redessine — le Canvas défilable de cet onglet,
+        voir _build_settings_tab — est un cas connu de fragilité Tk).
+        Les explications détaillées des 4 formules vivent désormais
+        UNIQUEMENT dans le manuel utilisateur (chapitre "Onglet
+        Paramètres", section Primes en détail) — seul le texte court
+        reste dans l'interface elle-même.
+
+        Renvoie (label, row_frame, combo, short_lbl, legacy_note_ou_
+        None). L'appelant ajoute à self._primes_section_widgets les
+        widgets INTERACTIFS eux-mêmes (label, combo, short_lbl, et
+        legacy_note s'il existe) — PAS row_frame (un ttk.Frame n'a pas
+        d'option "state" ; l'y mettre faisait échouer silencieusement
+        configure(state=...) sur toute la ligne, voir le diagnostic du
+        2026-09-11 : le Combobox ne réagissait alors JAMAIS à "Calculer
+        les primes"). _update_primes_section_state traite `combo` à
+        part (jamais state="normal", voir sa docstring)."""
+        ranking_lbl = ttk.Label(parent, text="Système de points distribués :")
+        ranking_lbl.grid(row=row, column=0, sticky="w", pady=4)
+
+        ranking_row = ttk.Frame(parent)
+        ranking_row.grid(row=row, column=1, pady=4, padx=10, sticky="w")
+
+        formula, legacy_flat_value = self.db.resolve_ranking_formula()
+        if legacy_flat_value is not None:
+            # Ancien tournoi utilisant encore la valeur fixe historique
+            # (ranking_bonus_points > 0) : aucune présélection parmi les
+            # 4 nouveaux choix tant que le responsable n'a pas choisi
+            # explicitement — voir RANKING_FORMULA_LEGACY_PLACEHOLDER et
+            # _collect_and_save_all_settings (n'écrit ranking_formula que
+            # si un vrai choix a été fait, jamais ce placeholder).
+            initial_display = RANKING_FORMULA_LEGACY_PLACEHOLDER
+            initial_internal = ""
+        else:
+            initial_display = RANKING_FORMULA_LABELS.get(formula, RANKING_FORMULA_LABELS[RANKING_FORMULA_CURRENT])
+            initial_internal = formula
+
+        self.ranking_formula_display_var = tk.StringVar(value=initial_display)
+        ranking_formula_var = tk.StringVar(value=initial_internal)
+        self.settings_vars["ranking_formula"] = ranking_formula_var
+
+        def _on_ranking_formula_display_changed(*_a):
+            # Traduit le libellé affiché (Aucun/Classique/...) vers la
+            # valeur interne réellement enregistrée (none/current/...) —
+            # ne se déclenche QUE sur une vraie sélection utilisateur
+            # (trace ajoutée après la construction ci-dessus, jamais sur
+            # la valeur initiale).
+            label = self.ranking_formula_display_var.get()
+            for internal, display in RANKING_FORMULA_LABELS.items():
+                if display == label:
+                    ranking_formula_var.set(internal)
+                    break
+            # Texte court sous la Combobox (demande du 2026-09-11 :
+            # l'aide du bouton "ⓘ" seule n'était pas assez visible) —
+            # mis à jour immédiatement à CHAQUE changement de sélection,
+            # y compris la toute première fois (appelé une fois "à la
+            # main" juste après la construction du widget, plus bas).
+            internal = ranking_formula_var.get()
+            self.ranking_formula_short_lbl.configure(
+                text=RANKING_FORMULA_SHORT_TEXTS.get(internal, "")
+            )
+
+        self.ranking_formula_display_var.trace_add("write", _on_ranking_formula_display_changed)
+
+        # combo_line : sous-frame pour la liste déroulante — ranking_row
+        # (la cellule de grille) peut ainsi empiler cette ligne, le texte
+        # court, ET la note "valeur fixe historique" ci-dessous SANS
+        # ajouter de nouvelle ligne de grille (ce qui aurait décalé tous
+        # les réglages suivants — bounty, PKO...). Ne contient QUE le
+        # Combobox (le bouton d'aide "ⓘ" envisagé le 2026-09-11 a été
+        # retiré le 2026-09-12, voir la docstring de cette méthode).
+        combo_line = ttk.Frame(ranking_row)
+        combo_line.pack(side="top", anchor="w")
+
+        ranking_combo = ttk.Combobox(
+            combo_line, textvariable=self.ranking_formula_display_var,
+            values=list(RANKING_FORMULA_LABELS.values()), state="readonly", width=16,
+        )
+        ranking_combo.pack(side="left")
+
+        # Texte court, discret, sous la Combobox
+        # — mis à jour à chaque sélection par _on_ranking_formula_display_
+        # changed ci-dessus ; initialisé explicitement ici juste après sa
+        # création (la trace ne s'est pas déclenchée pour la valeur
+        # affichée à la construction du widget, posée avant l'ajout de
+        # la trace — même principe que ranking_formula_var/
+        # initial_internal plus haut).
+        self.ranking_formula_short_lbl = ttk.Label(ranking_row, text="", foreground=MUTED)
+        self.ranking_formula_short_lbl.pack(side="top", anchor="w", pady=(2, 0))
+        _on_ranking_formula_display_changed()
+
+        ranking_legacy_note = None
+        if legacy_flat_value is not None:
+            ranking_legacy_note = ttk.Label(
+                ranking_row,
+                text=(
+                    f"Valeur fixe historique conservée : {legacy_flat_value} points.\n"
+                    "Choisissez une formule ci-dessus pour la remplacer."
+                ),
+                foreground=MUTED, justify="left",
+            )
+            ranking_legacy_note.pack(side="top", anchor="w", pady=(2, 0))
+
+        return (
+            ranking_lbl, ranking_row, ranking_combo,
+            self.ranking_formula_short_lbl, ranking_legacy_note,
+        )
+
     # ---------------------------------------------------------------
     # Onglet Paramètres
     # ---------------------------------------------------------------
@@ -10380,22 +10845,19 @@ class App(tk.Tk):
         consecutive_note.grid(row=bounty_start_row + 5, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self._primes_section_widgets += [consecutive_lbl, consecutive_entry, consecutive_note]
 
-        ranking_lbl = ttk.Label(right, text="Montant de la prime de classement en points :")
-        ranking_lbl.grid(row=bounty_start_row + 6, column=0, sticky="w", pady=4)
-        Tooltip(
-            ranking_lbl,
-            "Valeur fixe (en points) attribuée au rang final d'un joueur.\n"
-            "Si ce champ est à 0, la valeur est calculée automatiquement\n"
-            "avec la formule 100×√N / P (N = nombre de joueurs du tournoi,\n"
-            "P = rang du joueur), pour ne pas sur-récompenser les petits\n"
-            "champs. Connue seulement une fois le joueur éliminé (ou\n"
-            "vainqueur, tournoi terminé).",
-        )
-        ranking_var = tk.StringVar(value=self.db.get_setting("ranking_bonus_points", "0"))
-        ranking_entry = ttk.Entry(right, textvariable=ranking_var, width=25)
-        ranking_entry.grid(row=bounty_start_row + 6, column=1, pady=4, padx=10)
-        self.settings_vars["ranking_bonus_points"] = ranking_var
-        self._primes_section_widgets += [ranking_lbl, ranking_entry]
+        (
+            ranking_lbl, _ranking_row, ranking_combo,
+            ranking_short_lbl, ranking_legacy_note,
+        ) = self._build_ranking_formula_widget(right, bounty_start_row + 6)
+        # ranking_row (le ttk.Frame conteneur) n'est PAS ajouté ici — voir
+        # la docstring de _build_ranking_formula_widget et le diagnostic
+        # du 2026-09-11 : un Frame n'a pas d'option "state", configure()
+        # y échouait silencieusement et ne touchait donc jamais les
+        # widgets qu'il contient. On ajoute directement les widgets
+        # interactifs eux-mêmes.
+        self._primes_section_widgets += [ranking_lbl, ranking_combo, ranking_short_lbl]
+        if ranking_legacy_note is not None:
+            self._primes_section_widgets.append(ranking_legacy_note)
 
         bounty_lbl = ttk.Label(right, text="Montant du bounty en points :")
         bounty_lbl.grid(row=bounty_start_row + 7, column=0, sticky="w", pady=4)
@@ -10744,14 +11206,26 @@ class App(tk.Tk):
         change pas le verrouillage) sans le refaire à chaque appelant.
         N'agit jamais sur la case "Calculer les primes" elle-même (son
         propre état "disabled" est géré par ses appelants, voir
-        _sync_primes_enabled_checkbox / _on_primes_enabled_toggle)."""
+        _sync_primes_enabled_checkbox / _on_primes_enabled_toggle).
+
+        Cas particulier du ttk.Combobox "Système de points distribués"
+        (ranking_combo, voir _build_ranking_formula_widget) — demande du
+        2026-09-11, diagnostic de la régression où ce widget restait
+        visuellement figé sur "readonly" (confondu avec "disabled" sous
+        le thème Aqua) : il ne doit JAMAIS recevoir state="normal" (ce
+        qui autoriserait une saisie libre, valeur interne inconnue) —
+        "readonly" quand la section est modifiable, "disabled" sinon,
+        jamais le `state` générique calculé pour les autres widgets."""
         if locked is None:
             locked = _primes_session_locked()
         editable = enabled and not locked
         state = "normal" if editable else "disabled"
         for widget in getattr(self, "_primes_section_widgets", []):
             try:
-                widget.configure(state=state)
+                if isinstance(widget, ttk.Combobox):
+                    widget.configure(state="readonly" if editable else "disabled")
+                else:
+                    widget.configure(state=state)
             except tk.TclError:
                 pass  # widget sans option "state" (ne devrait pas arriver ici)
 
@@ -10887,25 +11361,85 @@ class App(tk.Tk):
         Paramètres sous..." et par "Régénérer la structure de blindes",
         qui enregistre ainsi tout en même temps sans clic séparé. Renvoie
         le dict `values` rassemblé (ex : pour "Enregistrer Paramètres
-        sous...", qui en a aussi besoin pour le modèle nommé)."""
+        sous...", qui en a aussi besoin pour le modèle nommé).
+
+        PHASE 2 de l'architecture de rééquilibrage (validée le
+        2026-09-10) : un changement de "Nombre de sièges par table" qui
+        laisserait, une fois le tournoi démarré (clock_started == 1), au
+        moins une table avec plus de joueurs que ce nouveau nombre de
+        sièges est REFUSÉ CIBLÉ — ni `max_seats_per_table` ni
+        `tables_pk.max_seats` ne sont modifiés (voir database.py:
+        tables_over_capacity), le champ à l'écran est ramené à l'ancienne
+        valeur, un message d'erreur explique quelle(s) table(s) bloquent
+        le changement, et TOUS LES AUTRES réglages modifiés dans le même
+        geste sont malgré tout enregistrés normalement. Cette vérification
+        est faite AVANT le moindre appel à set_settings/set_all_tables_
+        max_seats : il ne doit jamais exister d'état intermédiaire où
+        max_seats_per_table est enregistré sans que les tables réelles ne
+        l'aient suivi. Avant le premier démarrage (clock_started == 0),
+        comportement inchangé : la réorganisation automatique reste
+        entièrement autorisée (PHASE 1)."""
         values = {}
         for k, v in self.settings_vars.items():
             raw = v.get()
             if isinstance(raw, bool):
                 raw = "1" if raw else "0"
             values[k] = raw
+
+        try:
+            candidate_max_seats = int(values.get("max_seats_per_table", ""))
+        except (ValueError, TypeError):
+            candidate_max_seats = None
+        new_max_seats = candidate_max_seats if candidate_max_seats and candidate_max_seats >= 2 else None
+
+        if (
+            new_max_seats is not None
+            and self.db.get_setting_int("clock_started", 0) == 1
+        ):
+            over = self.db.tables_over_capacity(new_max_seats)
+            if over:
+                # Refus ciblé : on revient à l'ancienne valeur, à la fois
+                # dans `values` (donc dans db_values ci-dessous et dans
+                # tournament_prefs.save_last_settings) et dans le champ à
+                # l'écran, pour qu'aucune trace du changement refusé ne
+                # subsiste nulle part.
+                old_value = self.db.get_setting("max_seats_per_table", "9")
+                values["max_seats_per_table"] = old_value
+                if "max_seats_per_table" in self.settings_vars:
+                    self.settings_vars["max_seats_per_table"].set(old_value)
+                new_max_seats = None
+                if len(over) == 1:
+                    detail = f"La {over[0]['name']} contient actuellement {over[0]['count']} joueurs."
+                else:
+                    noms = ", ".join(f"{t['name']} ({t['count']} joueurs)" for t in over)
+                    detail = f"Ces tables contiennent plus de joueurs que {candidate_max_seats} : {noms}."
+                messagebox.showerror(
+                    "Nombre de sièges par table",
+                    f"Impossible d'appliquer {candidate_max_seats} sièges par table.\n"
+                    f"{detail}\n"
+                    "Effectuez d'abord le rééquilibrage de cette table.",
+                )
+
         # "club_name" est commun à tous les tournois/Sit & Go (préférences
-        # partagées, voir le trace_add posé sur son StringVar) : jamais
+        # partagées, voir le trace_add posé sur sa StringVar) : jamais
         # écrit dans ce fichier .tournoi, pour éviter une copie qui
         # divergerait silencieusement de la valeur réellement affichée.
-        db_values = {k: v for k, v in values.items() if k != "club_name"}
+        #
+        # "ranking_formula" vide ("") : ce tournoi utilise encore la
+        # valeur fixe historique (ranking_bonus_points, voir Database.
+        # resolve_ranking_formula) et le responsable n'a fait AUCUN choix
+        # explicite dans la nouvelle liste déroulante (voir
+        # RANKING_FORMULA_LEGACY_PLACEHOLDER) — on n'écrit alors RIEN
+        # dans ranking_formula, pour ne jamais remplacer silencieusement
+        # cette valeur fixe par une formule à l'occasion d'un simple
+        # "Appliquer"/"Enregistrer" portant sur d'AUTRES réglages.
+        db_values = {
+            k: v for k, v in values.items()
+            if k != "club_name" and not (k == "ranking_formula" and v == "")
+        }
         self.db.set_settings(db_values)
         tournament_prefs.save_last_settings(values)
-        try:
-            new_max_seats = int(values.get("max_seats_per_table", ""))
-        except ValueError:
-            new_max_seats = None
-        if new_max_seats and new_max_seats >= 2:
+        if new_max_seats is not None:
             self.db.set_all_tables_max_seats(new_max_seats)
         moves = self.db.rebalance_tables()
         self._update_window_title()
