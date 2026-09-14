@@ -90,6 +90,18 @@ def _is_test_build():
     return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
 
 
+def _menu_principal_key():
+    """Clé de verrouillage du "Menu principal" (demande du 2026-09-14,
+    voir open_windows.register_menu_principal/menu_principal_pid) —
+    "test" ou "prod" selon _is_test_build() : Poker Senaco et Poker
+    Senaco TEST doivent chacun garder leur propre instance unique, sans
+    jamais se bloquer l'un l'autre (installations volontairement
+    coexistantes sur un même poste, voir windows/README.md). Fonction
+    MODULE-LEVEL (pas une méthode) : réutilisable telle quelle, sans
+    construire de fenêtre, y compris dans les tests."""
+    return "test" if _is_test_build() else "prod"
+
+
 def _app_title_prefix():
     """"[TEST] {APP_NAME} v{APP_VERSION}[complément dev]" — préfixe
     commun à TOUS les titres de fenêtre de premier niveau (demande du
@@ -384,7 +396,22 @@ def tournament_day_folder_proposal(is_sng=False):
     return folder, filename
 
 
-def spawn_app_process(extra_args=None):
+# Marqueur d'environnement (demande du 2026-09-14, unicité du Menu
+# principal) posé UNIQUEMENT par spawn_app_process(internal_menu_child=
+# True) — voir App._open_new_window, seul appelant à le passer — pour
+# distinguer de façon fiable un processus enfant VOLONTAIRE (bouton "🏠
+# Menu principal", au même titre que le Lobby) d'un vrai second
+# lancement externe accidentel (raccourci Windows/macOS re-double-
+# cliqué) : un double-clic sur le raccourci ne peut, par construction,
+# jamais porter cette variable (l'OS ne la connaît pas), contrairement à
+# `open_path` qui, lui, ne suffit pas à distinguer ces deux cas (les
+# deux valent None). Voir App.__init__ pour la vérification, et
+# open_windows.py (section "Unicité du Menu principal") pour le verrou
+# lui-même.
+POKER_TOURNAMENT_INTERNAL_LAUNCH = "POKER_TOURNAMENT_INTERNAL_LAUNCH"
+
+
+def spawn_app_process(extra_args=None, internal_menu_child=False):
     """Lance une nouvelle instance indépendante de l'application (autre
     processus). `extra_args` : arguments supplémentaires passés au
     programme — notamment le chemin d'un fichier .tournoi à ouvrir
@@ -392,6 +419,13 @@ def spawn_app_process(extra_args=None):
     App.__init__/open_path, et LobbyDialog qui l'utilise pour "Ouvrir"
     un tournoi de la liste dans sa propre fenêtre). Renvoie l'objet
     Popen. Lève OSError si le lancement échoue (à l'appelant de gérer).
+
+    `internal_menu_child=True` (demande du 2026-09-14, UNIQUEMENT passé
+    par App._open_new_window) : marque le nouveau processus comme un
+    "Menu principal" supplémentaire VOLONTAIRE (voir
+    POKER_TOURNAMENT_INTERNAL_LAUNCH ci-dessus), exempté du verrou
+    d'unicité — sans ce marqueur, `open_path=None` seul ne permettrait
+    pas de le distinguer d'un vrai second lancement externe accidentel.
 
     `stdin=subprocess.DEVNULL` : le nouveau process reçoit un stdin neuf
     et toujours valide, plutôt que d'hériter du descripteur de fichier 0
@@ -407,12 +441,17 @@ def spawn_app_process(extra_args=None):
     capturant réellement stdout/stderr du process mort, voir l'historique
     git de ce fichier)."""
     extra_args = list(extra_args or [])
+    env = None
+    if internal_menu_child:
+        env = os.environ.copy()
+        env[POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
     if getattr(sys, "frozen", False):
         # Application empaquetée (PyInstaller) : sys.executable est déjà
         # le programme lui-même, pas besoin de lui repasser main.py.
-        return subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL)
+        return subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL, env=env)
     return subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), *extra_args], stdin=subprocess.DEVNULL,
+        [sys.executable, os.path.abspath(__file__), *extra_args],
+        stdin=subprocess.DEVNULL, env=env,
     )
 
 
@@ -4129,6 +4168,17 @@ class App(tk.Tk):
         # d'en accumuler plusieurs par des clics répétés ; ne concerne que
         # CE process-ci (chaque tournoi garde sa propre référence).
         self._menu_principal_proc = None
+        # Unicité GLOBALE du "Menu principal" (demande du 2026-09-14,
+        # distincte de self._menu_principal_proc ci-dessus, qui n'est
+        # qu'une optimisation locale à cette fenêtre) : True si CE
+        # process a lui-même posé le verrou open_windows.
+        # register_menu_principal (voir plus bas dans __init__) — permet
+        # à _cleanup_for_close de ne libérer QUE le verrou qu'il détient
+        # réellement, jamais celui d'un autre processus. Initialisé ICI,
+        # avant même tout risque de sortie anticipée (licence non
+        # activée, etc.), pour que _cleanup_for_close (appelée par
+        # certains chemins de fermeture) trouve toujours cet attribut.
+        self._holds_menu_principal_lock = False
         # Mode Test (demande du 2026-09-09) : outil de test/développement,
         # PROPRE À CE PROCESS, jamais mémorisé nulle part (ni export_prefs,
         # ni réglage de tournoi) — décoché à chaque lancement du logiciel,
@@ -4283,9 +4333,24 @@ class App(tk.Tk):
                 )
                 self.destroy()
                 return
-        elif not self._choose_tournament_file():
-            self.destroy()
-            return
+        else:
+            if not self._acquire_menu_principal_lock_if_needed(open_path):
+                # Une autre instance (MÊME ligne prod/test) existe déjà
+                # et a été ramenée au premier plan — voir la docstring de
+                # _acquire_menu_principal_lock_if_needed : self.after
+                # (destroy différé) déjà programmé, rien d'autre à faire.
+                return
+            if not self._choose_tournament_file():
+                # _cleanup_for_close (pas juste self.destroy()) : libère
+                # aussi le verrou de Menu principal éventuellement posé
+                # juste au-dessus (voir self._holds_menu_principal_lock)
+                # — sans quoi annuler l'écran "Bienvenue" (Sit & Go NON
+                # créé) laisserait le verrou posé indéfiniment, bloquant
+                # à tort tout futur lancement externe. self.db est
+                # encore None ici : _cleanup_for_close n'y touche pas.
+                self._cleanup_for_close()
+                self.destroy()
+                return
 
         # Enregistre ce processus comme affichant ce tournoi (voir
         # open_windows.py) : permet au Lobby SNG de détecter qu'il est
@@ -4542,20 +4607,35 @@ class App(tk.Tk):
         contournait cet état grisé) — c'est LÀ, jamais ici, que la
         protection doit intervenir.
 
-        UNICITÉ (self._menu_principal_proc) : n'en relance PAS un second
-        tant que celui déjà lancé depuis CETTE fenêtre est encore vivant
-        — le ramène simplement au premier plan à la place. Sans cette
-        garde, chaque clic répété créait un nouveau process indépendant,
-        aussi longtemps que l'utilisateur cliquait. Pas de vraie modalité
-        possible ici (grab_set/transient de Tkinter ne s'appliquent qu'à
-        l'intérieur d'un même process — "Menu principal" en est un
-        second, voir spawn_app_process) : la fenêtre tournoi reste
-        techniquement cliquable derrière, seule l'unicité est garantie."""
+        UNICITÉ locale (self._menu_principal_proc) : n'en relance PAS un
+        second tant que celui déjà lancé DEPUIS CETTE fenêtre est encore
+        vivant — le ramène simplement au premier plan à la place. Sans
+        cette garde, chaque clic répété créait un nouveau process
+        indépendant, aussi longtemps que l'utilisateur cliquait. Pas de
+        vraie modalité possible ici (grab_set/transient de Tkinter ne
+        s'appliquent qu'à l'intérieur d'un même process — "Menu
+        principal" en est un second, voir spawn_app_process) : la
+        fenêtre tournoi reste techniquement cliquable derrière, seule
+        l'unicité est garantie.
+
+        `internal_menu_child=True` (demande du 2026-09-14) : ce nouveau
+        process est un "Menu principal" supplémentaire VOLONTAIRE
+        (comme le Lobby pour un tournoi précis) — voir
+        POKER_TOURNAMENT_INTERNAL_LAUNCH et open_windows.
+        menu_principal_pid : ce marqueur l'exempte du verrou global
+        d'unicité "un seul Menu principal externe par PC" posé dans
+        App.__init__, qui ne concerne QUE le raccourci Windows/macOS
+        re-double-cliqué. Reste par ailleurs limité par self.
+        _menu_principal_proc ci-dessus (un seul par fenêtre déjà
+        ouverte) — les deux mécanismes sont indépendants, jamais
+        redondants : celui-ci évite de spammer des process depuis LA
+        MÊME fenêtre, l'autre (global) évite un second lancement
+        EXTERNE accidentel."""
         if self._menu_principal_proc is not None and self._menu_principal_proc.poll() is None:
             open_windows.bring_pid_to_front(self._menu_principal_proc.pid)
             return
         try:
-            proc = spawn_app_process()
+            proc = spawn_app_process(internal_menu_child=True)
         except OSError as e:
             messagebox.showerror(
                 "Erreur", f"Impossible d'ouvrir une nouvelle fenêtre :\n{e}"
@@ -4577,6 +4657,66 @@ class App(tk.Tk):
 
         self._menu_principal_proc = proc
         raise_process_when_ready(self, proc.pid)
+
+    def _acquire_menu_principal_lock_if_needed(self, open_path):
+        """Pose (si nécessaire) le verrou d'unicité du "Menu principal"
+        pour CE lancement (demande du 2026-09-14) — extrait d'App.
+        __init__ dans sa propre méthode pour rester testable isolément
+        (voir tests/test_menu_principal_singleton.py), même principe que
+        _build_ranking_formula_widget.
+
+        Ne s'applique QUE si `open_path` vaut None (jamais pour "chemin
+        fourni mais fichier introuvable", qui retombe sur le même écran
+        d'accueil par un chemin différent, déjà existant, inchangé —
+        seul appelant : App.__init__) ET sans le marqueur
+        POKER_TOURNAMENT_INTERNAL_LAUNCH (posé UNIQUEMENT par
+        spawn_app_process(internal_menu_child=True), voir
+        _open_new_window ci-dessus) : le Lobby (chemin réel) et "🏠 Menu
+        principal" (marqueur présent) sont ainsi TOUJOURS exemptés,
+        quel que soit l'état du verrou — jamais de vérification pour eux
+        du tout.
+
+        `_menu_principal_key()` sépare Poker Senaco de Poker Senaco
+        TEST : chacun garde sa propre instance unique, sans jamais se
+        bloquer l'un l'autre.
+
+        Renvoie True si l'appelant doit continuer normalement vers
+        _choose_tournament_file() (cas B — open_path fourni ou marqueur
+        interne présent — ou cas A où aucune autre instance n'existait,
+        verrou fraîchement posé par CE process, self.
+        _holds_menu_principal_lock passé à True). Renvoie False si une
+        autre instance de la MÊME ligne existe déjà : elle a été ramenée
+        au premier plan (best-effort, jamais de message d'erreur) et
+        self.after(destroy) déjà programmé — l'appelant ne doit alors
+        RIEN faire de plus, ni construire la moindre fenêtre.
+
+        Le verrou est posé AVANT _choose_tournament_file() et gardé
+        pendant TOUTE la vie de cette fenêtre (libéré uniquement dans
+        _cleanup_for_close, jamais ici) — jamais relâché dès qu'un
+        tournoi est choisi : sans ça, un second double-clic sur le
+        raccourci PENDANT qu'un tournoi est déjà affiché ouvrirait quand
+        même un second écran Bienvenue, exactement le cas que cette
+        demande doit empêcher."""
+        if open_path is not None or os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH):
+            return True
+        menu_key = _menu_principal_key()
+        existing_pid = open_windows.menu_principal_pid(menu_key)
+        if existing_pid is not None:
+            # Une autre instance du Menu principal (de la MÊME ligne
+            # prod/test) tourne déjà sur ce poste : on la ramène au
+            # premier plan (fonctionne qu'elle affiche encore
+            # "Bienvenue" ou déjà un tournoi, bring_pid_to_front visant
+            # le PID, pas une fenêtre précise) et on quitte
+            # SILENCIEUSEMENT — jamais de fenêtre affichée, jamais de
+            # message d'erreur. self.after (pas un appel synchrone) :
+            # laisse mainloop() traiter les tentatives successives de
+            # raise_process_when_ready avant de se détruire pour de bon.
+            raise_process_when_ready(self, existing_pid)
+            self.after(3500, self.destroy)
+            return False
+        open_windows.register_menu_principal(os.getpid(), menu_key)
+        self._holds_menu_principal_lock = True
+        return True
 
     def _open_lobby(self):
         LobbyDialog(self)
@@ -5014,16 +5154,35 @@ class App(tk.Tk):
 
     def _cleanup_for_close(self):
         """Nettoyage commun avant de fermer ce tournoi dans ce processus,
-        que ce soit pour de bon (_on_close) ou pour revenir au menu
+        que ce soit pour de bon (_on_close), pour revenir au menu
         principal et en ouvrir un autre dans la même fenêtre
-        (_new_tournament) : arrête le contrôle à distance, désinscrit ce
-        tournoi du registre des fenêtres ouvertes (voir open_windows.py
-        — sinon il resterait signalé "ouvert ici" alors que ce n'est
-        plus vrai) et ferme la base."""
+        (_new_tournament), ou en annulant l'écran "Bienvenue" avant
+        même d'avoir choisi un tournoi (voir App.__init__) : arrête le
+        contrôle à distance, désinscrit ce tournoi du registre des
+        fenêtres ouvertes (voir open_windows.py — sinon il resterait
+        signalé "ouvert ici" alors que ce n'est plus vrai), ferme la
+        base, et libère le verrou d'unicité du Menu principal (demande
+        du 2026-09-14) SI ce process le détient encore.
+
+        self._holds_menu_principal_lock : posé UNIQUEMENT par
+        App.__init__ pour un lancement externe (open_path=None, sans le
+        marqueur POKER_TOURNAMENT_INTERNAL_LAUNCH) — jamais pour un
+        tournoi ouvert avec un chemin (Lobby) ni pour un "Menu
+        principal" supplémentaire volontaire (bouton 🏠, voir
+        _open_new_window/spawn_app_process(internal_menu_child=True)),
+        qui n'ont donc jamais rien à libérer ici (le `getattr` par
+        défaut à False couvre aussi un appel avant que __init__ n'ait
+        atteint cette étape). Le verrou est gardé pendant TOUTE la vie
+        de cette fenêtre, pas seulement le temps de l'écran Bienvenue :
+        c'est précisément ce qui empêche un second lancement externe
+        pendant qu'un tournoi est déjà affiché — voir App.__init__."""
         self._stop_remote_control()
         if self.db:
             open_windows.unregister(self.db.path)
             self.db.close()
+        if getattr(self, "_holds_menu_principal_lock", False):
+            open_windows.unregister_menu_principal(os.getpid(), _menu_principal_key())
+            self._holds_menu_principal_lock = False
 
     def _on_close(self):
         self._cleanup_for_close()
@@ -5408,6 +5567,13 @@ class App(tk.Tk):
             # masquage automatique (_collapse_tiny_player_columns) ait pu
             # s'en apercevoir.
             self.players_tree.column(c, width=90, anchor="center", stretch=False)
+        # Colonne des cases à cocher ("sel") : tri par en-tête réservé au
+        # Mode Test (demande du 2026-09-14) — voir _on_players_checkbox_
+        # header_click, qui filtre lui-même sur _test_mode_enabled() ;
+        # la commande reste toujours attachée (Mode Test peut être
+        # coché/décoché en cours de session sans reconstruire cet
+        # onglet), elle ne fait simplement rien hors Mode Test.
+        self.players_tree.heading("sel", command=self._on_players_checkbox_header_click)
         self.players_tree.heading("name", command=lambda: self._sort_players_by("name"))
         self.players_tree.heading("club", command=lambda: self._sort_players_by("club"))
         self.players_tree.heading("status", command=lambda: self._sort_players_by("status"))
@@ -5484,13 +5650,40 @@ class App(tk.Tk):
 
     def _sort_players_by(self, column):
         """Tri par clic sur un en-tête (Nom / Statut) : ré-appuyer sur le
-        même en-tête inverse l'ordre (croissant <-> décroissant)."""
+        même en-tête inverse l'ordre (croissant <-> décroissant). Utilisé
+        aussi pour la colonne "sel" (voir _on_players_checkbox_header_
+        click) : `ascending` y prend le sens "cochés d'abord" (True) /
+        "décochés d'abord" (False) plutôt que croissant/décroissant, mais
+        le même bascule à chaque clic répété fonctionne à l'identique."""
         if self.players_sort["column"] == column:
             self.players_sort["ascending"] = not self.players_sort["ascending"]
         else:
             self.players_sort["column"] = column
             self.players_sort["ascending"] = True
         self._refresh_players_tab()
+
+    def _on_players_checkbox_header_click(self):
+        """Tri par l'en-tête de la colonne des cases à cocher (demande du
+        2026-09-14) — réservé au Mode Test (voir _test_mode_enabled) :
+        premier clic -> joueurs COCHÉS en haut (triés par nom, insensible
+        à la casse), décochés en dessous (triés par nom) ; second clic ->
+        l'inverse (décochés en haut) ; clics suivants, alternance — voir
+        _sort_players_by et le tri effectif dans _refresh_players_tab
+        (sort_col == "sel").
+
+        Ne modifie JAMAIS self.checked_player_ids : uniquement l'ORDRE
+        d'affichage (comme les tris existants Nom/Club/... de cet
+        onglet), aucune écriture en base pour ce tri.
+
+        Hors Mode Test, ce clic ne fait rien — la commande reste
+        attachée à l'en-tête en permanence (voir _build_players_tab) car
+        Mode Test peut être coché/décoché en cours de session sans que
+        cet onglet soit reconstruit ; c'est cette méthode qui vérifie
+        l'état actuel à chaque clic, jamais un état figé à la
+        construction de l'onglet."""
+        if not self._test_mode_enabled():
+            return
+        self._sort_players_by("sel")
 
     def _update_sort_headings(self):
         base_headers = {
@@ -5503,6 +5696,18 @@ class App(tk.Tk):
                 self.players_tree.heading(col, text=label + arrow)
             else:
                 self.players_tree.heading(col, text=label)
+        # Colonne "sel" (Mode Test, voir _on_players_checkbox_header_
+        # click) : reprend les glyphes ☑/☐ déjà utilisés pour les cases
+        # elles-mêmes plutôt qu'un texte, l'en-tête étant trop étroit
+        # pour un libellé ; vide (comme avant cette fonction) dans tous
+        # les autres cas, y compris hors Mode Test.
+        if self.players_sort["column"] == "sel":
+            checked_first = self.players_sort["ascending"]
+            self.players_tree.heading(
+                "sel", text=self.CHECKBOX_CHECKED if checked_first else self.CHECKBOX_UNCHECKED,
+            )
+        else:
+            self.players_tree.heading("sel", text="")
 
     # -- Colonnes affichées (masquage auto au redimensionnement minimal) --
     # ttk impose une largeur minimale de colonne de 20px par défaut :
@@ -7661,7 +7866,30 @@ class App(tk.Tk):
             players.sort(key=lambda p: p["elim_time"] or "")
         elif sort_col == "eliminated_by":
             players.sort(key=lambda p: (p["eliminated_by_name"] or "").lower())
-        if sort_col and not self.players_sort["ascending"]:
+        elif sort_col == "sel":
+            # Tri par la colonne des cases à cocher (Mode Test, demande du
+            # 2026-09-14, voir _on_players_checkbox_header_click) :
+            # `ascending` vaut ici "cochés d'abord" (True) / "décochés
+            # d'abord" (False), jamais un sens croissant/décroissant
+            # classique. Deux tris successifs, en s'appuyant sur la
+            # stabilité garantie de list.sort() (Python) : le tri
+            # alphabétique posé en premier reste l'ordre interne de
+            # chaque groupe une fois le second tri (par groupe
+            # coché/décoché) appliqué par-dessus — sans lui, un simple
+            # sort() par groupe seul laisserait les joueurs d'un même
+            # groupe dans un ordre non déterminé. N'écrit jamais dans
+            # self.checked_player_ids : seul l'ORDRE d'affichage change.
+            players.sort(key=lambda p: p["name"].lower())
+            checked_first = self.players_sort["ascending"]
+            players.sort(
+                key=lambda p: (p["id"] not in self.checked_player_ids) if checked_first
+                else (p["id"] in self.checked_player_ids)
+            )
+        # La colonne "sel" gère elle-même son sens ci-dessus (groupe
+        # coché/décoché en premier) : lui appliquer EN PLUS ce reverse()
+        # global inverserait aussi l'ordre alphabétique interne de
+        # chaque groupe (Z->A), ce qui n'est pas le comportement demandé.
+        if sort_col and sort_col != "sel" and not self.players_sort["ascending"]:
             players.reverse()
         self._update_sort_headings()
 
@@ -10134,10 +10362,23 @@ class App(tk.Tk):
         (mélanger place() avec les widgets pack()/grid() voisins, dans
         une zone qui se redessine — le Canvas défilable de cet onglet,
         voir _build_settings_tab — est un cas connu de fragilité Tk).
-        Les explications détaillées des 4 formules vivent désormais
-        UNIQUEMENT dans le manuel utilisateur (chapitre "Onglet
-        Paramètres", section Primes en détail) — seul le texte court
-        reste dans l'interface elle-même.
+        Les explications détaillées des 4 formules vivent aussi dans le
+        manuel utilisateur (chapitre "Onglet Paramètres", section Primes
+        en détail) — et, depuis le 2026-09-14, dans un Tooltip ordinaire
+        sur `ranking_lbl` lui-même (même mécanisme que TOUS les autres
+        libellés de cet onglet, ex. `pko_check` ci-dessous — PAS un
+        nouveau bouton/popup séparé, jamais de retour au bouton "ⓘ"
+        retiré ci-dessus). `Tooltip.__init__` se contente de `widget.
+        bind("<Enter>"/"<Leave>", ...)` : ces liaisons déclenchent
+        normalement même si `ranking_lbl` est grisé par
+        _update_primes_section_state (l'état ttk "disabled" bloque
+        l'interaction — clic, saisie — pas les événements de survol de
+        la souris), donc ce Tooltip fonctionne aussi section Primes
+        désactivée — voir tests/test_ranking_formula_widget.py.
+
+        Texte court sous la Combobox (RANKING_FORMULA_SHORT_TEXTS)
+        inchangé : les deux se complètent (aperçu immédiat + détail au
+        survol du libellé).
 
         Renvoie (label, row_frame, combo, short_lbl, legacy_note_ou_
         None). L'appelant ajoute à self._primes_section_widgets les
@@ -10150,6 +10391,32 @@ class App(tk.Tk):
         part (jamais state="normal", voir sa docstring)."""
         ranking_lbl = ttk.Label(parent, text="Système de points distribués :")
         ranking_lbl.grid(row=row, column=0, sticky="w", pady=4)
+        # Tooltip sur le libellé (demande du 2026-09-14) : détail complet
+        # des 4 formules, au survol — jamais un bouton/popup séparé (voir
+        # la docstring ci-dessus sur le bouton "ⓘ" définitivement retiré).
+        # Contenu EXACT demandé, texte identique à celui du manuel
+        # utilisateur (chapitre "Onglet Paramètres", section Primes en
+        # détail) pour qu'aucune des deux sources ne diverge de l'autre.
+        Tooltip(
+            ranking_lbl,
+            "Aucun — aucun point n'est attribué en fonction du\n"
+            "classement final.\n"
+            "\n"
+            "Classique — formule 100 × √N / P\n"
+            "(N = nombre de joueurs du tournoi, P = place finale du\n"
+            "joueur). Favorise davantage les premières places.\n"
+            "\n"
+            "Progressive — formule 100 × √N / √P\n"
+            "(N = nombre de joueurs du tournoi, P = place finale du\n"
+            "joueur). Réduit l'écart entre les premières places et\n"
+            "récompense davantage la régularité.\n"
+            "\n"
+            "Sit & Go CPC — formule 1000 + 100(N+1) − 200×P\n"
+            "(N = nombre de joueurs du Sit & Go, P = place finale du\n"
+            "joueur). Chaque joueur apporte 1000 points au total\n"
+            "distribué ; l'écart entre deux places successives est de\n"
+            "200 points.",
+        )
 
         ranking_row = ttk.Frame(parent)
         ranking_row.grid(row=row, column=1, pady=4, padx=10, sticky="w")
@@ -10787,7 +11054,13 @@ class App(tk.Tk):
             "son chronomètre ; verrouillée ensuite jusqu'à ce que tous\n"
             "soient refermés.",
         )
-        if _primes_session_locked():
+        # État initial de la case (avant même le premier tick) : reflète
+        # le verrouillage EFFECTIF (exception Mode Test comprise, voir
+        # _primes_section_effectively_locked, demande du 2026-09-14) —
+        # pas seulement le verrouillage réel, pour qu'un onglet Paramètres
+        # ouvert alors que Mode Test est DÉJÀ coché s'affiche correctement
+        # déverrouillé dès la toute première image.
+        if self._primes_section_effectively_locked():
             self.primes_enabled_check.configure(state="disabled")
 
         # Widgets de réglage des montants/PKO ci-dessous : grisés/
@@ -11131,16 +11404,35 @@ class App(tk.Tk):
     def _test_mode_enabled(self):
         """Mode Test (demande du 2026-09-09) : jamais mémorisé, propre à
         CE process — voir self.test_mode_var (App.__init__) et la case
-        "Mode Test" (_build_settings_tab). Assouplit UNIQUEMENT les
-        facilités d'élimination (_eliminate_selected/_remote_eliminate) :
+        "Mode Test" (_build_settings_tab). Assouplit les facilités
+        d'élimination (_eliminate_selected/_remote_eliminate) :
         élimination groupée sans désigner d'éliminateur, et éliminateur
         redevenant facultatif (bouton "Ignorer") pour une élimination
-        individuelle hors PKO+bounty — jamais d'autre effet sur le
-        fonctionnement du logiciel."""
+        individuelle hors PKO+bounty. Active aussi, depuis le 2026-09-14,
+        le tri par en-tête de la colonne des cases à cocher de l'onglet
+        Joueurs (voir _on_players_checkbox_header_click), ET, depuis le
+        2026-09-14 également, garde la section Primes des Paramètres
+        modifiable même si la session est réellement verrouillée (voir
+        _primes_section_effectively_locked — n'affecte que CET onglet,
+        jamais primes_session_started.json ni les autres fenêtres de la
+        session) — jamais d'autre effet sur le fonctionnement du
+        logiciel."""
         return self.test_mode_var.get()
 
     def _on_test_mode_toggle(self):
         self._update_window_title()
+        # Bascule immédiate du (dé)verrouillage de la section Primes
+        # (demande du 2026-09-14, voir _primes_section_effectively_
+        # locked) : sans cet appel, il faudrait attendre le prochain tick
+        # (jusqu'à 1s, voir _sync_primes_enabled_checkbox) pour voir
+        # l'effet — la demande est explicitement "immédiatement". Garde
+        # défensive (comme la plupart des méthodes touchant l'onglet
+        # Paramètres) : self.db/primes_enabled_check n'existent qu'une
+        # fois un tournoi ouvert et cet onglet construit — toujours vrai
+        # en pratique ici (la case "Mode Test" vit dans ce même onglet),
+        # mais sans risque à vérifier.
+        if getattr(self, "db", None) is not None and hasattr(self, "primes_enabled_check"):
+            self._sync_primes_enabled_checkbox()
 
     def _sync_single_tournament_pref_checkbox(self):
         """Préférence GLOBALE (voir SINGLE_TOURNAMENT_PREF_KEY) : une
@@ -11160,27 +11452,66 @@ class App(tk.Tk):
         if self.single_tournament_var.get() != current:
             self.single_tournament_var.set(current)
 
+    def _primes_section_effectively_locked(self):
+        """Verrouillage EFFECTIF de la section Primes pour CET onglet
+        Paramètres (demande du 2026-09-14) — reflète _primes_session_
+        locked() (verrouillage RÉEL de la session, dérivé de
+        primes_session_started.json/open_windows.json, JAMAIS modifié
+        ici), SAUF en Mode Test (self._test_mode_enabled()), où cette
+        méthode renvoie toujours False : la section reste alors
+        modifiable même si la session est réellement verrouillée
+        (chronomètre déjà démarré sur ce tournoi ou un autre de la
+        session).
+
+        Mode Test (self.test_mode_var) est un réglage strictement LOCAL
+        à CE PROCESS — jamais mémorisé, jamais partagé entre fenêtres
+        (voir _test_mode_enabled) — donc cette exception ne touche
+        jamais primes_session_started.json ni open_windows.json : les
+        AUTRES fenêtres/tournois de la session (Mode Test coché ou non
+        chez elles) continuent de voir et d'appliquer le verrouillage
+        réel normalement, exactement comme avant cette demande. Décocher
+        Mode Test fait immédiatement réapparaître le verrouillage réel
+        (voir _on_test_mode_toggle, qui rappelle _sync_primes_enabled_
+        checkbox sans attendre le prochain tick).
+
+        Seuls appelants (tous les 3 anciens appels directs à
+        _primes_session_locked() dans cette classe, remplacés le
+        2026-09-14) : _on_primes_enabled_toggle, _update_primes_section_
+        state (valeur par défaut), _sync_primes_enabled_checkbox — et le
+        grisement initial de la case dans _build_settings_tab."""
+        if self._test_mode_enabled():
+            return False
+        return _primes_session_locked()
+
     def _on_primes_enabled_toggle(self):
         """Case "Calculer les primes" (Paramètres, demande du
         2026-09-09) : modifiable uniquement tant qu'aucun tournoi de la
         session n'a démarré son chronomètre — la case est déjà grisée
         dans ce cas (voir _sync_primes_enabled_checkbox), ce garde n'est
         qu'un filet de sécurité (ex. clic "en vol" juste au moment où un
-        autre tournoi démarre). Répercute le choix (a) dans la valeur
-        globale "proposée" (export_prefs, voir _set_primes_enabled_
-        proposed), pour que les autres tournois pas encore démarrés
-        convergent au prochain tick (voir _sync_primes_enabled_pref), et
-        (b) tout de suite dans la copie SQLite de CE tournoi précis, sans
-        attendre ce prochain tick, pour que son propre onglet Primes et
-        le grisement de la section réagissent sans délai perceptible."""
-        if _primes_session_locked():
+        autre tournoi démarre) — SAUF en Mode Test (demande du
+        2026-09-14, voir _primes_section_effectively_locked), qui laisse
+        alors passer le changement même session réellement verrouillée.
+        Répercute le choix (a) dans la valeur globale "proposée"
+        (export_prefs, voir _set_primes_enabled_proposed), pour que les
+        autres tournois pas encore démarrés convergent au prochain tick
+        (voir _sync_primes_enabled_pref) — SAUF précisément dans le cas
+        Mode Test + session réellement verrouillée : cette exception
+        doit rester strictement locale à CE tournoi/process, jamais se
+        propager à une autre fenêtre de la session (qui n'est peut-être
+        pas, elle, en Mode Test) — et (b) tout de suite dans la copie
+        SQLite de CE tournoi précis, sans attendre ce prochain tick, pour
+        que son propre onglet Primes et le grisement de la section
+        réagissent sans délai perceptible."""
+        if self._primes_section_effectively_locked():
             current = self.db.get_setting_int("primes_enabled", 1) == 1
             self.primes_enabled_var.set(current)
             self.primes_enabled_check.configure(state="disabled")
             self._update_primes_section_state(current, locked=True)
             return
         value = self.primes_enabled_var.get()
-        _set_primes_enabled_proposed(value)
+        if not _primes_session_locked():
+            _set_primes_enabled_proposed(value)
         self.db.set_setting("primes_enabled", "1" if value else "0")
         self._update_primes_section_state(value, locked=False)
         self._refresh_bounty_tab()
@@ -11201,12 +11532,14 @@ class App(tk.Tk):
             ne doit plus pouvoir changer un montant/le mode PKO en cours
             de route, qu'il ait démarré lui-même ou non.
         `locked=None` (valeur par défaut) : recalculé ici via
-        _primes_session_locked() — permet d'appeler cette méthode avec
-        seulement `enabled` (ex. juste après un changement local qui ne
-        change pas le verrouillage) sans le refaire à chaque appelant.
-        N'agit jamais sur la case "Calculer les primes" elle-même (son
-        propre état "disabled" est géré par ses appelants, voir
-        _sync_primes_enabled_checkbox / _on_primes_enabled_toggle).
+        _primes_section_effectively_locked() (verrouillage réel, sauf
+        exception Mode Test — voir sa docstring, demande du 2026-09-14)
+        — permet d'appeler cette méthode avec seulement `enabled` (ex.
+        juste après un changement local qui ne change pas le
+        verrouillage) sans le refaire à chaque appelant. N'agit jamais
+        sur la case "Calculer les primes" elle-même (son propre état
+        "disabled" est géré par ses appelants, voir _sync_primes_
+        enabled_checkbox / _on_primes_enabled_toggle).
 
         Cas particulier du ttk.Combobox "Système de points distribués"
         (ranking_combo, voir _build_ranking_formula_widget) — demande du
@@ -11217,7 +11550,7 @@ class App(tk.Tk):
         "readonly" quand la section est modifiable, "disabled" sinon,
         jamais le `state` générique calculé pour les autres widgets."""
         if locked is None:
-            locked = _primes_session_locked()
+            locked = self._primes_section_effectively_locked()
         editable = enabled and not locked
         state = "normal" if editable else "disabled"
         for widget in getattr(self, "_primes_section_widgets", []):
@@ -11236,19 +11569,22 @@ class App(tk.Tk):
         démarré) : reflète cette copie locale dans la case et grise/
         réactive à la fois la case elle-même ET tout le reste de la
         section Primes (voir _update_primes_section_state) selon l'état
-        de verrouillage de la SESSION (_primes_session_locked, demande du
-        2026-09-09 : verrouillage global, pas seulement la case) — même
-        principe que _sync_single_tournament_pref_checkbox, pour qu'un
-        tournoi A reflète un changement fait depuis les Paramètres d'un
-        tournoi B, ou le verrouillage causé par le démarrage d'un
-        tournoi C de la même session, sans qu'aucune action ne soit
-        nécessaire sur A."""
+        de verrouillage EFFECTIF de la SESSION (_primes_section_
+        effectively_locked — verrouillage réel, sauf exception Mode Test,
+        demande du 2026-09-14 — pas seulement la case) — même principe
+        que _sync_single_tournament_pref_checkbox, pour qu'un tournoi A
+        reflète un changement fait depuis les Paramètres d'un tournoi B,
+        ou le verrouillage causé par le démarrage d'un tournoi C de la
+        même session, sans qu'aucune action ne soit nécessaire sur A.
+        Appelée aussi directement par _on_test_mode_toggle (en plus du
+        tick habituel) pour que cocher/décocher Mode Test rebascule le
+        grisement de la section IMMÉDIATEMENT, sans attendre jusqu'à 1s."""
         if self.db is None:
             return
         current = self.db.get_setting_int("primes_enabled", 1) == 1
         if self.primes_enabled_var.get() != current:
             self.primes_enabled_var.set(current)
-        locked = _primes_session_locked()
+        locked = self._primes_section_effectively_locked()
         check_state = "disabled" if locked else "normal"
         if str(self.primes_enabled_check.cget("state")) != check_state:
             self.primes_enabled_check.configure(state=check_state)

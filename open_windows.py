@@ -19,10 +19,13 @@ processus se ferme proprement pour que son entrée disparaisse (plantage,
 Contient aussi (fichiers séparés, voir leurs docstrings) : la sélection
 téléphone du Lobby (set_phone_selected_pid), le verrouillage de session
 de "Calculer les primes" (mark_primes_session_started /
-primes_session_started, demande du 2026-09-09), et la sécurisation du
-contrôle à distance (code de session, anti-bruteforce, approbation
-persistante des appareils — voir le grand bloc de commentaires
-au-dessus de _REMOTE_TEST_CODE, plus bas dans ce fichier).
+primes_session_started, demande du 2026-09-09), l'unicité du "Menu
+principal" par ligne prod/test (register_menu_principal/
+unregister_menu_principal/menu_principal_pid, demande du 2026-09-14),
+et la sécurisation du contrôle à distance (code de session,
+anti-bruteforce, approbation persistante des appareils — voir le grand
+bloc de commentaires au-dessus de _REMOTE_TEST_CODE, plus bas dans ce
+fichier).
 """
 import contextlib
 import ctypes
@@ -530,6 +533,104 @@ def locked_primes_enabled(default=True):
     if not data.get("started"):
         return default
     return bool(data.get("primes_enabled", default))
+
+
+# =======================================================================
+# Unicité du "Menu principal" (demande du 2026-09-14) : un double-clic
+# accidentel sur le raccourci Windows/macOS lançait un second processus
+# Senaco totalement indépendant (nouvel écran "Bienvenue", nouvelle
+# session), même si un premier tournoi était déjà affiché — au lieu de
+# simplement ramener au premier plan la fenêtre déjà ouverte.
+#
+# Portée volontairement ÉTROITE (voir la docstring de main.py:
+# App.__init__ pour le câblage complet) : ce verrou ne concerne QUE les
+# lancements SANS argument de fichier .tournoi ET sans le marqueur
+# POKER_TOURNAMENT_INTERNAL_LAUNCH (voir main.py: spawn_app_process) —
+# donc jamais les tournois ouverts depuis le Lobby (spawn_app_process(
+# [path])), ni les fenêtres supplémentaires ouvertes depuis "🏠 Menu
+# principal" (spawn_app_process(internal_menu_child=True)), qui doivent
+# rester illimités. AUCUN rapport avec open_windows.json (registre des
+# tournois) ni primes_session_started.json ci-dessus : fichier séparé,
+# clé de verrouillage différente.
+#
+# Une clé par "produit" (`key`, ex. "prod"/"test" — voir main.py: _is_
+# test_build) : Poker Senaco et Poker Senaco TEST doivent pouvoir
+# cohabiter, chacun avec sa PROPRE instance unique de Menu principal,
+# sans jamais se bloquer l'un l'autre — un fichier distinct par clé.
+#
+# Même idiome que primes_session_started.json ci-dessus : le PID
+# enregistré est revérifié À LA LECTURE (menu_principal_pid, via
+# _pid_is_running — déjà cross-plateforme Windows/macOS/POSIX) plutôt
+# que de faire confiance à un drapeau statique — un ancien verrou laissé
+# par un plantage est donc automatiquement ignoré et nettoyé dès la
+# prochaine tentative de lancement, sans jamais bloquer durablement un
+# redémarrage.
+
+def _menu_principal_lock_path(key):
+    return os.path.join(
+        os.path.expanduser("~"), ".poker_tournament", f"menu_principal_{key}.json",
+    )
+
+
+def register_menu_principal(pid, key):
+    """Enregistre `pid` comme détenant l'unique "Menu principal" de la
+    ligne `key` (ex. "prod"/"test") — appelé UNE FOIS, au tout début
+    d'App.__init__, uniquement pour un lancement SANS fichier .tournoi
+    ET sans le marqueur d'appel interne (voir le bloc de commentaires
+    ci-dessus). À libérer explicitement via unregister_menu_principal
+    (voir App._cleanup_for_close) une fois ce processus fermé — jamais
+    remplacé silencieusement tant que ce PID reste vivant (voir
+    menu_principal_pid, seul lecteur)."""
+    try:
+        _atomic_write_json(_menu_principal_lock_path(key), {"pid": pid})
+    except OSError:
+        pass
+
+
+def unregister_menu_principal(pid, key):
+    """Retire le verrou de la ligne `key` SEULEMENT s'il appartient
+    encore à `pid` (même précaution que unregister() pour open_windows.
+    json : ne jamais effacer par erreur celui d'un processus PLUS
+    RÉCENT que soi, en cas de course improbable)."""
+    path = _menu_principal_lock_path(key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and data.get("pid") == pid:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def menu_principal_pid(key):
+    """PID détenant actuellement l'unique "Menu principal" de la ligne
+    `key`, ou None si aucun (jamais lancé, déjà fermé proprement, ou
+    verrou périmé). Auto-nettoyant : si le PID enregistré n'est PLUS
+    vivant (_pid_is_running, voir sa docstring pour le détail Windows/
+    POSIX), le fichier est supprimé ici même — un plantage ne peut donc
+    jamais empêcher durablement un futur lancement de reprendre la
+    main, exactement comme primes_session_started() ci-dessus."""
+    path = _menu_principal_lock_path(key)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return None
+    if not _pid_is_running(pid):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return pid
 
 
 def bring_pid_to_front(pid):

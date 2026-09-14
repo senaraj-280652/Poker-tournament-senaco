@@ -88,6 +88,17 @@ class _FakeSettingsWindow:
         self.primes_enabled_var = _FakeVar(db.get_setting_int("primes_enabled", 1) == 1)
         self.primes_enabled_check = _FakeCheckbutton()
         self._primes_section_widgets = [_FakeSectionWidget() for _ in range(3)]
+        # Mode Test (demande du 2026-09-14) : toujours désactivé dans ce
+        # fichier — aucun des scénarios ci-dessous ne le concerne, voir
+        # tests/test_primes_test_mode_override.py pour sa couverture
+        # dédiée.
+        self.test_mode_var = _FakeVar(False)
+
+    def _test_mode_enabled(self):
+        return main.App._test_mode_enabled(self)
+
+    def _primes_section_effectively_locked(self):
+        return main.App._primes_section_effectively_locked(self)
 
     def _update_primes_section_state(self, enabled, locked=None):
         main.App._update_primes_section_state(self, enabled, locked=locked)
@@ -98,7 +109,7 @@ class _FakeSettingsWindow:
         self.db.get_setting_int (déjà fait dans __init__ ci-dessus), la
         case elle-même grisée si la session est verrouillée, et la
         section alignée sur la valeur courante — AUCUN tick nécessaire."""
-        if main._primes_session_locked():
+        if self._primes_section_effectively_locked():
             self.primes_enabled_check.configure(state="disabled")
         self._update_primes_section_state(self.primes_enabled_var.get())
 

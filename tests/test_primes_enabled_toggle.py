@@ -495,15 +495,26 @@ class _FakeDb:
 
 
 class _FakeApp:
-    def __init__(self, db=None, primes_enabled=True):
+    def __init__(self, db=None, primes_enabled=True, test_mode=False):
         self.db = db
         self.primes_enabled_var = _FakeVar(primes_enabled)
         self.primes_enabled_check = _FakeCheckbutton()
         self._primes_section_widgets = []
         self.refresh_bounty_tab_calls = 0
+        # Mode Test (demande du 2026-09-14) : désactivé par défaut — les
+        # tests de CE fichier ne le concernent pas (voir tests/test_
+        # primes_test_mode_override.py pour sa couverture dédiée) ;
+        # paramètre gardé pour permettre malgré tout un cas ponctuel.
+        self.test_mode_var = _FakeVar(test_mode)
 
     def _refresh_bounty_tab(self):
         self.refresh_bounty_tab_calls += 1
+
+    def _test_mode_enabled(self):
+        return main.App._test_mode_enabled(self)
+
+    def _primes_section_effectively_locked(self):
+        return main.App._primes_section_effectively_locked(self)
 
     def _update_primes_section_state(self, enabled, locked=None):
         main.App._update_primes_section_state(self, enabled, locked=locked)

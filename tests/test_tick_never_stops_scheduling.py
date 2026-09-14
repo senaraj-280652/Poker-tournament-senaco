@@ -112,6 +112,17 @@ class TickNeverStopsSchedulingTest(unittest.TestCase):
         self.win.primes_enabled_var = tk.BooleanVar(value=True)
         self.win.primes_enabled_check = ttk.Checkbutton(self.root, text="Calculer les primes")
         self.win._primes_section_widgets = [ttk.Entry(self.root) for _ in range(2)]
+        # Mode Test (demande du 2026-09-14) : désactivé — sans rapport
+        # avec ce fichier (robustesse de la boucle _tick), voir tests/
+        # test_primes_test_mode_override.py pour sa couverture dédiée.
+        # Requis par _primes_section_effectively_locked, appelée depuis
+        # _update_primes_section_state/_sync_primes_enabled_checkbox
+        # ci-dessous.
+        self.win.test_mode_var = tk.BooleanVar(value=False)
+        self.win._test_mode_enabled = types.MethodType(main.App._test_mode_enabled, self.win)
+        self.win._primes_section_effectively_locked = types.MethodType(
+            main.App._primes_section_effectively_locked, self.win
+        )
         self.win._update_primes_section_state = types.MethodType(
             main.App._update_primes_section_state, self.win
         )

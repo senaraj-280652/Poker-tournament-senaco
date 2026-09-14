@@ -13,9 +13,12 @@ Vérifie, pour CHAQUE sélection dans la Combobox :
 Le bouton d'aide "ⓘ" (popup complet au clic) a été DÉFINITIVEMENT
 retiré le 2026-09-12 (invisible dans l'interface réelle une fois
 positionné avec place() — voir la docstring de _build_ranking_formula_
-widget) : les explications détaillées des 4 formules vivent désormais
-uniquement dans le manuel utilisateur. Les tests qui portaient
-uniquement sur ce bouton/son popup ont été retirés en même temps.
+widget) : les explications détaillées des 4 formules vivent dans le
+manuel utilisateur, ET, depuis le 2026-09-14, dans un Tooltip ordinaire
+sur `ranking_lbl` (voir RankingLabelTooltipTest ci-dessous) — jamais un
+nouveau bouton/popup séparé, jamais de retour au bouton "ⓘ" retiré. Les
+tests qui portaient uniquement sur ce bouton/son popup ont été retirés
+en même temps.
 
 Ne modifie pas la logique de calcul (RANKING_FORMULA_* eux-mêmes,
 ranking_points/get_ranking_bonuses) — non touchée par cette demande,
@@ -25,6 +28,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -164,6 +168,146 @@ class RankingFormulaWidgetValeurFixeHistoriqueTest(unittest.TestCase):
         self.win.ranking_formula_display_var.set("Classique")
         self.assertEqual(self.win.ranking_formula_short_lbl.cget("text"), "100 × √N / P")
         self.assertEqual(self.win.settings_vars["ranking_formula"].get(), "current")
+
+
+# =======================================================================
+# Tooltip sur le libellé "Système de points distribués" (demande du
+# 2026-09-14) — contenu détaillé des 4 formules au survol, JAMAIS un
+# nouveau bouton/popup (le bouton "ⓘ" reste définitivement retiré).
+# =======================================================================
+_EXPECTED_TOOLTIP_LINES = [
+    "Aucun — aucun point n'est attribué en fonction du",
+    "classement final.",
+    "Classique — formule 100 × √N / P",
+    "(N = nombre de joueurs du tournoi, P = place finale du",
+    "joueur). Favorise davantage les premières places.",
+    "Progressive — formule 100 × √N / √P",
+    "joueur). Réduit l'écart entre les premières places et",
+    "récompense davantage la régularité.",
+    "Sit & Go CPC — formule 1000 + 100(N+1) − 200×P",
+    "(N = nombre de joueurs du Sit & Go, P = place finale du",
+    "joueur). Chaque joueur apporte 1000 points au total",
+    "distribué ; l'écart entre deux places successives est de",
+    "200 points.",
+]
+
+
+@unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible dans cet environnement")
+class RankingLabelTooltipTest(unittest.TestCase):
+    """Un seul tk.Tk() par CLASSE de test (même précaution que les
+    classes ci-dessus)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tk.Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="ranking_label_tooltip_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.db = database.Database(os.path.join(self._tmp.name, "A.tournoi"))
+        self.addCleanup(self.db.conn.close)
+
+        self.win = self.root
+        self.win.db = self.db
+        self.win.settings_vars = {}
+        self.win._build_ranking_formula_widget = types.MethodType(
+            main.App._build_ranking_formula_widget, self.win
+        )
+        parent = ttk.Frame(self.root)
+        self.addCleanup(parent.destroy)
+
+        # Capture CHAQUE Tooltip réellement construit (classe réelle,
+        # jamais une doublure) pendant _build_ranking_formula_widget,
+        # pour retrouver ensuite celui posé sur ranking_lbl précisément
+        # — sans dépendre du délai réel de Tooltip.__init__ (500 ms) ni
+        # d'une boucle d'événements Tk (voir _show ci-dessous, appelée
+        # directement).
+        self._created_tooltips = []
+        real_tooltip_cls = main.Tooltip
+
+        def _capturing_tooltip(*args, **kwargs):
+            tt = real_tooltip_cls(*args, **kwargs)
+            self._created_tooltips.append(tt)
+            return tt
+
+        patcher = patch.object(main, "Tooltip", side_effect=_capturing_tooltip)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        (
+            self.ranking_lbl, self.ranking_row, self.ranking_combo,
+            self.ranking_short_lbl, self.ranking_legacy_note,
+        ) = self.win._build_ranking_formula_widget(parent, 0)
+
+        label_tooltips = [tt for tt in self._created_tooltips if tt.widget is self.ranking_lbl]
+        self.assertEqual(len(label_tooltips), 1, "un seul Tooltip attendu sur ranking_lbl")
+        self.tooltip = label_tooltips[0]
+        self.addCleanup(self.tooltip._hide)
+
+    def test_un_seul_tooltip_pose_uniquement_sur_le_libelle(self):
+        # Contrainte explicite : tooltip UNIQUEMENT sur le libellé, pas
+        # sur le Combobox ni le texte court (qui ont chacun leur propre
+        # rôle, jamais celui-ci).
+        self.assertNotIn(self.ranking_combo, [tt.widget for tt in self._created_tooltips])
+        self.assertNotIn(self.ranking_short_lbl, [tt.widget for tt in self._created_tooltips])
+
+    def test_contenu_exact_du_tooltip(self):
+        for line in _EXPECTED_TOOLTIP_LINES:
+            self.assertIn(line, self.tooltip.text)
+
+    def test_affichage_reel_du_tooltip_contient_le_texte_attendu(self):
+        """Appelle directement Tooltip._show() (le vrai code exécuté une
+        fois le délai de survol écoulé, voir Tooltip._schedule) plutôt
+        que d'attendre 500 ms ou de piloter une vraie boucle d'événements
+        Tk — vérifie que le Label réellement affiché porte le texte
+        exact, pas seulement l'attribut `.text` stocké."""
+        self.tooltip._show()
+        self.addCleanup(self.tooltip._hide)
+        self.assertIsNotNone(self.tooltip._tip)
+        shown_label = self.tooltip._tip.winfo_children()[0]
+        self.assertEqual(shown_label.cget("text"), self.tooltip.text)
+        for line in _EXPECTED_TOOLTIP_LINES:
+            self.assertIn(line, shown_label.cget("text"))
+
+    def test_tooltip_fonctionne_meme_libelle_grise(self):
+        """Contrainte explicite de la demande : le tooltip doit rester
+        disponible même si la section Primes est désactivée (ranking_lbl
+        fait partie de self._primes_section_widgets, grisé par
+        _update_primes_section_state — voir sa docstring). L'état ttk
+        "disabled" bloque l'interaction (clic, saisie), pas les
+        événements <Enter>/<Leave> sur lesquels Tooltip.__init__ se
+        contente de bind() : la liaison doit donc rester active, et
+        _show() doit continuer à fonctionner, une fois le libellé
+        grisé."""
+        self.ranking_lbl.configure(state="disabled")
+        self.assertEqual(str(self.ranking_lbl.cget("state")), "disabled")
+        # La liaison posée par Tooltip.__init__ (bind "<Enter>") n'est
+        # pas retirée par un changement d'état ttk — vérifié directement
+        # plutôt que supposé.
+        self.assertTrue(self.ranking_lbl.bind("<Enter>"))
+
+        self.tooltip._show()
+        self.addCleanup(self.tooltip._hide)
+        self.assertIsNotNone(self.tooltip._tip)
+        shown_label = self.tooltip._tip.winfo_children()[0]
+        self.assertIn(_EXPECTED_TOOLTIP_LINES[0], shown_label.cget("text"))
+
+    def test_aucun_bouton_ou_libelle_i_reintroduit(self):
+        """Non-régression explicite : ce Tooltip ne doit s'accompagner
+        d'aucun nouveau widget cliquable (bouton "ⓘ" ou équivalent) —
+        seul ranking_lbl (déjà existant) porte l'explication, au survol."""
+        children_texts = []
+        for w in self.ranking_row.winfo_children():
+            try:
+                children_texts.append(str(w.cget("text")))
+            except tk.TclError:
+                pass
+        self.assertNotIn("ⓘ", children_texts)
 
 
 if __name__ == "__main__":

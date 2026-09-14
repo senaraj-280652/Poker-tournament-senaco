@@ -101,9 +101,20 @@ class _SimulatedTournamentWindow:
         self.primes_enabled_check = _FakeCheckbutton()
         self._primes_section_widgets = [_FakeSectionWidget() for _ in range(3)]
         self.refresh_bounty_tab_calls = 0
+        # Mode Test (demande du 2026-09-14) : toujours désactivé dans ce
+        # scénario — aucun des tests ci-dessous ne le concerne, voir
+        # tests/test_primes_test_mode_override.py pour sa couverture
+        # dédiée.
+        self.test_mode_var = _FakeVar(False)
 
     def _refresh_bounty_tab(self):
         self.refresh_bounty_tab_calls += 1
+
+    def _test_mode_enabled(self):
+        return main.App._test_mode_enabled(self)
+
+    def _primes_section_effectively_locked(self):
+        return main.App._primes_section_effectively_locked(self)
 
     def _update_primes_section_state(self, enabled, locked=None):
         main.App._update_primes_section_state(self, enabled, locked=locked)
