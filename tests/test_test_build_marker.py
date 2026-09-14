@@ -88,6 +88,85 @@ class AppTitlePrefixTestMarkerTest(unittest.TestCase):
                 f"[TEST] {main.APP_NAME} v{main.APP_VERSION}-dev [abc1234]",
             )
 
+    def test_prefixe_test_numerote_quand_numero_de_build_present(self):
+        """Demande du 2026-09-14 : chaque build TEST identifiable par un
+        numéro (ex. "[TEST 3]") — voir TestBuildNumberTest/TestBuildLabelTest
+        ci-dessous pour la couverture de _test_build_number/_label."""
+        with patch.object(main, "_is_test_build", return_value=True), \
+             patch.object(main, "_test_build_number", return_value="3"), \
+             patch.object(main, "dev_suffix", return_value=""):
+            self.assertEqual(
+                main._app_title_prefix(),
+                f"[TEST 3] {main.APP_NAME} v{main.APP_VERSION}",
+            )
+
+
+class TestBuildNumberTest(unittest.TestCase):
+    """Demande du 2026-09-14 : numéro identifiant CE build TEST précis,
+    lu depuis windows/assets/TEST_BUILD_NUMBER (écrit par le workflow
+    GitHub Actions dédié avec ${{ github.run_number }}, voir tests/
+    test_build_msi_test_workflow.py) — jamais codé en dur dans main.py."""
+
+    def test_none_si_pas_un_build_test(self):
+        with patch.object(main, "_is_test_build", return_value=False):
+            self.assertIsNone(main._test_build_number())
+
+    def test_none_si_fichier_absent(self):
+        """Build TEST manuel/local sans passer par le workflow dédié :
+        TEST_BUILD_MARKER présent (donc _is_test_build() vrai) mais pas
+        TEST_BUILD_NUMBER — ne doit jamais lever, juste renvoyer None."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_test_no_number_") as d:
+            open(os.path.join(d, "TEST_BUILD_MARKER"), "w").close()
+            with patch.object(main.sys, "_MEIPASS", d, create=True), \
+                 patch.object(main, "_is_test_build", return_value=True):
+                self.assertIsNone(main._test_build_number())
+
+    def test_none_si_fichier_vide(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_test_number_empty_") as d:
+            open(os.path.join(d, "TEST_BUILD_NUMBER"), "w").close()
+            with patch.object(main.sys, "_MEIPASS", d, create=True), \
+                 patch.object(main, "_is_test_build", return_value=True):
+                self.assertIsNone(main._test_build_number())
+
+    def test_numero_lu_depuis_le_fichier(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_test_number_") as d:
+            with open(os.path.join(d, "TEST_BUILD_NUMBER"), "w", encoding="utf-8") as f:
+                f.write("3")
+            with patch.object(main.sys, "_MEIPASS", d, create=True), \
+                 patch.object(main, "_is_test_build", return_value=True):
+                self.assertEqual(main._test_build_number(), "3")
+
+    def test_espaces_et_retour_a_la_ligne_ignores(self):
+        """Le workflow écrit sans retour à la ligne (-NoNewline), mais un
+        éventuel fichier généré manuellement avec un \\n ne doit pas
+        casser l'affichage."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_test_number_ws_") as d:
+            with open(os.path.join(d, "TEST_BUILD_NUMBER"), "w", encoding="utf-8") as f:
+                f.write("  7\n")
+            with patch.object(main.sys, "_MEIPASS", d, create=True), \
+                 patch.object(main, "_is_test_build", return_value=True):
+                self.assertEqual(main._test_build_number(), "7")
+
+
+class TestBuildLabelTest(unittest.TestCase):
+    def test_vide_si_pas_un_build_test(self):
+        with patch.object(main, "_is_test_build", return_value=False):
+            self.assertEqual(main._test_build_label(), "")
+
+    def test_generique_si_pas_de_numero(self):
+        with patch.object(main, "_is_test_build", return_value=True), \
+             patch.object(main, "_test_build_number", return_value=None):
+            self.assertEqual(main._test_build_label(), "[TEST]")
+
+    def test_numerote_si_numero_present(self):
+        with patch.object(main, "_is_test_build", return_value=True), \
+             patch.object(main, "_test_build_number", return_value="3"):
+            self.assertEqual(main._test_build_label(), "[TEST 3]")
+
 
 class _DummySelfForAbout:
     """N'a besoin d'être QUE le `self` passé à App._show_about (voir son
@@ -105,6 +184,18 @@ class ShowAboutTestMarkerTest(unittest.TestCase):
         self.assertEqual(title, "À propos")
         self.assertTrue(
             message.startswith(f"[TEST] {main.APP_NAME}"),
+            message,
+        )
+
+    def test_about_affiche_test_numerote(self):
+        with patch.object(main, "_is_test_build", return_value=True), \
+             patch.object(main, "_test_build_number", return_value="3"), \
+             patch.object(main.licensing, "license_info", return_value=None), \
+             patch.object(main.messagebox, "showinfo") as mock_info:
+            main.App._show_about(_DummySelfForAbout())
+        _title, message = mock_info.call_args.args[:2]
+        self.assertTrue(
+            message.startswith(f"[TEST 3] {main.APP_NAME}"),
             message,
         )
 
@@ -186,6 +277,15 @@ class BuildFilesIsolationTest(unittest.TestCase):
 
     def test_marqueur_test_present_dans_le_spec_de_test(self):
         self.assertIn("TEST_BUILD_MARKER", self.test_spec)
+
+    def test_numero_test_absent_du_spec_de_production(self):
+        """Même garde-fou que pour TEST_BUILD_MARKER, appliqué au
+        mécanisme de numérotation (demande du 2026-09-14) : un build de
+        PRODUCTION ne doit jamais chercher/embarquer TEST_BUILD_NUMBER."""
+        self.assertNotIn("TEST_BUILD_NUMBER", self.prod_spec)
+
+    def test_numero_test_reference_dans_le_spec_de_test(self):
+        self.assertIn("TEST_BUILD_NUMBER", self.test_spec)
 
     def test_noms_pyinstaller_differents(self):
         import re

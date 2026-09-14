@@ -139,6 +139,36 @@ de test dédiés, et n'utilisez JAMAIS « ♻️ Restaurer depuis une clé USB �
 depuis la version de TEST (ça écraserait les données réellement utilisées
 par la version installée).
 
+### Numéro de build TEST (distinguer plusieurs MSI TEST entre eux)
+
+Demande du 2026-09-14 : plusieurs `.msi` TEST peuvent être générés au fil
+du temps (ex. « TEST 2 », « TEST 3 »...) — il faut pouvoir les distinguer
+d'un coup d'œil, sans jamais modifier `version.py` (`APP_VERSION` reste
+`1.2.38`) ni coder un numéro en dur dans `main.py`.
+
+Le mécanisme réutilise `${{ github.run_number }}` — le numéro de run du
+workflow GitHub Actions **« Build Windows .msi (TEST) »**
+(`.github/workflows/build-msi-test.yml`), qui s'incrémente tout seul (1,
+2, 3...) à chaque déclenchement manuel, sans jamais nécessiter de
+modification de code :
+
+1. Le workflow écrit `windows/assets/TEST_BUILD_NUMBER` avec ce numéro,
+   juste avant d'appeler PyInstaller.
+2. `poker_tournament-test.spec` embarque ce fichier dans l'exécutable
+   **s'il existe** (absent lors d'un build local manuel — dans ce cas,
+   voir point 4 ci-dessous).
+3. `main.py: _test_build_number()`/`_test_build_label()` le lisent au
+   démarrage et affichent `[TEST 3]` (au lieu du simple `[TEST]`) dans le
+   titre de fenêtre et « À propos ».
+4. Build local sans passer par le workflow : `TEST_BUILD_NUMBER` est
+   absent, l'appli retombe proprement sur le libellé générique `[TEST]`
+   (aucune erreur).
+
+Le nom du `.msi` et de l'artifact GitHub Actions publiés par ce workflow
+suivent le même numéro, ex. `PokerTournament-TEST-3.msi` (artifact
+`PokerTournament-TEST-3`) — un build local (commandes PowerShell
+ci-dessus) reste nommé `PokerTournament-TEST.msi`, sans numéro.
+
 ## Comment Claude (l'assistant IA) génère et livre ce .msi
 
 Cette section documente noir sur blanc la procédure suivie quand on

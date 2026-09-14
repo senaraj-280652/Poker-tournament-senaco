@@ -20,6 +20,18 @@
 #      _is_test_build) — seule différence FONCTIONNELLE avec la
 #      production : c'est ce fichier, et lui seul, qui fait afficher
 #      "[TEST]" dans le titre de fenêtre et "À propos" une fois compilé.
+#   3. datas ajoute AUSSI, s'il existe, windows/assets/TEST_BUILD_NUMBER
+#      (demande du 2026-09-14 : identifier chaque build TEST par un
+#      numéro, ex. "[TEST 3]", sans jamais modifier version.py ni coder
+#      un numéro en dur ici). Ce fichier est généré par .github/
+#      workflows/build-msi-test.yml juste avant l'appel à PyInstaller,
+#      avec le contenu ${{ github.run_number }} (compteur qui
+#      s'incrémente tout seul à chaque déclenchement de CE workflow).
+#      Absent en local (build manuel sans passer par le workflow) : dans
+#      ce cas on omet volontairement l'entrée `datas` correspondante —
+#      PyInstaller échouerait sur un fichier source inexistant — et
+#      main.py._test_build_number() retombe proprement sur None, donc
+#      sur le libellé générique "[TEST]" (voir main.py:_test_build_label).
 #
 # Toute correction apportée ici (icône, dépendances cachées...) doit être
 # reportée manuellement dans poker_tournament.spec si elle s'applique
@@ -38,17 +50,26 @@ ICON = Path(SPECPATH) / "assets" / "app_icon.ico"
 # nom des raccourcis (voir app-test.wxs) et le marqueur "[TEST]" affiché
 # une fois l'application ouverte (voir main.py: _is_test_build).
 TEST_MARKER = Path(SPECPATH) / "assets" / "TEST_BUILD_MARKER"
+# Optionnel (voir point 3 de l'en-tête ci-dessus) : n'existe que lorsque
+# ce spec est invoqué depuis le workflow GitHub Actions dédié, jamais en
+# local sans action explicite — d'où la vérification .exists() avant de
+# l'ajouter à `datas`.
+TEST_BUILD_NUMBER = Path(SPECPATH) / "assets" / "TEST_BUILD_NUMBER"
+
+_datas = [
+    (str(ROOT / "help_content.json"), "."),
+    # Seule différence fonctionnelle avec poker_tournament.spec — voir
+    # l'en-tête de ce fichier et main.py: _is_test_build.
+    (str(TEST_MARKER), "."),
+]
+if TEST_BUILD_NUMBER.exists():
+    _datas.append((str(TEST_BUILD_NUMBER), "."))
 
 a = Analysis(
     [str(ROOT / "main.py")],
     pathex=[str(ROOT)],
     binaries=[],
-    datas=[
-        (str(ROOT / "help_content.json"), "."),
-        # Seule différence fonctionnelle avec poker_tournament.spec — voir
-        # l'en-tête de ce fichier et main.py: _is_test_build.
-        (str(TEST_MARKER), "."),
-    ],
+    datas=_datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

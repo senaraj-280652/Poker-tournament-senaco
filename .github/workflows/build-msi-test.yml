@@ -52,6 +52,24 @@ jobs:
       # ce workflow. Sans _license_secret.py, license.py: SECRET reste
       # None et is_licensed() renvoie toujours Vrai (voir license.py).
 
+      # Demande du 2026-09-14 : identifier chaque build TEST par un
+      # numéro (ex. "[TEST 3]" dans "À propos", voir main.py:
+      # _test_build_number/_test_build_label) SANS jamais modifier
+      # version.py ni coder un numéro en dur dans le code — on réutilise
+      # ${{ github.run_number }}, le numéro de run de CE workflow précis,
+      # qui s'incrémente tout seul (1, 2, 3...) à chaque déclenchement.
+      # Écrit AVANT PyInstaller pour que windows/poker_tournament-test.
+      # spec puisse l'embarquer dans le .exe (voir ce spec : datas
+      # n'ajoute ce fichier que s'il existe, donc un build local sans
+      # cette étape reste possible et retombe sur "[TEST]" générique).
+      # -NoNewline + utf8NoBOM : main.py lit ce fichier avec
+      # encoding="utf-8" puis .strip() — un BOM ne serait pas retiré par
+      # .strip() et casserait la comparaison/affichage du numéro.
+      - name: Génération du numéro de build TEST (run ${{ github.run_number }})
+        shell: pwsh
+        run: |
+          Set-Content -Path windows/assets/TEST_BUILD_NUMBER -Value "${{ github.run_number }}" -NoNewline -Encoding utf8NoBOM
+
       - name: Génération de PokerTournamentTest.exe (PyInstaller, spec TEST)
         run: |
           pyinstaller windows/poker_tournament-test.spec --distpath windows/dist --workpath windows/build --noconfirm
@@ -61,13 +79,18 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           wix extension add WixToolset.UI.wixext/5.0.2 --global
 
-      - name: Génération de PokerTournament-TEST.msi (WiX, installateur TEST)
+      # Nom du .msi lui-même suffixé par le numéro de run (demande du
+      # 2026-09-14, « si cela peut être fait sans perturber le workflow
+      # TEST ») : WiX ne se soucie pas du nom du fichier de sortie
+      # (-out), seul compte le contenu produit par PyInstaller/app-test.
+      # wxs — aucun risque fonctionnel, juste un nom de fichier différent.
+      - name: Génération de PokerTournament-TEST-${{ github.run_number }}.msi (WiX, installateur TEST)
         run: |
-          wix build windows/app-test.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-TEST.msi
+          wix build windows/app-test.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-TEST-${{ github.run_number }}.msi
 
       - name: Publication de l'artifact (TEST uniquement — aucune Release)
         uses: actions/upload-artifact@v4
         with:
-          name: PokerTournament-TEST
-          path: windows/dist/PokerTournament-TEST.msi
+          name: PokerTournament-TEST-${{ github.run_number }}
+          path: windows/dist/PokerTournament-TEST-${{ github.run_number }}.msi
           if-no-files-found: error

@@ -12,8 +12,8 @@ le temps, même après une future modification du fichier :
    ou branche ne doit jamais déclencher ce workflow ;
 2. construit windows/poker_tournament-test.spec puis windows/app-test.wxs
    (jamais les fichiers de PRODUCTION poker_tournament.spec / app.wxs) ;
-3. produit et publie PokerTournament-TEST.msi (jamais PokerTournament-16
-   .msi, le nom de la production) ;
+3. produit et publie PokerTournament-TEST-<numéro de run>.msi (jamais
+   PokerTournament-16.msi, le nom de la production) ;
 4. AUCUNE injection de LICENSE_SECRET (aucune étape ne le référence) ;
 5. AUCUNE publication de Release GitHub (pas de action-gh-release) ;
 6. le workflow de PRODUCTION (build-msi.yml) reste, lui, inchangé dans
@@ -104,11 +104,21 @@ class CheminsSpecEtWxsTest(unittest.TestCase):
 
 
 class NomMsiEtArtifactTest(unittest.TestCase):
+    """Demande du 2026-09-14 : le .msi et l'artifact sont désormais
+    suffixés par ${{ github.run_number }} (numéro de run de CE workflow,
+    auto-incrémenté) pour distinguer immédiatement chaque build TEST —
+    "si cela peut être fait sans perturber le workflow TEST". Le YAML
+    n'est PAS évalué ici (pas de vrai run GitHub Actions dans les
+    tests) : on vérifie donc la présence littérale de l'expression."""
+
     def setUp(self):
         self.code = "\n".join(_code_lines(_raw(TEST_WORKFLOW_PATH)))
 
-    def test_msi_de_sortie_nomme_test(self):
-        self.assertIn("windows/dist/PokerTournament-TEST.msi", self.code)
+    def test_msi_de_sortie_nomme_test_avec_numero_de_run(self):
+        self.assertIn(
+            "windows/dist/PokerTournament-TEST-${{ github.run_number }}.msi",
+            self.code,
+        )
 
     def test_msi_de_sortie_jamais_nomme_comme_la_production(self):
         self.assertNotIn("PokerTournament-16.msi", self.code)
@@ -119,11 +129,46 @@ class NomMsiEtArtifactTest(unittest.TestCase):
         # et path corrects — recherche du bloc qui suit upload-artifact.
         idx = self.code.index("actions/upload-artifact@v4")
         following = self.code[idx:idx + 400]
-        self.assertIn('name: PokerTournament-TEST', following)
-        self.assertIn("path: windows/dist/PokerTournament-TEST.msi", following)
+        self.assertIn(
+            "name: PokerTournament-TEST-${{ github.run_number }}", following
+        )
+        self.assertIn(
+            "path: windows/dist/PokerTournament-TEST-${{ github.run_number }}.msi",
+            following,
+        )
 
     def test_un_seul_upload_artifact(self):
         self.assertEqual(self.code.count("actions/upload-artifact@"), 1)
+
+
+class NumeroDeBuildTestTest(unittest.TestCase):
+    """Demande du 2026-09-14 : le workflow écrit windows/assets/
+    TEST_BUILD_NUMBER avec ${{ github.run_number }} AVANT PyInstaller,
+    pour que main.py._test_build_number() (embarqué via windows/
+    poker_tournament-test.spec) puisse l'exposer dans "À propos" et le
+    titre de fenêtre — voir tests/test_test_build_marker.py pour la
+    couverture de cette lecture côté application."""
+
+    def setUp(self):
+        self.raw = _raw(TEST_WORKFLOW_PATH)
+        self.code = "\n".join(_code_lines(self.raw))
+
+    def test_ecrit_test_build_number_avec_le_numero_de_run(self):
+        self.assertIn("windows/assets/TEST_BUILD_NUMBER", self.code)
+        self.assertIn(
+            'Value "${{ github.run_number }}"',
+            self.code,
+        )
+
+    def test_ecriture_du_numero_precede_pyinstaller(self):
+        idx_number = self.code.index("windows/assets/TEST_BUILD_NUMBER")
+        idx_pyinstaller = self.code.index("pyinstaller windows/poker_tournament-test.spec")
+        self.assertLess(
+            idx_number,
+            idx_pyinstaller,
+            "TEST_BUILD_NUMBER doit être écrit AVANT l'appel à PyInstaller "
+            "pour être embarqué dans le .exe",
+        )
 
 
 class AucuneInjectionLicenceTest(unittest.TestCase):

@@ -157,20 +157,112 @@ def _registry_path():
     return os.path.join(d, "open_windows.json")
 
 
+def _registry_lock_path():
+    home = os.path.expanduser("~")
+    d = os.path.join(home, ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "open_windows.lock")
+
+
+@contextlib.contextmanager
+def _registry_lock(timeout=5.0):
+    """Verrou inter-processus (demande du 2026-09-14, suite à un cas réel
+    observé sur un poste Windows : primes_session_started.json disparu
+    alors qu'un tournoi restait vivant dans open_windows.json) autour de
+    TOUTE opération de lecture-décision-écriture portant sur open_
+    windows.json ET/OU primes_session_started.json ensemble — les deux
+    doivent être considérés comme UNE SEULE section critique, puisque la
+    décision "plus aucun tournoi vivant -> effacer primes_session_
+    started.json" dépend d'une lecture de open_windows.json : sans
+    verrou commun, un process pouvait lire ce registre à un instant où
+    un AUTRE process était au milieu de sa propre mise à jour (ou
+    inversement), lire une image transitoirement incohérente, et en
+    tirer à tort la conclusion "plus rien n'est ouvert".
+
+    Réutilise le MÊME mécanisme déjà éprouvé pour le contrôle à distance
+    (voir _file_lock, extrait de l'ancien corps de _remote_control_lock
+    lors de ce même correctif — jamais une architecture différente) :
+    verrou de fichier natif de l'OS (fcntl.flock/msvcrt.locking),
+    automatiquement relâché par le système même après un plantage brutal
+    — fichier de verrou DISTINCT de celui du contrôle à distance
+    (open_windows.lock, jamais remote_control.lock) : ce sont deux
+    sections critiques indépendantes, inutile de les faire attendre
+    l'une l'autre.
+
+    Voir les variantes "_locked" (register/unregister ci-dessous,
+    _read_primes_session_data_locked, mark_primes_session_started) pour
+    enchaîner plusieurs opérations SANS ré-acquérir ce verrou (fcntl.
+    flock/msvcrt.locking ne sont PAS ré-entrants — un second appel
+    imbriqué bloquerait sur son propre verrou jusqu'au timeout, voir la
+    même précaution déjà documentée pour _remote_control_lock/_ensure_
+    remote_session_auth_locked)."""
+    with _file_lock(_registry_lock_path(), timeout=timeout):
+        yield
+
+
+def _win32_open_process_handle(pid):
+    """Encapsule l'appel Windows brut (ctypes.windll.kernel32.
+    OpenProcess/CloseHandle) dans sa propre fonction MODULE-LEVEL
+    (demande du 2026-09-14, durcissement suite à un cas réel où
+    primes_session_started.json a disparu alors qu'un tournoi restait
+    vivant) — pour deux raisons :
+
+    1. Rester substituable dans les tests même sur une machine non-
+       Windows : ctypes.windll n'existe tout simplement pas hors
+       Windows, impossible d'y patcher quoi que ce soit directement ;
+       cette fonction, elle, existe sur toutes les plateformes et peut
+       être remplacée par une doublure (voir tests/test_pid_is_running_
+       windows.py) pour exercer la logique de _pid_is_running ci-dessous
+       sans jamais réellement appeler l'API Windows.
+    2. Isoler l'appel brut de toute interprétation : renvoie le handle
+       tel quel (int non nul si le process existe, 0/None si OpenProcess
+       échoue proprement), ou laisse remonter TELLE QUELLE toute
+       exception inattendue — jamais convertie ici en "process mort".
+       C'est _pid_is_running, l'appelant, qui décide quoi faire d'une
+       exception (voir sa docstring : jamais assimilée à une preuve de
+       mort du process)."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if handle:
+        kernel32.CloseHandle(handle)
+    return handle
+
+
 def _pid_is_running(pid):
     """Vrai si un processus portant cet identifiant existe encore sur
     cette machine — utilisé pour ignorer/retirer une entrée laissée par
     un processus disparu sans se désinscrire proprement (voir
-    App._on_close / App._cleanup_for_close)."""
+    App._on_close / App._cleanup_for_close).
+
+    CORRECTION du 2026-09-14 (cas réel observé sur un poste Windows :
+    primes_session_started.json disparu alors qu'un tournoi restait
+    vivant dans open_windows.json — diagnostic du même jour) : la
+    branche Windows n'avait AUCUN `try/except` autour de l'appel API
+    brut, contrairement à la branche POSIX juste en dessous (qui, elle,
+    distingue explicitement "process introuvable" de "erreur qui ne
+    prouve rien" — voir `except PermissionError: return True`). Toute
+    erreur Windows autre qu'un OpenProcess proprement refusé (handle nul)
+    — panne transitoire, antivirus, etc. — remonte maintenant comme une
+    exception plutôt que d'être silencieusement interprétée comme "mort".
+
+    RÈGLE DÉLIBÉRÉE, la même des deux côtés (Windows et POSIX) : en cas
+    de doute (exception/erreur qui ne prouve RIEN), on considère le
+    process VIVANT, jamais mort. Une entrée fantôme qui traîne un peu
+    plus longtemps qu'idéal est sans conséquence (elle disparaîtra au
+    prochain contrôle réussi) ; à l'inverse, déclarer à tort un
+    process mort peut faire croire à tort que "plus aucun tournoi n'est
+    ouvert" et effacer primes_session_started.json/open_windows.json
+    alors qu'un tournoi tourne toujours — l'incident qui a motivé ce
+    correctif. Mieux vaut échouer du côté prudent."""
     if not isinstance(pid, int):
         return False
     if sys.platform == "win32":
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if handle:
-            ctypes.windll.kernel32.CloseHandle(handle)
+        try:
+            handle = _win32_open_process_handle(pid)
+        except Exception:
             return True
-        return False
+        return bool(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -249,16 +341,26 @@ def register(path):
     durcissement du contrôle à distance) : nettoyés ICI aussi, avant
     d'ajouter cette nouvelle fenêtre — voir _clear_remote_control_
     session_files, qui protège cette opération avec le même verrou
-    inter-processus que la génération/consultation de ces fichiers."""
+    inter-processus que la génération/consultation de ces fichiers.
+
+    Tout le corps ci-dessous tourne désormais sous _registry_lock()
+    (demande du 2026-09-14) : la lecture de _load(), la décision "data
+    est-il vide ?", et l'écriture finale forment UNE SEULE section
+    critique — sans ce verrou, un autre process au même instant (son
+    propre register()/unregister()) pouvait lire la même image
+    "d'avant", chacun décidant indépendamment, la seconde écriture
+    écrasant silencieusement la première (perte de mise à jour
+    confirmée expérimentalement lors du diagnostic de ce correctif)."""
     if not path:
         return
-    data = _prune(_load())
-    if not data:
-        _clear_primes_session_started()
-        _clear_primes_enabled_proposed()
-        _clear_remote_control_session_files()
-    data[os.path.abspath(path)] = {"pid": os.getpid(), "registered_at": time.time()}
-    _save(data)
+    with _registry_lock():
+        data = _prune(_load())
+        if not data:
+            _clear_primes_session_started()
+            _clear_primes_enabled_proposed()
+            _clear_remote_control_session_files()
+        data[os.path.abspath(path)] = {"pid": os.getpid(), "registered_at": time.time()}
+        _save(data)
 
 
 def update_remote_info(path, port, name):
@@ -331,19 +433,26 @@ def unregister(path):
 
     Même chose pour le code/jeton de session du contrôle à distance et
     les compteurs anti-bruteforce (demande du 2026-09-09) : voir
-    _clear_remote_control_session_files."""
+    _clear_remote_control_session_files.
+
+    Sous _registry_lock() (demande du 2026-09-14) — même raison que
+    register() ci-dessus : lecture, retrait, décision "reste-t-il
+    quelque chose ?" et nettoyage éventuel forment UNE SEULE section
+    critique, jamais entrelacée avec le register()/unregister() d'un
+    autre process."""
     if not path:
         return
-    data = _prune(_load())
-    abs_path = os.path.abspath(path)
-    entry = data.get(abs_path)
-    if entry and entry.get("pid") == os.getpid():
-        del data[abs_path]
-        _save(data)
-        if not data:
-            _clear_primes_session_started()
-            _clear_primes_enabled_proposed()
-            _clear_remote_control_session_files()
+    with _registry_lock():
+        data = _prune(_load())
+        abs_path = os.path.abspath(path)
+        entry = data.get(abs_path)
+        if entry and entry.get("pid") == os.getpid():
+            del data[abs_path]
+            _save(data)
+            if not data:
+                _clear_primes_session_started()
+                _clear_primes_enabled_proposed()
+                _clear_remote_control_session_files()
 
 
 def find_open_pid(path):
@@ -462,15 +571,22 @@ def mark_primes_session_started(primes_enabled=True):
     raison que _phone_selection_path : celui-ci associe à chaque clé (un
     chemin de fichier .tournoi) un dict {"pid": ...} que _prune() relit
     systématiquement en boucle, y mélanger une clé non-chemin le
-    casserait."""
-    if primes_session_started():
-        return  # déjà verrouillée : la valeur du tout premier reste seule autoritative
-    try:
-        _atomic_write_json(
-            _primes_session_lock_path(), {"started": True, "primes_enabled": bool(primes_enabled)}
-        )
-    except OSError:
-        pass
+    casserait.
+
+    Sous _registry_lock() (demande du 2026-09-14) : le contrôle "déjà
+    verrouillée ?" et l'écriture qui suit forment une seule section
+    critique — via _read_primes_session_data_locked (PAS la fonction
+    publique primes_session_started(), qui ré-acquerrait ce même verrou
+    non ré-entrant, voir sa docstring)."""
+    with _registry_lock():
+        if _read_primes_session_data_locked().get("started"):
+            return  # déjà verrouillée : la valeur du tout premier reste seule autoritative
+        try:
+            _atomic_write_json(
+                _primes_session_lock_path(), {"started": True, "primes_enabled": bool(primes_enabled)}
+            )
+        except OSError:
+            pass
 
 
 def _clear_primes_session_started():
@@ -480,10 +596,19 @@ def _clear_primes_session_started():
         pass
 
 
-def _read_primes_session_data():
-    """Lecture brute du fichier de verrouillage — {} si absent/illisible/
-    session terminée (registre vide, voir primes_session_started et
-    locked_primes_enabled, les deux seuls appelants)."""
+def _read_primes_session_data_locked():
+    """Variante SANS verrou de _read_primes_session_data — le verrou
+    (_registry_lock) doit déjà être détenu par l'appelant (voir mark_
+    primes_session_started ci-dessus, qui a besoin d'enchaîner cette
+    lecture avec une écriture conditionnelle dans LA MÊME section
+    critique, sans jamais ré-acquérir le verrou : fcntl.flock/msvcrt.
+    locking ne sont PAS ré-entrants — un second appel imbriqué de
+    _registry_lock() depuis le même thread bloquerait sur son propre
+    verrou jusqu'au timeout, même précaution que _ensure_remote_
+    session_auth_locked plus bas dans ce fichier). N'appeler qu'à
+    l'intérieur d'un `with _registry_lock():` déjà ouvert.
+
+    {} si absent/illisible/session terminée (registre vide)."""
     if not list_open_paths():
         _clear_primes_session_started()
         return {}
@@ -498,6 +623,15 @@ def _read_primes_session_data():
     return data if isinstance(data, dict) else {}
 
 
+def _read_primes_session_data():
+    """Point d'entrée PUBLIC (acquiert lui-même _registry_lock) — voir
+    _read_primes_session_data_locked pour la variante réutilisable à
+    l'intérieur d'une section déjà verrouillée, et sa docstring pour le
+    détail du contenu renvoyé."""
+    with _registry_lock():
+        return _read_primes_session_data_locked()
+
+
 def primes_session_started():
     """True si un tournoi de la session ACTUELLE a déjà démarré son
     chronomètre à un moment donné, ET qu'il reste encore au moins un
@@ -507,18 +641,20 @@ def primes_session_started():
     reste ouvert -> doit rester verrouillé).
 
     Dès que list_open_paths() (déjà nettoyé des PID morts par _prune,
-    donc robuste à un plantage) devient complètement vide, la session
-    est considérée TERMINÉE : ce drapeau est alors ignoré (et le fichier
-    supprimé) pour la session SUIVANTE. En pratique, ce nettoyage a déjà
-    eu lieu ACTIVEMENT, dès l'instant précis où le dernier tournoi s'est
-    fermé (voir unregister) ou dès l'enregistrement du premier tournoi
-    d'une session suivante si un résidu avait survécu (voir register,
-    ex. dernier processus disparu par plantage plutôt que par unregister
-    propre) — cette vérification ici n'est qu'un filet de sécurité
-    supplémentaire (défense en profondeur), jamais le seul mécanisme de
-    nettoyage : aucune valeur `started=true` périmée ne peut donc
-    survivre jusqu'à une session suivante, peu importe qui/quand relit
-    ce drapeau en premier."""
+    donc robuste à un plantage — voir aussi _pid_is_running, durci le
+    2026-09-14 pour ne jamais confondre "process réellement mort" et
+    "erreur de détection transitoire") devient complètement vide, la
+    session est considérée TERMINÉE : ce drapeau est alors ignoré (et le
+    fichier supprimé) pour la session SUIVANTE. En pratique, ce
+    nettoyage a déjà eu lieu ACTIVEMENT, dès l'instant précis où le
+    dernier tournoi s'est fermé (voir unregister) ou dès l'enregistrement
+    du premier tournoi d'une session suivante si un résidu avait survécu
+    (voir register, ex. dernier processus disparu par plantage plutôt
+    que par unregister propre) — cette vérification ici n'est qu'un
+    filet de sécurité supplémentaire (défense en profondeur), jamais le
+    seul mécanisme de nettoyage : aucune valeur `started=true` périmée
+    ne peut donc survivre jusqu'à une session suivante, peu importe
+    qui/quand relit ce drapeau en premier."""
     return bool(_read_primes_session_data().get("started"))
 
 
@@ -889,6 +1025,44 @@ def _release_lock(fd):
 
 
 @contextlib.contextmanager
+def _file_lock(path, timeout=5.0):
+    """Verrou de FICHIER natif de l'OS (fcntl.flock sur macOS/Linux,
+    msvcrt.locking sur Windows) sur `path` — aucune nouvelle dépendance,
+    tous deux dans la bibliothèque standard. Extrait le 2026-09-14 du
+    corps de _remote_control_lock (demande du 2026-09-09) pour être
+    réutilisé tel quel par _registry_lock (open_windows.json/primes_
+    session_started.json) — même mécanisme partout dans ce fichier
+    plutôt qu'une seconde implémentation parallèle.
+
+    Choisi précisément pour sa robustesse à un plantage : contrairement
+    à un fichier ".lock" contenant un PID (qui exigerait de détecter
+    soi-même un verrou "périmé" si son propriétaire meurt sans le
+    relâcher), un verrou de fichier au niveau OS est automatiquement
+    relâché par le système dès que le processus qui le détient se
+    termine — même brutalement ("Forcer à quitter", plantage) — sans le
+    moindre code de nettoyage à écrire.
+
+    `fd` ouvert/fermé à CHAQUE utilisation (jamais gardé entre deux
+    appels) : le verrou lui-même est associé à cette "description de
+    fichier ouvert" précise, aussi bien entre process qu'entre threads
+    d'un même process. Contexte appelant VOLONTAIREMENT très court (une
+    lecture JSON, un calcul en mémoire, une écriture atomique — jamais
+    d'E/S réseau ni d'attente utilisateur à l'intérieur) ; `timeout` est
+    un filet de sécurité seulement (ne devrait jamais être atteint vu ce
+    qui précède) — remonte TimeoutError plutôt que de bloquer
+    indéfiniment le thread appelant."""
+    fd = os.open(path, os.O_CREAT | os.O_RDWR)
+    try:
+        _acquire_lock(fd, timeout)
+        try:
+            yield
+        finally:
+            _release_lock(fd)
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
 def _remote_control_lock(timeout=5.0):
     """Verrou inter-processus COURT (demande du 2026-09-09, durcissement
     du contrôle à distance) autour de toute opération de lecture-
@@ -905,36 +1079,13 @@ def _remote_control_lock(timeout=5.0):
     chacun écrit : la seconde écriture écrase silencieusement la
     première).
 
-    Verrou de FICHIER natif de l'OS (fcntl.flock sur macOS/Linux,
-    msvcrt.locking sur Windows) — aucune nouvelle dépendance, tous deux
-    dans la bibliothèque standard. Choisi précisément pour sa robustesse
-    à un plantage : contrairement à un fichier ".lock" contenant un PID
-    (qui exigerait de détecter soi-même un verrou "périmé" si son
-    propriétaire meurt sans le relâcher), un verrou de fichier au niveau
-    OS est automatiquement relâché par le système dès que le processus
-    qui le détient se termine — même brutalement ("Forcer à quitter",
-    plantage) — sans le moindre code de nettoyage à écrire.
-
-    `fd` ouvert/fermé à CHAQUE utilisation (jamais gardé entre deux
-    appels) : le verrou lui-même est associé à cette "description de
-    fichier ouvert" précise, aussi bien entre process qu'entre threads
-    d'un même process (chaque thread HTTP, voir ThreadingHTTPServer dans
-    remote_control.py, obtient son propre appel, donc son propre fd).
-    Contexte VOLONTAIREMENT très court (voir chaque appelant : une
-    lecture JSON, un calcul en mémoire, une écriture atomique — jamais
-    d'E/S réseau ni d'attente utilisateur à l'intérieur) ; `timeout` est
-    un filet de sécurité seulement (ne devrait jamais être atteint vu ce
-    qui précède) — remonte TimeoutError plutôt que de bloquer
-    indéfiniment le thread HTTP appelant."""
-    fd = os.open(_remote_lock_path(), os.O_CREAT | os.O_RDWR)
-    try:
-        _acquire_lock(fd, timeout)
-        try:
-            yield
-        finally:
-            _release_lock(fd)
-    finally:
-        os.close(fd)
+    Délègue à _file_lock (voir sa docstring pour le détail du mécanisme,
+    factorisé le 2026-09-14 — auparavant dupliqué ici) sur remote_
+    control.lock, jamais open_windows.lock (voir _registry_lock) : deux
+    sections critiques indépendantes, inutile de les faire attendre
+    l'une l'autre."""
+    with _file_lock(_remote_lock_path(), timeout=timeout):
+        yield
 
 
 def _read_json_or_empty(path):

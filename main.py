@@ -90,6 +90,48 @@ def _is_test_build():
     return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
 
 
+# Nom du fichier optionnel portant le numéro identifiant CE build TEST
+# précis (demande du 2026-09-14, "pouvoir distinguer immédiatement les
+# différents MSI TEST" — ex. "[TEST 3]") — voir _test_build_number.
+# Volontairement DISTINCT de _TEST_BUILD_MARKER_FILENAME ci-dessus (qui,
+# lui, reste un simple booléen "est-ce un build TEST ?", jamais retiré) :
+# ce numéro-ci est un simple COMPLÉMENT d'affichage, absent tant qu'un
+# build TEST n'a pas été produit par le workflow GitHub Actions dédié
+# (voir .github/workflows/build-msi-test.yml) — un build TEST local
+# (windows/build.ps1-style, sans ce fichier généré au préalable) reste
+# parfaitement fonctionnel, simplement affiché "[TEST]" sans numéro,
+# comme avant cette demande.
+_TEST_BUILD_NUMBER_FILENAME = "TEST_BUILD_NUMBER"
+
+
+def _test_build_number():
+    """Numéro identifiant CE build TEST précis (demande du 2026-09-14),
+    ou None si absent — jamais codé en dur : le workflow GitHub Actions
+    dédié (.github/workflows/build-msi-test.yml) écrit windows/assets/
+    TEST_BUILD_NUMBER avec ${{ github.run_number }} — le numéro de run
+    de CE workflow précis, qui s'incrémente TOUT SEUL à chaque
+    déclenchement (1, 2, 3...) — juste avant d'appeler PyInstaller, sans
+    jamais avoir à modifier le code pour un nouveau build TEST.
+
+    Renvoie None (jamais une exception, jamais une valeur trompeuse) si
+    : pas un build TEST du tout (voir _is_test_build, vérifié en
+    premier) ; fichier absent (build local sans cette étape, ou ancien
+    build TEST antérieur à cette demande) ; ou contenu illisible/vide.
+    Voir _app_title_prefix/App._show_about pour l'affichage résultant
+    ("[TEST N]" si un numéro est disponible, simplement "[TEST]" sinon
+    — comportement strictement inchangé pour tout build TEST déjà
+    existant, jamais une régression pour lui)."""
+    if not _is_test_build():
+        return None
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    try:
+        with open(os.path.join(base, _TEST_BUILD_NUMBER_FILENAME), "r", encoding="utf-8") as f:
+            number = f.read().strip()
+    except OSError:
+        return None
+    return number or None
+
+
 def _menu_principal_key():
     """Clé de verrouillage du "Menu principal" (demande du 2026-09-14,
     voir open_windows.register_menu_principal/menu_principal_pid) —
@@ -102,8 +144,23 @@ def _menu_principal_key():
     return "test" if _is_test_build() else "prod"
 
 
+def _test_build_label():
+    """"[TEST N]" si ce build TEST porte un numéro (voir
+    _test_build_number — le numéro de run du workflow GitHub Actions qui
+    l'a produit, demande du 2026-09-14), sinon simplement "[TEST]"
+    (build TEST local, ou antérieur à cette demande), ou "" si ce n'est
+    pas un build TEST du tout. Factorisé ici pour que _app_title_prefix
+    (titre de fenêtre) et App._show_about ("À propos") affichent
+    exactement le même texte, sans dupliquer cette logique à deux
+    endroits."""
+    if not _is_test_build():
+        return ""
+    number = _test_build_number()
+    return f"[TEST {number}]" if number else "[TEST]"
+
+
 def _app_title_prefix():
-    """"[TEST] {APP_NAME} v{APP_VERSION}[complément dev]" — préfixe
+    """"[TEST N] {APP_NAME} v{APP_VERSION}[complément dev]" — préfixe
     commun à TOUS les titres de fenêtre de premier niveau (demande du
     2026-09-09) : Menu principal (voir App.__init__) ET fenêtre de
     tournoi (voir App._update_window_title), pour identifier
@@ -113,17 +170,19 @@ def _app_title_prefix():
     jamais avoir à toucher APP_VERSION à la main pour ça. En build
     officielle (PyInstaller) de PRODUCTION, dev_suffix() est vide : le
     titre reste strictement "{APP_NAME} v{APP_VERSION}", inchangé par ce
-    correctif. Le préfixe "[TEST] " (voir _is_test_build, demande du
-    2026-09-12) s'ajoute, lui, uniquement pour un exécutable compilé avec
-    windows/poker_tournament-test.spec — cohabite sans conflit avec
-    dev_suffix() (les deux peuvent apparaître ensemble en théorie, mais
-    en pratique un build "-test.spec" est toujours une build PyInstaller
-    figée, donc dev_suffix() y est de toute façon vide). Fonction
-    MODULE-LEVEL (pas une méthode) : réutilisable telle quelle, sans
-    construire de fenêtre, y compris dans les tests."""
+    correctif. Le préfixe "[TEST]"/"[TEST N]" (voir _test_build_label,
+    demandes du 2026-09-12 et du 2026-09-14) s'ajoute, lui, uniquement
+    pour un exécutable compilé avec windows/poker_tournament-test.spec —
+    cohabite sans conflit avec dev_suffix() (les deux peuvent apparaître
+    ensemble en théorie, mais en pratique un build "-test.spec" est
+    toujours une build PyInstaller figée, donc dev_suffix() y est de
+    toute façon vide). Fonction MODULE-LEVEL (pas une méthode) :
+    réutilisable telle quelle, sans construire de fenêtre, y compris
+    dans les tests."""
     prefix = f"{APP_NAME} v{APP_VERSION}{dev_suffix()}"
-    if _is_test_build():
-        prefix = f"[TEST] {prefix}"
+    label = _test_build_label()
+    if label:
+        prefix = f"{label} {prefix}"
     return prefix
 
 
@@ -5260,13 +5319,16 @@ class App(tk.Tk):
         HelpBrowser.open_at(self, chapter_title=chapter)
 
     def _show_about(self, parent=None):
-        # "[TEST] " (demande du 2026-09-12, voir _is_test_build) : visible
-        # dès la première ligne de "À propos", en plus du titre de
-        # fenêtre (_app_title_prefix) — pour qu'une fenêtre de la version
-        # de TEST ne puisse jamais être confondue avec la v1.2.38 installée
-        # à côté, même une fois "À propos" ouvert en plein écran sans le
-        # reste de la fenêtre visible.
-        name_line = f"[TEST] {APP_NAME}" if _is_test_build() else APP_NAME
+        # "[TEST]"/"[TEST N]" (demandes du 2026-09-12 et du 2026-09-14,
+        # voir _test_build_label) : visible dès la première ligne de "À
+        # propos", en plus du titre de fenêtre (_app_title_prefix) — pour
+        # qu'une fenêtre de la version de TEST ne puisse jamais être
+        # confondue avec la v1.2.38 installée à côté, même une fois "À
+        # propos" ouvert en plein écran sans le reste de la fenêtre
+        # visible ; le numéro (quand disponible) distingue en plus
+        # immédiatement plusieurs builds TEST entre eux (ex. "[TEST 3]").
+        label = _test_build_label()
+        name_line = f"{label} {APP_NAME}" if label else APP_NAME
         lines = [
             name_line,
             f"Version {APP_VERSION}",
@@ -8867,6 +8929,23 @@ class App(tk.Tk):
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
             self.db.set_settings({"is_paused": 0, "level_start_epoch": int(time.time()) - self._elapsed_before_pause()})
+            # RÉPARATION AUTOMATIQUE (demande du 2026-09-14, suite à un cas
+            # réel observé sur un poste Windows) : ce tournoi a déjà
+            # démarré (clock_started=1) — normalement, mark_primes_session_
+            # started a donc déjà été posé plus haut, à SON tout premier
+            # démarrage. Si primes_session_started.json a depuis disparu
+            # pour une raison quelconque (diagnostic du 2026-09-14 : cause
+            # initiale non démontrée, mais _pid_is_running durci et
+            # _registry_lock ajoutés le même jour pour la traiter à la
+            # racine) alors qu'un tournoi reste bel et bien vivant, une
+            # simple pause/reprise ne le recréait JUSQU'ICI JAMAIS (seule
+            # la transition clock_started 0->1, quelques lignes plus haut,
+            # appelait mark_primes_session_started) — laissant la section
+            # Primes déverrouillée à tort, indéfiniment, hors Mode Test.
+            # mark_primes_session_started est idempotente (aucun effet si
+            # déjà posée, voir sa docstring) : cet appel est donc sans
+            # risque même quand tout va bien, et répare le cas contraire.
+            open_windows.mark_primes_session_started(self.db.get_setting_int("primes_enabled", 1) == 1)
         self._refresh_clock_tab()
 
     def _elapsed_before_pause(self):
