@@ -3233,6 +3233,33 @@ class PeriodSummaryDialog(ttk.Frame):
         )
         self._refresh_display()
 
+    def _club_filtered_players(self, players):
+        """Sous-ensemble de `players` (une liste comme summary["players"])
+        qui passe le filtre "Club" actuellement sélectionné à l'écran —
+        extrait de _refresh_display (demande du 2026-09-14) pour que
+        _open_export_dialog puisse transmettre à l'export EXACTEMENT les
+        mêmes joueurs que ceux affichés, au lieu de dupliquer cette
+        logique (et de risquer qu'elle diverge un jour). Renvoie `players`
+        tel quel si aucun club n'est coché (voir get_selected_clubs).
+
+        Filtre "Club" (voir build_club_filter_widget) : club actuel du
+        joueur dans le répertoire (roster.py), pas celui, potentiellement
+        différent d'un tournoi à l'autre, enregistré au moment de son
+        inscription à chacun — un joueur ayant changé de club entre-temps
+        ne doit compter que pour son club actuel. Aucune coche = tous les
+        clubs (voir get_selected_clubs). Un joueur sans club renseigné
+        dans le répertoire (le cas le plus courant pour les joueurs du
+        club organisateur, jamais explicitement tagués) compte pour le
+        club réglé dans Paramètres, pas pour "aucun club"."""
+        home_club = export_prefs.load_value("club_name", "").strip()
+        selected_clubs = get_selected_clubs(self.stats_club_listbox)
+        if not selected_clubs:
+            return players
+        return [
+            a for a in players
+            if (roster.get_club(a["name"]) or home_club) in selected_clubs
+        ]
+
     def _refresh_display(self):
         for row in self.tournaments_tree.get_children():
             self.tournaments_tree.delete(row)
@@ -3243,23 +3270,12 @@ class PeriodSummaryDialog(ttk.Frame):
             return
 
         tournaments = self.summary["tournaments"]
-        players = self.summary["players"]
-        # Filtre "Club" (voir build_club_filter_widget) : club actuel du
-        # joueur dans le répertoire (roster.py), pas celui, potentiellement
-        # différent d'un tournoi à l'autre, enregistré au moment de son
-        # inscription à chacun — un joueur ayant changé de club entre-temps
-        # ne doit compter que pour son club actuel. Aucune coche = tous les
-        # clubs (voir get_selected_clubs). Un joueur sans club renseigné
-        # dans le répertoire (le cas le plus courant pour les joueurs du
-        # club organisateur, jamais explicitement tagués) compte pour le
-        # club réglé dans Paramètres, pas pour "aucun club".
+        players = self._club_filtered_players(self.summary["players"])
+        # Repris ici (pas seulement dans _club_filtered_players ci-dessus,
+        # qui a son propre usage interne du même réglage) : sert aussi à
+        # la colonne "Club" affichée plus bas, pour chaque ligne restante
+        # après filtrage.
         home_club = export_prefs.load_value("club_name", "").strip()
-        selected_clubs = get_selected_clubs(self.stats_club_listbox)
-        if selected_clubs:
-            players = [
-                a for a in players
-                if (roster.get_club(a["name"]) or home_club) in selected_clubs
-            ]
 
         # Ligne de total (en gras, voir tag "totalcol" plus bas), tout en
         # haut du tableau, insérée avant la boucle pour y rester quel que
@@ -3337,7 +3353,21 @@ class PeriodSummaryDialog(ttk.Frame):
         # portait son contenu une fois hors de l'application.
         _, date_from = self._parse_date(self.date_from_var.get())
         _, date_to = self._parse_date(self.date_to_var.get())
-        PeriodExportDialog(self, self.summary, date_from=date_from, date_to=date_to)
+        # Demande du 2026-09-14 : l'export doit refléter EXACTEMENT le
+        # filtre "Club" actuellement sélectionné à l'écran (voir
+        # _club_filtered_players, même logique que _refresh_display,
+        # jamais dupliquée) — auparavant self.summary (donc TOUS les
+        # clubs) était transmis tel quel, quel que soit le filtre affiché.
+        # "tournaments" n'est, lui, jamais filtré par club (ni à l'écran
+        # ni ici) : seul "players" l'est, comme dans _refresh_display.
+        # Un nouveau dict (jamais une mutation de self.summary) : un
+        # "Générer" ultérieur ou un changement de filtre ne doit jamais
+        # dépendre de l'état d'un export précédent.
+        export_summary = {
+            "tournaments": self.summary["tournaments"],
+            "players": self._club_filtered_players(self.summary["players"]),
+        }
+        PeriodExportDialog(self, export_summary, date_from=date_from, date_to=date_to)
 
 
 class PeriodExportDialog(tk.Toplevel):

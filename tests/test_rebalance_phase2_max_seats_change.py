@@ -14,6 +14,15 @@ niveau du VRAI point d'entrée App._collect_and_save_all_settings
   tables_pk.max_seats restent inchangés, un message d'erreur est
   affiché, et les AUTRES réglages modifiés dans le même geste sont
   malgré tout enregistrés (test #3).
+- Demande du 2026-09-14 (cas réel observé sur le HP, build TEST 3) :
+  quand il ne reste qu'UNE seule table active et que son occupation
+  tient dans la convention de "table finale" (<= FINAL_TABLE_MAX_SEATS,
+  database.py — la même déjà appliquée par rebalance_tables), le refus
+  ciblé ci-dessus ne doit JAMAIS s'appliquer, quelle que soit la
+  nouvelle capacité demandée : voir TablesOverCapacityFinalTableException
+  DirectTest (Database.tables_over_capacity isolée) et
+  TableFinaleExceptionAucunPopupTest (au niveau App._collect_and_save_
+  all_settings, popup compris) plus bas dans ce fichier.
 
 N'instancie PAS App(tk.Tk) au complet : App._collect_and_save_all_
 settings ne touche, pour ce qu'on teste ici, que self.db/self.
@@ -133,6 +142,12 @@ class CollectAndSaveAllSettingsTestCase(unittest.TestCase):
             _seat_new_player(self.db, t2_id, seat, f"T2-{seat}")
         return t1_id, t2_id
 
+    def _seat_one_table(self, count):
+        t1_id = self.db.list_tables()[0]["id"]
+        for seat in range(1, count + 1):
+            _seat_new_player(self.db, t1_id, seat, f"T1-{seat}")
+        return t1_id
+
 
 class AvantDemarrageChangementAccepteTest(CollectAndSaveAllSettingsTestCase):
     """2. AVANT le premier démarrage (clock_started == 0, valeur par
@@ -222,6 +237,149 @@ class ApresDemarrageChangementRefuseTest(CollectAndSaveAllSettingsTestCase):
         self.assertEqual(self.db.get_setting_int("max_seats_per_table"), 8)
         for t in self.db.list_tables():
             self.assertEqual(t["max_seats"], 8)
+
+
+class TablesOverCapacityFinalTableExceptionDirectTest(unittest.TestCase):
+    """Couverture directe de Database.tables_over_capacity (sans App ni
+    Tk) pour l'exception de "table finale" ajoutée le 2026-09-14 —
+    isole précisément la règle réutilisée (même constante
+    FINAL_TABLE_MAX_SEATS que rebalance_tables) de son câblage dans
+    App._collect_and_save_all_settings, couvert séparément ci-dessous
+    (TableFinaleExceptionAucunPopupTest)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="tables_over_capacity_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.db = database.Database(os.path.join(self._tmp.name, "A.tournoi"))
+        self.addCleanup(self.db.conn.close)
+
+    def _seat(self, table_id, count, prefix):
+        for seat in range(1, count + 1):
+            _seat_new_player(self.db, table_id, seat, f"{prefix}-{seat}")
+
+    def test_une_table_8_joueurs_capacite_7_aucune_table_en_exces(self):
+        t1_id = self.db.list_tables()[0]["id"]
+        self._seat(t1_id, 8, "T1")
+        self.assertEqual(self.db.tables_over_capacity(7), [])
+
+    def test_une_table_10_joueurs_capacite_7_aucune_table_en_exces(self):
+        t1_id = self.db.list_tables()[0]["id"]
+        self._seat(t1_id, 10, "T1")
+        self.assertEqual(self.db.tables_over_capacity(7), [])
+
+    def test_une_table_11_joueurs_capacite_7_refuse(self):
+        """Au-delà de FINAL_TABLE_MAX_SEATS (10), aucune exception :
+        comportement de refus normal, même sur une seule table."""
+        t1_id = self.db.list_tables()[0]["id"]
+        self._seat(t1_id, 11, "T1")
+        over = self.db.tables_over_capacity(7)
+        self.assertEqual(len(over), 1)
+        self.assertEqual(over[0]["count"], 11)
+
+    def test_deux_tables_8_et_3_joueurs_capacite_7_refuse(self):
+        """Plusieurs tables actives : l'exception ne s'applique jamais,
+        même si le total (11) est proche de FINAL_TABLE_MAX_SEATS."""
+        t1_id = self.db.list_tables()[0]["id"]
+        t2_id = self.db.add_table("Table 2")
+        self._seat(t1_id, 8, "T1")
+        self._seat(t2_id, 3, "T2")
+        over = self.db.tables_over_capacity(7)
+        self.assertEqual(len(over), 1)
+        self.assertEqual(over[0]["name"], "Table 1")
+        self.assertEqual(over[0]["count"], 8)
+
+
+class TableFinaleExceptionAucunPopupTest(CollectAndSaveAllSettingsTestCase):
+    """Demande du 2026-09-14, suite à un cas réel observé sur le HP (test
+    TEST 3) : 1 seule Table 1 active, 8 joueurs, "Nombre de sièges par
+    table" réglé à 7 -> le message "Impossible d'appliquer 7 sièges par
+    table... Effectuez d'abord le rééquilibrage de cette table." était
+    affiché à tort, alors que l'exception de "table finale" (voir
+    FINAL_TABLE_MAX_SEATS, database.rebalance_tables) autorise déjà
+    cette même table à dépasser "Nombre de sièges par table" tant que le
+    total tient dans une table finale (<= 10 joueurs).
+
+    Database.tables_over_capacity réutilise EXACTEMENT cette même
+    convention (même constante FINAL_TABLE_MAX_SEATS) au lieu d'une
+    deuxième règle indépendante — ces tests vérifient le comportement
+    observable au niveau du VRAI point d'entrée, App._collect_and_save_
+    all_settings, comme le reste de ce fichier."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.set_settings({"clock_started": 1})
+
+    def test_une_table_8_joueurs_capacite_7_accepte_sans_popup(self):
+        t1_id = self._seat_one_table(8)
+        self.win.settings_vars["max_seats_per_table"].set("7")
+
+        with patch.object(main, "messagebox") as mock_messagebox:
+            self.win._collect_and_save_all_settings()
+            mock_messagebox.showerror.assert_not_called()
+
+        # La valeur configurée est bien enregistrée...
+        self.assertEqual(self.db.get_setting_int("max_seats_per_table"), 7)
+        # ... mais la table finale reste malgré tout ouverte à 8 (aucun
+        # joueur déplacé, aucun rééquilibrage demandé) — exactement la
+        # même mécanique que rebalance_tables applique déjà pour toute
+        # table finale (voir n_tables_needed == 1 and n_active > max_seats).
+        t1 = next(t for t in self.db.list_tables() if t["id"] == t1_id)
+        self.assertEqual(t1["max_seats"], 8)
+        occ = self.db.conn.execute(
+            "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'", (t1_id,)
+        ).fetchone()["c"]
+        self.assertEqual(occ, 8)
+
+    def test_une_table_10_joueurs_capacite_7_accepte(self):
+        """Borne haute exacte de la table finale (FINAL_TABLE_MAX_SEATS
+        = 10, database.py) : toujours acceptée, jamais de popup."""
+        t1_id = self._seat_one_table(10)
+        self.win.settings_vars["max_seats_per_table"].set("7")
+
+        with patch.object(main, "messagebox") as mock_messagebox:
+            self.win._collect_and_save_all_settings()
+            mock_messagebox.showerror.assert_not_called()
+
+        self.assertEqual(self.db.get_setting_int("max_seats_per_table"), 7)
+        t1 = next(t for t in self.db.list_tables() if t["id"] == t1_id)
+        self.assertEqual(t1["max_seats"], 10)
+
+    def test_plusieurs_tables_en_surcapacite_reste_refuse(self):
+        """Non-régression explicite : l'exception ne s'applique QUE
+        lorsqu'il ne reste qu'UNE seule table active — avec plusieurs
+        tables, le contrôle de capacité existant (refus ciblé) reste
+        strictement inchangé, popup compris."""
+        self._seat_two_tables(8, 3)
+        self.win.settings_vars["max_seats_per_table"].set("7")
+
+        with patch.object(main, "messagebox") as mock_messagebox:
+            self.win._collect_and_save_all_settings()
+            mock_messagebox.showerror.assert_called_once()
+
+        self.assertEqual(self.db.get_setting_int("max_seats_per_table"), 9)
+        for t in self.db.list_tables():
+            self.assertEqual(t["max_seats"], 9)
+
+    def test_onze_joueurs_sur_une_table_aucune_exception(self):
+        """11 joueurs dépasse strictement FINAL_TABLE_MAX_SEATS (10) :
+        même regroupés sur une seule table active (état construit
+        directement pour isoler précisément cette limite — en pratique
+        rebalance_tables aurait déjà ouvert une deuxième table avant
+        d'atteindre ce nombre), l'exception de table finale NE
+        S'APPLIQUE JAMAIS au-delà de 10 joueurs, et le refus ciblé
+        normal continue de s'appliquer."""
+        t1_id = self._seat_one_table(11)
+        self.win.settings_vars["max_seats_per_table"].set("7")
+
+        with patch.object(main, "messagebox") as mock_messagebox:
+            self.win._collect_and_save_all_settings()
+            mock_messagebox.showerror.assert_called_once()
+            error_args = mock_messagebox.showerror.call_args[0]
+            self.assertIn("11 joueurs", error_args[1])
+
+        self.assertEqual(self.db.get_setting_int("max_seats_per_table"), 9)
+        t1 = next(t for t in self.db.list_tables() if t["id"] == t1_id)
+        self.assertEqual(t1["max_seats"], 9)
 
 
 if __name__ == "__main__":

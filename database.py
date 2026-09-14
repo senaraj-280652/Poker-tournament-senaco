@@ -401,6 +401,32 @@ def _log_defensive_relocation(message):
     except OSError:
         pass
 
+
+def _log_skipped_tournament_file(path, exc):
+    """Trace, dans le même journal que les plantages (voir _log_
+    defensive_relocation ci-dessus pour le choix de ne pas importer
+    main.py ici), qu'un fichier .tournoi a dû être ignoré par
+    build_period_summary — soit à l'ouverture de la connexion, soit dès
+    sa toute première lecture (ex. fichier tronqué/corrompu, disque
+    plein interrompu, permissions) — demande du 2026-09-14 : un fichier
+    illisible ne doit plus jamais faire échouer TOUTE la synthèse (voir
+    build_period_summary), mais l'utilisateur doit pouvoir identifier
+    PLUS TARD, dans ~/.poker_tournament/crash.log, lequel précisément a
+    été ignoré, sans qu'une popup bloquante n'interrompe la génération
+    de la synthèse pour autant. Ne lève jamais d'exception elle-même
+    (best-effort, comme _log_defensive_relocation/_log_exception)."""
+    try:
+        with open(_defensive_integrity_log_path(), "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S") + "\n")
+            f.write(
+                "[build_period_summary] Fichier .tournoi ignoré (illisible ou "
+                f"corrompu) : {path}\n"
+                f"  Cause : {type(exc).__name__}: {exc}\n"
+            )
+    except OSError:
+        pass
+
 # Préférence GLOBALE (voir export_prefs.py — même mécanisme que
 # "remote_control_enabled", partagée par tous les tournois/Sit & Go de
 # cette machine, pas une donnée du tournoi) qui active/désactive la
@@ -589,15 +615,39 @@ class Database:
         automatique complète reste autorisée (voir rebalance_tables,
         PHASE 1).
 
+        Exception de "table finale" (demande du 2026-09-14, suite à un
+        cas réel : 1 table / 8 joueurs / capacité réglée à 7 affichait à
+        tort ce refus) — réutilise EXACTEMENT la même convention que
+        rebalance_tables (voir FINAL_TABLE_MAX_SEATS ci-dessus), jamais
+        une règle indépendante : quand il ne reste qu'UNE seule table
+        active et que son occupation totale tient dans la table finale
+        (<= FINAL_TABLE_MAX_SEATS, actuellement 10), aucun refus n'est
+        jamais opposé, quelle que soit la nouvelle capacité demandée —
+        cette table est déjà, par construction (voir rebalance_tables),
+        la table finale autorisée à dépasser "Nombre de sièges par
+        table" ; il serait incohérent de refuser d'un côté ce que
+        l'autre mécanisme autorise déjà explicitement. Dès qu'il y a
+        plusieurs tables actives, ou que l'occupation dépasse
+        FINAL_TABLE_MAX_SEATS (11 joueurs ou plus), cette exception ne
+        s'applique JAMAIS : le contrôle de capacité normal s'applique
+        alors sans changement.
+
         Chaque élément de la liste renvoyée : {"name": <nom de la
         table>, "count": <nombre de joueurs actifs qui y sont assis>}."""
         new_max = int(new_max)
-        over = []
-        for t in self.list_tables():
-            occ = self.conn.execute(
+        active_tables = list(self.list_tables())
+        occupancies = {
+            t["id"]: self.conn.execute(
                 "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'",
                 (t["id"],),
             ).fetchone()["c"]
+            for t in active_tables
+        }
+        if len(active_tables) == 1 and sum(occupancies.values()) <= FINAL_TABLE_MAX_SEATS:
+            return []
+        over = []
+        for t in active_tables:
+            occ = occupancies[t["id"]]
             if occ > new_max:
                 over.append({"name": t["name"], "count": occ})
         return over
@@ -3437,15 +3487,51 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
     l'onglet Primes de chaque tournoi joué (Présence + Assiduité +
     Classement + Bounty, en points) — pas un calcul en euros ("total_cost"
     / "total_gain" restent disponibles pour qui en aurait besoin, mais
-    n'entrent plus dans "total_points")."""
+    n'entrent plus dans "total_points").
+
+    "tournaments_played" (règle métier validée le 2026-09-15) : un joueur
+    déclaré forfait (status='withdrawn', voir Database.withdraw_player) a
+    bien participé ADMINISTRATIVEMENT à ce tournoi (inscrit, blindes
+    éventuellement prélevées avant sa déclaration de forfait ~1h après le
+    début) — il reste donc dans "players" et continue de peser sur
+    "total_cost"/"total_bounty_won"/"total_points" exactement comme
+    avant cette règle — mais ce tournoi ne doit PAS compter dans son
+    nombre de tournois JOUÉS : "tournaments_played" n'est incrémenté que
+    pour un joueur resté "active" (encore en jeu, y compris le vainqueur)
+    ou "eliminated" (a réellement joué jusqu'à son élimination), jamais
+    pour "withdrawn". "wins"/"best_place" restent, eux, déjà inatteignables
+    pour un forfait de toute façon (aucune "place" ne lui est jamais
+    attribuée, voir la boucle plus bas) — inchangé par cette règle."""
     tournaments = []
     players = {}
 
     for path in find_tournament_files(folder, recursive=recursive):
         try:
             db = Database(path, read_only=True)
-        except Exception:
+        except Exception as e:
+            # Échec à l'OUVERTURE de la connexion (permissions, fichier
+            # supprimé entre le glob et l'ouverture...) — voir le second
+            # bloc try ci-dessous pour l'échec, plus fréquent en pratique,
+            # sur la PREMIÈRE VRAIE REQUÊTE (sqlite3 ne valide le format
+            # du fichier qu'à la première lecture, jamais à la connexion
+            # elle-même, voir _log_skipped_tournament_file).
+            _log_skipped_tournament_file(path, e)
             continue
+
+        # Demande du 2026-09-14, suite à un fichier .tournoi corrompu
+        # ayant fait échouer TOUTE la synthèse (pas seulement le fichier
+        # en cause) : `tournament_entry`/`player_updates` sont calculés
+        # dans des variables LOCALES, jamais directement ajoutés à
+        # `tournaments`/`players` avant la fin du bloc ci-dessous — pour
+        # qu'une erreur survenant n'importe où pendant le traitement de
+        # CE fichier (première requête comme les suivantes, y compris au
+        # milieu de la boucle sur les joueurs) ne laisse jamais un
+        # tournoi à moitié construit ou une agrégation partielle
+        # contaminer le résultat global. `finally: db.close()` garantit
+        # que la connexion est TOUJOURS refermée proprement, que ce
+        # fichier ait pu être traité ou non.
+        tournament_entry = None
+        player_updates = None
         try:
             date = db.get_tournament_date()
             if date_from and date < date_from:
@@ -3458,8 +3544,20 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
             )
             all_players = db.list_players()
             active = [p for p in all_players if p["status"] == "active"]
-            finished = len(active) == 1
-            winner = active[0]["name"] if finished else "-"
+            # "Terminé" (demande du 2026-09-14) : réutilise EXACTEMENT la
+            # règle déjà appliquée par le Lobby (get_live_status, voir sa
+            # docstring) — <= 1 joueur actif restant ET plus d'un joueur
+            # au total — plutôt qu'une définition indépendante ("== 1"
+            # actif) qui divergeait du Lobby dès que TOUS les joueurs
+            # avaient fini par quitter le tournoi (forfaits compris,
+            # 0 actif restant) sans qu'aucun vainqueur ne soit désigné.
+            finished = db.get_live_status()["finished"]
+            # "Vainqueur" reste distinct de "Terminé" : un tournoi peut
+            # être "Terminé" au sens ci-dessus sans qu'il ne reste
+            # personne pour être désigné vainqueur (0 actif) — dans ce
+            # cas précis, "-" (comme "En cours") plutôt qu'une IndexError
+            # sur `active[0]`.
+            winner = active[0]["name"] if len(active) == 1 else "-"
             # Même source que l'onglet Primes de ce tournoi (voir
             # get_primes_summary) : "bo_montant" = bounty en points, "total"
             # = Présence + Assiduité + Classement + Bounty pour ce tournoi.
@@ -3469,7 +3567,7 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
             stats = db.get_stats()
             payouts_by_place = {r["place"]: r["amount"] for r in db.get_payouts_amounts()}
 
-            tournaments.append({
+            tournament_entry = {
                 "name": name,
                 "date": date,
                 "path": path,
@@ -3478,12 +3576,13 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
                 "status": "Terminé" if finished else "En cours",
                 "winner": winner,
                 "bounty_distributed": bounty_distributed,
-            })
+            }
 
             buyin_amount = db.get_setting_float("buyin_amount", 0)
             rebuy_amount = db.get_setting_float("rebuy_amount", 0)
             addon_amount = db.get_setting_float("addon_amount", 0)
 
+            player_updates = []
             for p in all_players:
                 place = None
                 gain = 0.0
@@ -3502,28 +3601,41 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
                 prime_row = primes_by_name.get(p["name"])
                 bounty_won = prime_row["bo_montant"] if prime_row else 0
                 points = prime_row["total"] if prime_row else 0
-
-                agg = players.setdefault(p["name"], {
-                    "name": p["name"],
-                    "tournaments_played": 0,
-                    "wins": 0,
-                    "best_place": None,
-                    "total_cost": 0.0,
-                    "total_gain": 0.0,
-                    "total_bounty_won": 0,
-                    "total_points": 0,
-                })
-                agg["tournaments_played"] += 1
-                agg["total_cost"] += cost
-                agg["total_gain"] += gain
-                agg["total_bounty_won"] += bounty_won
-                agg["total_points"] += points
-                if place == 1:
-                    agg["wins"] += 1
-                if place is not None and (agg["best_place"] is None or place < agg["best_place"]):
-                    agg["best_place"] = place
+                # Règle métier du 2026-09-15 (voir la docstring de cette
+                # fonction) : un forfait ("withdrawn") compte comme une
+                # participation ADMINISTRATIVE, jamais comme un tournoi
+                # JOUÉ — seul "played" distingue les deux ci-dessous, rien
+                # d'autre n'est modifié pour ce joueur (coût, primes...).
+                played = p["status"] != "withdrawn"
+                player_updates.append((p["name"], place, cost, gain, bounty_won, points, played))
+        except Exception as e:
+            _log_skipped_tournament_file(path, e)
+            continue
         finally:
             db.close()
+
+        tournaments.append(tournament_entry)
+        for p_name, place, cost, gain, bounty_won, points, played in player_updates:
+            agg = players.setdefault(p_name, {
+                "name": p_name,
+                "tournaments_played": 0,
+                "wins": 0,
+                "best_place": None,
+                "total_cost": 0.0,
+                "total_gain": 0.0,
+                "total_bounty_won": 0,
+                "total_points": 0,
+            })
+            if played:
+                agg["tournaments_played"] += 1
+            agg["total_cost"] += cost
+            agg["total_gain"] += gain
+            agg["total_bounty_won"] += bounty_won
+            agg["total_points"] += points
+            if place == 1:
+                agg["wins"] += 1
+            if place is not None and (agg["best_place"] is None or place < agg["best_place"]):
+                agg["best_place"] = place
 
     tournaments.sort(key=lambda t: t["date"])
     players_list = sorted(players.values(), key=lambda a: a["total_points"], reverse=True)
