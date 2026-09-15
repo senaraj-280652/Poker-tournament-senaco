@@ -119,6 +119,28 @@ class RefreshTablesTabPlayerCountsTest(unittest.TestCase):
         self.win.tables_inner = ttk.Frame(self.root)
         self.addCleanup(self.win.tables_inner.destroy)
 
+        # Avertissement "mouvements en attente" + clignotement (demande du
+        # 2026-09-16, voir tests/test_tables_tab_movement_pending_banner.py
+        # pour leur comportement réel) : hors du périmètre de CE fichier
+        # (comptage/titres), mais désormais lus/appelés inconditionnellement
+        # par _refresh_tables_tab — greffés ici au minimum nécessaire pour
+        # qu'il continue de s'exécuter sans erreur (aucun de ces tests ne
+        # met movement_alert_active à 1, jamais exercés autrement qu'en
+        # no-op ici).
+        self.win._movement_pending_frame = ttk.Frame(self.root)
+        self.addCleanup(self.win._movement_pending_frame.destroy)
+        self.win._tables_scroll_container = ttk.Frame(self.root)
+        self.addCleanup(self.win._tables_scroll_container.destroy)
+        self.win._tables_blink_after_id = None
+        self.win._tables_blink_phase = False
+        self.win._tables_blink_ids = set()
+        self.win._cancel_tables_blink = types.MethodType(
+            main.App._cancel_tables_blink, self.win
+        )
+        self.win._tables_blink_tick = types.MethodType(
+            main.App._tables_blink_tick, self.win
+        )
+
         self.win._pending_old_seat_by_name = types.MethodType(
             main.App._pending_old_seat_by_name, self.win
         )
@@ -295,6 +317,13 @@ class TablesTotalLabelStyleTest(unittest.TestCase):
         self.win._tables_zoom_by = lambda delta: None
         self.win._continue_pending_rebalance_without_bb = lambda: None
         self.win._on_tables_mousewheel = lambda event: None
+        # Bouton "Terminé" du bandeau "mouvements en attente" (demande du
+        # 2026-09-16, voir tests/test_tables_tab_movement_pending_banner.py
+        # pour son vrai comportement) : sa commande est lue dès la
+        # construction du bouton par _build_tables_tab — hors du périmètre
+        # de CE test (style visuel du bandeau total de joueurs), simple
+        # doublure ici.
+        self.win._finish_movement_alert_from_tables = lambda: None
 
         self.win._build_tables_tab = types.MethodType(main.App._build_tables_tab, self.win)
         self.win._build_tables_tab()

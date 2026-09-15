@@ -5266,6 +5266,7 @@ class App(tk.Tk):
         c'est précisément ce qui empêche un second lancement externe
         pendant qu'un tournoi est déjà affiché — voir App.__init__."""
         self._stop_remote_control()
+        self._cancel_tables_blink()
         if self.db:
             open_windows.unregister(self.db.path)
             self.db.close()
@@ -6670,7 +6671,7 @@ class App(tk.Tk):
             self.lift()
             self.focus_force()
 
-    def _finish_movement_alert(self):
+    def _finish_movement_alert(self, switch_to_clock=True):
         """Bouton "Terminé" de l'onglet Mouvements (ou raccourci clavier/
         contrôle à distance, voir _on_voice_word) : referme le bandeau
         d'alerte, vide la liste des mouvements affichée (le prochain
@@ -6685,15 +6686,27 @@ class App(tk.Tk):
         raison, ex : "Élimination" en attente de désignation via
         Ctrl+Maj+J/le contrôle à distance — voir _voice_start_elimination)
         : sans effet si le chrono tournait déjà, ce qui est désormais
-        toujours le cas pendant un simple mouvement de tables."""
+        toujours le cas pendant un simple mouvement de tables.
+
+        `switch_to_clock=False` (utilisé UNIQUEMENT par le bouton "Terminé"
+        de l'onglet Tables, voir _build_tables_tab) : conserve tout le
+        même mécanisme de validation ci-dessus (aucune logique dupliquée),
+        seulement sans faire passer l'onglet Chronomètre ni l'écran
+        projecteur au premier plan — l'utilisateur qui clique depuis
+        Tables veut voir IMMÉDIATEMENT les positions réelles sur CET
+        onglet, pas être redirigé ailleurs. Tous les autres appelants
+        (onglet Mouvements, raccourci clavier, contrôle à distance)
+        laissent ce paramètre à sa valeur par défaut : comportement
+        strictement inchangé pour eux."""
         self.db.set_settings({"movement_alert_active": 0})
         self.voice_awaiting_resume = False
         self._clock_resume()
         self.db.clear_seat_moves()
         self._refresh_moves_tab()
-        self.notebook.select(self.clock_tab)
+        if switch_to_clock:
+            self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
-        if self.clock_window is not None and self.clock_window.winfo_exists():
+        if switch_to_clock and self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
 
     # ---------------------------------------------------------------
@@ -8226,8 +8239,60 @@ class App(tk.Tk):
             bg=FELT, fg="white",
         ).pack(side="right", padx=(6, 0))
 
+        # -- Avertissement "mouvements en attente" (demande du 2026-09-16,
+        # suite au diagnostic confirmé sur le HP du club — voir
+        # _pending_old_seat_by_name) : tant que movement_alert_active=1,
+        # l'onglet Tables affiche VOLONTAIREMENT les anciennes positions
+        # des joueurs concernés par un mouvement pas encore confirmé
+        # (comportement métier conservé, voir _refresh_tables_tab) — sans
+        # ce bandeau, rien ne l'indiquait sur CET onglet précis (seuls
+        # Chronomètre/l'écran projecteur montraient "Changement de tables
+        # en cours"), ce qui donnait à tort l'impression d'une base de
+        # données désynchronisée. Construit une seule fois ici ; montré/
+        # masqué par _refresh_tables_tab (jamais reconstruit, contrairement
+        # aux cadres de table eux-mêmes). `before=scroll_container` (pas
+        # un simple .pack() qui l'ajouterait à la fin de l'ordre
+        # d'empilement actuel) garantit sa position juste au-dessus de la
+        # grille de tables à CHAQUE réaffichage, quel que soit l'historique
+        # pack()/pack_forget() précédent.
+        self._movement_pending_frame = ttk.Frame(self.tables_tab)
+        self._movement_pending_label = ttk.Label(
+            self._movement_pending_frame,
+            text="⚠ Mouvements de tables en attente — positions avant déplacement affichées",
+            font=("Helvetica", 11, "bold"), foreground=DANGER_RED,
+        )
+        self._movement_pending_label.pack(side="left", padx=(0, 10))
+        movement_pending_finish_btn = ttk.Button(
+            self._movement_pending_frame, text="Terminé",
+            # switch_to_clock=False (voir _finish_movement_alert) : reste
+            # sur l'onglet Tables pour y montrer tout de suite les
+            # positions réelles, plutôt que de basculer sur Chronomètre
+            # comme le bouton "Terminé" de l'onglet Mouvements — même
+            # mécanisme de validation sous-jacent, aucune logique dupliquée.
+            command=self._finish_movement_alert_from_tables,
+            style="Danger.TButton",
+        )
+        movement_pending_finish_btn.pack(side="left")
+        Tooltip(
+            movement_pending_finish_btn,
+            "Exactement le même bouton que dans l'onglet Mouvements : à\n"
+            "cliquer une fois que tous les joueurs déplacés ont rejoint\n"
+            "leur nouvelle table. Referme cet avertissement et affiche\n"
+            "aussitôt les positions réelles ci-dessous.",
+        )
+
+        # Clignotement des tables concernées par un mouvement en attente
+        # (voir _tables_blink_tick) : UN SEUL callback after() à la fois,
+        # quel que soit le nombre de rafraîchissements successifs de cet
+        # onglet (_refresh_tables_tab annule systématiquement l'ancien
+        # avant d'en programmer un nouveau).
+        self._tables_blink_after_id = None
+        self._tables_blink_phase = False
+        self._tables_blink_ids = set()
+
         scroll_container = ttk.Frame(self.tables_tab)
         scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._tables_scroll_container = scroll_container
 
         # Zone défilante : un Canvas (seul widget dont on peut piloter le
         # défilement par programme) contenant un Frame avec les tables en
@@ -8292,6 +8357,13 @@ class App(tk.Tk):
         self._check_pending_rebalance()
 
     def _refresh_tables_tab(self):
+        # Annule tout cycle de clignotement en cours AVANT de détruire les
+        # cadres qu'il visait (voir _tables_blink_tick) — sans ça, un
+        # rafraîchissement de plus en plus rapproché (éliminations
+        # successives) programmerait un nouveau callback after() à chaque
+        # appel sans jamais annuler le précédent, les faisant s'accumuler.
+        self._cancel_tables_blink()
+
         for w in self.tables_inner.winfo_children():
             w.destroy()
 
@@ -8303,6 +8375,29 @@ class App(tk.Tk):
         all_tables_by_id = {t["id"]: t for t in self.db.list_tables(active_only=False)}
         name_to_id = {t["name"]: t["id"] for t in all_tables_by_id.values()}
         active_ids = {t["id"] for t in self.db.list_tables()}
+
+        # Avertissement + tables à faire clignoter (voir _build_tables_tab
+        # et _tables_blink_tick) : déterminés à partir des mouvements
+        # RÉELLEMENT en attente (seat_moves), pas de `pending_old_by_name`
+        # (qui ne liste que les JOUEURS encore actifs concernés — une
+        # table de départ peut être concernée par le mouvement même si
+        # tous les joueurs qui l'occupaient ont depuis été éliminés).
+        movement_alert = self.db.get_setting_int("movement_alert_active", 0) == 1
+        blinking_ids = set()
+        if movement_alert:
+            for mv in self.db.get_seat_moves():
+                old_id = name_to_id.get(mv["old_table_name"])
+                new_id = name_to_id.get(mv["new_table_name"])
+                if old_id is not None:
+                    blinking_ids.add(old_id)
+                if new_id is not None:
+                    blinking_ids.add(new_id)
+        if movement_alert:
+            self._movement_pending_frame.pack(
+                fill="x", padx=10, pady=(0, 8), before=self._tables_scroll_container,
+            )
+        else:
+            self._movement_pending_frame.pack_forget()
 
         players_by_table = {}
         for p in self.db.list_players(status="active"):
@@ -8359,6 +8454,13 @@ class App(tk.Tk):
                 font=title_font,
                 bg=FELT, fg=GOLD, bd=1, relief="groove", highlightbackground=GOLD_DARK,
             )
+            # Attribut Python ordinaire posé sur le widget (pas une option
+            # Tk) : simple étiquette relue par _tables_blink_tick pour
+            # savoir, à CHAQUE bascule, quels cadres actuellement affichés
+            # doivent clignoter — jamais de référence directe au widget
+            # gardée ailleurs, qui deviendrait invalide au prochain
+            # _refresh_tables_tab (destruction/reconstruction complète).
+            frame._blink_table_id = t["id"]
             frame.grid(row=idx // cols, column=idx % cols, padx=grid_pad, pady=grid_pad, sticky="n")
             if not plist:
                 tk.Label(frame, text="(vide)", font=row_font, bg=FELT, fg=CREAM).pack(
@@ -8384,6 +8486,82 @@ class App(tk.Tk):
         self.tables_canvas.configure(scrollregion=self.tables_canvas.bbox("all"))
         self.tables_canvas.yview_moveto(0.0)
         self._tables_scroll_paused = False
+
+        # (Re)démarre le clignotement des tables concernées, le cas
+        # échéant — toujours EN DERNIER, une fois les nouveaux cadres
+        # construits et tagués ci-dessus (voir frame._blink_table_id).
+        # Repart d'une phase "éteinte" à chaque reconstruction plutôt que
+        # de garder l'ancienne : un rafraîchissement enchaîné ne doit
+        # jamais laisser un cadre bloqué en phase "allumée" par accident.
+        self._tables_blink_ids = blinking_ids
+        self._tables_blink_phase = False
+        if movement_alert and blinking_ids:
+            self._tables_blink_tick()
+
+    def _cancel_tables_blink(self):
+        """Annule proprement le cycle de clignotement de l'onglet Tables
+        (voir _tables_blink_tick), s'il y en a un en cours — appelé avant
+        toute reconstruction des cadres (_refresh_tables_tab) et à la
+        fermeture du tournoi (_cleanup_for_close), pour ne jamais laisser
+        un callback after() orphelin viser des widgets déjà détruits."""
+        after_id = getattr(self, "_tables_blink_after_id", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            self._tables_blink_after_id = None
+
+    def _tables_blink_tick(self):
+        """Fait alterner l'apparence (fond/en-tête, JAMAIS les noms des
+        joueurs — toujours affichés sur leur propre fond FELT distinct,
+        voir _refresh_tables_tab) des cadres de table concernés par un
+        mouvement en attente, entre la couleur d'alerte (DANGER_RED) et
+        l'apparence normale (FELT/GOLD), toutes les 600 ms. UN SEUL
+        cycle actif à la fois (voir _tables_blink_after_id/
+        _cancel_tables_blink, systématiquement annulé avant d'en
+        programmer un nouveau). S'arrête de lui-même (sans se
+        reprogrammer) dès que la fenêtre/les widgets concernés n'existent
+        plus, ou que plus aucun mouvement n'est en attente — jamais
+        d'erreur Tkinter après destruction, jamais de boucle qui persiste
+        inutilement une fois "Terminé" cliqué."""
+        self._tables_blink_after_id = None
+        if not self.winfo_exists() or not self.tables_inner.winfo_exists():
+            return
+        if self.db is None or self.db.get_setting_int("movement_alert_active", 0) != 1:
+            return
+        ids = getattr(self, "_tables_blink_ids", set())
+        if not ids:
+            return
+        self._tables_blink_phase = not self._tables_blink_phase
+        on = self._tables_blink_phase
+        for frame in self.tables_inner.winfo_children():
+            if getattr(frame, "_blink_table_id", None) not in ids:
+                continue
+            try:
+                if on:
+                    frame.configure(
+                        bg=DANGER_RED, fg=CREAM,
+                        highlightthickness=3, highlightbackground=DANGER_RED_ACTIVE,
+                    )
+                else:
+                    frame.configure(
+                        bg=FELT, fg=GOLD,
+                        highlightthickness=3, highlightbackground=DANGER_RED_ACTIVE,
+                    )
+            except tk.TclError:
+                pass
+        self._tables_blink_after_id = self.after(600, self._tables_blink_tick)
+
+    def _finish_movement_alert_from_tables(self):
+        """Bouton "Terminé" de l'onglet Tables (voir _build_tables_tab) :
+        délègue entièrement à _finish_movement_alert (switch_to_clock=
+        False, voir sa docstring — aucune logique de validation dupliquée
+        ici), puis rafraîchit immédiatement CET onglet pour y montrer sans
+        attendre les positions réelles (arrêt du clignotement compris,
+        via le _cancel_tables_blink en tête de _refresh_tables_tab)."""
+        self._finish_movement_alert(switch_to_clock=False)
+        self._refresh_tables_tab()
 
     def _tables_autoscroll_tick(self):
         """Boucle de défilement automatique et lent de l'onglet Tables,

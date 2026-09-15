@@ -145,6 +145,13 @@ class _StubWindow:
     def _stop_remote_control(self):
         pass
 
+    def _cancel_tables_blink(self):
+        # Appelé inconditionnellement par _cleanup_for_close (voir
+        # tests/test_tables_tab_movement_pending_banner.py pour le vrai
+        # comportement) — sans rapport avec ce que teste ce fichier
+        # (verrou "Menu principal"), donc un simple no-op ici.
+        pass
+
 
 @unittest.skipUnless(hasattr(main.App, "_acquire_menu_principal_lock_if_needed"), "méthode absente")
 class AcquireMenuPrincipalLockTest(unittest.TestCase):
