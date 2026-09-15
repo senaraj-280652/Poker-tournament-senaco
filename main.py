@@ -6431,6 +6431,53 @@ class App(tk.Tk):
         self._refresh_all()
         self._check_pending_rebalance()
 
+    def _ask_eliminator_position(self):
+        """Dernière position mémorisée pour la fenêtre "Qui a éliminé ce
+        joueur ?" (demande du 2026-09-16), ou None si aucune n'est encore
+        connue, ou si elle est devenue hors écran (changement de
+        résolution/moniteur — voir _is_position_onscreen, même garde-fou
+        déjà utilisé pour la fenêtre flottante de demande de téléphone).
+        None laisse Tk choisir sa position par défaut, EXACTEMENT le
+        comportement d'avant cette demande — jamais de nouvelle position
+        par défaut inventée ici, seule la RESTAURATION est ajoutée.
+
+        export_prefs (préférence PERSISTANTE, comme remote_device_popup_
+        x/y) plutôt qu'un mécanisme séparé : survit à un redémarrage
+        complet de Senaco, réutilise tel quel le mécanisme déjà éprouvé
+        (voir _remote_device_popup_position/_save_remote_device_popup_
+        position, plus haut)."""
+        x = export_prefs.load_value("ask_eliminator_window_x", None)
+        y = export_prefs.load_value("ask_eliminator_window_y", None)
+        if (
+            isinstance(x, int) and isinstance(y, int)
+            and self._is_position_onscreen(x, y, self.winfo_screenwidth(), self.winfo_screenheight())
+        ):
+            return x, y
+        return None
+
+    def _save_ask_eliminator_position(self, x, y):
+        """Mémorise la position de "Qui a éliminé ce joueur ?" à chaque
+        déplacement (voir le bind <Configure> dans _ask_eliminator) —
+        même mécanisme que _save_remote_device_popup_position."""
+        export_prefs.save_value("ask_eliminator_window_x", x)
+        export_prefs.save_value("ask_eliminator_window_y", y)
+
+    def _on_ask_eliminator_window_configure(self, event):
+        """Gestionnaire lié à <Configure> pour la fenêtre "Qui a éliminé
+        ce joueur ?" (voir _ask_eliminator) — méthode LIÉE (App), pas une
+        fonction imbriquée : directement testable avec un faux événement
+        (voir tests/test_ask_eliminator_window_position.py), comme
+        RemoteDeviceRequestWindow._on_configure. `event.widget` porte la
+        fenêtre concernée (bind() posé directement dessus, jamais sur un
+        de ses enfants) : pas de vérification d'identité supplémentaire
+        nécessaire ici. <Configure> se déclenche aussi pour un simple
+        redessin interne (pas seulement un déplacement) — inoffensif,
+        réécrire la même position ne coûte presque rien."""
+        try:
+            self._save_ask_eliminator_position(event.widget.winfo_x(), event.widget.winfo_y())
+        except tk.TclError:
+            pass
+
     def _ask_eliminator(self, exclude_id, mandatory=False):
         """Petite fenêtre pour choisir qui a éliminé le joueur — sert à
         compter ses bounties (kills, onglet Primes) et, si une bounty est
@@ -6471,6 +6518,15 @@ class App(tk.Tk):
         win.resizable(False, False)
         win.transient(self)
         win.grab_set()
+        # Mémorisation de position (demande du 2026-09-16) : si aucune
+        # position valide n'est encore connue, `position` vaut None et
+        # Tk choisit lui-même où l'afficher — comportement STRICTEMENT
+        # inchangé pour la toute première ouverture. Voir _ask_eliminator_
+        # position/_save_ask_eliminator_position ci-dessus.
+        position = self._ask_eliminator_position()
+        if position is not None:
+            win.geometry(f"+{position[0]}+{position[1]}")
+        win.bind("<Configure>", self._on_ask_eliminator_window_configure)
         result = {"id": None}
         header_text = f"Qui a éliminé {eliminated['name']} ?"
         if eliminated["bounty"] > 0:
@@ -8146,8 +8202,29 @@ class App(tk.Tk):
         # décompte que celui utilisé pour le titre de chaque table (voir
         # plus bas) — garantit que ce total correspond toujours
         # exactement à la somme des nombres affichés par table.
-        self._tables_total_label = ttk.Label(top, text="", foreground=GOLD_DARK)
+        # Demande du 2026-09-16 (amélioration de visibilité uniquement,
+        # observée lors du test réel sur le HP) : libellé blanc + nombre
+        # en gros caractères, à la place du petit texte discret d'avant
+        # ("Total : ..." en ttk.Label, taille de police par défaut du
+        # thème — non personnalisable par instance, voir la remarque
+        # équivalente plus bas sur tk.LabelFrame/tk.Label pour le zoom
+        # des tables). AUCUN changement du calcul ni de la logique :
+        # toujours `total_players`/_format_players_count, alimenté par
+        # _refresh_tables_tab exactement comme avant (voir plus bas,
+        # `if hasattr(self, "_tables_total_label")`). bg=FELT : même
+        # couleur que le fond réel de `top` (ttk.Frame, style "TFrame"
+        # réglé sur FELT — voir _setup_style), pour éviter tout patch de
+        # couleur visible autour d'un tk.Label brut. Position INCHANGÉE
+        # (toujours à droite de ce même bandeau, voir top.pack ci-dessus)
+        # : la disposition de l'onglet Tables n'est pas bouleversée.
+        self._tables_total_label = tk.Label(
+            top, text="", font=("Helvetica", 16, "bold"), bg=FELT, fg=GOLD,
+        )
         self._tables_total_label.pack(side="right", padx=(3, 0))
+        tk.Label(
+            top, text="Nombre de joueurs :", font=("Helvetica", 14, "bold"),
+            bg=FELT, fg="white",
+        ).pack(side="right", padx=(6, 0))
 
         scroll_container = ttk.Frame(self.tables_tab)
         scroll_container.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -8294,7 +8371,11 @@ class App(tk.Tk):
                 ).pack(anchor="w", padx=row_padx, pady=row_pady)
 
         if hasattr(self, "_tables_total_label"):
-            self._tables_total_label.configure(text=f"Total : {_format_players_count(total_players)}")
+            # Le libellé "Nombre de joueurs :" (voir sa construction plus
+            # haut) précède déjà ce nombre — jamais répété ici, seul le
+            # compte lui-même (inchangé : _format_players_count(total_
+            # players), exactement comme avant cette demande).
+            self._tables_total_label.configure(text=_format_players_count(total_players))
 
         # Repart du haut à chaque rafraîchissement (rééquilibrage,
         # élimination...) plutôt que de rester sur une position de

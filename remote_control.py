@@ -108,6 +108,7 @@ import os
 import re
 import secrets
 import socket
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -1631,6 +1632,64 @@ def resolve_current_pid(cookie_header, own_pid, live_tournaments):
     return max(live_tournaments, key=lambda t: t.get("registered_at", 0))["pid"]
 
 
+class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer utilisé PAR CE MODULE UNIQUEMENT (jamais un
+    changement global de http.server) — correctif du 502 multi-tournois
+    reproduit sur Windows le 2026-09-15 (voir tests/test_remote_control_
+    windows_port_collision.py pour le diagnostic complet et sa
+    reproduction).
+
+    http.server.HTTPServer (dont hérite ThreadingHTTPServer) pose
+    `allow_reuse_address = True`, donc SO_REUSEADDR avant chaque bind()
+    (voir socketserver.TCPServer.server_bind). Sur POSIX (macOS/Linux),
+    SO_REUSEADDR ne fait sauter QUE la contrainte TIME_WAIT : un bind()
+    sur un port où un AUTRE socket écoute déjà ACTIVEMENT échoue
+    toujours avec OSError — RemoteControlServer.start()/try_reclaim_
+    default_port() (inchangés ci-dessous, toujours leur seule branche
+    `except OSError` déjà existante) s'appuient entièrement sur cette
+    garantie. C'EST AUSSI ce qui permet à try_reclaim_default_port() de
+    refonctionner immédiatement après la fermeture d'un routeur ayant
+    réellement servi des requêtes (connexions HTTP passées en TIME_WAIT
+    sur ce même port local) : retirer purement et simplement SO_REUSEADDR
+    sur POSIX réintroduirait ce vieux problème (bind() refusé pendant
+    jusqu'à quelques minutes) — d'où l'importance de ne JAMAIS toucher à
+    ce comportement sur POSIX (demande explicite du 2026-09-15).
+
+    Sur Windows, en revanche, SO_REUSEADDR a un comportement radicalement
+    différent (documenté par Microsoft) : il autorise PLUSIEURS sockets à
+    bind() ET écouter SIMULTANÉMENT sur le MÊME port, sans jamais lever
+    la moindre erreur — c'est la cause démontrée du 502 ("Ce tournoi
+    n'est momentanément plus joignable") : deux RemoteControlServer
+    distincts croyaient tous deux avoir obtenu le port 8765, et open_
+    windows.update_remote_info (jamais modifié ici) enregistrait alors
+    fidèlement cette valeur pour les deux.
+
+    Correctif MINIMAL, sans toucher à l'architecture (routeur/relais/
+    Lobby inchangés) : UNIQUEMENT sous Windows, remplace SO_REUSEADDR
+    par SO_EXCLUSIVEADDRUSE (option Windows dédiée à exactement ce
+    problème), qui restaure sous Windows la même garantie qu'en POSIX
+    SANS reproduire son défaut (SO_EXCLUSIVEADDRUSE reste compatible
+    avec un rebind légitime une fois le socket précédent réellement
+    fermé — seul un bind() concurrent avec un socket encore actif est
+    refusé). server_bind() est donc entièrement réécrit pour Windows
+    (jamais un appel à super().server_bind(), qui poserait SO_REUSEADDR)
+    — POSIX continue, lui, d'appeler super().server_bind() SANS AUCUNE
+    modification, exactement comme avant ce correctif (voir tests/
+    test_remote_control_windows_port_collision.py:
+    DeuxServeursReelsPosixTest, qui passe sans changement). Les deux
+    options ne doivent JAMAIS être posées ensemble sur le même socket
+    (documentation Microsoft) : les deux branches ci-dessous sont donc
+    mutuellement exclusives, jamais combinées."""
+
+    def server_bind(self):
+        if sys.platform == "win32" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            self.socket.bind(self.server_address)
+            self.server_address = self.socket.getsockname()
+        else:
+            super().server_bind()
+
+
 class RemoteControlServer:
     """Petit serveur HTTP embarqué (bibliothèque standard uniquement),
     tourne dans un thread dédié (un thread par requête, voir
@@ -2363,7 +2422,7 @@ class RemoteControlServer:
                     self.send_error(404)
 
         try:
-            self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+            self._httpd = _ExclusiveThreadingHTTPServer(("0.0.0.0", self.port), Handler)
         except OSError:
             # Port déjà pris par un autre tournoi/processus (voir docstring
             # de la classe) : on prend un port libre quelconque à la place
@@ -2372,7 +2431,7 @@ class RemoteControlServer:
             # update_remote_info, appelé par l'appelant juste après ce
             # start()), même s'il n'est pas celui que le téléphone
             # contacte directement.
-            self._httpd = ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+            self._httpd = _ExclusiveThreadingHTTPServer(("0.0.0.0", 0), Handler)
         self.port = self._httpd.server_address[1]
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -2409,7 +2468,7 @@ class RemoteControlServer:
         if not self.is_running or self.port == DEFAULT_PORT:
             return False
         try:
-            new_httpd = ThreadingHTTPServer(("0.0.0.0", DEFAULT_PORT), self._httpd.RequestHandlerClass)
+            new_httpd = _ExclusiveThreadingHTTPServer(("0.0.0.0", DEFAULT_PORT), self._httpd.RequestHandlerClass)
         except OSError:
             return False  # toujours pris (par un autre tournoi, ou perdu la course) : on garde notre port actuel
         old_httpd = self._httpd
