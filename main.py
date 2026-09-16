@@ -507,11 +507,13 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
     if getattr(sys, "frozen", False):
         # Application empaquetée (PyInstaller) : sys.executable est déjà
         # le programme lui-même, pas besoin de lui repasser main.py.
-        return subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL, env=env)
-    return subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), *extra_args],
-        stdin=subprocess.DEVNULL, env=env,
-    )
+        proc = subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL, env=env)
+    else:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), *extra_args],
+            stdin=subprocess.DEVNULL, env=env,
+        )
+    return proc
 
 
 SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
@@ -1626,16 +1628,57 @@ class CropDialog(tk.Toplevel):
         self.destroy()
 
 
+# Mémorisation de position de "Club de XXX" (ask_club_dialog, demande du
+# 2026-09-16) : mêmes principes que App._ask_eliminator_position/_save_
+# ask_eliminator_position/_on_ask_eliminator_window_configure (export_
+# prefs, préférence PERSISTANTE ; repli sur None — Tk choisit alors sa
+# position par défaut — si jamais mémorisée ou devenue hors écran, voir
+# App._is_position_onscreen, réutilisé tel quel). En fonctions MODULE-
+# LEVEL, jamais des méthodes d'App : ask_club_dialog est une fonction
+# libre, appelée aussi bien depuis RosterManagerDialog que depuis
+# PlayerSelectionDialog — une seule position mémorisée, PARTAGÉE par
+# tous ses appelants (déplacer la fenêtre une fois depuis n'importe
+# lequel la mémorise pour tous les suivants, quel que soit l'appelant).
+def _ask_club_dialog_position(master):
+    x = export_prefs.load_value("ask_club_window_x", None)
+    y = export_prefs.load_value("ask_club_window_y", None)
+    if (
+        isinstance(x, int) and isinstance(y, int)
+        and App._is_position_onscreen(x, y, master.winfo_screenwidth(), master.winfo_screenheight())
+    ):
+        return x, y
+    return None
+
+
+def _save_ask_club_dialog_position(x, y):
+    export_prefs.save_value("ask_club_window_x", x)
+    export_prefs.save_value("ask_club_window_y", y)
+
+
+def _on_ask_club_dialog_configure(event):
+    try:
+        _save_ask_club_dialog_position(event.widget.winfo_x(), event.widget.winfo_y())
+    except tk.TclError:
+        pass
+
+
 def ask_club_dialog(master, title="Club", current_club=""):
     """Petite fenêtre pour choisir un club dans une liste déroulante des
     clubs déjà connus du répertoire, ou en saisir un nouveau. Renvoie le
-    club choisi/saisi (chaîne, éventuellement vide), ou None si annulé."""
+    club choisi/saisi (chaîne, éventuellement vide), ou None si annulé.
+
+    Position flottante mémorisée (demande du 2026-09-16) : voir
+    _ask_club_dialog_position ci-dessus."""
     win = tk.Toplevel(master)
     win.title(title)
     win.configure(bg=FELT_DARK)
     win.resizable(False, False)
     win.transient(master)
     win.grab_set()
+    position = _ask_club_dialog_position(master)
+    if position is not None:
+        win.geometry(f"+{position[0]}+{position[1]}")
+    win.bind("<Configure>", _on_ask_club_dialog_configure)
     result = {"club": None}
 
     tk.Label(
@@ -1952,13 +1995,49 @@ class RosterManagerDialog(ttk.Frame):
 
     def _add(self):
         name = self.new_name_var.get().strip()
-        if name:
-            # Club par défaut = "Nom du Club" réglé dans Paramètres (commun
-            # à tous les tournois/Sit & Go) plutôt que vide — voir le même
-            # principe dans PlayerSelectionDialog._add_new_name.
-            roster.add_to_roster(name, club=export_prefs.load_value("club_name", "") or None)
-            self.new_name_var.set("")
+        if not name:
+            return
+        # Créé SANS club pour l'instant (demande du 2026-09-16) : la
+        # fenêtre "Club de {name}" ci-dessous propose immédiatement le
+        # club par défaut réglé dans Paramètres ("Nom du Club", commun à
+        # tous les tournois/Sit & Go — voir aussi PlayerSelectionDialog.
+        # _add_new_name, qui l'applique directement sans le proposer, un
+        # contexte différent) — mais ne l'attribue QUE si l'utilisateur
+        # valide, jamais en douce. Fermer/annuler cette fenêtre laisse
+        # donc le membre sans club, jamais un club arbitraire imposé —
+        # la création elle-même (juste au-dessus) n'est jamais remise en
+        # cause par ce qui se passe ensuite dans la fenêtre.
+        roster.add_to_roster(name)
+        self.new_name_var.set("")
+        self._refresh()
+        default_club = export_prefs.load_value("club_name", "") or ""
+        club = ask_club_dialog(self, title=f"Club de {name}", current_club=default_club)
+        if club is not None:
+            roster.set_club(name, club)
             self._refresh()
+        # Pointe/sélectionne le nouveau membre dans la liste (demande du
+        # 2026-09-16) — que "Club de {name}" ait été validée ou annulée/
+        # fermée : le membre est créé dans les DEUX cas (voir plus haut),
+        # donc toujours à faire apparaître sélectionné ensuite. APRÈS le
+        # (ou les) _refresh() ci-dessus, qui reconstruit entièrement les
+        # lignes du Treeview (roster_tree.insert avec iid=nom, voir
+        # _refresh) — jamais avant, sinon la ligne n'existerait pas
+        # encore.
+        self._select_and_reveal(name)
+
+    def _select_and_reveal(self, name):
+        """Sélectionne la ligne `name` dans roster_tree (iid = le nom du
+        joueur, voir _refresh) et la fait défiler à l'écran si besoin —
+        réutilise directement selection_set()/see(), déjà le mécanisme
+        de sélection existant de ce Treeview (voir _refresh, qui
+        préserve la sélection courante de la même façon). Ne modifie
+        jamais le tri actuel (roster_sort, inchangé ici) ni aucun autre
+        comportement de sélection : simple sélection/défilement
+        ponctuel, sans effet de bord sur _selected_name()/_refresh()
+        pour la suite."""
+        if self.roster_tree.exists(name):
+            self.roster_tree.selection_set(name)
+            self.roster_tree.see(name)
 
     def _rename(self):
         name = self._selected_name()
@@ -4414,9 +4493,31 @@ class App(tk.Tk):
         # lancée depuis le Lobby SNG pour un tournoi précis (voir
         # spawn_app_process / LobbyDialog._open_selected).
         if open_path and os.path.exists(open_path):
+            # Réservation ATOMIQUE inter-processus AVANT toute ouverture
+            # réelle du fichier (demande du 2026-09-16, "interdire
+            # l'ouverture simultanée du même .tournoi") — voir
+            # open_windows.try_register, qui refuse si ce chemin est déjà
+            # détenu par un autre processus vivant, quel qu'il soit.
+            # Lancement interne (Lobby, association de fichier) : personne
+            # n'est devant un écran d'accueil à qui expliquer quoi que ce
+            # soit, on ramène juste la fenêtre déjà ouverte au premier
+            # plan et on abandonne silencieusement CE lancement-ci — même
+            # principe que _acquire_menu_principal_lock_if_needed.
+            existing_pid = open_windows.try_register(open_path)
+            if existing_pid is not None:
+                open_windows.bring_pid_to_front(existing_pid)
+                self.destroy()
+                return
             try:
                 self.db = Database(open_path)
             except Exception as e:
+                # Réservation prise mais ouverture réelle échouée : la
+                # libérer immédiatement, sinon elle resterait bloquée
+                # (sans conséquence durable — _prune()/_pid_is_running la
+                # nettoierait de toute façon dès que ce process se
+                # termine — mais autant le faire proprement tout de
+                # suite plutôt que d'attendre).
+                open_windows.unregister(open_path)
                 messagebox.showerror(
                     "Erreur", f"Impossible d'ouvrir ce fichier :\n{e}"
                 )
@@ -4441,11 +4542,12 @@ class App(tk.Tk):
                 self.destroy()
                 return
 
-        # Enregistre ce processus comme affichant ce tournoi (voir
-        # open_windows.py) : permet au Lobby SNG de détecter qu'il est
-        # déjà ouvert ici et de ramener CETTE fenêtre au premier plan
-        # plutôt que d'en ouvrir une deuxième sur le même fichier.
-        open_windows.register(self.db.path)
+        # Ce tournoi est déjà enregistré à ce stade (voir open_windows.
+        # try_register, appelé plus haut — branche `open_path`, ou dans
+        # _choose_tournament_file pour l'écran "Bienvenue" — AVANT
+        # l'ouverture réelle de Database) : jamais un second appel à
+        # register() ici, qui referait exactement le même travail en
+        # double (voir la docstring de try_register).
         # Aligne ce tournoi (nouveau OU existant) sur "Calculer les
         # primes" VERROUILLÉ de la session, s'il y a lieu (demande du
         # 2026-09-09, 4e relecture) — AVANT _build_tabs()/_build_
@@ -5148,6 +5250,45 @@ class App(tk.Tk):
         self.wait_window(win)
         if not result["path"]:
             return False
+        # Réservation ATOMIQUE inter-processus AVANT toute ouverture réelle
+        # (demande du 2026-09-16, "interdire l'ouverture simultanée du
+        # même .tournoi") — voir open_windows.try_register. Ici, action
+        # DÉLIBÉRÉE de l'utilisateur ("Ouvrir un tournoi existant" vient
+        # justement de choisir CE fichier précis) : contrairement à la
+        # branche `open_path` d'App.__init__ (lancement interne, personne
+        # devant l'écran), un message explicite est justifié en plus de
+        # ramener l'autre fenêtre au premier plan.
+        existing_pid = open_windows.try_register(result["path"])
+        if existing_pid is not None:
+            # ORDRE VOLONTAIRE (demande du 2026-09-16, diagnostic du focus
+            # qui repart ~2s après) : la messagebox D'ABORD, bring_pid_to_
+            # front ENSUITE, en tout dernier — jamais l'inverse. À ce
+            # stade, `self` (la racine de CE processus, qui vient
+            # d'échouer) est encore withdraw()ée (jamais deiconify()ée,
+            # voir plus bas) : la SEULE fenêtre réellement visible de ce
+            # processus est cette messagebox elle-même. L'appeler AVANT
+            # bring_pid_to_front garantit qu'elle a fini de capter le
+            # focus (et d'être refermée par l'utilisateur) AVANT même que
+            # le tournoi déjà ouvert ne soit activé — jamais la messagebox
+            # de CE processus mourant ne peut plus revenir devant lui
+            # après coup. Il ne reste alors plus qu'à sortir vite (return
+            # False -> _cleanup_for_close()+self.destroy() dans l'appelant) :
+            # une fois ce processus réellement terminé, raise_process_
+            # when_ready (lancé par la fenêtre d'origine du "🏠 Menu
+            # principal" ayant créé CE processus, voir _open_new_window)
+            # cesse déjà de lui-même de le ramener au premier plan dès
+            # qu'il constate ce PID mort (voir sa docstring) — rien à
+            # changer de ce côté, seulement ne plus lui laisser une longue
+            # fenêtre "vivant avec sa messagebox affichée" pendant laquelle
+            # il pourrait être reramené au premier plan À LA PLACE du
+            # tournoi déjà ouvert.
+            messagebox.showinfo(
+                "Tournoi déjà ouvert",
+                "Ce tournoi est déjà ouvert dans une autre fenêtre — elle "
+                "va être ramenée au premier plan.",
+            )
+            open_windows.bring_pid_to_front(existing_pid)
+            return False
         # Le dossier cible peut ne pas exister (dossier tout juste créé via
         # le sélecteur, ou choisi par erreur) : on le crée si besoin plutôt
         # que de laisser sqlite3 échouer plus loin, et on attrape toute
@@ -5159,6 +5300,10 @@ class App(tk.Tk):
                 os.makedirs(target_dir, exist_ok=True)
             self.db = Database(result["path"])
         except Exception as e:
+            # Réservation prise mais ouverture réelle échouée : la libérer
+            # immédiatement (voir la même remarque dans la branche
+            # `open_path` ci-dessus).
+            open_windows.unregister(result["path"])
             messagebox.showerror(
                 "Erreur",
                 f"Impossible de créer/ouvrir le fichier de tournoi :\n"
@@ -5704,6 +5849,13 @@ class App(tk.Tk):
             lambda e: self.players_tree.yview_scroll(int(-e.delta / 120 * 3) or (-3 if e.delta > 0 else 3), "units"),
         )
         self.players_tree.bind("<Button-1>", self._on_players_tree_click)
+        # Clic droit sur une ligne : raccourci "Éliminer" sans confirmation
+        # (demande du 2026-09-16) — même principe que LobbyDialog.
+        # _on_tree_right_click (Button-3 la plupart des plateformes,
+        # Button-2 sur Mac avec certains trackpads/souris — les deux liés
+        # par précaution).
+        self.players_tree.bind("<Button-3>", self._on_players_tree_right_click)
+        self.players_tree.bind("<Button-2>", self._on_players_tree_right_click)
         # Après tout relâchement de clic dans l'en-tête (typiquement la fin
         # d'un redimensionnement de colonne à la souris), masque
         # automatiquement les colonnes réduites à presque rien plutôt que
@@ -5731,6 +5883,41 @@ class App(tk.Tk):
         self._apply_checkbox_display(row_iid)
         self._update_checked_count_label()
         return "break"  # évite que le clic ne change aussi la sélection classique
+
+    def _on_players_tree_right_click(self, event):
+        """Clic droit sur la ligne d'un joueur ACTIF (demande du
+        2026-09-16, CORRIGÉE le même jour — plus de menu contextuel) :
+        raccourci d'élimination rapide qui ouvre DIRECTEMENT "Qui a
+        éliminé ce joueur ?" (_ask_eliminator), sans le moindre menu ni
+        la confirmation "Voulez-vous éliminer ce joueur ?" habituelle.
+        Sélectionne d'abord la ligne réellement sous le curseur (même
+        principe que LobbyDialog._on_tree_right_click), puis appelle
+        _eliminate_selected avec :
+        - skip_confirmation=True : saute la boîte "Confirmer" ;
+        - ids=[pid] : agit TOUJOURS sur CE joueur précis, jamais sur une
+          case cochée ou une sélection multiple précédente — un clic
+          droit sur B après un clic sur A agit bien sur B ;
+        - force_mandatory_eliminator=True : "Qui a éliminé ce joueur ?"
+          devient elle-même le garde-fou (bouton "Annuler l'élimination"
+          plutôt que "Ignorer (pas de prime)") — tant qu'elle n'est pas
+          validée par "Valider", AUCUNE élimination n'est enregistrée
+          (fermer la fenêtre ou cliquer "Annuler l'élimination" produisent
+          tous deux eliminator_id=None, voir _ask_eliminator, qui abandonne
+          alors l'élimination — déjà le mécanisme existant, jamais
+          dupliqué ici).
+
+        Rien ne se passe : en dehors d'une vraie ligne (zone vide,
+        en-tête), ou sur un joueur qui n'est plus actif (déjà
+        éliminé/forfait — rien à éliminer)."""
+        row_iid = self.players_tree.identify_row(event.y)
+        if not row_iid:
+            return
+        self.players_tree.selection_set(row_iid)
+        pid = int(row_iid)
+        player = self.db.get_player(pid)
+        if player is None or player["status"] != "active":
+            return
+        self._eliminate_selected(skip_confirmation=True, ids=[pid], force_mandatory_eliminator=True)
 
     def _apply_checkbox_display(self, row_iid):
         pid = int(row_iid)
@@ -6287,8 +6474,39 @@ class App(tk.Tk):
             self.db.set_chips(pid, val)
             self._refresh_all()
 
-    def _eliminate_selected(self):
-        ids = self._checked_or_selected_ids()
+    def _eliminate_selected(self, skip_confirmation=False, ids=None,
+                             force_mandatory_eliminator=False):
+        """`ids` : liste explicite de joueurs à éliminer, prioritaire sur
+        les cases cochées/la sélection du tableau (voir _checked_or_
+        selected_ids) — utilisé UNIQUEMENT par le raccourci clic droit
+        (_on_players_tree_right_click), qui vise sciemment CE joueur
+        précis, quels que soient les cases cochées ou la sélection en
+        cours au moment du clic. None (par défaut, bouton rouge
+        "Éliminer" existant) : comportement inchangé, _checked_or_
+        selected_ids() comme avant.
+
+        `skip_confirmation=True` (raccourci clic droit UNIQUEMENT, et
+        seulement pour une élimination d'UN SEUL joueur) : saute la boîte
+        de dialogue "Confirmer" ci-dessous — un raccourci volontairement
+        plus rapide, qui rejoint ensuite exactement le même mécanisme
+        métier que le bouton rouge (enregistrement, classement, Primes/
+        PKO, rééquilibrage, mouvements, bandeau, contrôle à distance :
+        rien de tout ça n'est dupliqué ni contourné). Ignoré (jamais
+        appliqué) pour une élimination groupée : le bouton rouge reste
+        alors la seule voie, avec sa confirmation habituelle.
+
+        `force_mandatory_eliminator=True` (raccourci clic droit
+        UNIQUEMENT) : force `mandatory=True` pour l'appel à _ask_eliminator
+        ci-dessous, quel que soit le contexte de bounty — la fenêtre "Qui
+        a éliminé ce joueur ?" devient alors ELLE-MÊME le garde-fou
+        remplaçant la confirmation sautée juste au-dessus (bouton "Annuler
+        l'élimination" plutôt que "Ignorer (pas de prime)" ; la fermer ou
+        cliquer ce bouton renvoie eliminator_id=None, et le garde-fou
+        DÉJÀ EXISTANT `if mandatory and eliminator_id is None: return`
+        abandonne alors l'élimination — aucune nouvelle logique, seulement
+        un mécanisme déjà là appliqué plus largement)."""
+        if ids is None:
+            ids = self._checked_or_selected_ids()
         if not ids:
             return
         # Un joueur doit toujours rester en jeu : c'est le vainqueur. On
@@ -6372,8 +6590,12 @@ class App(tk.Tk):
                 "ici. Éliminez ces joueurs un par un si vous voulez "
                 "enregistrer qui élimine qui.)" + bounty_note
             )
-        if not messagebox.askyesno("Confirmer", question):
-            return
+        # skip_confirmation : voir la docstring ci-dessus — jamais honoré
+        # pour une élimination groupée (len(ids) > 1), seulement pour le
+        # raccourci clic droit sur un seul joueur.
+        if not (skip_confirmation and len(ids) == 1):
+            if not messagebox.askyesno("Confirmer", question):
+                return
 
         eliminator_id = None
         if len(ids) == 1:
@@ -6388,7 +6610,7 @@ class App(tk.Tk):
             # mandatory=True (il devient "Annuler l'élimination") ; il
             # reste disponible normalement si aucune bounty n'est en jeu
             # (primes désactivées, bounty nulle, ou classique/PKO à 0).
-            mandatory = primes_matter and p["bounty"] > 0
+            mandatory = force_mandatory_eliminator or (primes_matter and p["bounty"] > 0)
             eliminator_id = self._ask_eliminator(exclude_id=ids[0], mandatory=mandatory)
             if mandatory and eliminator_id is None:
                 return  # élimination abandonnée : rien n'est modifié

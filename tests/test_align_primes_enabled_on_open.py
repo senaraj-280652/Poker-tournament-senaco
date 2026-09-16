@@ -329,10 +329,25 @@ class WiringStructurelTest(unittest.TestCase):
 
     def test_align_appele_apres_register_et_avant_build_tabs(self):
         """Ordre exact requis (voir la docstring de _align_primes_
-        enabled_on_open) : après open_windows.register() (pour refléter
-        l'état final, y compris son éventuel nettoyage de session), et
-        AVANT _build_tabs() (qui construit la case/section depuis la
-        valeur locale — doit donc déjà être alignée à ce moment-là)."""
+        enabled_on_open) : après l'enregistrement de ce tournoi (pour
+        refléter l'état final, y compris son éventuel nettoyage de
+        session), et AVANT _build_tabs() (qui construit la case/section
+        depuis la valeur locale — doit donc déjà être alignée à ce
+        moment-là).
+
+        Depuis la demande du 2026-09-16 ("interdire l'ouverture
+        simultanée du même .tournoi"), l'enregistrement effectif se fait
+        PLUS TÔT qu'avant, via open_windows.try_register() — AVANT même
+        l'ouverture réelle de Database() — au lieu de l'ancien
+        open_windows.register() inconditionnel appelé ici après coup
+        (voir main.py: App.__init__, branche `open_path`, et
+        _choose_tournament_file juste avant `self.db = Database(...)`,
+        pour l'autre branche). Le vieux `open_windows.register()` a donc
+        disparu du corps de __init__ (déplacé plus tôt, et devenu
+        inutile ensuite — voir le commentaire qui l'a remplacé) ; seul
+        `open_windows.try_register(` y reste littéralement visible (branche
+        `open_path`), toujours AVANT _align_primes_enabled_on_open/
+        _build_tabs — la propriété vérifiée ici reste donc intacte."""
         app_class = next(
             n for n in ast.walk(self.tree) if isinstance(n, ast.ClassDef) and n.name == "App"
         )
@@ -344,10 +359,10 @@ class WiringStructurelTest(unittest.TestCase):
         # code source généré par ast.unparse, plus robuste ici qu'un
         # simple ast.walk qui ne préserve pas l'ordre entre branches).
         src = ast.unparse(init_func)
-        register_pos = src.index("open_windows.register(")
+        register_pos = src.index("open_windows.try_register(")
         align_pos = src.index("_align_primes_enabled_on_open(")
         build_tabs_pos = src.index("_build_tabs(")
-        self.assertLess(register_pos, align_pos, "l'alignement doit avoir lieu APRÈS register()")
+        self.assertLess(register_pos, align_pos, "l'enregistrement doit avoir lieu APRÈS register()")
         self.assertLess(align_pos, build_tabs_pos, "l'alignement doit avoir lieu AVANT _build_tabs()")
 
 

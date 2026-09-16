@@ -363,6 +363,67 @@ def register(path):
         _save(data)
 
 
+def try_register(path):
+    """Réservation ATOMIQUE d'un fichier .tournoi AVANT même de l'ouvrir
+    (demande du 2026-09-16, "interdire l'ouverture simultanée du même
+    .tournoi") — à appeler à la place de register() PAR-DESSUS `Database
+    (path)`, jamais après : contrairement à register() (qui écrase
+    toujours inconditionnellement, pensé pour "je viens d'ouvrir ce
+    fichier, enregistre-moi"), try_register() REFUSE si `path` est déjà
+    présent dans le registre, quel que soit le PID propriétaire — MÊME
+    LE SIEN. Aucune exception "même processus" : dans ce logiciel,
+    chaque fenêtre de tournoi tourne dans son propre processus, et le
+    seul cas où un même processus rouvrirait un chemin (App.
+    _new_tournament) libère déjà explicitement l'ancien via unregister()
+    AVANT de recommencer — un chemin encore présent au moment de
+    try_register() signifie donc toujours "réellement déjà ouvert
+    ailleurs", jamais une re-confirmation légitime.
+
+    Renvoie :
+    - None si la réservation a réussi (l'appelant peut ouvrir Database()
+      en toute sécurité, PUIS ne doit PAS rappeler register() ensuite :
+      cette fonction a déjà tout fait, y compris le nettoyage de session
+      "premier tournoi du registre" — voir register() ci-dessus, dont
+      cette fonction reprend exactement les mêmes précautions) ;
+    - le PID (int) du processus qui détient déjà `path` sinon — l'appelant
+      doit alors renoncer à ouvrir ce fichier (voir open_windows.
+      bring_pid_to_front) et JAMAIS appeler Database(path).
+
+    Atomique par construction : lecture (_prune/_load), décision (déjà
+    pris ?) et écriture forment UNE SEULE section critique sous
+    _registry_lock() (verrou de fichier natif de l'OS, inter-processus,
+    voir sa docstring) — deux processus qui appellent try_register() sur
+    LE MÊME chemin quasi simultanément se sérialisent sur ce verrou :
+    le second relit alors une image à jour incluant la réservation du
+    premier, et se voit refuser. Jamais de fenêtre de course entre "lire
+    l'état" et "écrire ma réservation", contrairement à l'ancien schéma
+    (find_open_pid() dans un process, register() bien plus tard dans un
+    AUTRE — voir LobbyDialog._open_selected, qui garde son propre
+    find_open_pid() comme confort UX — "basculer vers" au lieu d'un
+    message d'erreur — mais n'est plus la seule protection réelle).
+
+    Récupération après un crash : entièrement héritée de _prune()/
+    _pid_is_running (aucun code supplémentaire nécessaire) — un
+    processus mort libère automatiquement son entrée dès le PROCHAIN
+    appel (à ce chemin ou À N'IMPORTE QUEL AUTRE, puisque _prune()
+    nettoie tout le dict à chaque lecture)."""
+    if not path:
+        return None
+    with _registry_lock():
+        data = _prune(_load())
+        abs_path = os.path.abspath(path)
+        existing = data.get(abs_path)
+        if existing:
+            return existing.get("pid")
+        if not data:
+            _clear_primes_session_started()
+            _clear_primes_enabled_proposed()
+            _clear_remote_control_session_files()
+        data[abs_path] = {"pid": os.getpid(), "registered_at": time.time()}
+        _save(data)
+        return None
+
+
 def update_remote_info(path, port, name):
     """Complète l'entrée de ce processus avec les infos nécessaires au
     Lobby de la page "Contrôle à distance" du téléphone (voir
