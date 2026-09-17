@@ -98,6 +98,11 @@ class TickNeverStopsSchedulingTest(unittest.TestCase):
         self.win._refresh_clock_tab = lambda: None
         self.win._refresh_moves_tab = lambda: None
         self.win._refresh_players_tab = lambda: None
+        # "Timeout pour Annuler Eliminer" (demande du 2026-09-17) : _tick
+        # appelle désormais aussi ceci directement (onglet "Joueurs"
+        # sélectionné ici, voir plus haut) — même principe de doublure
+        # no-op que les autres lignes de ce bloc.
+        self.win._update_undo_elimination_button_state = lambda: None
         self.win._refresh_remote_players_cache = lambda: None
         self.win._maybe_reclaim_default_remote_port = lambda: None
         self.win._check_pending_rebalance = lambda: None

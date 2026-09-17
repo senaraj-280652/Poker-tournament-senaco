@@ -9,6 +9,7 @@ import time
 import math
 import os
 import glob
+import json
 import shutil
 import random
 import uuid
@@ -358,6 +359,11 @@ MOVE_REASON_TABLE_CLOSURE = "fermeture_table"  # fusion/fermeture de table (cass
 MOVE_REASON_AUTO_BALANCE = "equilibrage_auto"  # équilibrage historique automatique (guidage BB désactivé, ou Phase 1)
 MOVE_REASON_BB_GUIDED = "equilibrage_bb"      # réponse "quel siège est la grosse blinde" reçue
 MOVE_REASON_BB_SKIPPED = "continuer_sans_bb"  # "Continuer sans indiquer la BB" (téléphone ou bouton Mac)
+# Mouvement de retour généré par une annulation d'élimination (demande du
+# 2026-09-17, voir undo_last_elimination) : un joueur revient à sa table/
+# siège d'avant l'élimination annulée — distingué des autres raisons pour
+# rester compréhensible dans l'onglet Mouvements.
+MOVE_REASON_ELIMINATION_UNDO = "annulation_elimination"
 
 # Libellés humains (français), utilisés par main.py (onglet Mouvements) —
 # regroupés ici plutôt que dans main.py pour rester à côté des constantes
@@ -369,8 +375,27 @@ MOVE_REASON_LABELS = {
     MOVE_REASON_AUTO_BALANCE: "Équilibrage automatique",
     MOVE_REASON_BB_GUIDED: "Grosse blinde (guidé)",
     MOVE_REASON_BB_SKIPPED: "Continuer sans indiquer la BB",
+    MOVE_REASON_ELIMINATION_UNDO: "Annulation d'élimination",
     "": "Équilibrage",
 }
+
+
+def _comparable_undo_state(state):
+    """Sous-ensemble d'un état renvoyé par Database._player_undo_state,
+    utilisé UNIQUEMENT pour la comparaison stricte "l'état a-t-il changé
+    depuis cette élimination ?" de undo_last_elimination — exclut
+    délibérément `elim_time` (demande du 2026-09-17, "Timeout pour
+    Annuler Eliminer") : ce champ est désormais lu en LIVE pour calculer
+    le délai écoulé (voir Database.undo_last_elimination_available), sa
+    valeur exacte au moment de l'élimination n'ayant par ailleurs aucune
+    incidence sur la sécurité de la restauration table/siège/primes
+    elle-même. `elim_time` reste néanmoins conservé tel quel dans
+    l'instantané et bien RESTAURÉ normalement (voir le bloc de
+    restauration de undo_last_elimination, qui utilise l'état complet,
+    jamais cette version filtrée)."""
+    if state is None:
+        return None
+    return {k: v for k, v in state.items() if k != "elim_time"}
 
 
 def _defensive_integrity_log_path():
@@ -900,7 +925,20 @@ class Database:
         l'inscription du round/nom de l'éliminateur (`eliminated_by_name`/
         `elim_round`) reste enregistrée dans tous les cas : elle sert au
         bandeau d'élimination, à l'onglet Classement/Joueurs et aux
-        statistiques, indépendamment des primes — jamais supprimée ici."""
+        statistiques, indépendamment des primes — jamais supprimée ici.
+
+        Annulation (demande du 2026-09-17, voir undo_last_elimination) :
+        un instantané complet de l'état juste AVANT cette élimination
+        (joueur éliminé, éventuel éliminateur, toutes les tables, fin de
+        tournoi, dernière ligne bounty_events, question de rééquilibrage
+        éventuellement déjà en attente) est capturé ICI, avant la moindre
+        écriture, puis complété d'un second instantané "APRÈS" une fois
+        l'élimination ET le rééquilibrage qui la suit terminés — le tout
+        mémorisé dans settings["last_elimination_undo"]. Écrasé par la
+        PROCHAINE élimination, quelle qu'elle soit : un seul niveau
+        d'annulation possible, toujours le tout dernier joueur éliminé,
+        jamais un historique remontant plus loin (règle absolue demandée
+        par l'utilisateur)."""
         active = self.list_players(status="active")
         place = len(active)  # ce joueur prend la place n° (nb d'actifs restants)
         eliminated = self.get_player(player_id)
@@ -918,6 +956,24 @@ class Database:
                 f"{eliminated['bounty']} pts : un éliminateur doit être "
                 "désigné pour ne pas la rendre orpheline."
             )
+
+        # Instantané "AVANT" (voir la docstring ci-dessus et undo_last_
+        # elimination) : capturé maintenant, juste avant la toute première
+        # écriture de cette méthode — jamais après.
+        undo_tracked_ids = sorted(
+            {p["id"] for p in active} | ({eliminated_by_id} if eliminated_by_id else set())
+        )
+        undo_tables_before = [dict(t) for t in self.list_tables(active_only=False)]
+        undo_end_epoch_before = self.get_setting("tournament_end_epoch")
+        undo_bounty_max_before = self.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) m FROM bounty_events"
+        ).fetchone()["m"]
+        undo_pending_id_before = (
+            self.pending_rebalance["request_id"] if self.pending_rebalance else None
+        )
+        undo_states_before = {
+            str(pid): self._player_undo_state(pid) for pid in undo_tracked_ids
+        }
 
         self.conn.execute(
             "UPDATE players SET status='eliminated', place=?, elim_time=?, "
@@ -984,7 +1040,23 @@ class Database:
             if pko_mode and len(still_active) == 1:
                 self._close_out_winner_bounty(still_active[0]["id"], now)
 
-        return self.rebalance_tables(record_moves=True)
+        moves = self.rebalance_tables(record_moves=True)
+
+        # Instantané "APRÈS" (voir la docstring plus haut) : maintenant
+        # que l'élimination ET le rééquilibrage qui la suit sont
+        # entièrement terminés — persisté seulement à ce stade, une fois
+        # les deux moitiés (avant/après) disponibles.
+        self._save_elimination_undo_snapshot(
+            player_id=player_id,
+            tracked_ids=undo_tracked_ids,
+            tables_before=undo_tables_before,
+            tournament_end_epoch_before=undo_end_epoch_before,
+            bounty_events_max_id_before=undo_bounty_max_before,
+            pending_rebalance_id_before=undo_pending_id_before,
+            player_states_before=undo_states_before,
+        )
+
+        return moves
 
     def _close_out_winner_bounty(self, winner_id, now=None):
         """Clôture la bounty finale du VAINQUEUR d'un tournoi PKO (demande
@@ -1039,6 +1111,421 @@ class Database:
         if len(active) == 1 and active[0]["id"] == player["id"]:
             won += player["bounty"]
         return won
+
+    # =====================================================================
+    # Annulation de la dernière élimination (demande du 2026-09-17)
+    # =====================================================================
+    #
+    # Fonctionnalité distincte de reinstate_player()/"Réinscrire" (bouton
+    # existant, INCHANGÉ) : "Réinscrire" remet un joueur en jeu avec les
+    # jetons de départ, réassis à la table la moins pleine, sans toucher
+    # aux primes/kills/mouvements — pratique pour une remise en jeu
+    # ordinaire, mais PAS une annulation. Ici, il s'agit au contraire de
+    # faire comme si l'élimination n'avait jamais eu lieu : même table,
+    # même siège, mêmes jetons (jamais touchés par une élimination de
+    # toute façon), primes/kills/bounty_events et mouvements de tables
+    # provoqués par CETTE élimination précise entièrement défaits.
+    #
+    # Approche retenue (validée avec l'utilisateur le 2026-09-17) :
+    # INSTANTANÉ COMPLET avant/après (voir eliminate_player), jamais une
+    # tentative d'inverser mouvement par mouvement — un cassage de table
+    # répartit ALÉATOIREMENT les joueurs évincés (rebalance_tables),
+    # opération non réversible étape par étape ; revenir directement à
+    # l'état exact d'avant, lui, fonctionne quel que soit le mécanisme de
+    # rééquilibrage qui s'est déclenché (simple équilibrage, fusion,
+    # table finale...).
+    #
+    # SÉCURITÉ AVANT TOUT (demande explicite) : plutôt que de tenter une
+    # reconstruction approximative, undo_last_elimination() REFUSE
+    # entièrement (ValueError, aucune écriture) dès que l'état courant ne
+    # correspond plus EXACTEMENT à l'instantané "après" mémorisé.
+
+    def _player_undo_state(self, player_id):
+        """Sous-ensemble des colonnes de `players` nécessaires à
+        l'instantané d'annulation d'élimination (identité de la ligne au
+        moment de la capture) : utilisé à la fois pour la capture avant/
+        après (eliminate_player) et pour la revalidation stricte au
+        moment de l'annulation (undo_last_elimination compare l'état
+        courant à l'état "après" mémorisé, champ par champ). Ne couvre
+        QUE ce qu'une élimination peut modifier — jamais chips/buyin/
+        rebuy/addon/club/nom, volontairement : un rebuy, un renommage ou
+        une correction de jetons entre-temps n'a aucun rapport avec
+        l'élimination et ne doit jamais bloquer son annulation.
+
+        Renvoie None si le joueur n'existe plus (supprimé) — une
+        divergence par rapport à n'importe quel instantané préexistant,
+        détectée telle quelle par la comparaison d'égalité de
+        undo_last_elimination (None != un dict), jamais un cas particulier
+        séparé."""
+        row = self.get_player(player_id)
+        if row is None:
+            return None
+        return {
+            "status": row["status"], "table_id": row["table_id"], "seat": row["seat"],
+            "bounty": row["bounty"], "bounty_won": row["bounty_won"], "kills": row["kills"],
+            "place": row["place"], "elim_time": row["elim_time"], "elim_round": row["elim_round"],
+            "eliminated_by_name": row["eliminated_by_name"],
+        }
+
+    def _save_elimination_undo_snapshot(self, player_id, tracked_ids, tables_before,
+                                         tournament_end_epoch_before,
+                                         bounty_events_max_id_before,
+                                         pending_rebalance_id_before,
+                                         player_states_before):
+        """Termine et persiste l'instantané d'annulation démarré par
+        eliminate_player (voir sa docstring pour le détail de chaque
+        pièce "avant") : capture le pendant "APRÈS", une fois l'élimination
+        ET le rééquilibrage qui la suit entièrement terminés, sur EXACTEMENT
+        les mêmes joueurs/tables, puis écrit le tout dans settings["last_
+        elimination_undo"] au format JSON — remplace systématiquement tout
+        instantané précédent (RÈGLE ABSOLUE demandée : seule la toute
+        dernière élimination reste annulable, jamais un historique)."""
+        player_states_after = {
+            str(pid): self._player_undo_state(pid) for pid in tracked_ids
+        }
+        tables_after = [dict(t) for t in self.list_tables(active_only=False)]
+        tournament_end_epoch_after = self.get_setting("tournament_end_epoch")
+        bounty_events_max_id_after = self.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) m FROM bounty_events"
+        ).fetchone()["m"]
+        pending_rebalance_id_after = (
+            self.pending_rebalance["request_id"] if self.pending_rebalance else None
+        )
+        snapshot = {
+            "version": 1,
+            "player_id": player_id,
+            "before": {
+                "tables": tables_before,
+                "tournament_end_epoch": tournament_end_epoch_before,
+                "bounty_events_max_id": bounty_events_max_id_before,
+                "pending_rebalance_request_id": pending_rebalance_id_before,
+                "player_states": player_states_before,
+            },
+            "after": {
+                "tables": tables_after,
+                "tournament_end_epoch": tournament_end_epoch_after,
+                "bounty_events_max_id": bounty_events_max_id_after,
+                "pending_rebalance_request_id": pending_rebalance_id_after,
+                "player_states": player_states_after,
+            },
+        }
+        self.set_setting("last_elimination_undo", json.dumps(snapshot))
+
+    def get_last_eliminated_player(self):
+        """Le joueur éliminé le plus RÉCEMMENT, ou None s'il n'y a
+        actuellement aucun joueur éliminé. `place` est assigné de façon
+        strictement décroissante à chaque élimination (nombre d'actifs
+        restants à cet instant précis, voir eliminate_player) ; withdraw_
+        player/reinstate_player ne font que décaler TOUS les `place` déjà
+        attribués d'un même montant (+1/-1, voir leurs docstrings), ce qui
+        préserve toujours l'ordre relatif entre éliminations. Le dernier
+        éliminé est donc, en toute fiabilité, celui dont `place` est le
+        plus PETIT parmi les joueurs status='eliminated' — jamais besoin
+        d'un compteur ou d'un horodatage séparé."""
+        return self.conn.execute(
+            "SELECT * FROM players WHERE status='eliminated' AND place IS NOT NULL "
+            "ORDER BY place ASC LIMIT 1"
+        ).fetchone()
+
+    def _undo_elimination_timeout_minutes(self):
+        """Délai (en minutes) au-delà duquel "Annule Eliminer" n'est plus
+        disponible pour la dernière élimination (Paramètres : "Timeout
+        pour Annuler Eliminer (m)", demande du 2026-09-17) — 5 minutes
+        par défaut. Même convention que "elimination_banner_seconds" :
+        JAMAIS dans DEFAULT_SETTINGS, un simple repli Python ici (un
+        ancien fichier .tournoi sans ce réglage retombe donc proprement
+        sur 5, comme "Durée du bandeau d'élimination" juste au-dessus de
+        lui dans Paramètres). RÈGLE ABSOLUE demandée : 0 DÉSACTIVE
+        complètement la fonction, jamais interprété comme "illimité"."""
+        return self.get_setting_int("undo_elimination_timeout_minutes", 5)
+
+    def _elim_time_to_epoch(self, elim_time_str):
+        """Convertit elim_time ("%Y-%m-%d %H:%M:%S", heure locale — même
+        format que celui écrit par eliminate_player via time.strftime)
+        en epoch (secondes), pour un calcul de délai ÉCOULÉ fiable —
+        JAMAIS une comparaison de texte HH:MM affiché, qui casserait dès
+        un changement de minute/heure/jour entre l'élimination et la
+        tentative d'annulation (mise en garde explicite du 2026-09-17).
+        Renvoie None si la valeur est vide ou illisible (défensif : ne
+        devrait normalement jamais arriver pour un joueur réellement
+        éliminé, elim_time étant toujours renseigné par eliminate_
+        player)."""
+        if not elim_time_str:
+            return None
+        try:
+            return time.mktime(time.strptime(elim_time_str, "%Y-%m-%d %H:%M:%S"))
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    def undo_last_elimination_available(self):
+        """True si "Annule Eliminer" doit être proposé MAINTENANT — un
+        dernier joueur éliminé existe, le timeout n'est pas à 0
+        (désactivation complète du bouton comme du clic droit) et le
+        temps écoulé depuis son elim_time reste STRICTEMENT inférieur au
+        timeout configuré (donc déjà refusé PILE à l'expiration, pas
+        seulement après — demande explicite). Utilisée par main.py pour
+        l'état du bouton "Annule Eliminer" ET la condition du clic droit
+        sur le dernier joueur éliminé — jamais une logique dupliquée :
+        undo_last_elimination() revalide de toute façon indépendamment ce
+        même délai (avec ses propres messages d'erreur précis) avant de
+        restaurer quoi que ce soit, ce qui garantit qu'AUCUNE autre voie
+        d'appel ne peut contourner ce délai, même en ignorant cette
+        méthode-ci."""
+        if self._undo_elimination_timeout_minutes() <= 0:
+            return False
+        last = self.get_last_eliminated_player()
+        if last is None:
+            return False
+        elim_epoch = self._elim_time_to_epoch(last["elim_time"])
+        if elim_epoch is None:
+            return False
+        return (time.time() - elim_epoch) < self._undo_elimination_timeout_minutes() * 60
+
+    def undo_last_elimination(self):
+        """Annule la DERNIÈRE élimination (demande du 2026-09-17) —
+        fonction métier CENTRALE UNIQUE appelée aussi bien par le bouton
+        "Annule Eliminer" que par le clic droit sur le dernier joueur
+        éliminé (main.py: App._undo_last_elimination), jamais dupliquée.
+        Ne prend AUCUN paramètre : la cible n'est jamais celle d'une
+        sélection courante, toujours déterminée ici via get_last_
+        eliminated_player() — RÈGLE ABSOLUE demandée par l'utilisateur :
+        il ne doit jamais être possible d'annuler une élimination
+        antérieure à la dernière.
+
+        Voir la section "Annulation de la dernière élimination" plus haut
+        pour le choix d'architecture (instantané complet avant/après,
+        jamais une inversion mouvement par mouvement).
+
+        SÉCURITÉ AVANT TOUT (demande explicite du 2026-09-17, "REFUSE
+        plutôt que de tenter une reconstruction approximative") :
+        revalide D'ABORD, un par un, que l'état ACTUEL correspond
+        EXACTEMENT à l'état "APRÈS" mémorisé au moment de cette
+        élimination — mêmes joueurs actifs, mêmes position/statut/bounty/
+        bounty_won/kills/place pour chaque joueur concerné, mêmes tables
+        (nom, capacité, active ou non), même fin de tournoi, même
+        question de rééquilibrage en attente le cas échéant, aucune prime
+        enregistrée depuis. La moindre divergence lève ValueError SANS
+        AUCUNE écriture, plutôt que de deviner. Cette revalidation couvre
+        notamment, sans code séparé pour chaque cas :
+        - une élimination suivante a eu lieu depuis (get_last_eliminated_
+          player() renvoie alors un autre joueur, refusé dès la première
+          vérification) ;
+        - un joueur a été ajouté/réintégré/retiré depuis (l'ensemble des
+          joueurs actifs ne correspond plus) ;
+        - une question de rééquilibrage guidé par la grosse blinde,
+          encore ouverte au moment de cette élimination, a depuis reçu
+          une réponse (son request_id a changé ou a disparu) ;
+        - les tables ont été modifiées manuellement depuis.
+        Chips/buyin/rebuy/addon/club/nom ne sont volontairement PAS
+        vérifiés (voir _player_undo_state) : un rebuy ou un renommage
+        entre-temps n'a aucun rapport avec l'élimination et ne bloque
+        jamais son annulation.
+
+        Si l'annulation aboutit : restaure atomiquement la ligne de
+        chaque joueur concerné (y compris l'ancienne table/siège du
+        joueur éliminé, ses primes, celles de l'éventuel éliminateur),
+        l'état complet de tables_pk, la fin de tournoi le cas échéant,
+        supprime les lignes bounty_events créées par cette élimination
+        (élimination normale + éventuelle clôture de bounty du vainqueur
+        PKO), annule proprement toute question de rééquilibrage que
+        CETTE élimination avait créée ou modifiée (laisse intacte une
+        question totalement étrangère, déjà présente avant elle et
+        inchangée depuis), et efface l'instantané consommé. Renvoie la
+        liste des mouvements de tables réellement nécessaires pour que
+        chacun revienne à sa position d'avant (même format que
+        rebalance_tables, réutilisable telle quelle par l'alerte de
+        mouvement existante) — jamais un nouveau rebalance_tables() : on
+        revient en arrière, on ne recalcule pas."""
+        raw = self.get_setting("last_elimination_undo")
+        if not raw:
+            raise ValueError("Aucune élimination à annuler.")
+        try:
+            snapshot = json.loads(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Instantané d'annulation illisible : annulation impossible."
+            )
+
+        player_id = snapshot.get("player_id")
+        last = self.get_last_eliminated_player()
+        if last is None or last["id"] != player_id:
+            raise ValueError(
+                "Impossible d'annuler : ce n'est plus la dernière élimination "
+                "(une autre élimination a eu lieu depuis, ou ce joueur n'est "
+                "plus éliminé)."
+            )
+
+        # ---- Timeout (demande du 2026-09-17) : contrôlé ICI, dans la ----
+        # logique métier elle-même, quelle que soit la voie d'appel (bouton
+        # "Annule Eliminer", clic droit, ou tout futur appelant) — jamais
+        # seulement côté interface (voir undo_last_elimination_available,
+        # utilisée par main.py pour l'état du bouton/clic droit, mais qui
+        # NE remplace PAS ce contrôle-ci). Calculé à partir d'elim_time
+        # converti en epoch (voir _elim_time_to_epoch), jamais une
+        # comparaison de texte HH:MM qui casserait au changement de
+        # minute/heure/jour. RÈGLE ABSOLUE : 0 minute désactive
+        # complètement la fonction (jamais "illimité") ; un délai déjà
+        # écoulé (>=, pas seulement >) refuse — pile à l'expiration
+        # incluse.
+        timeout_minutes = self._undo_elimination_timeout_minutes()
+        if timeout_minutes <= 0:
+            raise ValueError(
+                "Impossible d'annuler : « Annule Eliminer » est désactivé "
+                "(Timeout pour Annuler Eliminer réglé à 0 minute dans "
+                "Paramètres)."
+            )
+        elim_epoch = self._elim_time_to_epoch(last["elim_time"])
+        if elim_epoch is None or (time.time() - elim_epoch) >= timeout_minutes * 60:
+            raise ValueError(
+                "Impossible d'annuler : le délai autorisé "
+                f"({timeout_minutes} minute(s), voir Paramètres) pour "
+                "annuler cette élimination est dépassé."
+            )
+
+        before = snapshot["before"]
+        after = snapshot["after"]
+
+        # ---- Revalidation stricte : refuse au moindre écart ------------
+        tracked_ids = [int(pid) for pid in after["player_states"].keys()]
+        expected_active_ids = {
+            pid for pid in tracked_ids
+            if (after["player_states"][str(pid)] or {}).get("status") == "active"
+        }
+        current_active_ids = {p["id"] for p in self.list_players(status="active")}
+        if current_active_ids != expected_active_ids:
+            raise ValueError(
+                "Impossible d'annuler : la liste des joueurs actifs a changé "
+                "depuis cette élimination (joueur ajouté, réintégré ou "
+                "retiré entre-temps)."
+            )
+        for pid in tracked_ids:
+            expected = after["player_states"][str(pid)]
+            current = self._player_undo_state(pid)
+            # elim_time exclu de CETTE comparaison (voir _comparable_
+            # undo_state) : lu en LIVE pour le timeout (contrôlé
+            # séparément juste après), sa valeur exacte au moment de
+            # l'élimination n'a par ailleurs aucune incidence sur la
+            # sécurité de la restauration table/siège/primes elle-même —
+            # toujours restauré normalement plus bas (voir before[
+            # "player_states"], qui, lui, conserve bien elim_time).
+            if _comparable_undo_state(current) != _comparable_undo_state(expected):
+                raise ValueError(
+                    "Impossible d'annuler : l'état du tournoi a changé "
+                    "depuis cette élimination — annulation refusée pour ne "
+                    "pas produire une restauration incohérente."
+                )
+
+        current_tables = {t["id"]: dict(t) for t in self.list_tables(active_only=False)}
+        expected_tables = {t["id"]: t for t in after["tables"]}
+        if current_tables != expected_tables:
+            raise ValueError(
+                "Impossible d'annuler : la configuration des tables a "
+                "changé depuis cette élimination."
+            )
+
+        if self.get_setting("tournament_end_epoch") != after["tournament_end_epoch"]:
+            raise ValueError(
+                "Impossible d'annuler : l'état de fin de tournoi a changé "
+                "depuis cette élimination."
+            )
+
+        current_pending_id = (
+            self.pending_rebalance["request_id"] if self.pending_rebalance else None
+        )
+        if current_pending_id != after["pending_rebalance_request_id"]:
+            raise ValueError(
+                "Impossible d'annuler : une question de rééquilibrage "
+                "(grosse blinde) a été traitée depuis cette élimination."
+            )
+
+        current_bounty_max = self.conn.execute(
+            "SELECT COALESCE(MAX(id), 0) m FROM bounty_events"
+        ).fetchone()["m"]
+        if current_bounty_max != after["bounty_events_max_id"]:
+            raise ValueError(
+                "Impossible d'annuler : d'autres primes ont été "
+                "enregistrées depuis cette élimination."
+            )
+
+        # ---- Toutes les vérifications passent : restauration atomique --
+        for pid_str, state in before["player_states"].items():
+            if state is None:
+                continue
+            self.conn.execute(
+                "UPDATE players SET status=?, table_id=?, seat=?, bounty=?, "
+                "bounty_won=?, kills=?, place=?, elim_time=?, elim_round=?, "
+                "eliminated_by_name=? WHERE id=?",
+                (state["status"], state["table_id"], state["seat"], state["bounty"],
+                 state["bounty_won"], state["kills"], state["place"], state["elim_time"],
+                 state["elim_round"], state["eliminated_by_name"], int(pid_str)),
+            )
+
+        for t in before["tables"]:
+            self.conn.execute(
+                "UPDATE tables_pk SET name=?, max_seats=?, is_active=? WHERE id=?",
+                (t["name"], t["max_seats"], t["is_active"], t["id"]),
+            )
+
+        self.conn.execute(
+            "DELETE FROM bounty_events WHERE id > ?", (before["bounty_events_max_id"],)
+        )
+
+        if before["tournament_end_epoch"] is None:
+            self.conn.execute("DELETE FROM settings WHERE key='tournament_end_epoch'")
+        else:
+            self.conn.execute(
+                "INSERT INTO settings(key, value) VALUES ('tournament_end_epoch', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (before["tournament_end_epoch"],),
+            )
+
+        # La question de rééquilibrage actuellement affichée (déjà
+        # revalidée identique à l'instantané "après" ci-dessus) n'a plus
+        # lieu d'être si elle a été CRÉÉE ou MODIFIÉE par cette
+        # élimination (before != after) — mais reste intacte si elle lui
+        # est totalement étrangère (déjà présente, inchangée, avant même
+        # cette élimination).
+        if before["pending_rebalance_request_id"] != after["pending_rebalance_request_id"]:
+            self.pending_rebalance = None
+
+        self.conn.execute("DELETE FROM settings WHERE key='last_elimination_undo'")
+        self.conn.commit()
+
+        # Mouvements RÉELLEMENT nécessaires pour que chacun revienne à sa
+        # position d'avant cette élimination (comparaison directe des
+        # deux instantanés déjà capturés par eliminate_player) — jamais un
+        # nouveau rebalance_tables() : on revient en arrière à l'identique,
+        # on ne relance pas de calcul de rééquilibrage.
+        table_names = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        moves = []
+        for pid_str, before_state in before["player_states"].items():
+            after_state = after["player_states"].get(pid_str)
+            if (before_state is None or after_state is None
+                    or before_state["table_id"] == after_state["table_id"]):
+                continue
+            moves.append({
+                "player_name": self.get_player(int(pid_str))["name"],
+                "old_table_name": table_names.get(after_state["table_id"]),
+                "old_seat": after_state["seat"],
+                "new_table_name": table_names.get(before_state["table_id"]),
+                "new_seat": before_state["seat"],
+                "moved_at": now,
+                "reason": MOVE_REASON_ELIMINATION_UNDO,
+            })
+        if moves:
+            self.conn.execute("DELETE FROM seat_moves")
+            for move in moves:
+                self.conn.execute(
+                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
+                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
+                    (move["player_name"], move["old_table_name"], move["old_seat"],
+                     move["new_table_name"], move["new_seat"], move["moved_at"],
+                     move["reason"]),
+                )
+            self.conn.commit()
+
+        return moves
 
     def withdraw_player(self, player_id):
         """Retire un joueur de la liste active sans lui attribuer de place

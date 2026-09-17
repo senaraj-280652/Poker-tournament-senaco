@@ -17,6 +17,14 @@ fenêtre renvoie eliminator_id=None, et le garde-fou DÉJÀ EXISTANT
 `if mandatory and eliminator_id is None: return` (main.py) abandonne
 alors l'élimination — mécanisme réutilisé tel quel, jamais dupliqué.
 
+Complété le 2026-09-17 (voir tests/test_undo_last_elimination.py pour la
+couverture DATABASE de l'annulation elle-même) : un clic droit sur le
+DERNIER joueur éliminé propose désormais son annulation
+(_undo_last_elimination, même fonction métier centrale que le bouton
+"Annule Eliminer") — un clic droit sur un joueur éliminé plus ANCIEN
+reste sans aucun effet (RÈGLE ABSOLUE demandée : jamais d'annulation
+d'une élimination antérieure à la dernière).
+
 Deux volets, séparés pour éviter tout risque déjà documenté ailleurs
 dans cette suite :
 
@@ -32,11 +40,14 @@ dans cette suite :
 - PlayersTreeRightClickTest : _on_players_tree_right_click, avec un VRAI
   ttk.Treeview (nécessaire pour identify_row/selection_set — un
   comportement Tk réel, pas la peine de le réimplémenter à la main) ;
-  _eliminate_selected est ESPIONNÉE (jamais réellement exécutée dans
-  cette classe, déjà couverte séparément ci-dessus)."""
+  _eliminate_selected ET _undo_last_elimination sont ESPIONNÉES (jamais
+  réellement exécutées dans cette classe — _eliminate_selected déjà
+  couverte séparément ci-dessus, _undo_last_elimination dans tests/
+  test_undo_last_elimination.py)."""
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -59,6 +70,19 @@ except tk.TclError:
 
 def _new_db(tmp_dir, name):
     return database.Database(os.path.join(tmp_dir, f"{name}.tournoi"))
+
+
+def _set_elim_time_seconds_ago(db, player_id, seconds_ago):
+    """Même helper que tests/test_undo_last_elimination.py (dupliqué à
+    dessein plutôt qu'importé, pour garder ces deux fichiers de test
+    indépendants) : fixe elim_time à `seconds_ago` secondes avant le
+    vrai instant présent, pour contrôler précisément le délai "Timeout
+    pour Annuler Eliminer" (demande du 2026-09-17) sans time.sleep."""
+    target_epoch = time.time() - seconds_ago
+    elim_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(target_epoch))
+    db.conn.execute("UPDATE players SET elim_time=? WHERE id=?", (elim_time_str, player_id))
+    db.conn.commit()
+    return elim_time_str
 
 
 class _FakeAppForEliminateSelected:
@@ -308,6 +332,7 @@ class PlayersTreeRightClickTest(unittest.TestCase):
         self.tree.pack()
 
         self.eliminate_calls = []
+        self.undo_calls = 0
 
         def fake_eliminate(skip_confirmation=False, ids=None, force_mandatory_eliminator=False):
             self.eliminate_calls.append(
@@ -315,10 +340,14 @@ class PlayersTreeRightClickTest(unittest.TestCase):
                  force_mandatory_eliminator)
             )
 
+        def fake_undo():
+            self.undo_calls += 1
+
         self.win = types.SimpleNamespace(
             players_tree=self.tree,
             db=self.db,
             _eliminate_selected=fake_eliminate,
+            _undo_last_elimination=fake_undo,
         )
         self.win._on_players_tree_right_click = types.MethodType(
             main.App._on_players_tree_right_click, self.win
@@ -382,7 +411,10 @@ class PlayersTreeRightClickTest(unittest.TestCase):
 
         self.assertEqual(self.eliminate_calls, [])
 
-    def test_clic_droit_joueur_non_actif_aucun_effet(self):
+    def test_clic_droit_dernier_elimine_propose_annulation(self):
+        """Demande du 2026-09-17 : clic droit sur le DERNIER joueur
+        éliminé -> _undo_last_elimination (même fonction centrale que le
+        bouton "Annule Eliminer"), jamais _eliminate_selected."""
         pid = self.db.add_player("Alice")
         self.db.add_player("Bob")  # garde un vainqueur possible
         self.db.eliminate_player(pid)
@@ -390,6 +422,33 @@ class PlayersTreeRightClickTest(unittest.TestCase):
 
         self._right_click_on_row(str(pid))
 
+        self.assertEqual(self.undo_calls, 1)
+        self.assertEqual(self.eliminate_calls, [])
+
+    def test_clic_droit_elimine_plus_ancien_aucun_effet(self):
+        """RÈGLE ABSOLUE demandée : un clic droit sur un joueur éliminé
+        AVANT le dernier ne doit jamais rien proposer ni modifier."""
+        pid_a = self.db.add_player("Alice")
+        pid_b = self.db.add_player("Bob")
+        self.db.add_player("Chris")  # garde un vainqueur possible
+        self.db.eliminate_player(pid_a)  # plus ancien
+        self.db.eliminate_player(pid_b)  # dernier éliminé
+        self._insert_row(pid_a, "Alice")
+
+        self._right_click_on_row(str(pid_a))
+
+        self.assertEqual(self.undo_calls, 0)
+        self.assertEqual(self.eliminate_calls, [])
+
+    def test_clic_droit_forfait_aucun_effet(self):
+        pid = self.db.add_player("Alice")
+        self.db.add_player("Bob")
+        self.db.withdraw_player(pid)
+        self._insert_row(pid, "Alice")
+
+        self._right_click_on_row(str(pid))
+
+        self.assertEqual(self.undo_calls, 0)
         self.assertEqual(self.eliminate_calls, [])
 
     # -- 7 : clic droit sur B après sélection de A -------------------------
@@ -405,6 +464,35 @@ class PlayersTreeRightClickTest(unittest.TestCase):
 
         self.assertEqual(self.tree.selection(), (str(pid_b),))
         self.assertEqual(self.eliminate_calls, [(True, (pid_b,), True)])
+
+    # -- Timeout "Annule Eliminer" (demande du 2026-09-17) ----------------
+
+    def test_clic_droit_dernier_elimine_dans_le_delai_propose_annulation(self):
+        pid = self.db.add_player("Alice")
+        self.db.add_player("Bob")
+        self.db.eliminate_player(pid)
+        _set_elim_time_seconds_ago(self.db, pid, 1)
+        self._insert_row(pid, "Alice")
+
+        self._right_click_on_row(str(pid))
+
+        self.assertEqual(self.undo_calls, 1)
+
+    def test_clic_droit_dernier_elimine_delai_depasse_aucun_effet(self):
+        """RÈGLE demandée : passé le timeout, le clic droit sur le
+        dernier éliminé ne propose plus rien — même comportement qu'un
+        éliminé plus ancien."""
+        pid = self.db.add_player("Alice")
+        self.db.add_player("Bob")
+        self.db.eliminate_player(pid)
+        _set_elim_time_seconds_ago(self.db, pid, 5 * 60 + 1)  # timeout par défaut = 5 min
+        self._insert_row(pid, "Alice")
+
+        self._right_click_on_row(str(pid))
+
+        self.assertEqual(self.undo_calls, 0)
+        self.assertEqual(self.eliminate_calls, [])
+        self.assertEqual(self.db.get_player(pid)["status"], "eliminated")  # inchangé
 
 
 if __name__ == "__main__":

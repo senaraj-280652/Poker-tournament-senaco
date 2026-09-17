@@ -103,6 +103,7 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
             "_on_players_checkbox_header_click", "_update_sort_headings",
             "_update_tournament_started_buttons", "_pending_old_seat_by_name",
             "_test_mode_enabled", "_update_checked_count_label",
+            "_update_undo_elimination_button_state",
         ):
             setattr(self.win, meth, types.MethodType(getattr(main.App, meth), self.win))
 
@@ -119,6 +120,11 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
         self.win.eliminate_player_btn = ttk.Button(parent)
         self.win.eliminate_player_btn_tooltip = main.Tooltip(self.win.eliminate_player_btn, "")
         self.win._eliminate_btn_tooltip_normal_text = ""
+        # "Annule Eliminer" (demande du 2026-09-17) : _refresh_players_tab
+        # appelle désormais aussi _update_undo_elimination_button_state,
+        # qui a besoin de ce bouton — même principe que delete_player_btn/
+        # eliminate_player_btn ci-dessus.
+        self.win.undo_elimination_btn = ttk.Button(parent)
         self.win.player_photo_images = {}
 
     def _names_in_order(self):

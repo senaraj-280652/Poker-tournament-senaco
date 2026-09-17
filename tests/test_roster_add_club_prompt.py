@@ -229,22 +229,49 @@ class AskClubDialogPositionUnitTest(unittest.TestCase):
         position.py : un faux événement portant juste `.widget`, jamais
         un vrai <Configure> généré (event_generate a provoqué un
         segfault ailleurs dans cette suite) — PAS de update_idletasks()
-        non plus (même mise en garde)."""
+        non plus (même mise en garde). `win` passé explicitement en
+        second argument (CORRECTIF du 2026-09-17, même diagnostic que
+        App._on_ask_eliminator_window_configure) : l'appelé ne fait plus
+        confiance à `event.widget` seul."""
         fake_win = tk.Toplevel(self.root)
         self.addCleanup(fake_win.destroy)
         fake_win.geometry("+333+444")
         fake_event = type("FakeEvent", (), {"widget": fake_win})()
 
-        main._on_ask_club_dialog_configure(fake_event)
+        main._on_ask_club_dialog_configure(fake_event, fake_win)
 
         self.assertEqual(export_prefs.load_value("ask_club_window_x"), fake_win.winfo_x())
         self.assertEqual(export_prefs.load_value("ask_club_window_y"), fake_win.winfo_y())
+
+    def test_configure_dun_enfant_est_ignore(self):
+        """CORRECTIF du 2026-09-17 (régression constatée sur Mac, même
+        cause que pour "Qui a éliminé ce joueur ?" — voir tests/test_ask_
+        eliminator_window_position.py) : un <Configure> dont `event.
+        widget` est un ENFANT de la fenêtre (Label, Combobox — voir ask_
+        club_dialog, empaquetés juste après le bind) remonte pourtant
+        jusqu'à ce gestionnaire via les bindtags de `win` — winfo_x()/
+        winfo_y() de cet enfant renvoient sa position relative à SON
+        PARENT, pas la position écran de la fenêtre. Doit désormais être
+        totalement ignoré."""
+        fake_win = tk.Toplevel(self.root)
+        self.addCleanup(fake_win.destroy)
+        fake_win.geometry("+333+444")
+        child = tk.Label(fake_win)  # jamais empaqueté : seule l'identité compte ici
+        self.addCleanup(child.destroy)
+        export_prefs.save_value("ask_club_window_x", 111)
+        export_prefs.save_value("ask_club_window_y", 222)
+        fake_event = type("FakeEvent", (), {"widget": child})()
+
+        main._on_ask_club_dialog_configure(fake_event, fake_win)
+
+        self.assertEqual(export_prefs.load_value("ask_club_window_x"), 111)
+        self.assertEqual(export_prefs.load_value("ask_club_window_y"), 222)
 
     def test_configure_ne_leve_jamais_meme_fenetre_detruite(self):
         fake_win = tk.Toplevel(self.root)
         fake_win.destroy()
         fake_event = type("FakeEvent", (), {"widget": fake_win})()
-        main._on_ask_club_dialog_configure(fake_event)  # ne doit pas lever
+        main._on_ask_club_dialog_configure(fake_event, fake_win)  # ne doit pas lever
 
     def test_position_partagee_entre_tous_les_appelants(self):
         """ask_club_dialog est une fonction unique, appelée aussi bien

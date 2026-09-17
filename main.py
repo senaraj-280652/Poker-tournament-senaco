@@ -389,6 +389,10 @@ MUTED = "#b9c9bd"  # texte discret, lisible sur fond foncé
 DANGER_RED = "#8a1f1f"
 DANGER_RED_ACTIVE = "#a92c2c"
 ELIMINATION_BLUE = "#1f4e8a"  # bandeau d'élimination (écran projecteur + onglet Chronomètre)
+# Variante plus claire pour l'état "survolé/pressé" du bouton "Annule
+# Eliminer" (demande du 2026-09-17) — même principe que DANGER_RED_ACTIVE
+# pour "Éliminer".
+ELIMINATION_BLUE_ACTIVE = "#2f63a8"
 
 
 def default_tournament_dir():
@@ -1655,9 +1659,19 @@ def _save_ask_club_dialog_position(x, y):
     export_prefs.save_value("ask_club_window_y", y)
 
 
-def _on_ask_club_dialog_configure(event):
+def _on_ask_club_dialog_configure(event, win):
+    """CORRECTIF du 2026-09-17 (même diagnostic, même cause que App._on_
+    ask_eliminator_window_configure — voir sa docstring pour le détail
+    complet) : `win` est passé explicitement (capturé par la lambda de
+    ask_club_dialog) plutôt que de faire confiance à `event.widget`, qui
+    peut être n'importe quel enfant de `win` (Label, Combobox, Bouton —
+    leur <Configure> remonte jusqu'à ce gestionnaire via les bindtags de
+    `win`) et dont winfo_x()/winfo_y() renverraient alors une position
+    relative à SON PARENT, pas la position écran de la fenêtre."""
+    if event.widget is not win:
+        return
     try:
-        _save_ask_club_dialog_position(event.widget.winfo_x(), event.widget.winfo_y())
+        _save_ask_club_dialog_position(win.winfo_x(), win.winfo_y())
     except tk.TclError:
         pass
 
@@ -1678,7 +1692,7 @@ def ask_club_dialog(master, title="Club", current_club=""):
     position = _ask_club_dialog_position(master)
     if position is not None:
         win.geometry(f"+{position[0]}+{position[1]}")
-    win.bind("<Configure>", _on_ask_club_dialog_configure)
+    win.bind("<Configure>", lambda e: _on_ask_club_dialog_configure(e, win))
     result = {"club": None}
 
     tk.Label(
@@ -4626,6 +4640,19 @@ class App(tk.Tk):
             background=[("active", DANGER_RED_ACTIVE), ("pressed", DANGER_RED), ("disabled", FELT)],
             foreground=[("active", CREAM), ("pressed", CREAM), ("disabled", MUTED)],
         )
+        # Variante bleue pour "Annule Eliminer" (demande du 2026-09-17) —
+        # même couleur que le bandeau d'élimination (ELIMINATION_BLUE),
+        # pour la distinguer à la fois du rouge "Éliminer" et du reste des
+        # boutons neutres.
+        style.configure(
+            "Undo.TButton", background=ELIMINATION_BLUE, foreground=CREAM, padding=(10, 6),
+            borderwidth=0, focuscolor=ELIMINATION_BLUE, font=bold_font,
+        )
+        style.map(
+            "Undo.TButton",
+            background=[("active", ELIMINATION_BLUE_ACTIVE), ("pressed", ELIMINATION_BLUE), ("disabled", FELT)],
+            foreground=[("active", CREAM), ("pressed", CREAM), ("disabled", MUTED)],
+        )
         style.configure("TCheckbutton", background=FELT, foreground=CREAM)
         style.map("TCheckbutton", background=[("active", FELT)])
         style.configure(
@@ -5769,6 +5796,25 @@ class App(tk.Tk):
         # lui-même pour un nouveau tournoi (clock_started y repart à 0).
         self.delete_player_btn_tooltip = Tooltip(self.delete_player_btn, "")
 
+        # "Annule Eliminer" (demande du 2026-09-17) — sert à corriger
+        # rapidement une erreur d'élimination faite depuis le téléphone :
+        # annule TOUJOURS la toute dernière élimination, quelle que soit
+        # la sélection/le cochage courant dans ce tableau (voir
+        # App._undo_last_elimination, fonction métier centrale UNIQUE
+        # partagée avec le clic droit sur le dernier joueur éliminé —
+        # voir _on_players_tree_right_click). Grisé s'il n'y a
+        # actuellement aucun joueur éliminé (voir _update_undo_
+        # elimination_button_state) — reste néanmoins possible que le
+        # clic soit refusé si l'état a changé depuis (voir Database.
+        # undo_last_elimination), auquel cas un message clair l'explique,
+        # sans jamais rien modifier.
+        self.undo_elimination_btn = ttk.Button(
+            actions, text="Annule Eliminer", command=self._undo_last_elimination,
+            style="Undo.TButton",
+        )
+        self.undo_elimination_btn.pack(side="left", padx=3)
+        Tooltip(self.undo_elimination_btn, "Annule la dernière élimination")
+
         columns = ("sel", "id", "name", "club", "table", "seat", "chips", "buyin", "rebuy", "addon", "bounty", "status", "rang",
                    "elim_time", "elim_round", "eliminated_by")
         headers = ["", "ID", "Nom", "Club", "Table", "Siège", "Chips", "Buy-in", "Rebuys", "Add-ons", "Prime", "Statut", "Rang",
@@ -5885,39 +5931,67 @@ class App(tk.Tk):
         return "break"  # évite que le clic ne change aussi la sélection classique
 
     def _on_players_tree_right_click(self, event):
-        """Clic droit sur la ligne d'un joueur ACTIF (demande du
-        2026-09-16, CORRIGÉE le même jour — plus de menu contextuel) :
-        raccourci d'élimination rapide qui ouvre DIRECTEMENT "Qui a
-        éliminé ce joueur ?" (_ask_eliminator), sans le moindre menu ni
-        la confirmation "Voulez-vous éliminer ce joueur ?" habituelle.
-        Sélectionne d'abord la ligne réellement sous le curseur (même
-        principe que LobbyDialog._on_tree_right_click), puis appelle
-        _eliminate_selected avec :
-        - skip_confirmation=True : saute la boîte "Confirmer" ;
-        - ids=[pid] : agit TOUJOURS sur CE joueur précis, jamais sur une
-          case cochée ou une sélection multiple précédente — un clic
-          droit sur B après un clic sur A agit bien sur B ;
-        - force_mandatory_eliminator=True : "Qui a éliminé ce joueur ?"
-          devient elle-même le garde-fou (bouton "Annuler l'élimination"
-          plutôt que "Ignorer (pas de prime)") — tant qu'elle n'est pas
-          validée par "Valider", AUCUNE élimination n'est enregistrée
-          (fermer la fenêtre ou cliquer "Annuler l'élimination" produisent
-          tous deux eliminator_id=None, voir _ask_eliminator, qui abandonne
-          alors l'élimination — déjà le mécanisme existant, jamais
-          dupliqué ici).
+        """Clic droit sur une ligne du tableau Joueurs — deux
+        comportements distincts selon le statut du joueur visé (demande
+        du 2026-09-16, complétée le 2026-09-17) :
 
-        Rien ne se passe : en dehors d'une vraie ligne (zone vide,
-        en-tête), ou sur un joueur qui n'est plus actif (déjà
-        éliminé/forfait — rien à éliminer)."""
+        - joueur ACTIF : raccourci d'élimination rapide qui ouvre
+          DIRECTEMENT "Qui a éliminé ce joueur ?" (_ask_eliminator), sans
+          le moindre menu ni la confirmation "Voulez-vous éliminer ce
+          joueur ?" habituelle. Sélectionne d'abord la ligne réellement
+          sous le curseur (même principe que LobbyDialog._on_tree_right_
+          click), puis appelle _eliminate_selected avec :
+          - skip_confirmation=True : saute la boîte "Confirmer" ;
+          - ids=[pid] : agit TOUJOURS sur CE joueur précis, jamais sur une
+            case cochée ou une sélection multiple précédente — un clic
+            droit sur B après un clic sur A agit bien sur B ;
+          - force_mandatory_eliminator=True : "Qui a éliminé ce joueur ?"
+            devient elle-même le garde-fou (bouton "Annuler l'élimination"
+            plutôt que "Ignorer (pas de prime)") — tant qu'elle n'est pas
+            validée par "Valider", AUCUNE élimination n'est enregistrée
+            (fermer la fenêtre ou cliquer "Annuler l'élimination"
+            produisent tous deux eliminator_id=None, voir _ask_eliminator,
+            qui abandonne alors l'élimination — déjà le mécanisme
+            existant, jamais dupliqué ici).
+        - joueur ÉLIMINÉ, qu'il s'agit bien du DERNIER éliminé (demande
+          du 2026-09-17, voir Database.get_last_eliminated_player) ET que
+          le timeout ("Timeout pour Annuler Eliminer", Paramètres,
+          ajouté le 2026-09-17) n'est pas dépassé (voir Database.undo_
+          last_elimination_available) : propose son annulation via
+          _undo_last_elimination (même fonction métier centrale que le
+          bouton "Annule Eliminer", jamais dupliquée — confirmation
+          obligatoire incluse).
+        - joueur éliminé plus ANCIEN que le dernier, OU délai dépassé (OU
+          "Timeout pour Annuler Eliminer" réglé à 0, désactivation
+          complète) : RÈGLE ABSOLUE demandée par l'utilisateur, aucune
+          action.
+        - forfait (withdrawn), zone vide (aucune ligne sous le curseur),
+          ou en-tête : aucune action, inchangé."""
         row_iid = self.players_tree.identify_row(event.y)
         if not row_iid:
             return
         self.players_tree.selection_set(row_iid)
         pid = int(row_iid)
         player = self.db.get_player(pid)
-        if player is None or player["status"] != "active":
+        if player is None:
             return
-        self._eliminate_selected(skip_confirmation=True, ids=[pid], force_mandatory_eliminator=True)
+        if player["status"] == "active":
+            self._eliminate_selected(skip_confirmation=True, ids=[pid], force_mandatory_eliminator=True)
+            return
+        if player["status"] == "eliminated":
+            last = self.db.get_last_eliminated_player()
+            # undo_last_elimination_available() couvre à la fois "c'est
+            # bien le dernier éliminé" (implicitement, via son propre
+            # get_last_eliminated_player()) ET le timeout (demande du
+            # 2026-09-17) — mais on vérifie explicitement `last["id"] ==
+            # pid` en plus : cette ligne précise doit être celle du
+            # dernier éliminé, jamais une autre même si, par impossible,
+            # la disponibilité globale était vraie pour un autre id.
+            if (last is not None and last["id"] == pid
+                    and self.db.undo_last_elimination_available()):
+                self._undo_last_elimination()
+            # Sinon (éliminé plus ancien, ou délai dépassé) : aucune
+            # action, RÈGLE ABSOLUE.
 
     def _apply_checkbox_display(self, row_iid):
         pid = int(row_iid)
@@ -6685,19 +6759,40 @@ class App(tk.Tk):
         export_prefs.save_value("ask_eliminator_window_x", x)
         export_prefs.save_value("ask_eliminator_window_y", y)
 
-    def _on_ask_eliminator_window_configure(self, event):
+    def _on_ask_eliminator_window_configure(self, event, win):
         """Gestionnaire lié à <Configure> pour la fenêtre "Qui a éliminé
         ce joueur ?" (voir _ask_eliminator) — méthode LIÉE (App), pas une
         fonction imbriquée : directement testable avec un faux événement
         (voir tests/test_ask_eliminator_window_position.py), comme
-        RemoteDeviceRequestWindow._on_configure. `event.widget` porte la
-        fenêtre concernée (bind() posé directement dessus, jamais sur un
-        de ses enfants) : pas de vérification d'identité supplémentaire
-        nécessaire ici. <Configure> se déclenche aussi pour un simple
-        redessin interne (pas seulement un déplacement) — inoffensif,
-        réécrire la même position ne coûte presque rien."""
+        RemoteDeviceRequestWindow._on_configure.
+
+        CORRECTIF du 2026-09-17 (diagnostic confirmé : la position ne se
+        conservait plus correctement) : `win.bind("<Configure>", ...)`
+        est posé sur la fenêtre, mais un <Configure> émis par N'IMPORTE
+        LEQUEL de ses enfants (Label, Combobox, Frame, Bouton — chacun
+        empaqueté juste après ce bind, voir _ask_eliminator) REMONTE
+        aussi jusqu'à ce gestionnaire : la fenêtre fait partie des
+        bindtags de chacun de ses enfants. `event.widget` n'est alors
+        PAS `win` mais cet enfant, dont winfo_x()/winfo_y() renvoient une
+        position relative à SON PARENT (souvent de petites valeurs, ex.
+        16/190), pas la position écran de la fenêtre — ce qui écrasait
+        silencieusement la position réellement mémorisée dès la
+        construction de la fenêtre (et à chaque redessin d'un enfant),
+        indépendamment de tout vrai déplacement par l'utilisateur.
+
+        `win` est désormais passé explicitement (capturé par la lambda
+        de _ask_eliminator, jamais un nouvel attribut persistant sur
+        self) : seul un `<Configure>` dont `event.widget is win` est
+        pris en compte — reproduit la garde déjà correcte de
+        RemoteDeviceRequestWindow._on_configure (`if event.widget is
+        self`), qui n'avait pas été reprise ici à l'origine. <Configure>
+        se déclenche aussi pour un simple redessin interne DE `win`
+        elle-même (pas seulement un déplacement) — inoffensif, réécrire
+        la même position ne coûte presque rien."""
+        if event.widget is not win:
+            return
         try:
-            self._save_ask_eliminator_position(event.widget.winfo_x(), event.widget.winfo_y())
+            self._save_ask_eliminator_position(win.winfo_x(), win.winfo_y())
         except tk.TclError:
             pass
 
@@ -6749,7 +6844,7 @@ class App(tk.Tk):
         position = self._ask_eliminator_position()
         if position is not None:
             win.geometry(f"+{position[0]}+{position[1]}")
-        win.bind("<Configure>", self._on_ask_eliminator_window_configure)
+        win.bind("<Configure>", lambda e: self._on_ask_eliminator_window_configure(e, win))
         result = {"id": None}
         header_text = f"Qui a éliminé {eliminated['name']} ?"
         if eliminated["bounty"] > 0:
@@ -6823,6 +6918,70 @@ class App(tk.Tk):
             self.db.reinstate_player(pid)
         self._clear_checked()
         self._refresh_all()
+
+    def _undo_last_elimination(self):
+        """Fonction métier CENTRALE UNIQUE pour "Annule Eliminer" (demande
+        du 2026-09-17) — appelée aussi bien par le bouton de l'onglet
+        Joueurs que par le clic droit sur le dernier joueur éliminé (voir
+        _on_players_tree_right_click), jamais dupliquée. Vise TOUJOURS le
+        dernier joueur éliminé (Database.undo_last_elimination ne prend
+        d'ailleurs aucun paramètre) — indépendant de toute sélection/
+        cochage courant dans le tableau.
+
+        Distincte de "Réinscrire" (_reinstate_selected, INCHANGÉE) : ici,
+        une vraie annulation — même table/siège, primes/kills/bounty_
+        events et mouvements de tables provoqués par cette élimination
+        précise entièrement défaits (voir Database.undo_last_elimination
+        pour le détail).
+
+        Confirmation obligatoire AVANT toute modification : fermer ou
+        refuser la confirmation ne modifie strictement rien (on ne
+        touche à la base qu'après le "Oui"). Si l'état a changé depuis
+        cette élimination au point de ne plus garantir une restauration
+        exacte — y compris le "Timeout pour Annuler Eliminer" (Paramètres,
+        demande du 2026-09-17) désormais dépassé ou réglé à 0 — Database.
+        undo_last_elimination lève ValueError — affichée telle quelle,
+        sans rien modifier (principe de sécurité demandé : refuser
+        plutôt que reconstruire approximativement). Ce contrôle de délai
+        est fait dans undo_last_elimination lui-même (pas seulement ici
+        ni dans l'état grisé du bouton/le clic droit) : même appelée
+        directement, en contournant entièrement l'interface, cette
+        méthode ne peut jamais restaurer une élimination hors délai."""
+        last = self.db.get_last_eliminated_player()
+        if last is None:
+            return
+        question = (
+            f"Annuler l'élimination de {last['name']} ?\n\n"
+            "Il/elle redevient actif(ve), reprend sa table, son siège et "
+            "son classement d'avant cette élimination. Tout ce qu'elle "
+            "avait provoqué (primes, mouvements de tables...) est annulé."
+        )
+        if not messagebox.askyesno("Confirmer", question):
+            return
+        try:
+            moves = self.db.undo_last_elimination()
+        except ValueError as e:
+            messagebox.showerror("Annulation impossible", str(e))
+            return
+        # _trigger_movement_alert/_finish_movement_alert AVANT _refresh_all
+        # (même remarque que _eliminate_selected/_remote_eliminate) :
+        # positionne movement_alert_active avant que l'onglet Joueurs ne
+        # se rafraîchisse.
+        if len(self.db.list_players(status="active")) <= 1:
+            if (self.db.get_setting_int("movement_alert_active", 0) == 1
+                    or self.db.count_seat_moves() > 0):
+                self._finish_movement_alert()
+        elif moves:
+            self._trigger_movement_alert()
+        elif self.db.get_setting_int("movement_alert_active", 0) == 1:
+            # L'annulation elle-même n'a provoqué aucun mouvement (cas
+            # simple), mais une alerte de l'élimination désormais annulée
+            # était encore affichée sans avoir été fermée via "Terminé" :
+            # elle n'a plus lieu d'être, plus rien à confirmer.
+            self._finish_movement_alert()
+        self._clear_checked()
+        self._refresh_all()
+        self._check_pending_rebalance()
 
     def _delete_selected(self):
         ids = self._checked_or_selected_ids()
@@ -8177,6 +8336,28 @@ class App(tk.Tk):
             "(cliquez « Démarrer » dans l'onglet Chronomètre)."
         )
 
+    def _update_undo_elimination_button_state(self):
+        """Grise "Annule Eliminer" (demande du 2026-09-16, timeout ajouté
+        le 2026-09-17) s'il n'y a actuellement AUCUN joueur éliminé, ou
+        si le délai configuré ("Timeout pour Annuler Eliminer", onglet
+        Paramètres) est dépassé — ou réglé à 0 (désactivation complète,
+        jamais "illimité") — voir Database.undo_last_elimination_
+        available, SEULE source de vérité pour cette condition (jamais
+        dupliquée ici). Reste actif si un joueur éliminé existe et que le
+        délai n'est pas dépassé, MÊME si l'instantané mémorisé s'avère
+        ensuite incompatible pour une autre raison (voir Database.undo_
+        last_elimination) : ce cas, plus rare, est signalé par un message
+        clair au clic plutôt que par un bouton grisé de façon préventive.
+
+        Jamais mis en cache : relu à chaque rafraîchissement de l'onglet
+        Joueurs, à chaque changement du réglage Timeout (voir _save_undo_
+        elimination_timeout_minutes), ET une fois par seconde tant que
+        l'onglet Joueurs est affiché (voir _tick) — pour que le bouton se
+        grise de lui-même dans la seconde qui suit l'expiration du délai,
+        sans attendre un rafraîchissement déclenché par autre chose."""
+        available = self.db.undo_last_elimination_available()
+        self.undo_elimination_btn.configure(state="normal" if available else "disabled")
+
     def _pending_old_seat_by_name(self):
         """Tant qu'un mouvement de tables est en attente (bandeau
         "Changement de tables en cours" affiché, avant que le responsable
@@ -8205,6 +8386,7 @@ class App(tk.Tk):
         # ajouté/modifié entre-temps depuis le répertoire de joueurs).
         self.new_player_club_combo.configure(values=roster.list_clubs())
         self._update_tournament_started_buttons()
+        self._update_undo_elimination_button_state()
         for row in self.players_tree.get_children():
             self.players_tree.delete(row)
         tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
@@ -11521,6 +11703,54 @@ class App(tk.Tk):
             "Si 0, le bandeau n'est pas affiché.",
         )
 
+        # -- Timeout pour "Annule Eliminer" (demande du 2026-09-17) : sous
+        # "Durée du bandeau d'élimination" ci-dessus, même principe (CE
+        # tournoi + repris par défaut pour le prochain via tournament_
+        # prefs). Le contrôle réel du délai se fait dans Database.undo_
+        # last_elimination() (voir sa docstring) : ce réglage-ci ne pilote
+        # que l'AFFICHAGE (bouton grisé/clic droit sans effet une fois
+        # dépassé) — aucune voie d'appel ne peut donc jamais le contourner
+        # simplement parce que l'interface n'aurait pas encore été
+        # rafraîchie.
+        undo_timeout_row = elim_row + 1
+        undo_timeout_lbl = ttk.Label(left, text="Timeout pour Annuler Eliminer (m) :")
+        undo_timeout_lbl.grid(row=undo_timeout_row, column=0, sticky="w", pady=4)
+        Tooltip(
+            undo_timeout_lbl,
+            "Délai, en minutes, pendant lequel « Annule Eliminer » (onglet\n"
+            "Joueurs) reste disponible pour annuler la DERNIÈRE élimination\n"
+            "— décompté depuis l'heure exacte de cette élimination, jamais\n"
+            "seulement l'heure affichée (fiable même à cheval sur un\n"
+            "changement de minute/heure). Passé ce délai, le bouton se\n"
+            "grise et le clic droit sur ce joueur ne propose plus rien —\n"
+            "5 minutes par défaut. Mettre 0 minute pour DÉSACTIVER "
+            "complètement\n« Annule Eliminer » (0 ne signifie jamais "
+            "« illimité »).",
+        )
+        undo_timeout_var = tk.IntVar(
+            value=max(0, self.db.get_setting_int("undo_elimination_timeout_minutes", 5))
+        )
+        undo_timeout_spin = ttk.Spinbox(
+            left, from_=0, to=180, width=5, textvariable=undo_timeout_var,
+            command=lambda: self._save_undo_elimination_timeout_minutes(undo_timeout_var),
+        )
+        undo_timeout_spin.grid(row=undo_timeout_row, column=1, sticky="w", padx=10, pady=4)
+        undo_timeout_spin.bind(
+            "<Return>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
+        )
+        undo_timeout_spin.bind(
+            "<FocusOut>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
+        )
+        # Tooltip propre à la Spinbox elle-même (même principe que
+        # elim_spin ci-dessus) — rappelle explicitement le rôle de 0,
+        # demande complémentaire du 2026-09-17.
+        Tooltip(
+            undo_timeout_spin,
+            "Délai en minutes avant que « Annule Eliminer » ne soit plus "
+            "disponible.\nMettre 0 minute pour désactiver complètement "
+            "cette possibilité\n(0 ne signifie pas « illimité »).",
+        )
+
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
             right, text="Structure de blindes — niveau 1 et antes",
@@ -12428,6 +12658,28 @@ class App(tk.Tk):
         self.db.set_settings({"elimination_banner_seconds": seconds})
         tournament_prefs.save_last_settings({"elimination_banner_seconds": seconds})
 
+    def _save_undo_elimination_timeout_minutes(self, var):
+        """Enregistre le timeout de "Annule Eliminer" (demande du
+        2026-09-17), même principe que _save_elimination_banner_seconds
+        juste au-dessus : CE tournoi + préférences globales (repris par
+        défaut pour le prochain). Une valeur invalide/vide est ignorée
+        sans planter. 0 est une valeur valide (désactive complètement la
+        fonction, voir Database.undo_last_elimination_available/undo_
+        last_elimination — RÈGLE ABSOLUE : jamais interprété comme
+        "illimité"), jamais remonté à 1. Rafraîchit aussitôt l'état du
+        bouton "Annule Eliminer" (voir _update_undo_elimination_button_
+        state) : un changement de ce réglage prend ainsi effet
+        immédiatement, sans attendre le prochain rafraîchissement de
+        l'onglet Joueurs."""
+        try:
+            minutes = max(0, min(180, int(var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self.db.set_settings({"undo_elimination_timeout_minutes": minutes})
+        tournament_prefs.save_last_settings({"undo_elimination_timeout_minutes": minutes})
+        if hasattr(self, "undo_elimination_btn"):
+            self._update_undo_elimination_button_state()
+
     def _save_club_name(self):
         """Enregistre en continu le "Nom du Club" (préférence partagée,
         commune à tous les tournois/Sit & Go — voir _build_settings_tab)
@@ -12681,6 +12933,14 @@ class App(tk.Tk):
                 self._refresh_clock_tab()
             elif current == "Mouvements":
                 self._refresh_moves_tab()
+            elif current == "Joueurs" and self.db is not None:
+                # "Timeout pour Annuler Eliminer" (demande du 2026-09-17) :
+                # revérifié ici, 1x/seconde, tant que l'onglet Joueurs est
+                # affiché — pour que le bouton se grise de lui-même dans
+                # la seconde qui suit l'expiration du délai, sans attendre
+                # une action qui rafraîchirait cet onglet pour une autre
+                # raison (voir _update_undo_elimination_button_state).
+                self._update_undo_elimination_button_state()
             if self._remote_photo_uploaded:
                 # Une photo vient d'être envoyée depuis le téléphone (voir
                 # _remote_upload_photo) : rafraîchit la colonne Photo de

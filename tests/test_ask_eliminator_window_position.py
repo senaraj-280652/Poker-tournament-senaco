@@ -5,6 +5,20 @@ le HP) — main.py: App._ask_eliminator_position/_save_ask_eliminator_
 position/_on_ask_eliminator_window_configure, câblées dans App.
 _ask_eliminator.
 
+CORRECTIF du 2026-09-17 (régression constatée sur Mac : la position ne
+se conservait plus correctement) : un <Configure> émis par n'importe
+quel ENFANT de la fenêtre (Label, Combobox, Bouton) remonte jusqu'au
+gestionnaire posé sur la fenêtre elle-même (bindtags) — `event.widget`
+n'était alors PAS forcément la fenêtre, et winfo_x()/winfo_y() de cet
+enfant renvoient une position relative à SON PARENT, pas la position
+écran de la fenêtre, écrasant silencieusement la vraie position
+mémorisée. _on_ask_eliminator_window_configure prend désormais `win` en
+second paramètre (capturé par une lambda au bind(), jamais un nouvel
+attribut persistant sur self) et ignore tout événement dont `event.
+widget is not win` — voir AskEliminatorPositionUnitTest.test_configure_
+dun_enfant_est_ignore ci-dessous, et le même correctif appliqué à
+ask_club_dialog (tests/test_roster_add_club_prompt.py).
+
 Réutilise EXACTEMENT le mécanisme déjà existant pour la fenêtre
 flottante de demande de téléphone (export_prefs, préférence PERSISTANTE
 — survit à un redémarrage complet de Senaco — et App._is_position_
@@ -120,7 +134,10 @@ class AskEliminatorPositionUnitTest(unittest.TestCase):
         PopupGeometryTest.test_configure_de_la_fenetre_declenche_la_
         sauvegarde — un faux événement portant juste `.widget`, jamais
         un vrai <Configure> généré (event_generate a provoqué le
-        segfault mentionné dans la docstring du module)."""
+        segfault mentionné dans la docstring du module). `win` est
+        désormais passé explicitement en second argument (CORRECTIF du
+        2026-09-17, voir _on_ask_eliminator_window_configure) : l'appelé
+        ne fait plus confiance à `event.widget` seul."""
         fake_win = tk.Toplevel(self.win)
         self.addCleanup(fake_win.destroy)
         fake_win.geometry("+333+444")
@@ -137,10 +154,38 @@ class AskEliminatorPositionUnitTest(unittest.TestCase):
         # passage d'idle-tasks.
         fake_event = type("FakeEvent", (), {"widget": fake_win})()
 
-        self.win._on_ask_eliminator_window_configure(fake_event)
+        self.win._on_ask_eliminator_window_configure(fake_event, fake_win)
 
         self.assertEqual(export_prefs.load_value("ask_eliminator_window_x"), fake_win.winfo_x())
         self.assertEqual(export_prefs.load_value("ask_eliminator_window_y"), fake_win.winfo_y())
+
+    def test_configure_dun_enfant_est_ignore(self):
+        """CORRECTIF du 2026-09-17 (diagnostic confirmé, régression
+        constatée sur Mac) : un <Configure> dont `event.widget` est un
+        ENFANT de la fenêtre (Label, Combobox, Bouton — voir _ask_
+        eliminator, chacun empaqueté juste après le bind) remonte
+        pourtant jusqu'à ce gestionnaire via les bindtags de `win` —
+        c'était exactement la cause du bug : winfo_x()/winfo_y() de cet
+        enfant renvoient sa position relative à SON PARENT (souvent une
+        petite valeur), pas la position écran de la fenêtre, écrasant
+        silencieusement la position réellement mémorisée. Doit
+        désormais être totalement ignoré, quelles que soient ses
+        coordonnées."""
+        fake_win = tk.Toplevel(self.win)
+        self.addCleanup(fake_win.destroy)
+        fake_win.geometry("+333+444")
+        child = tk.Label(fake_win)  # jamais empaqueté : pas nécessaire, seule l'identité compte
+        self.addCleanup(child.destroy)
+        export_prefs.save_value("ask_eliminator_window_x", 111)
+        export_prefs.save_value("ask_eliminator_window_y", 222)
+        fake_event = type("FakeEvent", (), {"widget": child})()
+
+        self.win._on_ask_eliminator_window_configure(fake_event, fake_win)
+
+        # Valeur précédente strictement inchangée : l'événement de
+        # l'enfant a bien été ignoré, jamais confondu avec `win`.
+        self.assertEqual(export_prefs.load_value("ask_eliminator_window_x"), 111)
+        self.assertEqual(export_prefs.load_value("ask_eliminator_window_y"), 222)
 
     def test_configure_ne_leve_jamais_meme_fenetre_detruite(self):
         """Filet de sécurité (même principe que RemoteDeviceRequestWindow.
@@ -149,7 +194,7 @@ class AskEliminatorPositionUnitTest(unittest.TestCase):
         fake_win = tk.Toplevel(self.win)
         fake_win.destroy()
         fake_event = type("FakeEvent", (), {"widget": fake_win})()
-        self.win._on_ask_eliminator_window_configure(fake_event)  # ne doit pas lever
+        self.win._on_ask_eliminator_window_configure(fake_event, fake_win)  # ne doit pas lever
 
 
 class AskEliminatorSourceWiringTest(unittest.TestCase):
@@ -177,12 +222,20 @@ class AskEliminatorSourceWiringTest(unittest.TestCase):
         self.assertIn("_ask_eliminator_position", self._calls())
 
     def test_bind_configure_vers_la_methode_liee_dediee(self):
-        """bind("<Configure>", self._on_ask_eliminator_window_configure) —
-        jamais une fonction imbriquée locale (voir git history) : la
-        méthode liée reste testable indépendamment (voir AskEliminator
-        PositionUnitTest.test_configure_memorise_la_position ci-dessus)."""
+        """bind("<Configure>", lambda e: self._on_ask_eliminator_window_
+        configure(e, win)) — `win` capturé explicitement par la lambda
+        (CORRECTIF du 2026-09-17 : plus jamais de confiance aveugle en
+        event.widget, voir _on_ask_eliminator_window_configure), jamais
+        un nouvel attribut persistant sur self (demande explicite de
+        l'utilisateur) ni une fonction imbriquée `def` locale (voir git
+        history) : la méthode liée reste testable indépendamment (voir
+        AskEliminatorPositionUnitTest.test_configure_memorise_la_
+        position ci-dessus)."""
         normalized = self.source.replace("'<Configure>'", '"<Configure>"')
-        self.assertIn('bind("<Configure>", self._on_ask_eliminator_window_configure)', normalized)
+        self.assertIn(
+            'bind("<Configure>", lambda e: self._on_ask_eliminator_window_configure(e, win))',
+            normalized,
+        )
         self.assertNotIn("def _on_configure", self.source)  # pas de fonction imbriquée réintroduite
 
     def test_geometry_appliquee_conditionnellement_jamais_inconditionnellement(self):
