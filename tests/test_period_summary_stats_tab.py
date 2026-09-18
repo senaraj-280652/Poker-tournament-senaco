@@ -17,19 +17,26 @@ RECENSEMENT (voir aussi le rapport livré séparément) :
 - Chaque "tournoi" de la synthèse vient de get_tournament_date, get_
   setting("tournament_name"), list_players, get_primes_summary (donc
   get_presence_bonuses/get_assiduity_bonuses/get_ranking_bonuses/get_
-  bounty_bonuses), get_stats (prize_pool) et get_payouts_amounts —
-  exactement les mêmes fonctions que les onglets Primes/Classement/
-  Joueurs de CE tournoi, jamais un calcul dupliqué indépendant.
+  bounty_bonuses) et get_stats (prize_pool) — exactement les mêmes
+  fonctions que les onglets Primes/Classement/Joueurs de CE tournoi,
+  jamais un calcul dupliqué indépendant.
 - Chaque "joueur" agrégé sur la période : tournaments_played (compte
   chaque fichier où le joueur est resté "active" ou a été réellement
   "eliminated" — PAS un forfait "withdrawn", règle métier validée le
   2026-09-15, voir ForfaitNeCompteJamaisCommeTournoiJoueTest : un
   forfait reste néanmoins agrégé dans "players" comme une participation
-  administrative, total_cost/total_bounty_won/total_points compris),
-  wins (place == 1), best_place (minimum des places connues), total_cost/
-  total_gain (€, jamais affichés dans le tableau à l'écran — seulement
-  disponibles à l'export), total_bounty_won et total_points (somme du
-  "total" de get_primes_summary pour ce joueur, tournoi par tournoi).
+  administrative, total_bounty_won/total_points/total_presence_
+  assiduity compris), wins (place == 1), best_place (minimum des places
+  connues), total_bounty_won et total_points (somme du "total" de
+  get_primes_summary pour ce joueur, tournoi par tournoi).
+- Demande du 2026-09-18 : les anciennes colonnes d'export "Total investi
+  (€)"/"Gains classement (€)" (total_cost/total_gain, jamais affichées à
+  l'écran, plus aucun autre usage vérifié dans le projet) sont
+  SUPPRIMÉES et remplacées par "Pts Prés/Ass"/"Pts Gain Clsmt"
+  (total_presence_assiduity/total_ranking_points) — sommes, sur la
+  période, EXCLUSIVEMENT de presence+assiduite et de cl_montant de
+  get_primes_summary() (jamais une formule dupliquée) — voir
+  PrimesPointsColumnsTest.
 - Filtres/sélections : dossier + "Inclure les sous-dossiers" + période
   (date_from/date_to, bornes INCLUSES) => reparcourent les fichiers ;
   filtre "Club" => ne touche que l'AFFICHAGE (voir _refresh_display) ET,
@@ -249,22 +256,28 @@ class TournoiCompletEliminationOrdreControleTest(unittest.TestCase):
         self.assertEqual(by_name["Bob"]["total_bounty_won"], 1 * bv)
         self.assertEqual(by_name["Chris"]["total_bounty_won"], 0)
 
-    def test_total_cost_et_gain_recalcules_independamment(self):
-        """total_cost/total_gain (€) : présents dans build_period_summary
-        et exportables (PERIOD_PLAYER_COLUMNS) mais ABSENTS du tableau
-        affiché à l'écran (voir cols_p dans PeriodSummaryDialog.__init__,
-        recensement du rapport) — vérifiés ici indépendamment tout de
-        même puisqu'ils font partie du contrat de build_period_summary."""
+    def test_pts_pres_ass_et_gain_clsmt_recalcules_independamment(self):
+        """total_presence_assiduity/total_ranking_points (demande du
+        2026-09-18, remplacent les anciens total_cost/total_gain en
+        euros — voir PrimesPointsColumnsTest pour la couverture dédiée) :
+        recalculés ici indépendamment de get_primes_summary, sur ce
+        même scénario "classement complet" déjà utilisé pour total_
+        points ci-dessus."""
         summary = database.build_period_summary(self._tmp.name, recursive=False)
         by_name = {a["name"]: a for a in summary["players"]}
-        # buyin_amount par défaut (DEFAULT_SETTINGS) = 50 ; 1 achat chacun.
+        # attendance_bonus_points=5 (setUp), aucune assiduité réglée
+        # (0/désactivée par défaut) : presence+assiduite = 5+0 = 5 pour
+        # chacun (get_presence_bonuses boucle sur tous les joueurs, sans
+        # condition de rang).
         for name in ("Alice", "Bob", "Chris", "Dana"):
-            self.assertEqual(by_name[name]["total_cost"], 50.0, name)
-        # payout_structure par défaut = {1: 100%} ; pool = 4*50*(1-0%) = 200 ;
-        # seule la 1re place (Alice) touche un gain.
-        self.assertEqual(by_name["Alice"]["total_gain"], 200.0)
-        for name in ("Bob", "Chris", "Dana"):
-            self.assertEqual(by_name[name]["total_gain"], 0.0, name)
+            self.assertEqual(by_name[name]["total_presence_assiduity"], 5, name)
+        # ranking_formula="current" (Classique) : cl_montant = _expected_
+        # ranking(place) — mêmes valeurs déjà vérifiées pour total_points
+        # ci-dessus (200/100/67/50).
+        self.assertEqual(by_name["Alice"]["total_ranking_points"], self._expected_ranking(1))
+        self.assertEqual(by_name["Bob"]["total_ranking_points"], self._expected_ranking(2))
+        self.assertEqual(by_name["Chris"]["total_ranking_points"], self._expected_ranking(3))
+        self.assertEqual(by_name["Dana"]["total_ranking_points"], self._expected_ranking(4))
 
 
 class PrimesDesactiveesTest(unittest.TestCase):
@@ -289,6 +302,11 @@ class PrimesDesactiveesTest(unittest.TestCase):
             by_name = {a["name"]: a for a in summary["players"]}
             self.assertEqual(by_name["Alice"]["total_points"], 0)
             self.assertEqual(by_name["Alice"]["total_bounty_won"], 0)
+            # Demande du 2026-09-18 : mêmes garanties pour les deux
+            # nouveaux totaux en points (get_primes_summary() renvoie déjà
+            # [] pour ce tournoi, donc aucune contribution).
+            self.assertEqual(by_name["Alice"]["total_presence_assiduity"], 0)
+            self.assertEqual(by_name["Alice"]["total_ranking_points"], 0)
             # Alice a malgré tout bien "joué" ce tournoi.
             self.assertEqual(by_name["Alice"]["tournaments_played"], 1)
 
@@ -416,8 +434,8 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
     déclaré forfait (Database.withdraw_player — inscrit, blindes
     éventuellement prélevées pendant son absence, déclaré forfait au
     bout d'~1h) a bien participé ADMINISTRATIVEMENT à ce tournoi (il
-    reste dans "players", continue de peser sur total_cost/total_
-    bounty_won/total_points exactement comme avant), mais ce tournoi ne
+    reste dans "players", continue de peser sur total_bounty_won/total_
+    points/total_presence_assiduity exactement comme avant), mais ce tournoi ne
     doit PLUS compter dans son nombre de tournois JOUÉS
     (tournaments_played)."""
 
@@ -499,11 +517,12 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
             self.assertEqual(summary["tournaments"][0]["status"], "Terminé")
             self.assertEqual(summary["tournaments"][0]["winner"], "-")
 
-    def test_forfait_ne_change_ni_cout_ni_primes_deja_dues(self):
+    def test_forfait_ne_change_ni_primes_ni_pts_pres_ass_deja_dues(self):
         """Non-régression explicite (demande du 2026-09-15, "ne change pas
-        d'autres règles métier") : total_cost/total_bounty_won/
-        total_points d'un forfait restent calculés exactement comme
-        avant cette règle — seul tournaments_played change."""
+        d'autres règles métier" ; mise à jour le 2026-09-18 après
+        suppression de total_cost) : total_bounty_won/total_points/
+        total_presence_assiduity d'un forfait restent calculés exactement
+        comme avant cette règle — seul tournaments_played change."""
         with tempfile.TemporaryDirectory(prefix="stats_withdrawn_cost_") as tmp:
             db = _new_db(
                 tmp, "forfait3.tournoi", tournament_date="2026-01-24",
@@ -517,13 +536,12 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
             summary = database.build_period_summary(tmp, recursive=False)
             bob = next(p for p in summary["players"] if p["name"] == "Bob")
             self.assertEqual(bob["tournaments_played"], 0)
-            # Coût du buy-in déjà encaissé avant le forfait : toujours
-            # compté (buyin_amount par défaut = 50, voir DEFAULT_SETTINGS).
-            self.assertEqual(bob["total_cost"], 50.0)
             # Prime de présence (5 pts) : get_presence_bonuses boucle sur
             # TOUS les joueurs (voir sa docstring), forfait compris —
             # inchangé par cette règle, qui ne touche QUE tournaments_played.
             self.assertEqual(bob["total_points"], 5)
+            self.assertEqual(bob["total_presence_assiduity"], 5)  # même source
+            self.assertEqual(bob["total_ranking_points"], 0)  # jamais classé
             self.assertEqual(bob["total_bounty_won"], 0)  # aucun kill
 
     def test_melange_multi_tournois_avec_certains_forfaits(self):
@@ -931,10 +949,16 @@ class PeriodSummaryDialogUiTestCase(unittest.TestCase):
 
         p_rows = self._rows(self.dialog.players_tree)
         alice_row = next(r for r in p_rows if r[1] == "Alice")
-        _club, _name, played, wins, best, bounty_won, total_pts = alice_row
+        # Colonnes ajustées le 2026-09-18 (2e ajustement) : "Victoires"/
+        # "Meilleur Rang" remplacées à l'écran par "Pts Prés/Ass"/"Pts
+        # Gain Clsmt" (voir cols_p) — wins=1/best_place=1 restent
+        # inchangés dans build_period_summary (voir PrimesPointsColumns
+        # Test/PrizePoolColumnRemovedTest pour leur couverture dédiée),
+        # simplement plus affichés dans CE Treeview.
+        _club, _name, played, presence_assiduity, ranking_pts, bounty_won, total_pts = alice_row
         self.assertEqual(played, "1")
-        self.assertEqual(wins, "1")
-        self.assertEqual(best, "1")
+        self.assertEqual(presence_assiduity, "0")  # aucune prime de présence/assiduité réglée
+        self.assertEqual(ranking_pts, "0")  # ranking_formula "none" -> toujours 0
         self.assertEqual(bounty_won, "10")
         self.assertEqual(total_pts, "10")  # ranking_formula "none" -> seul le bounty compte
 
@@ -1127,6 +1151,412 @@ class ClubFilterExportConsistencyTest(unittest.TestCase):
         self.assertEqual(
             {a["name"] for a in self.dialog.summary["players"]}, {"Alice", "Bob"}
         )
+
+
+# =====================================================================
+# "Pts Prés/Ass" / "Pts Gain Clsmt" (demande du 2026-09-18) — remplacent
+# définitivement les anciennes colonnes d'export "Total investi (€)"/
+# "Gains classement (€)" (total_cost/total_gain, supprimées de build_
+# period_summary — plus aucun autre usage vérifié dans le projet).
+# Valeurs = somme, sur les tournois retenus, de presence+assiduite et de
+# cl_montant — EXCLUSIVEMENT lues depuis Database.get_primes_summary
+# (jamais une formule dupliquée ici), donc déjà correctes pour les 4
+# formules de classement, les forfaits, et primes désactivées.
+# =====================================================================
+class PrimesPointsColumnsTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="stats_primes_pts_")
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_cumul_sur_plusieurs_tournois(self):
+        """Un même joueur sur 2 tournois avec des valeurs DIFFÉRENTES à
+        chaque fois (présence différente, place différente) : preuve
+        d'une vraie SOMME sur la période, jamais le report du dernier
+        tournoi rencontré."""
+        db1 = _new_db(
+            self._tmp.name, "t1.tournoi", tournament_date="2026-02-01",
+            attendance_bonus_points=5, ranking_formula="current",
+        )
+        a1 = db1.add_player("Alice")
+        db1.add_player("Bob")
+        db1.eliminate_player(a1)  # Alice 2e sur 2 (Bob gagne)
+        db1.conn.close()
+
+        db2 = _new_db(
+            self._tmp.name, "t2.tournoi", tournament_date="2026-02-02",
+            attendance_bonus_points=7, ranking_formula="current",
+        )
+        b2 = db2.add_player("Bob")
+        db2.add_player("Alice")
+        db2.eliminate_player(b2)  # Alice gagne cette fois (1re sur 2)
+        db2.conn.close()
+
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+        alice = next(p for p in summary["players"] if p["name"] == "Alice")
+
+        expected_ranking = (
+            database.ranking_points(2, 2, database.RANKING_FORMULA_CURRENT)  # t1 : 2e
+            + database.ranking_points(1, 2, database.RANKING_FORMULA_CURRENT)  # t2 : 1re
+        )
+        self.assertEqual(alice["total_ranking_points"], expected_ranking)
+        self.assertEqual(alice["total_presence_assiduity"], 5 + 7)  # aucune assiduité réglée
+
+    def _check_formula(self, formula):
+        """3 joueurs, classement complet (1/2/3) — total_ranking_points
+        de chacun comparé indépendamment à database.ranking_points(),
+        pour la formule `formula` précise. Couvre les 4 valeurs de
+        RANKING_FORMULA_LABELS (Aucun/Classique/Progressive/Sit & Go
+        CPC) : aucune n'est recalculée dans build_period_summary, ce
+        test le vérifie directement."""
+        db = _new_db(
+            self._tmp.name, f"formule_{formula}.tournoi", tournament_date="2026-03-01",
+            ranking_formula=formula,
+        )
+        a = db.add_player("Alice")
+        b = db.add_player("Bob")
+        c = db.add_player("Chris")
+        db.eliminate_player(c)  # 3e
+        db.eliminate_player(b)  # 2e
+        # Alice reste seule active -> vainqueur (1re).
+        db.conn.close()
+
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+        by_name = {p["name"]: p for p in summary["players"]}
+        for name, place in (("Alice", 1), ("Bob", 2), ("Chris", 3)):
+            expected = database.ranking_points(place, 3, formula)
+            self.assertEqual(by_name[name]["total_ranking_points"], expected, name)
+
+    def test_formule_aucun(self):
+        self._check_formula(database.RANKING_FORMULA_NONE)
+
+    def test_formule_classique(self):
+        self._check_formula(database.RANKING_FORMULA_CURRENT)
+
+    def test_formule_progressive(self):
+        self._check_formula(database.RANKING_FORMULA_PROGRESSIVE)
+
+    def test_formule_sitngo_cpc(self):
+        self._check_formula(database.RANKING_FORMULA_SITNGO_CPC)
+
+    def test_respecte_le_filtre_de_periode(self):
+        db1 = _new_db(
+            self._tmp.name, "avant.tournoi", tournament_date="2026-01-01",
+            attendance_bonus_points=10,
+        )
+        db1.add_player("Alice")
+        db1.conn.close()
+        db2 = _new_db(
+            self._tmp.name, "dans.tournoi", tournament_date="2026-06-01",
+            attendance_bonus_points=10,
+        )
+        db2.add_player("Alice")
+        db2.conn.close()
+
+        summary = database.build_period_summary(
+            self._tmp.name, recursive=False, date_from="2026-05-01", date_to="2026-12-31",
+        )
+        alice = next(p for p in summary["players"] if p["name"] == "Alice")
+        self.assertEqual(alice["total_presence_assiduity"], 10)  # seul "dans.tournoi" compte
+
+    def test_respecte_le_filtre_type_de_tournois(self):
+        db1 = _new_db(
+            self._tmp.name, "To010626.tournoi", tournament_date="2026-06-01",
+            attendance_bonus_points=10,
+        )
+        db1.add_player("Alice")
+        db1.conn.close()
+        db2 = _new_db(
+            self._tmp.name, "Sn020626.tournoi", tournament_date="2026-06-02",
+            attendance_bonus_points=20,
+        )
+        db2.add_player("Alice")
+        db2.conn.close()
+
+        summary = database.build_period_summary(
+            self._tmp.name, recursive=False,
+            tournament_type=database.STATS_TOURNAMENT_TYPE_SITNGO,
+        )
+        alice = next(p for p in summary["players"] if p["name"] == "Alice")
+        self.assertEqual(alice["total_presence_assiduity"], 20)  # seul le Sn compte
+
+    def test_anciennes_colonnes_euros_disparues_de_period_player_columns(self):
+        keys = [k for k, _, _ in database.PERIOD_PLAYER_COLUMNS]
+        headers = [h for _, h, _ in database.PERIOD_PLAYER_COLUMNS]
+        self.assertNotIn("total_cost", keys)
+        self.assertNotIn("total_gain", keys)
+        self.assertNotIn("Total investi (€)", headers)
+        self.assertNotIn("Gains classement (€)", headers)
+        self.assertIn("total_presence_assiduity", keys)
+        self.assertIn("total_ranking_points", keys)
+        self.assertIn("Pts Prés/Ass", headers)
+        self.assertIn("Pts Gain Clsmt", headers)
+
+    def test_anciennes_cles_absentes_du_dict_joueur(self):
+        db = _new_db(self._tmp.name, "x.tournoi", tournament_date="2026-04-01")
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+        alice = summary["players"][0]
+        self.assertNotIn("total_cost", alice)
+        self.assertNotIn("total_gain", alice)
+
+    def test_export_csv_contient_les_nouvelles_colonnes_pas_les_anciennes(self):
+        db = _new_db(
+            self._tmp.name, "t.tournoi", tournament_date="2026-05-01",
+            attendance_bonus_points=5, ranking_formula="current",
+        )
+        a = db.add_player("Alice")
+        db.add_player("Bob")
+        db.eliminate_player(a)
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.csv")
+        database.export_period_summary_csv(
+            summary, out_path,
+            player_keys=["name", "total_presence_assiduity", "total_ranking_points"],
+        )
+        with open(out_path, encoding="utf-8-sig") as f:
+            content = f.read()
+        self.assertIn("Pts Prés/Ass", content)
+        self.assertIn("Pts Gain Clsmt", content)
+        self.assertNotIn("Total investi", content)
+        self.assertNotIn("Gains classement", content)
+
+    def test_export_xlsx_contient_les_nouvelles_colonnes(self):
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            self.skipTest("openpyxl indisponible dans cet environnement")
+        db = _new_db(
+            self._tmp.name, "t.tournoi", tournament_date="2026-05-02",
+            attendance_bonus_points=5,
+        )
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.xlsx")
+        database.export_period_summary_xlsx(
+            summary, out_path,
+            player_keys=["name", "total_presence_assiduity", "total_ranking_points"],
+        )
+        wb = load_workbook(out_path)
+        ws = wb["Joueurs"]
+        headers = [cell.value for cell in ws[2]]  # ligne 1 = période, ligne 2 = en-têtes
+        self.assertIn("Pts Prés/Ass", headers)
+        self.assertIn("Pts Gain Clsmt", headers)
+        self.assertNotIn("Total investi (€)", headers)
+        self.assertNotIn("Gains classement (€)", headers)
+
+    def test_export_pdf_avec_les_nouvelles_colonnes_ne_plante_pas(self):
+        try:
+            import fpdf  # noqa: F401
+        except ImportError:
+            self.skipTest("fpdf2 indisponible dans cet environnement")
+        db = _new_db(
+            self._tmp.name, "t.tournoi", tournament_date="2026-05-03",
+            attendance_bonus_points=5,
+        )
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.pdf")
+        database.export_period_summary_pdf(
+            summary, out_path,
+            player_keys=["name", "total_presence_assiduity", "total_ranking_points"],
+        )
+        self.assertTrue(os.path.exists(out_path))
+        self.assertGreater(os.path.getsize(out_path), 0)
+
+
+# =====================================================================
+# "Prize pool (€)" retiré de "Colonnes — Tournois de la période"
+# (demande du 2026-09-18) — UNIQUEMENT la colonne d'export : build_
+# period_summary continue de calculer tournament_entry["prize_pool"]
+# (Database.get_stats(), utilisé ailleurs — Résultats/Classement,
+# jamais touchés ici) ; rien dans les fichiers .tournoi ni les calculs
+# historiques n'est modifié.
+# =====================================================================
+class PrizePoolColumnRemovedTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="stats_no_prize_pool_")
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_absente_de_period_tournament_columns(self):
+        keys = [k for k, _, _ in database.PERIOD_TOURNAMENT_COLUMNS]
+        headers = [h for _, h, _ in database.PERIOD_TOURNAMENT_COLUMNS]
+        self.assertNotIn("prize_pool", keys)
+        self.assertNotIn("Prize pool (€)", headers)
+
+    def test_autres_colonnes_tournois_toujours_presentes(self):
+        """Non-régression : les 5 autres colonnes restent exactement
+        celles d'avant, dans le même ordre relatif, avec le même
+        comportement — seule "prize_pool" a disparu."""
+        keys = [k for k, _, _ in database.PERIOD_TOURNAMENT_COLUMNS]
+        self.assertEqual(
+            keys, ["date", "name", "status", "entries", "winner", "bounty_distributed"]
+        )
+
+    def test_tournament_entry_garde_prize_pool_en_interne(self):
+        """build_period_summary ne doit RIEN changer à son calcul interne
+        — tournament_entry["prize_pool"] reste présent et correct
+        (Database.get_stats()), seule la colonne d'EXPORT a disparu."""
+        db = _new_db(self._tmp.name, "t.tournoi", tournament_date="2026-07-01")
+        db.add_player("Alice")
+        db.add_player("Bob")
+        expected_pool = db.get_stats()["prize_pool"]
+        db.conn.close()
+
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+        t = summary["tournaments"][0]
+        self.assertIn("prize_pool", t)
+        self.assertEqual(t["prize_pool"], expected_pool)
+
+    def test_absente_de_l_export_csv(self):
+        db = _new_db(self._tmp.name, "t.tournoi", tournament_date="2026-07-02")
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.csv")
+        # tournament_keys=None -> "toutes les colonnes disponibles" (voir
+        # _selected_period_columns) : si "prize_pool" était encore dans
+        # PERIOD_TOURNAMENT_COLUMNS, elle apparaîtrait ici.
+        database.export_period_summary_csv(summary, out_path)
+        with open(out_path, encoding="utf-8-sig") as f:
+            content = f.read()
+        self.assertNotIn("Prize pool", content)
+        self.assertIn("Date", content)  # les autres colonnes restent bien exportées
+        self.assertIn("Vainqueur", content)
+
+    def test_absente_de_l_export_xlsx(self):
+        try:
+            from openpyxl import load_workbook
+        except ImportError:
+            self.skipTest("openpyxl indisponible dans cet environnement")
+        db = _new_db(self._tmp.name, "t.tournoi", tournament_date="2026-07-03")
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.xlsx")
+        database.export_period_summary_xlsx(summary, out_path)
+        wb = load_workbook(out_path)
+        ws = wb["Tournois"]
+        headers = [cell.value for cell in ws[2]]
+        self.assertNotIn("Prize pool (€)", headers)
+        self.assertIn("Date", headers)
+
+    def test_absente_de_l_export_pdf(self):
+        try:
+            import fpdf  # noqa: F401
+        except ImportError:
+            self.skipTest("fpdf2 indisponible dans cet environnement")
+        db = _new_db(self._tmp.name, "t.tournoi", tournament_date="2026-07-04")
+        db.add_player("Alice")
+        db.conn.close()
+        summary = database.build_period_summary(self._tmp.name, recursive=False)
+
+        out_path = os.path.join(self._tmp.name, "export.pdf")
+        # N'échoue jamais même sans "prize_pool" dans les colonnes
+        # sélectionnées par défaut (None = toutes celles restantes).
+        database.export_period_summary_pdf(summary, out_path)
+        self.assertTrue(os.path.exists(out_path))
+        self.assertGreater(os.path.getsize(out_path), 0)
+
+    def test_aucune_ecriture_dans_le_fichier_tournoi(self):
+        db = _new_db(self._tmp.name, "t.tournoi", tournament_date="2026-07-05")
+        db.add_player("Alice")
+        before = dict(db.get_stats())
+        db.conn.close()
+
+        database.build_period_summary(self._tmp.name, recursive=False)
+        database.export_period_summary_csv(
+            database.build_period_summary(self._tmp.name, recursive=False),
+            os.path.join(self._tmp.name, "export.csv"),
+        )
+
+        db2 = database.Database(
+            os.path.join(self._tmp.name, "t.tournoi"), read_only=True
+        )
+        after = dict(db2.get_stats())
+        db2.close()
+        self.assertEqual(before, after)  # prize_pool et tout le reste inchangés
+
+
+@unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible dans cet environnement")
+class PtsColumnsRespectClubFilterUiTest(unittest.TestCase):
+    """Le filtre "Club" (déjà couvert par ClubFilterExportConsistencyTest
+    pour la LISTE de joueurs) ne doit jamais modifier le CONTENU des
+    deux nouveaux totaux — vérifié en réutilisant EXACTEMENT le même
+    mécanisme (_club_filtered_players, partagé par _refresh_display et
+    _open_export_dialog), jamais une deuxième logique de filtre."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = tk.Tk()
+        cls.root.withdraw()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.root.destroy()
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="stats_pts_club_")
+        self.addCleanup(self._tmp.cleanup)
+        roster_path = os.path.join(self._tmp.name, "roster.json")
+        prefs_path = os.path.join(self._tmp.name, "export_prefs.json")
+        for target in (
+            patch.object(roster, "_roster_path", return_value=roster_path),
+            patch.object(export_prefs, "_prefs_path", return_value=prefs_path),
+        ):
+            self.addCleanup(target.stop)
+            target.start()
+
+        roster.set_club("Alice", "Chemillé")
+        roster.set_club("Bob", "Angers")
+        db = _new_db(
+            self._tmp.name, "clubs.tournoi", tournament_date="2026-04-03",
+            attendance_bonus_points=10, ranking_formula="current",
+        )
+        a = db.add_player("Alice")
+        db.add_player("Bob")
+        db.eliminate_player(a)  # Alice 2e, Bob gagne
+        db.conn.close()
+
+        self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
+        self.addCleanup(self.dialog.destroy)
+        self.dialog.folder_var.set(self._tmp.name)
+        self.dialog._generate()
+
+    def _select_club(self, club_name):
+        listbox = self.dialog.stats_club_listbox
+        items = list(listbox.get(0, "end"))
+        listbox.selection_clear(0, "end")
+        listbox.selection_set(items.index(club_name))
+        self.dialog._refresh_display()
+
+    def test_valeur_du_champ_inchangee_par_le_filtre_club(self):
+        alice_before = next(
+            p for p in self.dialog.summary["players"] if p["name"] == "Alice"
+        )
+        self._select_club("Chemillé")
+        with patch.object(main, "PeriodExportDialog") as mock_dialog_cls:
+            self.dialog._open_export_dialog()
+        export_summary = mock_dialog_cls.call_args.args[1]
+        alice_exported = next(p for p in export_summary["players"] if p["name"] == "Alice")
+        self.assertEqual(
+            alice_exported["total_presence_assiduity"],
+            alice_before["total_presence_assiduity"],
+        )
+        self.assertEqual(
+            alice_exported["total_ranking_points"], alice_before["total_ranking_points"],
+        )
+        # Bob, filtré par le club, n'apparaît plus du tout — mais son
+        # absence ne doit rien dire sur la VALEUR du champ d'Alice.
+        self.assertEqual({p["name"] for p in export_summary["players"]}, {"Alice"})
 
 
 if __name__ == "__main__":

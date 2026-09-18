@@ -3945,18 +3945,119 @@ def find_previous_tournament_file(current_path, current_date=None):
     return found[0] if found else None
 
 
-def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
+# Valeurs internes acceptées par build_period_summary (paramètre
+# `tournament_type`, demande du 2026-09-17 — onglet Statistiques,
+# "Type de tournois") — jamais les libellés français affichés (voir
+# main.py: STATS_TOURNAMENT_TYPE_LABELS pour la correspondance).
+STATS_TOURNAMENT_TYPE_TOURNOIS = "tournois"
+STATS_TOURNAMENT_TYPE_SITNGO = "sitngo"
+STATS_TOURNAMENT_TYPE_ALL = "all"
+
+
+def _tournament_type_matches(path, tournament_type):
+    """True si le fichier .tournoi `path` correspond au filtre "Type de
+    tournois" de l'onglet Statistiques (demande du 2026-09-17) — jamais
+    appliqué à find_tournament_files elle-même (partagée par 5 autres
+    appelants sans rapport avec Statistiques : Lobby, réactivation de
+    joueurs bloqués, tournoi précédent, conflit de joueur actif
+    ailleurs), uniquement ici, localement à build_period_summary.
+
+    Convention de nommage établie par tournament_day_folder_proposal
+    (main.py) : un tournoi normal commence par "To" (ex. "To270826"), un
+    Sit & Go par "Sn" (ex. "Sn270826") — jamais l'inverse, jamais un
+    autre préfixe pour ces deux types.
+
+    - STATS_TOURNAMENT_TYPE_TOURNOIS : uniquement les fichiers dont le
+      nom commence par "To".
+    - STATS_TOURNAMENT_TYPE_SITNGO : uniquement ceux commençant par "Sn".
+    - STATS_TOURNAMENT_TYPE_ALL (ou toute autre valeur, y compris None) :
+      TOUS les fichiers, y COMPRIS ceux hors convention (ex. l'ancien
+      repli "tournoi.tournoi", ou un renommage manuel quelconque) —
+      OPTION A validée avec l'utilisateur le 2026-09-17 : "Tous" ne doit
+      jamais faire disparaître un fichier qui apparaissait déjà dans
+      Statistiques avant l'existence de ce filtre."""
+    if tournament_type == STATS_TOURNAMENT_TYPE_TOURNOIS:
+        return os.path.basename(path).startswith("To")
+    if tournament_type == STATS_TOURNAMENT_TYPE_SITNGO:
+        return os.path.basename(path).startswith("Sn")
+    return True
+
+
+# Sous-dossiers "jour" (demande du 2026-09-18, onglet Statistiques,
+# 7 cases à cocher Lundi...Dimanche) — mêmes noms que WEEKDAY_NAMES_FR
+# (main.py: tournament_day_folder_proposal), qui les CRÉE ; ce module ne
+# doit rien importer de main.py (sens inverse des dépendances), donc une
+# copie locale plutôt qu'un import croisé.
+STATS_WEEKDAY_FOLDER_NAMES = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
+
+
+def _tournament_day_matches(path, folder, selected_days):
+    """True si `path` correspond au filtre "jours" de l'onglet
+    Statistiques (demande du 2026-09-18) — jamais appliqué à
+    find_tournament_files elle-même (voir _tournament_type_matches
+    ci-dessus, même principe, uniquement local à build_period_summary).
+
+    Ne détermine JAMAIS le jour depuis la date enregistrée dans le
+    tournoi : uniquement depuis les NOMS DE SOUS-DOSSIERS réels sur
+    disque (organisation de l'utilisateur : dossier principal/Vendredi/
+    To....tournoi), retrouvés via os.path.relpath(dirname(path), folder).
+
+    `selected_days` : None, ou un itérable de noms de jours (sous-
+    ensemble de STATS_WEEKDAY_FOLDER_NAMES) actuellement cochés.
+    - None, ou une sélection couvrant les 7 jours : BYPASS TOTAL, jamais
+      la moindre analyse de chemin — un fichier à la racine, dans
+      Lundi...Dimanche, dans un dossier legacy/inconnu, ou dans un autre
+      sous-dossier quelconque, est TOUJOURS retenu (comportement
+      strictement identique à avant l'existence de ce filtre) — même
+      principe que STATS_TOURNAMENT_TYPE_ALL pour le filtre Type.
+    - Sélection partielle : retenu seulement si AU MOINS UN segment du
+      chemin relatif entre `folder` et le fichier correspond (insensible
+      à la casse) à l'un des jours sélectionnés — donc
+      Vendredi/sous_dossier/x.tournoi appartient bien à "Vendredi" (pas
+      seulement le dossier parent immédiat). Un fichier à la racine, ou
+      dans un dossier dont AUCUN segment ne nomme un jour, n'appartient
+      alors à aucun jour sélectionné : exclu.
+    - Sélection vide (aucun jour coché) : aucun segment ne peut jamais
+      correspondre à rien -> exclut tout, 0 résultat, sans cas spécial.
+
+    Appelée uniquement quand `recursive` est vrai côté build_period_
+    summary (voir sa docstring) : sans sous-dossiers, aucun fichier ne
+    peut de toute façon se trouver "dans" un jour, le filtre serait sans
+    objet."""
+    if selected_days is None:
+        return True
+    selected_cf = {d.casefold() for d in selected_days}
+    if selected_cf >= {d.casefold() for d in STATS_WEEKDAY_FOLDER_NAMES}:
+        return True
+    rel = os.path.relpath(os.path.dirname(path), folder)
+    segments = [] if rel == os.curdir else rel.split(os.sep)
+    return any(seg.casefold() in selected_cf for seg in segments)
+
+
+def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
+                          tournament_type=STATS_TOURNAMENT_TYPE_ALL, selected_days=None):
     """Parcourt tous les fichiers .tournoi d'un dossier et construit une
     synthèse des résultats pour la période indiquée. `date_from` /
     `date_to` sont des chaînes 'AAAA-MM-JJ' (bornes incluses), ou None
-    pour ne pas borner. Renvoie un dict :
+    pour ne pas borner. `tournament_type` (demande du 2026-09-17, voir
+    _tournament_type_matches ci-dessus) filtre en plus par CONVENTION DE
+    NOMMAGE du fichier (To.../Sn.../tous). `selected_days` (demande du
+    2026-09-18, voir _tournament_day_matches ci-dessus) filtre en plus
+    par SOUS-DOSSIER "jour" (Lundi...Dimanche) — mais UNIQUEMENT si
+    `recursive` est vrai : sans sous-dossiers explorés, aucun fichier ne
+    peut se trouver "dans" un jour, ce filtre serait sans effet et
+    DOIT rester totalement inopérant (demande explicite, cases grisées
+    côté main.py) plutôt que de faire disparaître les fichiers de la
+    racine. Les trois filtres (type, jour, période) se combinent : un
+    fichier doit tous les passer pour être retenu, dans la même passe
+    sur les fichiers, jamais des parcours distincts. Renvoie un dict :
 
       {
         "tournaments": [ {name, date, path, entries, prize_pool, status,
                            winner, bounty_distributed}, ... ],  # triés par date
         "players": [ {name, tournaments_played, wins, best_place,
-                       total_cost, total_gain, total_bounty_won,
-                       total_points}, ... ],  # triés par total_points décroissant
+                       total_presence_assiduity, total_ranking_points,
+                       total_bounty_won, total_points}, ... ],  # triés par total_points décroissant
       }
 
     "total_bounty_won" (par joueur) et "bounty_distributed" (par tournoi)
@@ -3972,27 +4073,53 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
 
     "total_points" par joueur = somme, sur toute la période, du TOTAL de
     l'onglet Primes de chaque tournoi joué (Présence + Assiduité +
-    Classement + Bounty, en points) — pas un calcul en euros ("total_cost"
-    / "total_gain" restent disponibles pour qui en aurait besoin, mais
-    n'entrent plus dans "total_points").
+    Classement + Bounty, en points).
+
+    "total_presence_assiduity" (demande du 2026-09-18, remplace l'ancien
+    "total_cost" en euros — voir plus bas) = somme, sur la période, de
+    presence + assiduite de get_primes_summary() pour chaque tournoi :
+    EXCLUSIVEMENT ces valeurs, jamais une formule dupliquée ici.
+    "total_ranking_points" (remplace l'ancien "total_gain" en euros) =
+    somme de cl_montant de get_primes_summary() — donc déjà correct pour
+    les 4 formules de classement (Aucun/Classique/Progressive/Sit & Go
+    CPC, voir resolve_ranking_formula/ranking_points, jamais recalculées
+    ici) et pour l'ancien réglage "valeur fixe" hérité. Comme presence/
+    assiduite (voir get_presence_bonuses/get_assiduity_bonuses, qui
+    bouclent sur TOUS les joueurs sans filtre de statut), un forfait
+    continue de peser sur "total_presence_assiduity" pour ce tournoi ;
+    "total_ranking_points" reste, lui, naturellement à 0 pour un forfait
+    (get_ranking_bonuses ne lui attribue jamais de place). Primes
+    désactivées pour un tournoi (_primes_enabled faux) : get_primes_
+    summary() renvoie [], donc aucune contribution de ce tournoi à ces
+    deux totaux, exactement comme pour total_bounty_won/total_points.
 
     "tournaments_played" (règle métier validée le 2026-09-15) : un joueur
     déclaré forfait (status='withdrawn', voir Database.withdraw_player) a
     bien participé ADMINISTRATIVEMENT à ce tournoi (inscrit, blindes
     éventuellement prélevées avant sa déclaration de forfait ~1h après le
     début) — il reste donc dans "players" et continue de peser sur
-    "total_cost"/"total_bounty_won"/"total_points" exactement comme
-    avant cette règle — mais ce tournoi ne doit PAS compter dans son
-    nombre de tournois JOUÉS : "tournaments_played" n'est incrémenté que
-    pour un joueur resté "active" (encore en jeu, y compris le vainqueur)
-    ou "eliminated" (a réellement joué jusqu'à son élimination), jamais
-    pour "withdrawn". "wins"/"best_place" restent, eux, déjà inatteignables
-    pour un forfait de toute façon (aucune "place" ne lui est jamais
-    attribuée, voir la boucle plus bas) — inchangé par cette règle."""
+    "total_bounty_won"/"total_points" (et désormais "total_presence_
+    assiduity") exactement comme avant cette règle — mais ce tournoi ne
+    doit PAS compter dans son nombre de tournois JOUÉS : "tournaments_
+    played" n'est incrémenté que pour un joueur resté "active" (encore
+    en jeu, y compris le vainqueur) ou "eliminated" (a réellement joué
+    jusqu'à son élimination), jamais pour "withdrawn". "wins"/"best_place"
+    restent, eux, déjà inatteignables pour un forfait de toute façon
+    (aucune "place" ne lui est jamais attribuée, voir la boucle plus
+    bas) — inchangé par cette règle.
+
+    SUPPRIMÉ le 2026-09-18 (demande explicite, plus aucun usage ailleurs
+    dans le projet — vérifié) : "total_cost"/"total_gain" (€, calculés à
+    partir de buyin_amount/rebuy_amount/addon_amount/get_payouts_
+    amounts) — remplacés ci-dessus par les deux totaux en points."""
     tournaments = []
     players = {}
 
     for path in find_tournament_files(folder, recursive=recursive):
+        if not _tournament_type_matches(path, tournament_type):
+            continue
+        if recursive and not _tournament_day_matches(path, folder, selected_days):
+            continue
         try:
             db = Database(path, read_only=True)
         except Exception as e:
@@ -4052,7 +4179,6 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
             bounty_distributed = sum(r["bo_montant"] for r in primes_by_name.values())
             entries = sum(p["buyin_count"] for p in all_players)
             stats = db.get_stats()
-            payouts_by_place = {r["place"]: r["amount"] for r in db.get_payouts_amounts()}
 
             tournament_entry = {
                 "name": name,
@@ -4065,36 +4191,39 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
                 "bounty_distributed": bounty_distributed,
             }
 
-            buyin_amount = db.get_setting_float("buyin_amount", 0)
-            rebuy_amount = db.get_setting_float("rebuy_amount", 0)
-            addon_amount = db.get_setting_float("addon_amount", 0)
-
             player_updates = []
             for p in all_players:
                 place = None
-                gain = 0.0
                 if p["status"] == "eliminated":
                     place = p["place"]
-                    gain = payouts_by_place.get(place, 0.0)
                 elif p["status"] == "active" and finished:
                     place = 1
-                    gain = payouts_by_place.get(1, 0.0)
 
-                cost = (
-                    p["buyin_count"] * buyin_amount
-                    + p["rebuy_count"] * rebuy_amount
-                    + p["addon_count"] * addon_amount
-                )
+                # EXCLUSIVEMENT get_primes_summary() (source unique déjà
+                # utilisée pour bounty_won/points ci-dessous, voir la
+                # docstring de cette fonction) : jamais une formule
+                # dupliquée pour presence/assiduite/cl_montant — ces
+                # valeurs sont déjà correctes pour les 4 formules de
+                # classement (Aucun/Classique/Progressive/Sit & Go CPC)
+                # et pour un tournoi "primes désactivées" (prime_row is
+                # None -> 0 partout, comme bounty_won/points).
                 prime_row = primes_by_name.get(p["name"])
                 bounty_won = prime_row["bo_montant"] if prime_row else 0
                 points = prime_row["total"] if prime_row else 0
+                presence_assiduity = (
+                    prime_row["presence"] + prime_row["assiduite"] if prime_row else 0
+                )
+                ranking_pts = prime_row["cl_montant"] if prime_row else 0
                 # Règle métier du 2026-09-15 (voir la docstring de cette
                 # fonction) : un forfait ("withdrawn") compte comme une
                 # participation ADMINISTRATIVE, jamais comme un tournoi
                 # JOUÉ — seul "played" distingue les deux ci-dessous, rien
-                # d'autre n'est modifié pour ce joueur (coût, primes...).
+                # d'autre n'est modifié pour ce joueur (primes...).
                 played = p["status"] != "withdrawn"
-                player_updates.append((p["name"], place, cost, gain, bounty_won, points, played))
+                player_updates.append((
+                    p["name"], place, bounty_won, points,
+                    presence_assiduity, ranking_pts, played,
+                ))
         except Exception as e:
             _log_skipped_tournament_file(path, e)
             continue
@@ -4102,21 +4231,21 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True):
             db.close()
 
         tournaments.append(tournament_entry)
-        for p_name, place, cost, gain, bounty_won, points, played in player_updates:
+        for p_name, place, bounty_won, points, presence_assiduity, ranking_pts, played in player_updates:
             agg = players.setdefault(p_name, {
                 "name": p_name,
                 "tournaments_played": 0,
                 "wins": 0,
                 "best_place": None,
-                "total_cost": 0.0,
-                "total_gain": 0.0,
+                "total_presence_assiduity": 0,
+                "total_ranking_points": 0,
                 "total_bounty_won": 0,
                 "total_points": 0,
             })
             if played:
                 agg["tournaments_played"] += 1
-            agg["total_cost"] += cost
-            agg["total_gain"] += gain
+            agg["total_presence_assiduity"] += presence_assiduity
+            agg["total_ranking_points"] += ranking_pts
             agg["total_bounty_won"] += bounty_won
             agg["total_points"] += points
             if place == 1:
@@ -4155,7 +4284,15 @@ PERIOD_TOURNAMENT_COLUMNS = [
     ("name", "Tournoi", lambda t: t["name"]),
     ("status", "Statut", lambda t: t["status"]),
     ("entries", "Entrées", lambda t: t["entries"]),
-    ("prize_pool", "Prize pool (€)", lambda t: round(t["prize_pool"], 2)),
+    # "prize_pool" ("Prize pool (€)") retiré le 2026-09-18 (demande
+    # explicite : ce club ne distribue pas de gains en argent réel, ce
+    # champ ne sert plus dans l'export Statistiques) — UNIQUEMENT cette
+    # entrée de colonne d'export : build_period_summary continue de
+    # calculer et de porter tournament_entry["prize_pool"] (depuis
+    # Database.get_stats(), lui-même utilisé ailleurs — exports
+    # Résultats/Classement notamment, jamais touchés ici) ; rien dans
+    # les fichiers .tournoi ni dans les calculs historiques n'est
+    # modifié, seule cette colonne n'est plus PROPOSÉE à l'export.
     ("winner", "Vainqueur", lambda t: t["winner"]),
     ("bounty_distributed", "Primes distribuées (pts)", lambda t: t["bounty_distributed"]),
 ]
@@ -4165,8 +4302,14 @@ PERIOD_PLAYER_COLUMNS = [
     ("tournaments_played", "Tournois joués", lambda a: a["tournaments_played"]),
     ("wins", "Victoires", lambda a: a["wins"]),
     ("best_place", "Meilleur Rang", lambda a: a["best_place"]),
-    ("total_cost", "Total investi (€)", lambda a: round(a["total_cost"], 2)),
-    ("total_gain", "Gains classement (€)", lambda a: round(a["total_gain"], 2)),
+    # Remplacent depuis le 2026-09-18 les anciennes colonnes en euros
+    # "Total investi (€)"/"Gains classement (€)" (plus aucun usage
+    # ailleurs dans le projet, retirées de build_period_summary) : sommes
+    # en POINTS, EXCLUSIVEMENT depuis Database.get_primes_summary (voir
+    # sa docstring et celle de build_period_summary) — jamais une
+    # formule dupliquée ici.
+    ("total_presence_assiduity", "Pts Prés/Ass", lambda a: a["total_presence_assiduity"]),
+    ("total_ranking_points", "Pts Gain Clsmt", lambda a: a["total_ranking_points"]),
     ("total_bounty_won", "Bounty", lambda a: a["total_bounty_won"]),
     ("total_points", "TOTAL Pts", lambda a: a["total_points"]),
 ]

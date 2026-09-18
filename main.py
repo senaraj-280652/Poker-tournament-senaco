@@ -19,6 +19,7 @@ import io
 import shutil
 import tempfile
 import uuid
+import calendar
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
@@ -34,6 +35,8 @@ from database import (
     BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY, MOVE_REASON_LABELS,
     RANKING_FORMULA_NONE, RANKING_FORMULA_CURRENT, RANKING_FORMULA_PROGRESSIVE,
     RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
+    STATS_TOURNAMENT_TYPE_TOURNOIS, STATS_TOURNAMENT_TYPE_SITNGO, STATS_TOURNAMENT_TYPE_ALL,
+    STATS_WEEKDAY_FOLDER_NAMES,
 )
 from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
 from clock_window import ClockWindow
@@ -277,6 +280,15 @@ def _crash_log_path():
     return os.path.join(d, "crash.log")
 
 
+def _spawned_child_log_path():
+    """Fichier de sortie standard/erreurs des process lancés par
+    spawn_app_process (voir ci-dessous) — même répertoire que crash.log,
+    créé au besoin."""
+    d = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "menu_principal_child.log")
+
+
 def _log_exception(exc_type, exc_value, exc_tb):
     import traceback
     try:
@@ -502,21 +514,46 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
     afficher, symptôme "Menu principal" qui ne "faisait rien" observé
     après plusieurs tournois fermés depuis le téléphone (diagnostiqué en
     capturant réellement stdout/stderr du process mort, voir l'historique
-    git de ce fichier)."""
+    git de ce fichier).
+
+    stdout/stderr : même raisonnement, étendu le 2026-09-18 (diagnostic
+    "Menu principal" -> "le nouveau processus s'est arrêté immédiatement
+    (code 1)" sur une instance restée ouverte tout un après-midi de
+    tests). Constaté via `lsof` sur le vrai process parent au moment du
+    bug : ses fd 1/2 étaient "(revoked)" par macOS (terminal/session
+    d'origine disparu depuis) — hérités tels quels par le nouveau
+    process (stdout/stderr n'étaient PAS redirigés jusqu'ici, seul stdin
+    l'était), provoquant exactement le même "Fatal Python error:
+    init_sys_streams" que ci-dessus, mais sur fd 1/2 cette fois : trop
+    tôt pour que _install_crash_logging() (ou le try/except de
+    `if __name__ == "__main__":`) puisse l'intercepter, et de toute
+    façon imprimé sur un stderr lui-même invalide — d'où crash.log
+    resté muet malgré deux reproductions réelles. Rediriger stdout ET
+    stderr vers un fichier neuf (_spawned_child_log_path(), ouvert par
+    CE process donc jamais revoked) élimine cette dépendance à l'état
+    des descripteurs du parent, quelle que soit son ancienneté."""
     extra_args = list(extra_args or [])
     env = None
     if internal_menu_child:
         env = os.environ.copy()
         env[POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
-    if getattr(sys, "frozen", False):
-        # Application empaquetée (PyInstaller) : sys.executable est déjà
-        # le programme lui-même, pas besoin de lui repasser main.py.
-        proc = subprocess.Popen([sys.executable, *extra_args], stdin=subprocess.DEVNULL, env=env)
-    else:
-        proc = subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), *extra_args],
-            stdin=subprocess.DEVNULL, env=env,
-        )
+    with open(_spawned_child_log_path(), "a", encoding="utf-8") as log_file:
+        # Popen duplique ce descripteur pour le nouveau process (voir la
+        # doc standard de subprocess) : ce fichier peut être refermé ici
+        # (fin du `with`, juste après la création du process) sans que le
+        # nouveau process perde son propre accès, déjà indépendant.
+        if getattr(sys, "frozen", False):
+            # Application empaquetée (PyInstaller) : sys.executable est déjà
+            # le programme lui-même, pas besoin de lui repasser main.py.
+            proc = subprocess.Popen(
+                [sys.executable, *extra_args],
+                stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, env=env,
+            )
+        else:
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), *extra_args],
+                stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, env=env,
+            )
     return proc
 
 
@@ -3145,6 +3182,268 @@ class ChipTemplatesDialog(tk.Toplevel):
             self._refresh()
 
 
+# =====================================================================
+# Onglet Statistiques — "Type de tournois" (demande du 2026-09-17)
+# =====================================================================
+# Libellés français affichés dans la Combobox <-> valeurs internes
+# transmises à Database.build_period_summary (voir STATS_TOURNAMENT_
+# TYPE_* importées de database.py) — même principe que RANKING_FORMULA_
+# LABELS : dict Python, ordre d'insertion préservé (garanti depuis
+# Python 3.7), donc .values() respecte l'ordre voulu dans la liste
+# déroulante (Tournois, SitnGo, Tous).
+STATS_TOURNAMENT_TYPE_LABELS = {
+    STATS_TOURNAMENT_TYPE_TOURNOIS: "Tournois",
+    STATS_TOURNAMENT_TYPE_SITNGO: "SitnGo",
+    STATS_TOURNAMENT_TYPE_ALL: "Tous",
+}
+STATS_TOURNAMENT_TYPE_VALUES_BY_LABEL = {v: k for k, v in STATS_TOURNAMENT_TYPE_LABELS.items()}
+
+
+# =====================================================================
+# Onglet Statistiques — tri par en-tête cliquable (demande du 2026-09-17)
+# =====================================================================
+# Mécanisme FACTORISÉ pour les deux nouveaux tableaux de PeriodSummary
+# Dialog ("Tournois de la période" / "Classement des joueurs") — jamais
+# une refonte des 4 mécanismes de tri déjà existants ailleurs dans ce
+# fichier (_sort_roster_by/_sort_players_by/_sort_primes_by/_sort_
+# classement_by, hors périmètre, chacun propre à son propre onglet et
+# déjà validé) : ceux-ci restent strictement inchangés. Fonctions PURES
+# (aucun accès à self/aux widgets) : trient une COPIE de la liste
+# fournie, ne modifient jamais la liste d'origine (donc jamais self.
+# summary) ni aucun fichier .tournoi — un tri est purement un choix
+# d'affichage.
+def _sorted_rows(rows, sort_state, key_funcs):
+    """Copie de `rows`, triée selon `sort_state` ({"column", "ascending"})
+    si sa colonne a une fonction de clé dans `key_funcs` ({colonne:
+    fonction(ligne) -> clé "naturelle", CROISSANTE}) — sinon renvoie une
+    copie de `rows` INCHANGÉE (ordre par défaut déjà décidé par
+    l'appelant, ex. Database.build_period_summary : tournois par date
+    croissante, joueurs par total_points décroissant). `reverse=` de
+    sorted() gère le sens : correct pour toute colonne "symétrique"
+    (une chaîne ou un nombre, où inverser le sens inverse simplement
+    l'ordre) — PAS pour "Meilleur Rang", qui a son propre traitement
+    dédié (voir _sort_stats_players) car l'absence de classement (None)
+    doit rester en dernière position quel que soit le sens, jamais
+    suivre ce mécanisme générique symétrique."""
+    col = sort_state.get("column")
+    if not col or col not in key_funcs:
+        return list(rows)
+    return sorted(rows, key=key_funcs[col], reverse=not sort_state.get("ascending", True))
+
+
+# Colonnes triables de "Tournois de la période" — clé de tri sur la
+# valeur BRUTE (jamais le texte déjà formaté affiché dans le Treeview,
+# voir _refresh_display) : "date" sur la chaîne ISO 'AAAA-MM-JJ' (jamais
+# format_date_fr, qui donnerait un tri sur le JOUR d'abord) ; "name"/
+# "winner" insensibles à la casse ; "bounty" numérique (clé du dict
+# summary : "bounty_distributed", mais nom de colonne Treeview "bounty").
+STATS_TOURNAMENTS_SORT_KEYS = {
+    "date": lambda t: t["date"],
+    "name": lambda t: t["name"].lower(),
+    "winner": lambda t: t["winner"].lower(),
+    "bounty": lambda t: t["bounty_distributed"],
+}
+STATS_TOURNAMENTS_SORT_HEADERS = {
+    "date": "Date", "name": "Tournoi", "winner": "Vainqueur",
+    "bounty": "Primes distribuées (pts)",
+}
+
+# Colonnes triables de "Classement des joueurs" (Treeview VISIBLE
+# uniquement — voir cols_p dans PeriodSummaryDialog.__init__). Demande
+# du 2026-09-18 (2e ajustement) : "wins" (Victoires) et "best" (Meilleur
+# Rang) ne sont PLUS des colonnes de CE Treeview, remplacées à l'écran
+# par "total_presence_assiduity" (Pts Prés/Ass) et "total_ranking_
+# points" (Pts Gain Clsmt) — toutes deux TOUJOURS des entiers simples
+# (jamais None, contrairement à best_place), donc un tri numérique
+# ordinaire suffit, sans cas particulier. "wins"/"best_place" restent
+# entièrement intacts dans build_period_summary et PERIOD_PLAYER_
+# COLUMNS (disponibles à l'export, voir Colonnes — Classement des
+# joueurs) — seule leur commande de tri sur CE Treeview disparaît, faute
+# de colonne pour la porter ; _sort_stats_players garde son traitement
+# "best" (inchangé, voir sa docstring) au cas où un appelant futur y
+# aurait recours, mais plus aucune en-tête de ce Treeview ne le
+# déclenche plus (voir STATS_PLAYERS_SORT_HEADERS ci-dessous, qui ne
+# porte plus "best").
+STATS_PLAYERS_SORT_KEYS = {
+    "name": lambda a: a["name"].lower(),
+    "played": lambda a: a["tournaments_played"],
+    "total_presence_assiduity": lambda a: a["total_presence_assiduity"],
+    "total_ranking_points": lambda a: a["total_ranking_points"],
+    "total_points": lambda a: a["total_points"],
+}
+STATS_PLAYERS_SORT_HEADERS = {
+    "name": "Joueur", "played": "Tournois joués",
+    "total_presence_assiduity": "Pts Prés/Ass", "total_ranking_points": "Pts Gain Clsmt",
+    "total_points": "TOTAL Pts",
+}
+
+
+def _sort_stats_players(players, sort_state):
+    """Comme _sorted_rows, mais gère en plus "best" (Meilleur Rang) —
+    cas particulier demandé le 2026-09-18 : un joueur sans classement
+    (best_place=None, affiché "-") doit TOUJOURS rester en DERNIÈRE
+    position, aussi bien en tri croissant qu'en tri décroissant (il
+    représente une absence de classement, jamais un rang numérique à
+    inverser comme les autres). Implémenté via une clé à deux niveaux —
+    (a_un_classement, valeur signée) — le premier niveau (False < True)
+    sépare définitivement les deux groupes sans jamais dépendre du sens,
+    le second n'inverse QUE l'ordre à l'intérieur du groupe classé."""
+    if sort_state.get("column") != "best":
+        return _sorted_rows(players, sort_state, STATS_PLAYERS_SORT_KEYS)
+    sign = 1 if sort_state.get("ascending", True) else -1
+    return sorted(
+        players,
+        key=lambda a: (a["best_place"] is None, sign * (a["best_place"] or 0)),
+    )
+
+
+def _apply_stats_sort_arrows(tree, sort_state, base_headers):
+    """Réécrit le texte des en-têtes triables de `tree` avec ▲/▼ sur la
+    colonne active (sort_state["column"]), texte nu sinon — factorisé
+    pour les deux tableaux de Statistiques (voir le grand commentaire
+    plus haut)."""
+    for col, label in base_headers.items():
+        if sort_state.get("column") == col:
+            arrow = " ▲" if sort_state.get("ascending", True) else " ▼"
+            tree.heading(col, text=label + arrow)
+        else:
+            tree.heading(col, text=label)
+
+
+# =====================================================================
+# Onglet Statistiques — calendrier pour les dates de période (demande du
+# 2026-09-17/18), sans aucune dépendance externe : bibliothèque standard
+# `calendar` (grille semaines/jours) + Tkinter, cohérent avec le reste
+# du projet ("l'application elle-même ne requiert que la bibliothèque
+# standard", voir windows/requirements.txt).
+# =====================================================================
+CALENDAR_WEEKDAY_LETTERS_FR = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+CALENDAR_MONTH_NAMES_FR = [
+    "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+    "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+]
+
+
+def _shift_month(year, month, delta):
+    """(année, mois) après avoir avancé/reculé de `delta` mois (positif
+    ou négatif) — gère le passage d'année (ex. décembre + 1 -> janvier
+    de l'année suivante ; janvier - 1 -> décembre de l'année
+    précédente). Fonction PURE, testable indépendamment de tout widget
+    Tk (voir tests/test_stats_period_calendar.py)."""
+    total = (year * 12 + (month - 1)) + delta
+    return total // 12, total % 12 + 1
+
+
+def _build_calendar_grid(parent, year, month, on_pick):
+    """Construit, DANS `parent` (un widget déjà existant — jamais créé
+    ni détruit par cette fonction elle-même, seul son CONTENU est
+    reconstruit), la grille d'un mois : une ligne d'en-têtes Lun..Dim,
+    puis un bouton par jour du mois (calendar.monthcalendar renvoie 0
+    pour les cases vides des semaines incomplètes en début/fin de mois —
+    laissées sans bouton). Chaque bouton appelle `on_pick(jour_iso)` à
+    son clic — ne détruit JAMAIS la fenêtre elle-même ici (voir
+    pick_date_dialog, seul appelant à connaître `win`) : reste ainsi
+    testable directement (construire un Frame ordinaire, appeler cette
+    fonction, invoquer le command() d'un bouton) sans jamais ouvrir de
+    vraie fenêtre modale (grab_set/wait_window), risque de segfault déjà
+    documenté ailleurs dans cette suite pour ce genre de fenêtre."""
+    for w in parent.winfo_children():
+        w.destroy()
+    for col, wd in enumerate(CALENDAR_WEEKDAY_LETTERS_FR):
+        ttk.Label(parent, text=wd, foreground=MUTED).grid(row=0, column=col, padx=2, pady=(0, 4))
+    for r, week in enumerate(calendar.monthcalendar(year, month), start=1):
+        for c, day in enumerate(week):
+            if day == 0:
+                continue
+            day_iso = f"{year:04d}-{month:02d}-{day:02d}"
+            ttk.Button(
+                parent, text=str(day), width=3,
+                command=lambda d=day_iso: on_pick(d),
+            ).grid(row=r, column=c, padx=1, pady=1)
+
+
+def pick_date_dialog(master, title="Choisir une date", initial_iso=None):
+    """Petite fenêtre de calendrier (demande du 2026-09-17/18) pour
+    choisir une date 'AAAA-MM-JJ' — sans aucune dépendance externe (voir
+    le grand commentaire plus haut). Ouvre sur le mois d'`initial_iso`
+    si fourni et valide, sinon le mois courant. Navigation mois
+    précédent/suivant, "Aujourd'hui", "Effacer" (vide explicitement le
+    champ — préserve "laisser vide = pas de borne", voir PeriodSummary
+    Dialog._pick_period_date) et "Annuler" (ferme sans rien changer,
+    y compris via la croix de fermeture native).
+
+    Renvoie :
+    - une chaîne 'AAAA-MM-JJ' si un jour (ou "Aujourd'hui") a été choisi ;
+    - '' (chaîne vide) si "Effacer" a été cliqué — DISTINCT de None,
+      l'appelant doit alors vider le champ explicitement ;
+    - None si annulé/fermé — l'appelant ne doit RIEN changer au champ
+      dans ce cas.
+
+    Fonction MODULE-LEVEL, jamais une méthode d'App/PeriodSummaryDialog :
+    générale, réutilisable pour tout futur champ de date de l'appli
+    (seul appelant pour l'instant : l'onglet Statistiques)."""
+    try:
+        initial_dt = datetime.strptime(initial_iso, "%Y-%m-%d") if initial_iso else datetime.now()
+    except (ValueError, TypeError):
+        initial_dt = datetime.now()
+    state = {"year": initial_dt.year, "month": initial_dt.month, "result": None}
+
+    win = tk.Toplevel(master)
+    win.title(title)
+    win.configure(bg=FELT_DARK)
+    win.resizable(False, False)
+    win.transient(master)
+    win.grab_set()
+
+    header = ttk.Frame(win)
+    header.pack(fill="x", padx=10, pady=(10, 4))
+
+    def go(delta):
+        state["year"], state["month"] = _shift_month(state["year"], state["month"], delta)
+        render()
+
+    ttk.Button(header, text="◀", width=3, command=lambda: go(-1)).pack(side="left")
+    ttk.Button(header, text="▶", width=3, command=lambda: go(1)).pack(side="right")
+    month_lbl = ttk.Label(header, font=("Helvetica", 11, "bold"), anchor="center")
+    month_lbl.pack(side="left", fill="x", expand=True)
+
+    grid_frame = ttk.Frame(win)
+    grid_frame.pack(padx=10, pady=(0, 6))
+
+    def on_pick(day_iso):
+        state["result"] = day_iso
+        win.destroy()
+
+    def render():
+        month_lbl.config(text=f"{CALENDAR_MONTH_NAMES_FR[state['month'] - 1]} {state['year']}")
+        _build_calendar_grid(grid_frame, state["year"], state["month"], on_pick)
+
+    render()
+
+    bottom = ttk.Frame(win)
+    bottom.pack(fill="x", padx=10, pady=(0, 10))
+
+    def choose_today():
+        state["result"] = datetime.now().strftime("%Y-%m-%d")
+        win.destroy()
+
+    def choose_clear():
+        state["result"] = ""
+        win.destroy()
+
+    def choose_cancel():
+        state["result"] = None
+        win.destroy()
+
+    ttk.Button(bottom, text="Aujourd'hui", command=choose_today).pack(side="left")
+    ttk.Button(bottom, text="Effacer", command=choose_clear).pack(side="left", padx=(6, 0))
+    ttk.Button(bottom, text="Annuler", command=choose_cancel).pack(side="right")
+    win.protocol("WM_DELETE_WINDOW", choose_cancel)
+
+    master.wait_window(win)
+    return state["result"]
+
+
 class PeriodSummaryDialog(ttk.Frame):
     """Onglet "Statistiques" de la fenêtre principale — synthèse des
     résultats de tous les tournois (.tournoi) trouvés dans un dossier,
@@ -3177,9 +3476,47 @@ class PeriodSummaryDialog(ttk.Frame):
                 default_folder = os.path.dirname(os.path.abspath(app.db.path))
         self.folder_var = tk.StringVar(value=default_folder)
         self.recursive_var = tk.BooleanVar(value=True)
+        # Filtre "jours" (demande du 2026-09-18, 7 cases Lundi...Dimanche
+        # à droite de "Tournois de la période") : cochées par défaut (voir
+        # Database._tournament_day_matches, bypass total tant que les 7
+        # restent cochées — comportement historique inchangé). Un
+        # BooleanVar par jour (jamais une seule variable composite) pour
+        # rester posé sur CETTE instance, comme recursive_var/
+        # tournament_type_var ci-dessus : survit à _generate()/tout
+        # rafraîchissement tant que cet onglet reste ouvert, jamais
+        # persisté entre deux lancements de Senaco (pas demandé). Les
+        # widgets Checkbutton eux-mêmes (grisés/réactivés selon
+        # recursive_var, voir _update_stats_day_checkboxes_state) sont
+        # construits plus bas ; ne JAMAIS réinitialiser ces BooleanVar en
+        # grisant/dégrisant — c'est justement ce qui garantit que l'état
+        # précédent est retrouvé telle quelle à la réactivation de
+        # "Inclure les sous-dossiers", sans code de sauvegarde/restauration
+        # séparé.
+        self.stats_day_vars = {day: tk.BooleanVar(value=True) for day in STATS_WEEKDAY_FOLDER_NAMES}
+        self._stats_day_checkbuttons = []
+        # "Type de tournois" (demande du 2026-09-17) : valeur par défaut
+        # "Tous" — comportement STRICTEMENT identique à avant l'existence
+        # de ce filtre pour qui ne le touche pas (voir Database.build_
+        # period_summary/_tournament_type_matches, OPTION A validée).
+        # Jamais persisté entre sessions (comme folder_var/recursive_var/
+        # les dates ci-dessous : aucun de ces réglages ne l'est
+        # aujourd'hui, pas de raison d'en faire une exception isolée).
+        self.tournament_type_var = tk.StringVar(value=STATS_TOURNAMENT_TYPE_LABELS[STATS_TOURNAMENT_TYPE_ALL])
         today = datetime.now()
         self.date_from_var = tk.StringVar(value=f"{today.year}-01-01")
         self.date_to_var = tk.StringVar(value=today.strftime("%Y-%m-%d"))
+        # État de tri des deux tableaux (demande du 2026-09-17/18) —
+        # aucune colonne active par défaut (comportement de Database.
+        # build_period_summary inchangé : "Tournois de la période" par
+        # date croissante, "Classement des joueurs" par TOTAL Pts
+        # décroissant, voir _sorted_rows/_sort_stats_players). Posé sur
+        # l'INSTANCE (cet onglet), donc survit à _generate()/_refresh_
+        # display() tant que l'onglet reste ouvert — demande explicite :
+        # le dernier tri choisi reste actif après Générer, changement de
+        # période, de Type de tournois, du filtre Club, ou tout
+        # rafraîchissement de l'affichage.
+        self.tournaments_sort = {"column": None, "ascending": True}
+        self.stats_players_sort = {"column": None, "ascending": True}
 
         params = ttk.Frame(self)
         params.pack(fill="x", padx=14, pady=(10, 4))
@@ -3197,6 +3534,26 @@ class PeriodSummaryDialog(ttk.Frame):
         ttk.Checkbutton(
             row1, text="Inclure les sous-dossiers", variable=self.recursive_var,
         ).pack(side="left", padx=(16, 0))
+        # Grise/dégrise les 7 cases Lundi...Dimanche (demande du
+        # 2026-09-18) selon recursive_var — jamais leur VALEUR (voir
+        # _refresh_stats_day_checkboxes_state) : la sélection reste donc
+        # intacte, retrouvée telle quelle si "Inclure les sous-dossiers"
+        # est réactivé. trace_add plutôt qu'un command= sur CE
+        # Checkbutton : réagit aussi si recursive_var change par un autre
+        # moyen (aucun aujourd'hui, mais plus robuste que le lier à un
+        # seul widget précis).
+        self.recursive_var.trace_add("write", lambda *_a: self._refresh_stats_day_checkboxes_state())
+        # "Type de tournois" (demande du 2026-09-17) : à droite de
+        # "Inclure les sous-dossiers", même ligne — aucune nouvelle ligne
+        # créée, disposition existante préservée. Combobox non
+        # modifiable (state="readonly") : seules les 3 valeurs proposées
+        # sont valides, jamais de saisie libre.
+        ttk.Label(row1, text="Type de tournois :").pack(side="left", padx=(16, 0))
+        ttk.Combobox(
+            row1, textvariable=self.tournament_type_var,
+            values=list(STATS_TOURNAMENT_TYPE_LABELS.values()),
+            state="readonly", width=10,
+        ).pack(side="left", padx=(6, 0))
 
         # Ligne 2 : filtre Club à gauche (haut sur 4 lignes) ; à droite,
         # empilées sur sa hauteur, "Période..." puis, juste en dessous,
@@ -3218,10 +3575,21 @@ class PeriodSummaryDialog(ttk.Frame):
         period_frame.pack(fill="x", anchor="w")
         ttk.Label(period_frame, text="Période — du (AAAA-MM-JJ) :").pack(side="left")
         ttk.Entry(period_frame, textvariable=self.date_from_var, width=12).pack(
-            side="left", padx=(4, 16)
+            side="left", padx=(4, 2)
         )
+        # Bouton calendrier (demande du 2026-09-17/18) : raccourci
+        # facultatif — la saisie manuelle du champ ci-dessus reste
+        # entièrement fonctionnelle, inchangée (voir _pick_period_date).
+        ttk.Button(
+            period_frame, text="📅", width=3,
+            command=lambda: self._pick_period_date(self.date_from_var),
+        ).pack(side="left", padx=(0, 14))
         ttk.Label(period_frame, text="au (AAAA-MM-JJ) :").pack(side="left")
-        ttk.Entry(period_frame, textvariable=self.date_to_var, width=12).pack(side="left", padx=4)
+        ttk.Entry(period_frame, textvariable=self.date_to_var, width=12).pack(side="left", padx=(4, 2))
+        ttk.Button(
+            period_frame, text="📅", width=3,
+            command=lambda: self._pick_period_date(self.date_to_var),
+        ).pack(side="left")
         ttk.Label(
             period_frame, text="(laisser vide = pas de borne)", foreground=MUTED,
         ).pack(side="left", padx=10)
@@ -3246,7 +3614,24 @@ class PeriodSummaryDialog(ttk.Frame):
         panes.grid_rowconfigure(1, weight=1)
         panes.grid_columnconfigure(0, weight=1)
 
-        top_pane = ttk.LabelFrame(panes, text="Tournois de la période")
+        # "Tournois de la période" + 7 cases Lundi...Dimanche À DROITE du
+        # titre (demande du 2026-09-18) : un ttk.LabelFrame(text=...)
+        # intègre son titre à sa propre bordure — impossible d'empaqueter
+        # un widget juste à côté avec un simple pack()/grid(). Passer par
+        # labelwidget= (un ttk.Frame construit à la place du texte,
+        # contenant le Label du titre PUIS les 7 Checkbutton) est la
+        # façon standard ttk de placer des widgets interactifs dans la
+        # zone de titre elle-même, sans toucher au reste du layout de
+        # top_pane (toujours plein largeur, hauteur inchangée).
+        top_pane = ttk.LabelFrame(panes)
+        top_pane_header = ttk.Frame(top_pane)
+        ttk.Label(top_pane_header, text="Tournois de la période").pack(side="left")
+        for day in STATS_WEEKDAY_FOLDER_NAMES:
+            cb = ttk.Checkbutton(top_pane_header, text=day, variable=self.stats_day_vars[day])
+            cb.pack(side="left", padx=(10, 0))
+            self._stats_day_checkbuttons.append(cb)
+        top_pane.configure(labelwidget=top_pane_header)
+        self._refresh_stats_day_checkboxes_state()
         top_pane.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
         # Pas de colonne "Prize pool (€)" ici : ce club ne distribue pas de
         # gains en argent réel (voir Classement, colonnes Total investi/
@@ -3262,6 +3647,18 @@ class PeriodSummaryDialog(ttk.Frame):
             self.tournaments_tree.column(c, width=120, anchor="center")
         self.tournaments_tree.column("name", width=180, anchor="w")
         self.tournaments_tree.pack(fill="both", expand=True, padx=6, pady=6)
+        # Tri par en-tête cliquable (demande du 2026-09-17/18) : Date,
+        # Tournoi, Vainqueur, Primes uniquement — "Statut"/"Entrées"
+        # restent sans command=, comme avant (non demandées). Voir
+        # STATS_TOURNAMENTS_SORT_KEYS/_sorted_rows/_apply_stats_sort_
+        # arrows, factorisés avec "Classement des joueurs" ci-dessous —
+        # la ligne TOTAL (voir _refresh_display) n'est JAMAIS concernée
+        # par ce tri, toujours insérée en premier, hors de la liste
+        # triée.
+        for col in STATS_TOURNAMENTS_SORT_HEADERS:
+            self.tournaments_tree.heading(
+                col, command=lambda c=col: self._on_stats_sort_click(self.tournaments_sort, c)
+            )
 
         bottom_pane = ttk.LabelFrame(panes, text="Classement des joueurs sur la période (primes incluses)")
         bottom_pane.grid(row=1, column=0, sticky="nsew")
@@ -3269,9 +3666,16 @@ class PeriodSummaryDialog(ttk.Frame):
         # remarque équivalente ci-dessus pour "Tournois de la période".
         # "club" en première colonne : club actuel du joueur dans le
         # répertoire (voir _refresh_display), pas de tri dédié dessus.
-        cols_p = ("club", "name", "played", "wins", "best", "bounty", "total_points")
+        # "Victoires"/"Meilleur Rang" remplacées le 2026-09-18 (2e
+        # ajustement) par "Pts Prés/Ass"/"Pts Gain Clsmt" (total_
+        # presence_assiduity/total_ranking_points, déjà calculés dans
+        # build_period_summary) — UNIQUEMENT dans ce Treeview VISIBLE :
+        # "wins"/"best_place" restent entièrement intacts et disponibles
+        # à l'export (voir PERIOD_PLAYER_COLUMNS, jamais modifiée pour
+        # cette demande).
+        cols_p = ("club", "name", "played", "total_presence_assiduity", "total_ranking_points", "bounty", "total_points")
         headers_p = [
-            "Club", "Joueur", "Tournois joués", "Victoires", "Meilleur Rang",
+            "Club", "Joueur", "Tournois joués", "Pts Prés/Ass", "Pts Gain Clsmt",
             "Bounty", "TOTAL Pts",
         ]
         self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=13)
@@ -3281,6 +3685,17 @@ class PeriodSummaryDialog(ttk.Frame):
         self.players_tree.column("club", width=110, anchor="w")
         self.players_tree.column("name", width=170, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=6, pady=6)
+        # Tri par en-tête cliquable (demande du 2026-09-17/18, colonnes
+        # ajustées le 2026-09-18) : Joueur, Tournois joués, Pts Prés/Ass,
+        # Pts Gain Clsmt, TOTAL Pts uniquement — "Club"/"Bounty" restent
+        # sans command=, comme avant (non demandées). Voir STATS_PLAYERS_
+        # SORT_KEYS/_sort_stats_players/_apply_stats_sort_arrows — la
+        # ligne TOTAL (voir _refresh_display) n'est jamais concernée,
+        # toujours insérée en premier.
+        for col in STATS_PLAYERS_SORT_HEADERS:
+            self.players_tree.heading(
+                col, command=lambda c=col: self._on_stats_sort_click(self.stats_players_sort, c)
+            )
 
     def _browse_folder(self):
         path = filedialog.askdirectory(
@@ -3289,6 +3704,34 @@ class PeriodSummaryDialog(ttk.Frame):
         )
         if path:
             self.folder_var.set(path)
+
+    def _refresh_stats_day_checkboxes_state(self):
+        """Grise/dégrise les 7 cases Lundi...Dimanche selon recursive_var
+        (demande du 2026-09-18) — ne touche JAMAIS aux BooleanVar elles-
+        mêmes : une sélection partielle faite pendant que "Inclure les
+        sous-dossiers" était coché reste donc mémorisée telle quelle
+        pendant qu'il est décoché (cases grisées, filtre sans effet, voir
+        Database.build_period_summary), et retrouvée automatiquement à la
+        réactivation — rien à sauvegarder/restaurer explicitement."""
+        state = "!disabled" if self.recursive_var.get() else "disabled"
+        for cb in self._stats_day_checkbuttons:
+            cb.state([state])
+
+    def _pick_period_date(self, var):
+        """Ouvre le calendrier (pick_date_dialog) pour le champ de
+        période `var` (date_from_var ou date_to_var) — bouton 📅 à côté
+        de chaque champ (demande du 2026-09-17/18). None (annulé/fermé,
+        y compris via la croix) laisse le champ inchangé ; '' (Effacer)
+        le vide explicitement, préservant "laisser vide = pas de
+        borne" ; toute autre valeur est la date choisie, au même format
+        AAAA-MM-JJ que la saisie manuelle déjà existante — jamais un
+        format différent. La saisie manuelle du champ reste par
+        ailleurs entièrement fonctionnelle, ce bouton n'est qu'un
+        raccourci facultatif."""
+        ok, current = self._parse_date(var.get())
+        chosen = pick_date_dialog(self, initial_iso=current if ok else None)
+        if chosen is not None:
+            var.set(chosen)
 
     @staticmethod
     def _parse_date(text):
@@ -3320,9 +3763,25 @@ class PeriodSummaryDialog(ttk.Frame):
             messagebox.showerror("Erreur", "La date de début doit précéder la date de fin.")
             return
 
+        # "Type de tournois" (demande du 2026-09-17) : se combine avec
+        # date_from/date_to, dans le MÊME appel à build_period_summary —
+        # un fichier doit passer les deux filtres pour être retenu (voir
+        # Database._tournament_type_matches).
+        tournament_type = STATS_TOURNAMENT_TYPE_VALUES_BY_LABEL.get(
+            self.tournament_type_var.get(), STATS_TOURNAMENT_TYPE_ALL
+        )
+        # Jours cochés (demande du 2026-09-18) : toujours transmis tel
+        # quel, même si "Inclure les sous-dossiers" est décoché — c'est
+        # build_period_summary/_tournament_day_matches qui rend ce filtre
+        # sans effet dans ce cas (jamais recalculé/ignoré ici), pour
+        # qu'une réactivation ultérieure retrouve la sélection réellement
+        # cochée à l'écran, jamais une valeur reconstruite à côté.
+        selected_days = [day for day, var in self.stats_day_vars.items() if var.get()]
         self.summary = build_period_summary(
             folder, date_from=date_from, date_to=date_to,
             recursive=self.recursive_var.get(),
+            tournament_type=tournament_type,
+            selected_days=selected_days,
         )
         self._refresh_display()
 
@@ -3353,6 +3812,24 @@ class PeriodSummaryDialog(ttk.Frame):
             if (roster.get_club(a["name"]) or home_club) in selected_clubs
         ]
 
+    def _on_stats_sort_click(self, sort_state, column):
+        """Clic sur un en-tête triable de l'un des deux tableaux de
+        Statistiques (demande du 2026-09-17/18) — factorisé, `sort_state`
+        est soit self.tournaments_sort, soit self.stats_players_sort.
+        Même colonne re-cliquée -> inverse `ascending` ; sinon nouvelle
+        colonne + `ascending=True` (repart dans son ordre initial) —
+        exactement le même principe que les 4 mécanismes de tri déjà
+        existants ailleurs dans ce fichier (roster/players/primes/
+        classement), jamais dupliqué en détail ici : voir _sorted_rows/
+        _sort_stats_players pour le tri effectif, appliqué dans _refresh_
+        display, seule méthode qui reconstruit ces deux Treeview."""
+        if sort_state["column"] == column:
+            sort_state["ascending"] = not sort_state["ascending"]
+        else:
+            sort_state["column"] = column
+            sort_state["ascending"] = True
+        self._refresh_display()
+
     def _refresh_display(self):
         for row in self.tournaments_tree.get_children():
             self.tournaments_tree.delete(row)
@@ -3362,8 +3839,24 @@ class PeriodSummaryDialog(ttk.Frame):
         if self.summary is None:
             return
 
-        tournaments = self.summary["tournaments"]
-        players = self._club_filtered_players(self.summary["players"])
+        # Tri (demande du 2026-09-17/18) : toujours sur une COPIE (voir
+        # _sorted_rows/_sort_stats_players), jamais self.summary lui-même
+        # — un changement de tri n'est qu'un choix d'affichage, jamais
+        # une écriture. Aucune colonne active (self.X_sort["column"] is
+        # None, valeur initiale) -> ordre par défaut de build_period_
+        # summary INCHANGÉ (date croissante / TOTAL Pts décroissant).
+        tournaments = _sorted_rows(
+            self.summary["tournaments"], self.tournaments_sort, STATS_TOURNAMENTS_SORT_KEYS
+        )
+        players = _sort_stats_players(
+            self._club_filtered_players(self.summary["players"]), self.stats_players_sort
+        )
+        _apply_stats_sort_arrows(
+            self.tournaments_tree, self.tournaments_sort, STATS_TOURNAMENTS_SORT_HEADERS
+        )
+        _apply_stats_sort_arrows(
+            self.players_tree, self.stats_players_sort, STATS_PLAYERS_SORT_HEADERS
+        )
         # Repris ici (pas seulement dans _club_filtered_players ci-dessus,
         # qui a son propre usage interne du même réglage) : sert aussi à
         # la colonne "Club" affichée plus bas, pour chaque ligne restante
@@ -3404,10 +3897,17 @@ class PeriodSummaryDialog(ttk.Frame):
         # Ligne de total (voir la même chose ci-dessus pour "Tournois de la
         # période") : reflète les joueurs actuellement affichés (donc déjà
         # filtrés par club le cas échéant, voir selected_clubs plus haut).
+        # Demande du 2026-09-18 (2e ajustement) : cumule désormais aussi
+        # Pts Prés/Ass et Pts Gain Clsmt (total_presence_assiduity/
+        # total_ranking_points), MÊME principe que Bounty/TOTAL Pts déjà
+        # cumulés ici — sur `players`, donc déjà filtré par Club à ce
+        # stade, jamais sur self.summary["players"] brut.
         self.players_tree.insert(
             "", "end",
             values=(
-                "", "TOTAL", "", "", "",
+                "", "TOTAL", "",
+                f"{sum(a['total_presence_assiduity'] for a in players):,}".replace(",", " "),
+                f"{sum(a['total_ranking_points'] for a in players):,}".replace(",", " "),
                 f"{sum(a['total_bounty_won'] for a in players):,}".replace(",", " "),
                 f"{sum(a['total_points'] for a in players):,}".replace(",", " "),
             ),
@@ -3419,7 +3919,9 @@ class PeriodSummaryDialog(ttk.Frame):
                 "", "end",
                 values=(
                     roster.get_club(a["name"]) or home_club or "-",
-                    a["name"], a["tournaments_played"], a["wins"], a["best_place"] or "-",
+                    a["name"], a["tournaments_played"],
+                    f"{a['total_presence_assiduity']:,}".replace(",", " "),
+                    f"{a['total_ranking_points']:,}".replace(",", " "),
                     f"{a['total_bounty_won']:,}".replace(",", " ") if a["total_bounty_won"] else "-",
                     f"{a['total_points']:,}".replace(",", " "),
                 ),
@@ -5370,16 +5872,26 @@ class App(tk.Tk):
             if guessed_name:
                 self.db.set_settings({"tournament_name": guessed_name})
             self.db.set_settings({"tournament_date": time.strftime("%Y-%m-%d")})
-            # Système de points distribués (demande du 2026-09-10) :
-            # stampé "none" ("Aucun") explicitement dès la création — PAS
+            # Système de points distribués (demande du 2026-09-10, étendu
+            # le 2026-09-18 : "reprendre automatiquement les paramètres
+            # Primes précédemment utilisés") : hérite du dernier choix
+            # EXPLICITE mémorisé dans last_settings s'il existe (voir
+            # tournament_prefs.PERSISTED_KEYS et le filtre "" appliqué à
+            # l'écriture dans _collect_and_save_all_settings — un
+            # placeholder légataire, "" jamais mémorisé, ne peut donc
+            # jamais apparaître ici). Sinon (premier lancement, ou dernier
+            # tournoi encore sur le placeholder légataire) : comportement
+            # sûr inchangé, stampé "none" ("Aucun") explicitement — PAS
             # via DEFAULT_SETTINGS/_init_defaults (voir sa docstring),
             # justement pour qu'un tournoi flambant neuf soit TOUJOURS
             # distinguable sans ambiguïté d'un ancien fichier antérieur à
             # cette fonctionnalité (qui, lui, n'aura jamais cette clé) —
-            # voir Database.resolve_ranking_formula. Jamais dans
-            # `last_settings`/PERSISTED_KEYS (voir tournament_prefs.py) :
-            # ce choix ne doit jamais être hérité d'un tournoi précédent.
-            self.db.set_settings({"ranking_formula": RANKING_FORMULA_NONE})
+            # voir Database.resolve_ranking_formula, volontairement NON
+            # modifiée par cette demande : l'interprétation des anciens
+            # fichiers .tournoi reste strictement inchangée.
+            inherited_formula = last_settings.get("ranking_formula")
+            if inherited_formula not in RANKING_FORMULA_LABELS:
+                self.db.set_settings({"ranking_formula": RANKING_FORMULA_NONE})
         self._update_window_title()
         if result.get("is_new") and result.get("selected_players"):
             for name in self._filter_active_conflicts(result["selected_players"]):
@@ -12594,7 +13106,14 @@ class App(tk.Tk):
             if k != "club_name" and not (k == "ranking_formula" and v == "")
         }
         self.db.set_settings(db_values)
-        tournament_prefs.save_last_settings(values)
+        # Même exclusion que db_values ci-dessus pour "ranking_formula"
+        # == "" (placeholder légataire, aucun choix explicite fait) —
+        # sans elle, tournament_prefs.PERSISTED_KEYS mémoriserait ce
+        # non-choix comme préférence héritée, et un futur tournoi neuf
+        # (voir _choose_tournament_file) tomberait silencieusement sur
+        # le fallback légataire (Classique) au lieu du "Aucun" sûr
+        # stampé par défaut (demande du 2026-09-18).
+        tournament_prefs.save_last_settings(db_values)
         if new_max_seats is not None:
             self.db.set_all_tables_max_seats(new_max_seats)
         moves = self.db.rebalance_tables()

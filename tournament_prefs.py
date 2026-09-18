@@ -38,6 +38,23 @@ PERSISTED_KEYS = [
     "tournament_day_folder",
     "tournament_days_of_week",
     "elimination_banner_seconds",
+    # Bloc Primes (demande du 2026-09-18, "reprendre automatiquement les
+    # paramètres Primes précédemment utilisés") : attendance_bonus_points/
+    # assiduity_bonus_points/assiduity_consecutive_days suivent le même
+    # principe générique que les réglages ci-dessus, sans traitement
+    # particulier. ranking_formula, lui, EXIGE un traitement particulier
+    # côté appelant (voir main.py: _choose_tournament_file/
+    # _collect_and_save_all_settings) avant d'atterrir ici : la valeur
+    # "" (aucun choix explicite encore fait, voir RANKING_FORMULA_
+    # LEGACY_PLACEHOLDER) ne doit JAMAIS être mémorisée comme préférence
+    # héritée, sous peine de faire silencieusement retomber un tournoi
+    # neuf sur le fallback légataire (Classique) au lieu du "Aucun" sûr
+    # stampé aujourd'hui par défaut — voir Database.resolve_ranking_
+    # formula, volontairement non modifiée par cette demande.
+    "attendance_bonus_points",
+    "assiduity_bonus_points",
+    "assiduity_consecutive_days",
+    "ranking_formula",
 ]
 
 
