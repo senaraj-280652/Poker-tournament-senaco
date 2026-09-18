@@ -3265,6 +3265,11 @@ STATS_TOURNAMENTS_SORT_HEADERS = {
 # déclenche plus (voir STATS_PLAYERS_SORT_HEADERS ci-dessous, qui ne
 # porte plus "best").
 STATS_PLAYERS_SORT_KEYS = {
+    # "rang" (demande du 2026-09-18) : trie l'AFFICHAGE selon le rang déjà
+    # figé par _stats_players_with_rank (appelée AVANT ce tri, voir
+    # _refresh_display) — ne recalcule jamais rien, un entier simple comme
+    # les autres colonnes numériques ci-dessous, jamais None.
+    "rang": lambda a: a["rang"],
     "name": lambda a: a["name"].lower(),
     "played": lambda a: a["tournaments_played"],
     "total_presence_assiduity": lambda a: a["total_presence_assiduity"],
@@ -3272,7 +3277,7 @@ STATS_PLAYERS_SORT_KEYS = {
     "total_points": lambda a: a["total_points"],
 }
 STATS_PLAYERS_SORT_HEADERS = {
-    "name": "Joueur", "played": "Tournois joués",
+    "rang": "Rang", "name": "Joueur", "played": "Tournois joués",
     "total_presence_assiduity": "Pts Prés/Ass", "total_ranking_points": "Pts Gain Clsmt",
     "total_points": "TOTAL Pts",
 }
@@ -3295,6 +3300,44 @@ def _sort_stats_players(players, sort_state):
         players,
         key=lambda a: (a["best_place"] is None, sign * (a["best_place"] or 0)),
     )
+
+
+def _stats_players_with_rank(players):
+    """Ajoute un "rang" (colonne "Rang", demande du 2026-09-18) à chaque
+    joueur de `players` — classement SPORTIF avec égalités (1, 2, 2, 4 —
+    jamais 1, 2, 3, 4), calculé EXCLUSIVEMENT depuis total_points
+    décroissant, jamais départagé par le nom en cas d'égalité stricte.
+
+    Identification des joueurs : `players` vient toujours de
+    Database.build_period_summary, qui agrège par NOM (dict Python
+    `players.setdefault(p_name, {...})`, voir sa docstring/son code) —
+    il n'existe aucun identifiant de joueur qui survive au-delà d'un
+    seul fichier .tournoi (l'id SQLite de chaque tournoi lui est propre,
+    inutilisable pour recouper plusieurs fichiers). `summary["players"]`
+    ne peut donc structurellement JAMAIS contenir deux entrées du même
+    nom — c'est cette même garantie, déjà celle dont dépend build_
+    period_summary lui-même, qui rend le nom sûr comme clé ici (voir
+    tests/test_stats_player_rank.py : NomsUniquesDansSummaryTest, qui le
+    démontre plutôt que de le supposer).
+
+    Calcule le rang sur une COPIE triée à part (jamais en réordonnant le
+    résultat) : la liste renvoyée est une NOUVELLE liste de NOUVEAUX
+    dicts (dict(a, rang=...), jamais une mutation de `players`/self.
+    summary), dans le MÊME ORDRE que `players` en entrée — appelée par
+    l'appelant AVANT tout tri visuel (voir _sort_stats_players) pour que
+    le rang reste fixe quel que soit l'ordre d'affichage choisi ensuite,
+    et APRÈS le filtre Club (voir PeriodSummaryDialog._club_filtered_
+    players) pour que le rang reflète bien la liste réellement affichée."""
+    ordered = sorted(players, key=lambda a: -a["total_points"])
+    rank_by_name = {}
+    rank = 0
+    prev_points = None
+    for idx, a in enumerate(ordered, start=1):
+        if a["total_points"] != prev_points:
+            rank = idx
+            prev_points = a["total_points"]
+        rank_by_name[a["name"]] = rank
+    return [dict(a, rang=rank_by_name[a["name"]]) for a in players]
 
 
 def _apply_stats_sort_arrows(tree, sort_state, base_headers):
@@ -3673,9 +3716,13 @@ class PeriodSummaryDialog(ttk.Frame):
         # "wins"/"best_place" restent entièrement intacts et disponibles
         # à l'export (voir PERIOD_PLAYER_COLUMNS, jamais modifiée pour
         # cette demande).
-        cols_p = ("club", "name", "played", "total_presence_assiduity", "total_ranking_points", "bounty", "total_points")
+        # "rang" (demande du 2026-09-18, 3e ajustement) : immédiatement à
+        # gauche de "name"/"Joueur" — valeur déjà calculée par _stats_
+        # players_with_rank (voir _refresh_display), jamais recalculée ici
+        # ni par le tri de cette colonne (voir STATS_PLAYERS_SORT_KEYS).
+        cols_p = ("club", "rang", "name", "played", "total_presence_assiduity", "total_ranking_points", "bounty", "total_points")
         headers_p = [
-            "Club", "Joueur", "Tournois joués", "Pts Prés/Ass", "Pts Gain Clsmt",
+            "Club", "Rang", "Joueur", "Tournois joués", "Pts Prés/Ass", "Pts Gain Clsmt",
             "Bounty", "TOTAL Pts",
         ]
         self.players_tree = ttk.Treeview(bottom_pane, columns=cols_p, show="headings", height=13)
@@ -3683,6 +3730,7 @@ class PeriodSummaryDialog(ttk.Frame):
             self.players_tree.heading(c, text=h)
             self.players_tree.column(c, width=115, anchor="center")
         self.players_tree.column("club", width=110, anchor="w")
+        self.players_tree.column("rang", width=55, anchor="center")
         self.players_tree.column("name", width=170, anchor="w")
         self.players_tree.pack(fill="both", expand=True, padx=6, pady=6)
         # Tri par en-tête cliquable (demande du 2026-09-17/18, colonnes
@@ -3848,8 +3896,13 @@ class PeriodSummaryDialog(ttk.Frame):
         tournaments = _sorted_rows(
             self.summary["tournaments"], self.tournaments_sort, STATS_TOURNAMENTS_SORT_KEYS
         )
+        # "rang" (demande du 2026-09-18) : calculé APRÈS le filtre Club
+        # (players réellement affichés) mais AVANT le tri visuel — voir
+        # _stats_players_with_rank, jamais recalculé par _sort_stats_
+        # players, qui ne fait que réordonner l'affichage.
         players = _sort_stats_players(
-            self._club_filtered_players(self.summary["players"]), self.stats_players_sort
+            _stats_players_with_rank(self._club_filtered_players(self.summary["players"])),
+            self.stats_players_sort,
         )
         _apply_stats_sort_arrows(
             self.tournaments_tree, self.tournaments_sort, STATS_TOURNAMENTS_SORT_HEADERS
@@ -3905,7 +3958,7 @@ class PeriodSummaryDialog(ttk.Frame):
         self.players_tree.insert(
             "", "end",
             values=(
-                "", "TOTAL", "",
+                "", "", "TOTAL", "",
                 f"{sum(a['total_presence_assiduity'] for a in players):,}".replace(",", " "),
                 f"{sum(a['total_ranking_points'] for a in players):,}".replace(",", " "),
                 f"{sum(a['total_bounty_won'] for a in players):,}".replace(",", " "),
@@ -3919,6 +3972,7 @@ class PeriodSummaryDialog(ttk.Frame):
                 "", "end",
                 values=(
                     roster.get_club(a["name"]) or home_club or "-",
+                    a["rang"],
                     a["name"], a["tournaments_played"],
                     f"{a['total_presence_assiduity']:,}".replace(",", " "),
                     f"{a['total_ranking_points']:,}".replace(",", " "),
@@ -3958,9 +4012,17 @@ class PeriodSummaryDialog(ttk.Frame):
         # Un nouveau dict (jamais une mutation de self.summary) : un
         # "Générer" ultérieur ou un changement de filtre ne doit jamais
         # dépendre de l'état d'un export précédent.
+        #
+        # "rang" (demande du 2026-09-18) : calculé ici, APRÈS le filtre
+        # Club, comme à l'écran — mais _stats_players_with_rank ne trie
+        # JAMAIS son résultat (voir sa docstring) : l'ordre exporté reste
+        # donc celui de _club_filtered_players, lui-même celui de build_
+        # period_summary (total_points décroissant), jamais un éventuel
+        # tri visuel temporaire du Treeview (self.stats_players_sort,
+        # volontairement non consulté ici).
         export_summary = {
             "tournaments": self.summary["tournaments"],
-            "players": self._club_filtered_players(self.summary["players"]),
+            "players": _stats_players_with_rank(self._club_filtered_players(self.summary["players"])),
         }
         PeriodExportDialog(self, export_summary, date_from=date_from, date_to=date_to)
 

@@ -948,14 +948,17 @@ class PeriodSummaryDialogUiTestCase(unittest.TestCase):
         self.assertEqual(bounty_disp, "10")  # 1 kill x 10 (valeur fixe)
 
         p_rows = self._rows(self.dialog.players_tree)
-        alice_row = next(r for r in p_rows if r[1] == "Alice")
+        alice_row = next(r for r in p_rows if r[2] == "Alice")
         # Colonnes ajustées le 2026-09-18 (2e ajustement) : "Victoires"/
         # "Meilleur Rang" remplacées à l'écran par "Pts Prés/Ass"/"Pts
         # Gain Clsmt" (voir cols_p) — wins=1/best_place=1 restent
         # inchangés dans build_period_summary (voir PrimesPointsColumns
         # Test/PrizePoolColumnRemovedTest pour leur couverture dédiée),
-        # simplement plus affichés dans CE Treeview.
-        _club, _name, played, presence_assiduity, ranking_pts, bounty_won, total_pts = alice_row
+        # simplement plus affichés dans CE Treeview. Colonne "rang"
+        # ajoutée le 2026-09-18 (3e ajustement) juste avant "name" — voir
+        # StatsPlayerRankUiTest pour sa couverture dédiée.
+        _club, rang, _name, played, presence_assiduity, ranking_pts, bounty_won, total_pts = alice_row
+        self.assertEqual(rang, "1")  # seule joueuse avec total_points > 0 ici
         self.assertEqual(played, "1")
         self.assertEqual(presence_assiduity, "0")  # aucune prime de présence/assiduité réglée
         self.assertEqual(ranking_pts, "0")  # ranking_formula "none" -> toujours 0
@@ -1004,7 +1007,7 @@ class PeriodSummaryDialogUiTestCase(unittest.TestCase):
             mock_build.assert_not_called()
 
         filtered_rows = self._rows(self.dialog.players_tree)
-        self.assertEqual([r[1] for r in filtered_rows], ["Alice"])
+        self.assertEqual([r[2] for r in filtered_rows], ["Alice"])
 
     def test_liste_des_clubs_du_filtre_jamais_rafraichie_apres_coup(self):
         """Recensement (comportement actuel, pas un correctif) : la liste
@@ -1097,7 +1100,9 @@ class ClubFilterExportConsistencyTest(unittest.TestCase):
 
     def _displayed_player_names(self):
         return {
-            self.dialog.players_tree.item(iid, "values")[1]
+            # index 2 : Club(0), Rang(1), Joueur(2) — voir cols_p (colonne
+            # "rang" ajoutée le 2026-09-18, 3e ajustement).
+            self.dialog.players_tree.item(iid, "values")[2]
             for iid in list(self.dialog.players_tree.get_children())[1:]  # saute TOTAL
         }
 
@@ -1423,8 +1428,13 @@ class PrizePoolColumnRemovedTest(unittest.TestCase):
         out_path = os.path.join(self._tmp.name, "export.csv")
         # tournament_keys=None -> "toutes les colonnes disponibles" (voir
         # _selected_period_columns) : si "prize_pool" était encore dans
-        # PERIOD_TOURNAMENT_COLUMNS, elle apparaîtrait ici.
-        database.export_period_summary_csv(summary, out_path)
+        # PERIOD_TOURNAMENT_COLUMNS, elle apparaîtrait ici. player_keys=[]
+        # (ce test ne porte que sur les colonnes TOURNOI) : summary["players"]
+        # ne porte pas "rang" ici (jamais passé par _stats_players_with_rank,
+        # main.py) — PERIOD_PLAYER_COLUMNS l'exige désormais strictement
+        # (contrat volontaire, voir sa docstring), donc l'exclure plutôt que
+        # de le préparer pour un test qui ne le concerne pas.
+        database.export_period_summary_csv(summary, out_path, player_keys=[])
         with open(out_path, encoding="utf-8-sig") as f:
             content = f.read()
         self.assertNotIn("Prize pool", content)
@@ -1442,7 +1452,10 @@ class PrizePoolColumnRemovedTest(unittest.TestCase):
         summary = database.build_period_summary(self._tmp.name, recursive=False)
 
         out_path = os.path.join(self._tmp.name, "export.xlsx")
-        database.export_period_summary_xlsx(summary, out_path)
+        # player_keys=[] : voir la remarque équivalente dans
+        # test_absente_de_l_export_csv ci-dessus (rang non préparé, hors
+        # périmètre de ce test).
+        database.export_period_summary_xlsx(summary, out_path, player_keys=[])
         wb = load_workbook(out_path)
         ws = wb["Tournois"]
         headers = [cell.value for cell in ws[2]]
@@ -1460,9 +1473,10 @@ class PrizePoolColumnRemovedTest(unittest.TestCase):
         summary = database.build_period_summary(self._tmp.name, recursive=False)
 
         out_path = os.path.join(self._tmp.name, "export.pdf")
-        # N'échoue jamais même sans "prize_pool" dans les colonnes
-        # sélectionnées par défaut (None = toutes celles restantes).
-        database.export_period_summary_pdf(summary, out_path)
+        # player_keys=[] : voir la remarque équivalente dans
+        # test_absente_de_l_export_csv ci-dessus (rang non préparé, hors
+        # périmètre de ce test).
+        database.export_period_summary_pdf(summary, out_path, player_keys=[])
         self.assertTrue(os.path.exists(out_path))
         self.assertGreater(os.path.getsize(out_path), 0)
 
@@ -1476,6 +1490,7 @@ class PrizePoolColumnRemovedTest(unittest.TestCase):
         database.export_period_summary_csv(
             database.build_period_summary(self._tmp.name, recursive=False),
             os.path.join(self._tmp.name, "export.csv"),
+            player_keys=[],  # "rang" non préparé ici, hors périmètre de ce test
         )
 
         db2 = database.Database(

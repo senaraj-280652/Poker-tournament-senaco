@@ -385,7 +385,9 @@ class PeriodSummaryDialogDayCheckboxesUiTest(unittest.TestCase):
         rows = self.dialog.players_tree.get_children()
         self.assertTrue(rows)
         total_values = self.dialog.players_tree.item(rows[0], "values")
-        self.assertEqual(total_values[1], "TOTAL")
+        # index 2 : Club(0), Rang(1), Joueur(2) — colonne "rang" ajoutée
+        # le 2026-09-18 (3e ajustement).
+        self.assertEqual(total_values[2], "TOTAL")
 
 
 if __name__ == "__main__":

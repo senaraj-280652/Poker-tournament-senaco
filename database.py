@@ -4298,6 +4298,17 @@ PERIOD_TOURNAMENT_COLUMNS = [
 ]
 
 PERIOD_PLAYER_COLUMNS = [
+    # "rang" (demande du 2026-09-18) : PAS calculé ici — build_period_
+    # summary n'a aucune connaissance du filtre Club (appliqué en aval,
+    # dans main.py), or le rang doit être recalculé sur la liste APRÈS
+    # ce filtre (voir main.py: _stats_players_with_rank). Chaque entrée
+    # `a` passée à ce lambda DOIT déjà porter "rang" — jamais un repli
+    # a.get("rang", "") : un oubli d'appeler _stats_players_with_rank en
+    # amont doit lever une KeyError bien visible, jamais être masqué
+    # silencieusement (choix explicite, voir tests qui appellent les
+    # fonctions d'export directement : elles préparent "rang" elles-
+    # mêmes avant l'appel).
+    ("rang", "Rang", lambda a: a["rang"]),
     ("name", "Joueur", lambda a: a["name"]),
     ("tournaments_played", "Tournois joués", lambda a: a["tournaments_played"]),
     ("wins", "Victoires", lambda a: a["wins"]),

@@ -694,12 +694,14 @@ class PlayersSortUiTest(StatsUiTestCase):
 
     def test_clic_sur_joueur_alphabetique(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "name")
-        names = [r[1] for r in self._rows(self.dialog.players_tree)]
+        # index 2 : Club(0), Rang(1), Joueur(2) — colonne "rang" ajoutée
+        # le 2026-09-18 (3e ajustement).
+        names = [r[2] for r in self._rows(self.dialog.players_tree)]
         self.assertEqual(names, ["Alice", "Bob", "Chris", "Dave", "Eve"])
 
     def test_clic_sur_tournois_joues_numerique(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "played")
-        played = [r[2] for r in self._rows(self.dialog.players_tree)]
+        played = [r[3] for r in self._rows(self.dialog.players_tree)]
         self.assertEqual(played, sorted(played, key=int))
 
     def _int_column(self, index):
@@ -709,35 +711,35 @@ class PlayersSortUiTest(StatsUiTestCase):
 
     def test_clic_sur_pts_pres_ass_numerique_croissant(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_presence_assiduity")
-        values = self._int_column(3)
+        values = self._int_column(4)
         self.assertEqual(values, sorted(values))
 
     def test_clic_sur_pts_pres_ass_numerique_decroissant(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_presence_assiduity")
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_presence_assiduity")
-        values = self._int_column(3)
+        values = self._int_column(4)
         self.assertEqual(values, sorted(values, reverse=True))
 
     def test_clic_sur_pts_gain_clsmt_numerique_croissant(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_ranking_points")
-        values = self._int_column(4)
+        values = self._int_column(5)
         self.assertEqual(values, sorted(values))
         # Alice (1re, ranking le plus élevé) doit se retrouver en dernier
         # en tri croissant, Dave/Eve (jamais classés, 0) en tête.
-        names = [r[1] for r in self._rows(self.dialog.players_tree)]
+        names = [r[2] for r in self._rows(self.dialog.players_tree)]
         self.assertEqual(names[-1], "Alice")
 
     def test_clic_sur_pts_gain_clsmt_numerique_decroissant(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_ranking_points")
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_ranking_points")
-        values = self._int_column(4)
+        values = self._int_column(5)
         self.assertEqual(values, sorted(values, reverse=True))
-        names = [r[1] for r in self._rows(self.dialog.players_tree)]
+        names = [r[2] for r in self._rows(self.dialog.players_tree)]
         self.assertEqual(names[0], "Alice")  # ranking le plus élevé, en tête en décroissant
 
     def test_clic_sur_total_pts_numerique(self):
         self.dialog._on_stats_sort_click(self.dialog.stats_players_sort, "total_points")
-        pts = [r[6] for r in self._rows(self.dialog.players_tree)]
+        pts = [r[7] for r in self._rows(self.dialog.players_tree)]
         pts_int = [int(p.replace(" ", "")) for p in pts]
         self.assertEqual(pts_int, sorted(pts_int))
 
@@ -747,7 +749,11 @@ class PlayersSortUiTest(StatsUiTestCase):
             first_row = self.dialog.players_tree.item(
                 self.dialog.players_tree.get_children()[0], "values"
             )
-            self.assertEqual(first_row[1], "TOTAL")
+            # index 2 : Club(0), Rang(1), Joueur(2) — colonne "rang"
+            # ajoutée le 2026-09-18 (3e ajustement) ; TOUJOURS vide sur
+            # cette ligne (voir StatsPlayerRankUiTest).
+            self.assertEqual(first_row[1], "")
+            self.assertEqual(first_row[2], "TOTAL")
 
     def test_cumul_pts_pres_ass_et_gain_clsmt_dans_la_ligne_total(self):
         """Même principe que les cumuls Bounty/TOTAL Pts déjà en place :
@@ -762,9 +768,9 @@ class PlayersSortUiTest(StatsUiTestCase):
         expected_ranking = sum(
             p["total_ranking_points"] for p in self.dialog.summary["players"]
         )
-        self.assertEqual(total_row[1], "TOTAL")
-        self.assertEqual(int(total_row[3].replace(" ", "")), expected_presence)
-        self.assertEqual(int(total_row[4].replace(" ", "")), expected_ranking)
+        self.assertEqual(total_row[2], "TOTAL")
+        self.assertEqual(int(total_row[4].replace(" ", "")), expected_presence)
+        self.assertEqual(int(total_row[5].replace(" ", "")), expected_ranking)
 
     def test_cumul_ligne_total_reflete_le_filtre_club(self):
         """Demande explicite : si un Club est sélectionné, la ligne TOTAL
@@ -786,7 +792,7 @@ class PlayersSortUiTest(StatsUiTestCase):
         listbox.selection_set(items.index("Chemillé"))
         self.dialog._refresh_display()
 
-        displayed_names = {r[1] for r in self._rows(self.dialog.players_tree)}
+        displayed_names = {r[2] for r in self._rows(self.dialog.players_tree)}
         self.assertEqual(displayed_names, {"Alice", "Bob"})
 
         expected_presence = sum(
@@ -805,8 +811,8 @@ class PlayersSortUiTest(StatsUiTestCase):
         total_row = self.dialog.players_tree.item(
             self.dialog.players_tree.get_children()[0], "values"
         )
-        self.assertEqual(int(total_row[3].replace(" ", "")), expected_presence)
-        self.assertEqual(int(total_row[4].replace(" ", "")), expected_ranking)
+        self.assertEqual(int(total_row[4].replace(" ", "")), expected_presence)
+        self.assertEqual(int(total_row[5].replace(" ", "")), expected_ranking)
 
     def test_tri_ne_mute_jamais_self_summary(self):
         """Le tri doit rester purement visuel : self.summary (la donnée
@@ -836,7 +842,7 @@ class PlayersSortUiTest(StatsUiTestCase):
         listbox.selection_set(items.index("Chemillé"))
         self.dialog._refresh_display()
 
-        names = [r[1] for r in self._rows(self.dialog.players_tree)]
+        names = [r[2] for r in self._rows(self.dialog.players_tree)]
         self.assertEqual(names, ["Alice"])  # filtre Club appliqué
         self.assertEqual(self.dialog.stats_players_sort["column"], "name")  # tri conservé
 
