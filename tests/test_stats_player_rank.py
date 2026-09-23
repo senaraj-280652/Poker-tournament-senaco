@@ -36,6 +36,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 
@@ -43,6 +44,7 @@ import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -197,7 +199,9 @@ class StatsPlayerRankUiTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_rank_ui_")
@@ -211,7 +215,12 @@ class StatsPlayerRankUiTest(unittest.TestCase):
             self.addCleanup(target.stop)
             target.start()
         self.dialog = main.PeriodSummaryDialog(self.root, _StubAppForRank())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py) : lambda relit self.dialog
+        # au moment du nettoyage — couvre aussi test_filtre_club_recalcule_
+        # les_rangs, qui réaffecte self.dialog à un SECOND dialogue en
+        # cours de test (l'ancien self.addCleanup(self.dialog.destroy)
+        # aurait capturé le PREMIER et jamais nettoyé le second).
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
         self.dialog.date_from_var.set("")
         self.dialog.date_to_var.set("")
 

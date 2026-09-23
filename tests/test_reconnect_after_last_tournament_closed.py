@@ -107,6 +107,16 @@ class LobbylistOwnPidHeaderTest(unittest.TestCase):
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
 
+        # _LOG_PATH/_logger (demande du 2026-09-19) : voir le même
+        # correctif dans test_remote_control_device_approval_http.py.
+        self.log_path = os.path.join(self._tmp.name, "remote_control.log")
+        log_patcher = patch.object(remote_control, "_LOG_PATH", self.log_path)
+        logger_patcher = patch.object(remote_control, "_logger", None)
+        self.addCleanup(log_patcher.stop)
+        self.addCleanup(logger_patcher.stop)
+        log_patcher.start()
+        logger_patcher.start()
+
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_tournament_name=lambda: "Tournoi Test",

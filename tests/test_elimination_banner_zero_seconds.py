@@ -163,7 +163,7 @@ class TooltipTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        start = source.index('elim_lbl = ttk.Label(left, text="Durée du bandeau')
+        start = source.index('elim_lbl = ttk.Label(right, text="Durée du bandeau')
         end = source.index("elim_seconds_var = tk.IntVar", start)
         tooltip_block = source[start:end]
         self.assertIn("Mettre 0 seconde pour désactiver l'affichage du bandeau", tooltip_block)
@@ -175,7 +175,7 @@ class TooltipTest(unittest.TestCase):
         source_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py")
         with open(source_path, encoding="utf-8") as f:
             source = f.read()
-        self.assertIn('left, from_=0, to=30, width=5, textvariable=elim_seconds_var', source)
+        self.assertIn('right, from_=0, to=30, width=5, textvariable=elim_seconds_var', source)
 
 
 class SpinboxTooltipTest(unittest.TestCase):
@@ -189,7 +189,14 @@ class SpinboxTooltipTest(unittest.TestCase):
                    encoding="utf-8") as f:
             source = f.read()
         start = source.index("elim_spin = ttk.Spinbox(")
-        end = source.index("# -- Colonne droite", start)
+        # Marqueur de fin (demande du 2026-09-22, "Durée du bandeau
+        # d'élimination"/"Timeout pour Annuler Eliminer" déplacées sous
+        # "Un seul tournoi à la fois", colonne droite de Paramètres) :
+        # ce bloc elim_spin est désormais suivi directement du bloc
+        # "Timeout pour Annule Eliminer", plus de "# -- Colonne droite"
+        # juste après (ce marqueur précède maintenant tout le bloc, pas
+        # seulement elim_spin).
+        end = source.index('# -- Timeout pour "Annule Eliminer"', start)
         return source[start:end]
 
     def test_tooltip_ajoute_sur_la_spinbox_avec_le_texte_demande(self):
@@ -211,7 +218,7 @@ class SpinboxTooltipTest(unittest.TestCase):
         block = self._spinbox_block()
         self.assertIn(
             "elim_spin = ttk.Spinbox(\n"
-            "            left, from_=0, to=30, width=5, textvariable=elim_seconds_var,\n"
+            "            right, from_=0, to=30, width=5, textvariable=elim_seconds_var,\n"
             "            command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),\n"
             "        )",
             block,

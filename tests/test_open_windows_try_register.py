@@ -56,6 +56,14 @@ class TryRegisterInProcessTest(unittest.TestCase):
         patcher = patch.object(open_windows, "_registry_path", return_value=registry_path)
         self.addCleanup(patcher.stop)
         patcher.start()
+        # _remote_control_dir (demande du 2026-09-19) : try_register()/
+        # unregister() peuvent déclencher _clear_remote_control_session_
+        # files() (registre isolé ci-dessus devenu vide), qui cible le
+        # VRAI ~/.poker_tournament si cette fonction n'est pas ELLE AUSSI
+        # isolée — voir tests/test_remote_control_dir_isolation.py.
+        dir_patcher = patch.object(open_windows, "_remote_control_dir", return_value=self._tmpdir_ctx.name)
+        self.addCleanup(dir_patcher.stop)
+        dir_patcher.start()
 
         self._files_dir = tempfile.mkdtemp(prefix="poker_try_register_files_")
         self.addCleanup(self._cleanup_files_dir)
@@ -127,10 +135,15 @@ class TryRegisterConcurrencyTest(unittest.TestCase):
         lock_path = os.path.join(self._tmpdir_ctx.name, "open_windows.lock")
         patcher1 = patch.object(open_windows, "_registry_path", return_value=registry_path)
         patcher2 = patch.object(open_windows, "_registry_lock_path", return_value=lock_path)
+        # _remote_control_dir (demande du 2026-09-19) : voir le même
+        # commentaire dans TryRegisterInProcessTest.setUp ci-dessus.
+        patcher3 = patch.object(open_windows, "_remote_control_dir", return_value=self._tmpdir_ctx.name)
         self.addCleanup(patcher1.stop)
         self.addCleanup(patcher2.stop)
+        self.addCleanup(patcher3.stop)
         patcher1.start()
         patcher2.start()
+        patcher3.start()
 
     def test_deux_tentatives_exactement_simultanees_une_seule_gagne(self):
         """Deux threads représentant deux processus DISTINCTS (PID simulés

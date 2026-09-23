@@ -83,6 +83,15 @@ class _RemoteControlTestCase(unittest.TestCase):
         for target in (
             patch.object(open_windows, "_registry_path", return_value=registry_path),
             patch.object(open_windows, "_registry_lock_path", return_value=lock_path),
+            # _remote_control_dir (demande du 2026-09-19, incident réel :
+            # ce test a effacé le VRAI remote_control_auth.json de
+            # l'utilisateur pendant qu'un tournoi réel tournait) : ce
+            # fichier register(path_a) ci-dessous déclenche _clear_
+            # remote_control_session_files() sur le registre isolé
+            # devenu vide, qui cible _remote_control_dir(), jamais
+            # _registry_path() — voir tests/test_remote_control_dir_
+            # isolation.py pour la preuve complète du mécanisme.
+            patch.object(open_windows, "_remote_control_dir", return_value=self._tmp.name),
         ):
             self.addCleanup(target.stop)
             target.start()

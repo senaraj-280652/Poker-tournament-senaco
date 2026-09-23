@@ -36,6 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import open_windows  # noqa: E402
 import remote_control  # noqa: E402
+import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
 
@@ -80,6 +81,14 @@ class _RemoteControlTestCase(unittest.TestCase):
         for target in (
             patch.object(open_windows, "_registry_path", return_value=registry_path),
             patch.object(open_windows, "_remote_control_dir", return_value=remote_dir),
+            # Phase 4, "Sécurisation du Contrôle à distance" (2026-09-20) :
+            # ce fichier teste la reconnexion/le cycle de vie du port, pas
+            # les permissions DIRTO — un rôle ADMIN inconditionnel évite
+            # d'isoler roster.py (fichier RÉEL ~/.poker_tournament/
+            # roster.json, jamais touché ici) juste pour que _authed_jar()
+            # retrouve un accès complet, comme avant l'existence des
+            # permissions.
+            patch.object(roster, "get_group", return_value=roster.ROSTER_GROUP_ADMIN),
         ):
             self.addCleanup(target.stop)
             target.start()
@@ -90,6 +99,19 @@ class _RemoteControlTestCase(unittest.TestCase):
         self._session_path = os.path.join(self._tmp.name, "session_marker.tournoi")
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
+
+        # _LOG_PATH/_logger (demande du 2026-09-19) : ce fichier exerce des
+        # scénarios 401/502 réels (reconnexion) — jamais isolé jusqu'ici,
+        # ce qui écrivait dans le VRAI ~/.poker_tournament/remote_control.
+        # log. Voir le même correctif dans test_remote_control_device_
+        # approval_http.py.
+        self.log_path = os.path.join(self._tmp.name, "remote_control.log")
+        log_patcher = patch.object(remote_control, "_LOG_PATH", self.log_path)
+        logger_patcher = patch.object(remote_control, "_logger", None)
+        self.addCleanup(log_patcher.stop)
+        self.addCleanup(logger_patcher.stop)
+        log_patcher.start()
+        logger_patcher.start()
 
     def _make_server(self, name="Tournoi", **kwargs):
         # port=self.test_port explicite : RemoteControlServer.__init__ lie
@@ -106,7 +128,7 @@ class _RemoteControlTestCase(unittest.TestCase):
         )
 
     def _authed_jar(self):
-        return authenticated_jar(f"http://127.0.0.1:{self.test_port}")
+        return authenticated_jar(f"http://127.0.0.1:{self.test_port}", owner_name="Test Admin")
 
 
 class TryReclaimDefaultPortTest(_RemoteControlTestCase):

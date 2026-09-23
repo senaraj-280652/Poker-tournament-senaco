@@ -950,9 +950,30 @@ def _bring_to_front_windows(pid):
 #    session_files ci-dessous) des appareils déjà vus : uniquement des
 #    données qui doivent survivre d'une session à l'autre (status
 #    pending/approved/revoked, short_id, label, ip_last_seen,
-#    horodatages) — AUCUN secret de session dedans (voir point 1 de la
+#    horodatages, et depuis le 2026-09-20 owner_name — voir juste en
+#    dessous) — AUCUN secret de session dedans (voir point 1 de la
 #    demande du 2026-09-09 : "je ne veux pas conserver les session_
 #    token dans remote_control_devices.json").
+#
+#    owner_name (Phase 2, "Sécurisation du Contrôle à distance",
+#    2026-09-20) : nom d'une personne du Répertoire (roster.py),
+#    attribuée à CET appareil par un ADMIN depuis le Mac UNIQUEMENT
+#    (voir main.py, jamais une route HTTP) — None/absent tant qu'aucune
+#    attribution n'a eu lieu ("appareil approuvé mais non lié"). Un seul
+#    propriétaire à la fois (une nouvelle attribution REMPLACE
+#    simplement la valeur, jamais une liste) — voir set_remote_device_
+#    owner/clear_remote_device_owner/get_remote_device_owner. Stocke
+#    UNIQUEMENT le nom : le groupe (ADMIN/DIRTO) n'est JAMAIS mis en
+#    cache ici, toujours résolu EN DIRECT depuis roster.get_group() au
+#    moment de l'utiliser — si le Répertoire change (personne
+#    reclassée/supprimée) après l'attribution, la conséquence est
+#    immédiate, jamais une copie figée qui pourrait devenir fausse.
+#    revoke_remote_device (plus bas) efface aussi owner_name : un
+#    appareil révoqué puis réapprouvé repart sans propriétaire, jamais
+#    une ré-attribution silencieuse à son ancien propriétaire (décision
+#    délibérée : "1 appareil = 1 propriétaire à un instant donné" ne
+#    doit jamais survivre implicitement à une révocation, un ADMIN doit
+#    reclasser consciemment).
 #
 # 2. remote_control_auth.json — code à 6 chiffres de la session
 #    ACTUELLE (`remote_session_code`) affiché dans Paramètres, plus les
@@ -1339,6 +1360,12 @@ def register_device_attempt(browser_id, ip):
             "requested_at": now,
             "approved_at": None,
             "revoked_at": (entry or {}).get("revoked_at"),
+            # Par construction, déjà None ici dans l'immense majorité
+            # des cas (revoke_remote_device efface owner_name — voir sa
+            # docstring et celle du bloc "Contrôle à distance" en tête
+            # de module) : préservé par simple symétrie avec label/
+            # revoked_at ci-dessus, jamais réattribué à la légère.
+            "owner_name": (entry or {}).get("owner_name"),
         }
         try:
             _atomic_write_json(_remote_devices_path(), devices)
@@ -1479,6 +1506,15 @@ def revoke_remote_device(browser_id):
     session. Un appareil ainsi révoqué qui reviendrait avec le bon code
     (même 131261) ne redevient JAMAIS approuvé automatiquement : voir
     register_device_attempt, qui le traite comme une demande neuve.
+
+    Efface aussi owner_name (Phase 2, 2026-09-20) dans la MÊME écriture
+    — décision délibérée : "1 appareil = 1 propriétaire à un instant
+    donné" ne doit jamais survivre implicitement à une révocation ; un
+    appareil révoqué puis réapprouvé repart SANS propriétaire, un ADMIN
+    doit reclasser consciemment plutôt que d'hériter en silence de
+    l'ancienne attribution (voir set_remote_device_owner). N'affecte en
+    rien le reste du comportement de révocation déjà en place ci-dessus.
+
     Renvoie False si ce browser_id est inconnu du registre."""
     with _remote_control_lock():
         devices = _read_json_or_empty(_remote_devices_path())
@@ -1486,6 +1522,7 @@ def revoke_remote_device(browser_id):
         if entry:
             entry["status"] = "revoked"
             entry["revoked_at"] = time.time()
+            entry["owner_name"] = None
             devices[browser_id] = entry
             try:
                 _atomic_write_json(_remote_devices_path(), devices)
@@ -1532,7 +1569,13 @@ def list_pending_remote_devices():
 def list_approved_remote_devices():
     """Appareils "approved", triés par nom affiché — pour la liste
     "Téléphones autorisés" de Paramètres (voir main.py), avec le
-    bouton "Révoquer" de chacun."""
+    bouton "Révoquer" de chacun.
+
+    "owner_name" (Phase 2, 2026-09-20) inclus tel quel (None si aucun
+    propriétaire attribué) — voir le commentaire d'en-tête de ce bloc :
+    c'est à l'appelant (main.py) de résoudre le GROUPE actuel via
+    roster.get_group(owner_name) au moment de l'affichage, jamais mis
+    en cache ici."""
     with _remote_control_lock():
         devices = _read_json_or_empty(_remote_devices_path())
     result = []
@@ -1545,9 +1588,66 @@ def list_approved_remote_devices():
             "label": entry.get("label") or entry.get("short_id", ""),
             "ip_last_seen": entry.get("ip_last_seen", ""),
             "approved_at": entry.get("approved_at", 0),
+            "owner_name": entry.get("owner_name"),
         })
     result.sort(key=lambda d: (d["label"] or "").lower())
     return result
+
+
+def set_remote_device_owner(browser_id, owner_name):
+    """Attribue (ou réattribue — REMPLACE toujours, jamais n'accumule)
+    `owner_name` (une personne du Répertoire, ADMIN ou DIRTO — la
+    validation qu'il s'agit bien d'un nom valide de l'un de ces deux
+    groupes est faite par l'APPELANT, main.py, qui ne propose que ces
+    noms-là dans son sélecteur ; cette fonction se contente de stocker
+    ce qu'on lui donne, comme approve_remote_device le fait déjà pour
+    `label`) à l'appareil `browser_id` — Phase 2, 2026-09-20, "Liaison
+    appareil ↔ propriétaire". Opération LOCALE Tkinter UNIQUEMENT
+    (aucune route HTTP n'appelle jamais cette fonction — le DIRTO ne
+    choisit jamais lui-même son identité depuis le téléphone, décision
+    explicite de l'utilisateur).
+
+    `owner_name` vide/None équivaut à clear_remote_device_owner (mais
+    préférez cette dernière pour la lisibilité de l'appelant). Renvoie
+    False si ce browser_id est inconnu du registre (rien à attribuer) —
+    n'exige PAS que l'appareil soit "approved" (reste utilisable même
+    si son statut venait à changer entre-temps), mais voir revoke_
+    remote_device : une révocation efface toujours owner_name."""
+    owner_name = (owner_name or "").strip() or None
+    with _remote_control_lock():
+        devices = _read_json_or_empty(_remote_devices_path())
+        entry = devices.get(browser_id)
+        if not entry:
+            return False
+        entry["owner_name"] = owner_name
+        devices[browser_id] = entry
+        try:
+            _atomic_write_json(_remote_devices_path(), devices)
+        except OSError:
+            pass
+    return True
+
+
+def clear_remote_device_owner(browser_id):
+    """Retire la liaison propriétaire d'un appareil SANS le révoquer
+    (demande explicite du 2026-09-20, distincte de revoke_remote_device
+    : l'appareil reste "approved", continue de passer le niveau 1
+    d'authentification — seule la notion de propriétaire disparaît,
+    l'appareil redevient "approuvé mais non lié"). Renvoie False si ce
+    browser_id est inconnu du registre."""
+    return set_remote_device_owner(browser_id, None)
+
+
+def get_remote_device_owner(browser_id):
+    """Nom du propriétaire actuellement attribué à `browser_id`, ou None
+    si inconnu du registre ou non lié. Sous verrou (même principe que
+    get_device_auth_status ci-dessus) : une lecture ne doit jamais
+    tomber sur un fichier à moitié écrit par une écriture concurrente
+    d'un autre process."""
+    with _remote_control_lock():
+        devices = _read_json_or_empty(_remote_devices_path())
+    entry = devices.get(browser_id)
+    return entry.get("owner_name") if entry else None
 
 
 def _fresh_remote_rate_limit_entry():

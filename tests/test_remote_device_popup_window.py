@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """Couverture automatisée de la fenêtre flottante de demande de
 téléphone (demande du 2026-09-09, retour DÉFINITIF à une fenêtre
-Tkinter indépendante après plusieurs tentatives d'intégration dans la
-grille de Paramètres, toutes abandonnées — la dernière ayant élargi la
+Tkinter indépendante après plusieurs tentatives d'intégration dans une
+grille de réglages, toutes abandonnées — la dernière ayant élargi la
 colonne gauche au point de repousser la colonne droite hors écran) :
 remplace tests/test_remote_device_pending_panel.py (supprimé, plus
 aucun panneau intégré à tester).
+
+Déplacée dans l'onglet "CA/LOG" le 2026-09-22 ("réorganisation visuelle
+du contrôle à distance", tout le bloc contrôle à distance quitte
+Paramètres pour cet onglet dédié) — mécanisme INCHANGÉ, seul l'onglet
+surveillé change (_is_ca_log_tab_active/_update_ca_log_tab_badge,
+s'appelaient respectivement _is_settings_tab_active/_update_settings_
+tab_badge tant que ce bloc vivait dans Paramètres).
 
 - RemoteDeviceRequestWindow (tk.Toplevel) présente UNE demande à la
   fois — UNE SEULE instance à la fois (voir App._remote_device_popup),
@@ -15,14 +22,15 @@ aucun panneau intégré à tester).
   d'authentification/approbation/révocation INCHANGÉ, non retesté ici —
   voir tests/test_remote_control_auth_backend.py) ;
 - "Plus tard" ferme la fenêtre SANS approuver/révoquer — le badge 🔔
-  reste, la demande redevient affichable au retour sur Paramètres ;
+  reste, la demande redevient affichable au retour sur CA/LOG ;
 - la position de la fenêtre est mémorisée dans export_prefs (JAMAIS le
   fichier de session éphémère remote_control_auth.json, aucun secret),
   restaurée si elle reste visible à l'écran, sinon une position par
-  défaut sûre est utilisée ;
-- la liste "Téléphones" de Paramètres (appareils déjà approuvés) et la
-  grille de _build_settings_tab ne sont plus jamais concernées par une
-  demande en attente.
+  défaut sûre est utilisée (sous le bloc "Téléphones autorisés" de
+  CA/LOG depuis le 2026-09-22, voir App._remote_device_popup_position) ;
+- la liste "Téléphones" de CA/LOG (appareils déjà approuvés) et la
+  grille de _build_settings_tab (qui ne construit plus rien de ce bloc)
+  ne sont plus jamais concernées par une demande en attente.
 
 Utilise un VRAI tk.Tk() caché (comme tests/test_tick_never_stops_
 scheduling.py) — nécessaire pour un vrai tk.Toplevel/ttk.Notebook.
@@ -38,6 +46,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
@@ -45,6 +54,7 @@ from tkinter import ttk
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import open_windows  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -64,10 +74,19 @@ _INSTANCE_METHODS_TO_GRAFT = (
     "_on_remote_device_popup_later",
     "_on_revoke_remote_device",
     "_on_rename_remote_device",
-    "_is_settings_tab_active",
-    "_update_settings_tab_badge",
+    "_is_ca_log_tab_active",
+    "_update_ca_log_tab_badge",
     "_remote_device_popup_position",
     "_save_remote_device_popup_position",
+    # Phase 3 "Sécurisation du Contrôle à distance" (2026-09-20) :
+    # _check_remote_device_requests appelle désormais aussi ceci —
+    # jamais testée ICI (hors sujet de ce fichier, voir tests/test_
+    # remote_device_owner_widget.py), greffée uniquement pour que ce
+    # sondage ne lève pas AttributeError sur ce harnais volontairement
+    # réduit. self.win.remote_dirto_admin_combo n'est jamais posé ici
+    # (voir setUp) : son propre garde-fou interne ("pas encore construit
+    # -> ne rien faire") la rend inoffensive, exactement comme prévu.
+    "_refresh_remote_dirto_permissions_panel",
 )
 _STATIC_METHODS_TO_GRAFT = (
     "_remote_devices_signature",
@@ -80,7 +99,6 @@ class RemoteDevicePopupWindowTest(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.addCleanup(self.root.destroy)
 
         self._tmp = tempfile.TemporaryDirectory(prefix="remote_device_popup_test_")
         self.addCleanup(self._tmp.cleanup)
@@ -101,24 +119,24 @@ class RemoteDevicePopupWindowTest(unittest.TestCase):
 
         # -- Greffe sur la racine RÉELLE (voir tests/test_tick_never_
         # stops_scheduling.py, même principe) : un vrai Notebook à deux
-        # onglets (pour _is_settings_tab_active/_update_settings_tab_
+        # onglets (pour _is_ca_log_tab_active/_update_ca_log_tab_
         # badge), un vrai conteneur pour "Téléphones" (approuvés). -------
         self.win = self.root
         self.notebook = ttk.Notebook(self.root)
         self.other_tab = ttk.Frame(self.notebook)
-        self.settings_tab = ttk.Frame(self.notebook)
+        self.ca_log_tab = ttk.Frame(self.notebook)
         self.notebook.add(self.other_tab, text="Joueurs")
-        self.notebook.add(self.settings_tab, text="Paramètres")
+        self.notebook.add(self.ca_log_tab, text="CA/LOG")
         self.notebook.select(self.other_tab)
         self.win.notebook = self.notebook
-        self.win.settings_tab = self.settings_tab
-        self.win.remote_devices_container = ttk.Frame(self.settings_tab)
+        self.win.ca_log_tab = self.ca_log_tab
+        self.win.remote_devices_container = ttk.Frame(self.ca_log_tab)
 
         self.win._remote_device_snoozed_keys = set()
         self.win._remote_device_popup = None
         self.win._remote_device_popup_current_key = None
         self.win._remote_device_popup_current_browser_id = None
-        self.win._last_settings_tab_active = False
+        self.win._last_ca_log_tab_active = False
         self.win._last_remote_devices_panel_signature = None
 
         for name in _INSTANCE_METHODS_TO_GRAFT:
@@ -136,6 +154,11 @@ class RemoteDevicePopupWindowTest(unittest.TestCase):
                     popup.destroy()
             except tk.TclError:
                 pass
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : 13 méthodes greffées sur self.win (= self.root)
+        # forment chacune un cycle, réclamé ici par gc.collect() —
+        # PER TEST, cette racine n'étant jamais partagée entre classes.
+        cleanup_tk(self, "root", "win", "notebook", "other_tab", "ca_log_tab")
 
     def _register(self, ip="192.168.0.191"):
         bid = os.urandom(16).hex()
@@ -157,7 +180,7 @@ class SingleWindowTest(RemoteDevicePopupWindowTest):
         bid1 = self._register("1.1.1.1")
         time.sleep(0.01)
         self._register("2.2.2.2")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup1 = self.win._remote_device_popup
         self.assertIsInstance(popup1, main.RemoteDeviceRequestWindow)
@@ -177,7 +200,7 @@ class SingleWindowTest(RemoteDevicePopupWindowTest):
         naturellement recréée — comportement correct, pas un bug (rien
         n'impose de garder une fenêtre fermée "en réserve")."""
         bid1 = self._register("1.1.1.1")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup1 = self.win._remote_device_popup
 
@@ -200,7 +223,7 @@ class SingleWindowTest(RemoteDevicePopupWindowTest):
 class ApproveRefuseTest(RemoteDevicePopupWindowTest):
     def test_autoriser_approuve_ferme_ou_avance_et_alimente_telephones(self):
         bid = self._register("3.3.3.3")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         self.win._remote_device_popup.show_request("ABCDEF", "3.3.3.3", "Salle 1")
         self.win._remote_device_popup._label_var.set("Salle 1 - Jean")
@@ -215,7 +238,7 @@ class ApproveRefuseTest(RemoteDevicePopupWindowTest):
 
     def test_refuser_revoque_et_naffecte_pas_telephones_approuves(self):
         bid = self._register("4.4.4.4")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.win._on_remote_device_popup_refuse()
@@ -229,7 +252,7 @@ class ApproveRefuseTest(RemoteDevicePopupWindowTest):
         time.sleep(0.01)
         bid2 = self._register("5.5.5.2")
 
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         self.assertIn("5.5.5.1", self.win._remote_device_popup._info_lbl.cget("text"))
 
@@ -248,7 +271,7 @@ class ApproveRefuseTest(RemoteDevicePopupWindowTest):
 class LaterSnoozeTest(RemoteDevicePopupWindowTest):
     def test_plus_tard_ferme_la_fenetre_sans_approuver_ni_revoquer(self):
         bid = self._register("6.6.6.6")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.win._on_remote_device_popup_later()
@@ -261,30 +284,30 @@ class LaterSnoozeTest(RemoteDevicePopupWindowTest):
 
     def test_badge_reste_apres_plus_tard(self):
         self._register("7.7.7.7")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         self.win._on_remote_device_popup_later()
         self.win._check_remote_device_requests()
-        self.assertEqual(self.notebook.tab(self.settings_tab, "text"), "Paramètres 🔔")
+        self.assertEqual(self.notebook.tab(self.ca_log_tab, "text"), "CA/LOG 🔔")
 
-    def test_demande_reapparait_au_retour_sur_parametres_sans_nouvelle_tentative(self):
+    def test_demande_reapparait_au_retour_sur_ca_log_sans_nouvelle_tentative(self):
         bid = self._register("8.8.8.8")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         device_before = open_windows.list_pending_remote_devices()[0]
         self.win._on_remote_device_popup_later()
         self.assertIsNone(self.win._remote_device_popup)
 
-        # Reste fermée tant que Paramètres reste actif en continu.
+        # Reste fermée tant que CA/LOG reste actif en continu.
         self.win._check_remote_device_requests()
         self.assertIsNone(self.win._remote_device_popup)
 
-        # Quitte puis revient sur Paramètres, sans nouvelle tentative du
+        # Quitte puis revient sur CA/LOG, sans nouvelle tentative du
         # téléphone (même browser_id/requested_at).
         self._switch_to(self.other_tab)
         self.win._check_remote_device_requests()
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.assertIsNotNone(self.win._remote_device_popup)
@@ -294,8 +317,9 @@ class LaterSnoozeTest(RemoteDevicePopupWindowTest):
 
 
 # =======================================================================
-# Demande du 2026-09-09 : la fenêtre flottante ne doit être VISIBLE que
-# lorsque l'onglet Paramètres est sélectionné — VISIBLE ⇔ Paramètres
+# Demande du 2026-09-09 (onglet "CA/LOG" depuis le 2026-09-22, voir la
+# docstring en tête de fichier) : la fenêtre flottante ne doit être
+# VISIBLE que lorsque l'onglet CA/LOG est sélectionné — VISIBLE ⇔ CA/LOG
 # actif ET au moins une demande pending. Sur tout autre onglet (Joueurs
 # ici, celui sélectionné par défaut dans setUp), elle doit être
 # masquée (`withdraw`, jamais détruite ni recréée), la demande restant
@@ -312,28 +336,28 @@ class TabVisibilityTest(RemoteDevicePopupWindowTest):
         popup = self.win._remote_device_popup
         return popup is not None and popup.winfo_exists() and popup.state() != "withdrawn"
 
-    def test_demande_recue_hors_parametres_popup_absent_cloche_presente(self):
+    def test_demande_recue_hors_ca_log_popup_absent_cloche_presente(self):
         """setUp sélectionne déjà "Joueurs" par défaut — une demande qui
         arrive pendant qu'on y reste ne doit jamais créer la fenêtre."""
         self._register("20.0.0.1")
         self.win._check_remote_device_requests()
         self.assertFalse(self._popup_is_visible())
-        self.assertEqual(self.notebook.tab(self.settings_tab, "text"), "Paramètres 🔔")
+        self.assertEqual(self.notebook.tab(self.ca_log_tab, "text"), "CA/LOG 🔔")
 
-    def test_passage_joueurs_vers_parametres_rend_le_popup_visible(self):
+    def test_passage_joueurs_vers_ca_log_rend_le_popup_visible(self):
         self._register("20.0.0.2")
         self.win._check_remote_device_requests()
         self.assertFalse(self._popup_is_visible())
 
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.assertTrue(self._popup_is_visible())
         self.assertIn("20.0.0.2", self.win._remote_device_popup._info_lbl.cget("text"))
 
-    def test_quitter_parametres_masque_le_popup_sans_supprimer_la_demande(self):
+    def test_quitter_ca_log_masque_le_popup_sans_supprimer_la_demande(self):
         bid = self._register("20.0.0.3")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         self.assertTrue(self._popup_is_visible())
         popup_while_visible = self.win._remote_device_popup
@@ -351,17 +375,17 @@ class TabVisibilityTest(RemoteDevicePopupWindowTest):
             open_windows.get_device_auth_status(bid), "pending",
             "changer d'onglet ne doit JAMAIS être traité comme Refuser/Plus tard",
         )
-        self.assertEqual(self.notebook.tab(self.settings_tab, "text"), "Paramètres 🔔", "le badge doit rester affiché")
+        self.assertEqual(self.notebook.tab(self.ca_log_tab, "text"), "CA/LOG 🔔", "le badge doit rester affiché")
 
-    def test_retour_sur_parametres_reaffiche_la_meme_demande(self):
+    def test_retour_sur_ca_log_reaffiche_la_meme_demande(self):
         bid = self._register("20.0.0.4")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         device_before = open_windows.list_pending_remote_devices()[0]
 
         self._switch_to(self.other_tab)
         self.win._check_remote_device_requests()
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.assertTrue(self._popup_is_visible())
@@ -379,14 +403,14 @@ class TabVisibilityTest(RemoteDevicePopupWindowTest):
         EXACTEMENT identique avant/après (jamais recréée, voir aussi
         SingleWindowTest pour l'identité de l'objet)."""
         self._register("20.0.0.5")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup = self.win._remote_device_popup
         geometry_before = popup.geometry()
 
         self._switch_to(self.other_tab)
         self.win._check_remote_device_requests()
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
 
         self.assertIs(self.win._remote_device_popup, popup)
@@ -412,13 +436,13 @@ class TabVisibilityTest(RemoteDevicePopupWindowTest):
         self.win._check_remote_device_requests()
         self.assertFalse(self._popup_is_visible())
 
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         self.assertTrue(self._popup_is_visible())
 
         self.win._on_remote_device_popup_approve()
         self.assertEqual(open_windows.get_device_auth_status(bid1), "approved")
-        self.assertTrue(self._popup_is_visible(), "la demande suivante doit rester visible, toujours sur Paramètres")
+        self.assertTrue(self._popup_is_visible(), "la demande suivante doit rester visible, toujours sur CA/LOG")
 
         self.win._on_remote_device_popup_refuse()
         self.assertEqual(open_windows.get_device_auth_status(bid2), "refused")
@@ -462,7 +486,7 @@ class NotebookTabChangedWiringTest(unittest.TestCase):
 class PopupGeometryTest(RemoteDevicePopupWindowTest):
     def test_position_sauvegardee_et_restauree(self):
         self._register("9.9.9.9")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup = self.win._remote_device_popup
 
@@ -487,7 +511,7 @@ class PopupGeometryTest(RemoteDevicePopupWindowTest):
         export_prefs.save_value("remote_device_popup_x", 999999)
         export_prefs.save_value("remote_device_popup_y", 999999)
         self._register("10.10.10.10")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup = self.win._remote_device_popup
         x, y = self.win._remote_device_popup_position(popup)
@@ -500,7 +524,7 @@ class PopupGeometryTest(RemoteDevicePopupWindowTest):
         export_prefs.save_value("remote_device_popup_x", "pas un nombre")
         export_prefs.save_value("remote_device_popup_y", None)
         self._register("11.11.11.11")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup = self.win._remote_device_popup
         x, y = self.win._remote_device_popup_position(popup)
@@ -509,7 +533,7 @@ class PopupGeometryTest(RemoteDevicePopupWindowTest):
 
     def test_configure_de_la_fenetre_declenche_la_sauvegarde(self):
         self._register("12.12.12.12")
-        self._switch_to(self.settings_tab)
+        self._switch_to(self.ca_log_tab)
         self.win._check_remote_device_requests()
         popup = self.win._remote_device_popup
 

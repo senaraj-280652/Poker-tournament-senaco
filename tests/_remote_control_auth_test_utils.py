@@ -52,13 +52,31 @@ def http_request(base_url, method, path, jar=None, body=None, headers=None):
         return e.code, e.read(), dict(e.headers)
 
 
-def authenticated_jar(base_url, code=None, label="Test"):
+def authenticated_jar(base_url, code=None, label="Test", owner_name=None):
     """Jar de cookies AUTHENTIFIÉ ET APPROUVÉ (rc_bid + rc_auth), prêt à
     requêter n'importe quelle route protégée de `base_url` — reproduit
     le parcours complet (code correct -> "pending" -> approbation
     "PC" via open_windows directement, comme le ferait main.py -> code
     ressaisi -> "approved") plutôt qu'une entrée par un raccourci
-    interne, pour rester représentatif d'un VRAI téléphone."""
+    interne, pour rester représentatif d'un VRAI téléphone.
+
+    `owner_name` (Phase 4, "Sécurisation du Contrôle à distance",
+    2026-09-20) : si fourni, lie l'appareil à ce propriétaire (voir
+    open_windows.set_remote_device_owner, déjà sans effet sur le vrai
+    disque tant que l'appelant a redirigé open_windows vers un dossier
+    temporaire, comme l'exige déjà la docstring de ce module) — SANS
+    rapport avec roster.py : c'est TOUJOURS à l'appelant de garantir que
+    `roster.get_group(owner_name)` renvoie le rôle voulu (ADMIN/DIRTO),
+    par une vraie entrée de Répertoire isolée (roster._roster_path
+    redirigé) ou par un patch direct de roster.get_group — jamais fait
+    ICI, pour ne jamais toucher le vrai ~/.poker_tournament/roster.json
+    depuis un test qui ne l'aurait pas explicitement isolé. Par défaut
+    (omis), comportement HISTORIQUE inchangé : appareil approuvé mais
+    SANS propriétaire (voir Phase 4 : équivaut désormais au rôle "NONE",
+    aucune permission — les appelants existants qui avaient besoin d'un
+    accès complet doivent donc migrer vers `owner_name=` + un rôle
+    ADMIN, voir tests/test_remote_control_reliability.py pour un
+    exemple)."""
     jar = http.cookiejar.CookieJar()
     http_request(base_url, "GET", "/login", jar)
     code = code or open_windows.remote_session_code()
@@ -73,4 +91,7 @@ def authenticated_jar(base_url, code=None, label="Test"):
     status, body, _ = http_request(base_url, "POST", "/authenticate", jar, body={"code": code})
     data = json.loads(body)
     assert data == {"ok": True, "status": "approved"}, data
+    if owner_name:
+        assigned = open_windows.set_remote_device_owner(browser_id, owner_name)
+        assert assigned, "set_remote_device_owner a échoué de façon inattendue"
     return jar

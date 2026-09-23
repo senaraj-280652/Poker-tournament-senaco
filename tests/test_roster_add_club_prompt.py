@@ -37,6 +37,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 from tkinter import ttk  # noqa: E402
@@ -44,6 +45,7 @@ from tkinter import ttk  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -195,7 +197,11 @@ class AskClubDialogPositionUnitTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal
+        # après destroy(), avant qu'un test HTTP ultérieur ne puisse en
+        # hériter par hasard.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="ask_club_position_test_")
@@ -307,7 +313,11 @@ class RosterSelectsNewMemberTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal
+        # après destroy(), avant qu'un test HTTP ultérieur ne puisse en
+        # hériter par hasard.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="roster_select_new_member_test_")
@@ -321,20 +331,26 @@ class RosterSelectsNewMemberTest(unittest.TestCase):
         self.addCleanup(prefs_patcher.stop)
         prefs_patcher.start()
 
-        self.roster_tree = ttk.Treeview(self.root, columns=("name", "club"), show="tree headings")
-        self.addCleanup(self.roster_tree.destroy)
+        # 5 colonnes (pas seulement name/club) : reflète le VRAI Treeview
+        # de RosterManagerDialog.__init__ depuis le 2026-09-20 (ajout
+        # group/phone/mail) — _update_roster_sort_headings() itère sur
+        # les 5, une racine à seulement 2 colonnes déclarées lèverait
+        # TclError: Invalid column index "group".
+        self.roster_tree = ttk.Treeview(
+            self.root, columns=("name", "club", "group", "phone", "mail"), show="tree headings",
+        )
         self.roster_tree.heading("name", text="Nom")
         self.roster_tree.heading("club", text="Club")
+        self.roster_tree.heading("group", text="Groupe")
+        self.roster_tree.heading("phone", text="Téléphone")
+        self.roster_tree.heading("mail", text="Mail")
 
         self.club_summary_tree = ttk.Treeview(self.root, columns=("club", "count"), show="headings")
-        self.addCleanup(self.club_summary_tree.destroy)
         self.club_summary_tree.heading("club", text="Club")
         self.club_summary_tree.heading("count", text="Nombre")
 
         self.summary_box = ttk.LabelFrame(self.root, text="")
-        self.addCleanup(self.summary_box.destroy)
         self.preview_lbl = tk.Label(self.root)
-        self.addCleanup(self.preview_lbl.destroy)
 
         self.dlg = types.SimpleNamespace(
             new_name_var=_FakeVar(),
@@ -356,6 +372,14 @@ class RosterSelectsNewMemberTest(unittest.TestCase):
             "_select_and_reveal", "_add",
         ):
             setattr(self.dlg, meth, types.MethodType(getattr(main.RosterManagerDialog, meth), self.dlg))
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : self.dlg (SimpleNamespace) porte 7 méthodes
+        # liées à lui-même (cycle) — remplace les 4 addCleanup(...destroy)
+        # séparés d'origine, PER TEST (cls.root, lui, n'est nettoyé
+        # qu'une fois en tearDownClass).
+        self.addCleanup(lambda: cleanup_tk(
+            self, "dlg", "roster_tree", "club_summary_tree", "summary_box", "preview_lbl",
+        ))
 
     def _add_member(self, name, ask_club_return):
         self.dlg.new_name_var.set(name)

@@ -17,8 +17,10 @@ import tkinter as tk
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -72,7 +74,12 @@ class HrDeDebutToggleTest(unittest.TestCase):
         self.root.withdraw()
 
     def tearDown(self):
-        self.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : le "harness" local de chaque test forme un
+        # cycle (main.py:11512/11559-11564, lambdas fermées sur lui) —
+        # déjà hors de portée ici, il est balayé par le gc.collect() de
+        # cleanup_tk sans qu'il soit besoin de le nommer explicitement.
+        cleanup_tk(self, "root")
 
     def test_base_00h00_par_defaut_comme_avant_ce_correctif(self):
         harness = _BlindsTabHarness(self.root, _rounds())

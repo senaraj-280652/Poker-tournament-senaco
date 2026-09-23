@@ -46,7 +46,16 @@ class ClockWindow(tk.Toplevel):
     MOVES_TABLE_MAX_HEIGHT = 260
     MOVES_AUTOSCROLL_STEP_PX = 2
     MOVES_AUTOSCROLL_INTERVAL_MS = 45
-    MOVES_AUTOSCROLL_PAUSE_MS = 2000  # pause en haut et en bas avant de reboucler
+    # Pas fixe (px) d'un appui sur les petites flèches ↓/↑ du téléphone,
+    # de part et d'autre de "Afficher Mouvements" (demande du
+    # 2026-09-20) — voir nudge_movement_alert_position. Valeur validée
+    # pour le premier test réel ; ajustable si besoin.
+    MOVEMENT_ALERT_NUDGE_STEP_PX = 40
+    # Pause EN BAS de la liste, dernière ligne pleinement visible (demande
+    # du 2026-09-19 — l'ancien comportement remontait IMMÉDIATEMENT en
+    # haut avant de programmer cette pause, qui avait donc lieu en haut,
+    # jamais en bas : voir _moves_autoscroll_tick/_moves_resume_autoscroll).
+    MOVES_AUTOSCROLL_PAUSE_MS = 2000
 
     def __init__(self, master, app):
         super().__init__(master)
@@ -178,6 +187,26 @@ class ClockWindow(tk.Toplevel):
         )
         self.movement_alert_lbl.pack(padx=40, pady=(22, 0))
 
+        # Glisser-déposer vertical du bandeau (demande du 2026-09-19,
+        # ergonomie : sur un vrai test 7 mouvements, la position calculée
+        # par défaut laissait le tableau déborder trop bas de l'écran
+        # projecteur, ~4 lignes visibles seulement). Prise en main
+        # UNIQUEMENT depuis la grande zone rouge du titre (le Label
+        # lui-même, PAS movement_alert_frame en entier) — pour ne jamais
+        # intercepter un clic destiné au tableau des joueurs concernés ou
+        # à son défilement automatique (_moves_canvas/_moves_table_frame,
+        # ci-dessous, ne reçoivent aucun de ces bindings). Horizontal
+        # jamais touché : seul `y` varie dans place(), `relx` reste fixe
+        # à 0.5 partout ci-dessous, donc le déplacement est structurellement
+        # vertical uniquement.
+        self._movement_alert_manual_y = None
+        self._movement_alert_dragging = False
+        self._movement_alert_drag_start_mouse_y = 0
+        self._movement_alert_drag_start_frame_y = 0
+        self.movement_alert_lbl.bind("<ButtonPress-1>", self._movement_alert_drag_start)
+        self.movement_alert_lbl.bind("<B1-Motion>", self._movement_alert_drag_motion)
+        self.movement_alert_lbl.bind("<ButtonRelease-1>", self._movement_alert_drag_end)
+
         # Le tableau lui-même vit dans un Canvas plutôt qu'un simple Frame :
         # ça permet de le défiler par programme quand un gros
         # rééquilibrage déplace beaucoup de joueurs à la fois (au-delà de
@@ -197,6 +226,14 @@ class ClockWindow(tk.Toplevel):
         self._moves_needs_scroll = False
         self._moves_scroll_after_id = None
         self._moves_scroll_paused = False
+        # Identifiant du timer de pause EN COURS (demande du 2026-09-19),
+        # stocké pour pouvoir l'annuler explicitement si le tableau est
+        # reconstruit (nouvelle confirmation individuelle de mouvement,
+        # par exemple) pendant qu'une pause est encore en attente — sans
+        # ça, ce timer périmé pouvait se déclencher plus tard et
+        # perturber le nouveau cycle de défilement. None tant qu'aucune
+        # pause n'est programmée.
+        self._moves_scroll_pause_after_id = None
         self._moves_autoscroll_tick()
 
         # Bandeau d'élimination "XXX est sorti par YYY" : overlay affiché
@@ -300,6 +337,90 @@ class ClockWindow(tk.Toplevel):
             # fiable pour vraiment repasser devant que de le faire avant.
             self.attributes("-fullscreen", True)
 
+    def _clamp_movement_alert_y(self, y):
+        """Ramène `y` dans l'intervalle qui garde movement_alert_frame
+        ENTIÈREMENT dans la fenêtre Tk (jamais seulement "pas totalement
+        hors champ") : entre 0 (haut) et winfo_height() de la fenêtre
+        moins la hauteur du bandeau (bas) — fixe en plein écran, variable
+        sinon. Aucune gestion spéciale du Dock macOS (demande explicite) :
+        winfo_height() de CETTE fenêtre suffit, sans notion d'écran
+        physique."""
+        max_y = max(0, self.winfo_height() - self.movement_alert_frame.winfo_height())
+        return max(0, min(int(y), max_y))
+
+    def _movement_alert_drag_start(self, event):
+        """Début d'un glisser vertical du bandeau, déclenché uniquement
+        depuis movement_alert_lbl (voir son bind dans __init__) — jamais
+        depuis _moves_canvas/_moves_table_frame, qui ne reçoivent aucun de
+        ces bindings et restent donc totalement dédiés au tableau/à son
+        défilement automatique."""
+        self._movement_alert_dragging = True
+        self._movement_alert_drag_start_mouse_y = event.y_root
+        self._movement_alert_drag_start_frame_y = self.movement_alert_frame.winfo_y()
+
+    def _movement_alert_drag_motion(self, event):
+        """Déplace movement_alert_frame en suivant la souris — SEUL `y`
+        varie dans ce place() ; `relx` n'est jamais touché ici (fixé à 0.5
+        partout, voir refresh()), donc le déplacement est structurellement
+        vertical uniquement. La position obtenue est mémorisée dans
+        _movement_alert_manual_y : refresh() (appelé ~1×/s pendant qu'une
+        alerte est affichée) la reprendra tant que ce glisser n'est pas
+        suivi de la fin de CETTE alerte (voir refresh(), qui remet
+        _movement_alert_manual_y à None dès que movement_alert redevient
+        faux — la position manuelle ne survit donc jamais à la fin de
+        l'alerte en cours, conformément à la demande)."""
+        if not self._movement_alert_dragging:
+            return
+        delta = event.y_root - self._movement_alert_drag_start_mouse_y
+        new_y = self._clamp_movement_alert_y(self._movement_alert_drag_start_frame_y + delta)
+        self.movement_alert_frame.place(relx=0.5, y=new_y, anchor="n")
+        self._movement_alert_manual_y = new_y
+
+    def _movement_alert_drag_end(self, event):
+        # Une fois le bouton relâché, refresh() reprend la main pour le
+        # placement (voir refresh()) — en respectant désormais
+        # _movement_alert_manual_y tant que l'alerte en cours continue.
+        self._movement_alert_dragging = False
+
+    def nudge_movement_alert_position(self, delta_y):
+        """Déplace movement_alert_frame verticalement d'un pas fixe
+        (demande du 2026-09-20, petites flèches ↓/↑ du téléphone de part
+        et d'autre de "Afficher Mouvements") — RÉUTILISE intégralement le
+        même mécanisme que le glisser souris (_movement_alert_manual_y,
+        _clamp_movement_alert_y), aucun second système de positionnement.
+        Appelée depuis le thread Tk uniquement (via App._on_voice_word,
+        lui-même déclenché par voice_command_queue — jamais directement
+        depuis le thread HTTP, voir remote_control.py).
+
+        Deux garde-fous (validés explicitement) :
+        1. Ignoré pendant un glisser souris en cours
+           (_movement_alert_dragging) — un nudge tombant pile pendant une
+           manipulation à la souris sur le Mac ne doit jamais la
+           perturber (même s'ils tournent tous deux sur ce même thread
+           Tk, donc sans risque de "course" au sens thread — seulement
+           une question de ne pas se battre visuellement).
+        2. Ignoré si movement_alert_frame n'est pas RÉELLEMENT affiché en
+           mode "mouvements" : soit il est masqué (place_forget(), aucune
+           alerte en cours), soit il affiche "Partie terminée" (placé par
+           place(rely=0.42, anchor="center"), jamais y=...,anchor="n") —
+           distingué ici par l'anchor courant plutôt que par un nouvel
+           indicateur d'état, pour ne jamais déplacer ce bandeau-là par
+           erreur ni faire réapparaître un bandeau masqué hors contexte."""
+        if self._movement_alert_dragging:
+            return
+        if not self.movement_alert_frame.winfo_ismapped():
+            return
+        if self.movement_alert_frame.place_info().get("anchor") != "n":
+            return
+        base_y = (
+            self._movement_alert_manual_y
+            if self._movement_alert_manual_y is not None
+            else self.movement_alert_frame.winfo_y()
+        )
+        new_y = self._clamp_movement_alert_y(base_y + delta_y)
+        self.movement_alert_frame.place(relx=0.5, y=new_y, anchor="n")
+        self._movement_alert_manual_y = new_y
+
     def refresh(self, remaining_seconds, level_row, next_row, stats, tournament_name,
                 is_paused, next_break_text="", movement_alert=False, chip_denominations=None,
                 moves=None, round_number=None, elimination_banner=None):
@@ -368,6 +489,14 @@ class ClockWindow(tk.Toplevel):
             self._moves_canvas.pack_forget()
             self._moves_needs_scroll = False
             self._moves_signature = None
+            # Position manuelle jamais pertinente pour ce bandeau "Partie
+            # terminée" (placement fixe via rely=0.42 ci-dessous, pas via
+            # _movement_alert_manual_y) : purgée par sécurité pour qu'une
+            # éventuelle alerte de mouvements ultérieure reparte bien de
+            # sa position par défaut plutôt que d'hériter d'un glisser
+            # antérieur à cette fin de partie.
+            self._movement_alert_manual_y = None
+            self._movement_alert_dragging = False
             self.movement_alert_frame.place(relx=0.5, rely=0.42, anchor="center")
             # Toujours au-dessus de _banner_ghost_patch (voir son
             # commentaire dans __init__ et son usage plus bas) : ce
@@ -503,13 +632,37 @@ class ClockWindow(tk.Toplevel):
                 # niveau/pause).
                 self.movement_alert_lbl.config(text="⚠  Changement de tables en cours  ⚠")
                 self._update_movement_moves_table(moves or [])
-                self.movement_alert_frame.place(relx=0.5, y=movement_y, anchor="n")
+                # Glisser-déposer (demande du 2026-09-19, voir son bind
+                # dans __init__ et _movement_alert_drag_motion) : pendant
+                # un glisser en cours, ce refresh() (~1×/s) ne doit JAMAIS
+                # replacer le bandeau — seul le contenu (label/tableau
+                # ci-dessus) se met à jour, la position reste celle que la
+                # souris vient d'imposer, sans quoi le bandeau "sauterait"
+                # en pleine manipulation. Sinon, une position manuelle
+                # mémorisée pour CETTE alerte (voir le bloc `else` plus
+                # bas, qui la remet à None dès que movement_alert redevient
+                # faux) prime sur la position par défaut recalculée
+                # (movement_y) — reclampée à chaque appel pour rester sûre
+                # même après un redimensionnement/bascule plein écran.
+                if not self._movement_alert_dragging:
+                    if self._movement_alert_manual_y is not None:
+                        y_to_place = self._clamp_movement_alert_y(self._movement_alert_manual_y)
+                    else:
+                        y_to_place = movement_y
+                    self.movement_alert_frame.place(relx=0.5, y=y_to_place, anchor="n")
                 # Voir le commentaire équivalent plus haut ("Partie
                 # terminée") : toujours au-dessus de _banner_ghost_patch,
                 # qui peut se trouver n'importe où sur l'écran.
                 self.movement_alert_frame.tkraise()
             else:
                 self.movement_alert_frame.place_forget()
+                # Fin de CETTE alerte (demande explicite du 2026-09-19) :
+                # une position glissée manuellement ne doit JAMAIS survivre
+                # à la prochaine alerte — celle-ci doit repartir de la
+                # position par défaut calculée par Senaco (movement_y
+                # ci-dessus), pas de l'endroit où le bandeau avait été
+                # laissé la fois précédente.
+                self._movement_alert_manual_y = None
 
         self._update_chips_display(chip_denominations or [])
         self._ensure_fits_content()
@@ -634,6 +787,15 @@ class ClockWindow(tk.Toplevel):
         visible_h = min(content_h, self.MOVES_TABLE_MAX_HEIGHT)
         self._moves_canvas.configure(width=content_w, height=visible_h)
         self._moves_canvas.configure(scrollregion=(0, 0, content_w, content_h))
+        # Annule un éventuel timer de pause encore en attente (demande du
+        # 2026-09-19) : cette reconstruction (confirmation individuelle
+        # d'un mouvement, entre autres) peut survenir PENDANT la pause de
+        # 2s en bas de liste — sans cette annulation, ce timer périmé se
+        # déclencherait quand même plus tard et perturberait le nouveau
+        # cycle de défilement qui commence ici.
+        if self._moves_scroll_pause_after_id is not None:
+            self.after_cancel(self._moves_scroll_pause_after_id)
+            self._moves_scroll_pause_after_id = None
         self._moves_canvas.yview_moveto(0.0)
         self._moves_needs_scroll = content_h > self.MOVES_TABLE_MAX_HEIGHT
         self._moves_scroll_paused = False
@@ -653,9 +815,16 @@ class ClockWindow(tk.Toplevel):
         if not self._moves_scroll_paused:
             top_frac, bottom_frac = self._moves_canvas.yview()
             if bottom_frac >= 1.0:
+                # Pause EN BAS (demande du 2026-09-19, corrige un
+                # défilement qui ne laissait la dernière ligne visible
+                # qu'un seul tick) : surtout PAS de yview_moveto ici — la
+                # dernière ligne doit rester entièrement affichée pendant
+                # TOUTE la pause. Le retour en haut n'a lieu que dans
+                # _moves_resume_autoscroll, une fois la pause écoulée.
                 self._moves_scroll_paused = True
-                self._moves_canvas.yview_moveto(0.0)
-                self.after(self.MOVES_AUTOSCROLL_PAUSE_MS, self._moves_resume_autoscroll)
+                self._moves_scroll_pause_after_id = self.after(
+                    self.MOVES_AUTOSCROLL_PAUSE_MS, self._moves_resume_autoscroll
+                )
             else:
                 self._moves_canvas.yview_scroll(self.MOVES_AUTOSCROLL_STEP_PX, "units")
 
@@ -664,6 +833,12 @@ class ClockWindow(tk.Toplevel):
         )
 
     def _moves_resume_autoscroll(self):
+        """Pause de MOVES_AUTOSCROLL_PAUSE_MS écoulée (demande du
+        2026-09-19) : c'est SEULEMENT MAINTENANT — jamais avant — que la
+        vue remonte en haut, la dernière ligne étant restée pleinement
+        visible pendant toute la pause."""
+        self._moves_scroll_pause_after_id = None
+        self._moves_canvas.yview_moveto(0.0)
         self._moves_scroll_paused = False
 
     ELIMINATION_PHOTO_SIZE = 150

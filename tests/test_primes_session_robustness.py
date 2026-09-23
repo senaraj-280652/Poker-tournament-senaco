@@ -75,6 +75,12 @@ class ClockResumeRepairsSessionFileTest(unittest.TestCase):
             patch.object(open_windows, "_primes_session_lock_path", return_value=lock_path),
             patch.object(open_windows, "_registry_lock_path", return_value=registry_lock_path),
             patch.object(export_prefs, "_prefs_path", return_value=prefs_path),
+            # _remote_control_dir (demande du 2026-09-19, incident réel où
+            # ce genre de test — register() sur un registre isolé devenu
+            # vide — a effacé le VRAI remote_control_auth.json de
+            # l'utilisateur) : voir tests/test_remote_control_dir_
+            # isolation.py pour le mécanisme complet.
+            patch.object(open_windows, "_remote_control_dir", return_value=self._tmp.name),
         ):
             target.start()
             self.addCleanup(target.stop)
@@ -393,6 +399,10 @@ class ModeTestStillWorksWithRegistryLockTest(unittest.TestCase):
             patch.object(open_windows, "_registry_path", return_value=registry_path),
             patch.object(open_windows, "_primes_session_lock_path", return_value=lock_path),
             patch.object(open_windows, "_registry_lock_path", return_value=registry_lock_path),
+            # _remote_control_dir (demande du 2026-09-19) : voir le même
+            # commentaire dans ClockResumeRepairsSessionFileTest.setUp
+            # ci-dessus.
+            patch.object(open_windows, "_remote_control_dir", return_value=self._tmp.name),
         ):
             target.start()
             self.addCleanup(target.stop)

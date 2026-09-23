@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import open_windows  # noqa: E402
 import remote_control  # noqa: E402
+import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
 
@@ -51,12 +52,34 @@ class _RemoteControlHttpTestCase(unittest.TestCase):
         for target in (
             patch.object(open_windows, "_registry_path", return_value=registry_path),
             patch.object(open_windows, "_remote_control_dir", return_value=remote_dir),
+            # Phase 4, "Sécurisation du Contrôle à distance" (2026-09-20) :
+            # ce fichier teste l'authentification NIVEAU 1 (code,
+            # approbation, anti-bruteforce), pas les permissions DIRTO —
+            # un rôle ADMIN inconditionnel évite d'isoler roster.py
+            # (fichier RÉEL ~/.poker_tournament/roster.json, jamais
+            # touché ici) juste pour qu'authenticated_jar(...,
+            # owner_name=...) retrouve un accès complet, comme avant
+            # l'existence des permissions.
+            patch.object(roster, "get_group", return_value=roster.ROSTER_GROUP_ADMIN),
         ):
             self.addCleanup(target.stop)
             target.start()
         self._session_path = os.path.join(self._tmp.name, "session_marker.tournoi")
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
+
+        # _LOG_PATH/_logger (demande du 2026-09-19, incident réel où ce
+        # fichier — AllSensitiveRoutesProtectedTest en particulier,
+        # itérant sur toutes les routes sensibles pour vérifier leur 401 —
+        # a écrit dans le VRAI ~/.poker_tournament/remote_control.log
+        # pendant qu'un tournoi réel tournait) : jamais isolé jusqu'ici.
+        self.log_path = os.path.join(self._tmp.name, "remote_control.log")
+        log_patcher = patch.object(remote_control, "_LOG_PATH", self.log_path)
+        logger_patcher = patch.object(remote_control, "_logger", None)
+        self.addCleanup(log_patcher.stop)
+        self.addCleanup(logger_patcher.stop)
+        log_patcher.start()
+        logger_patcher.start()
 
         self.port = _free_port()
         self.base = f"http://127.0.0.1:{self.port}"
@@ -104,6 +127,13 @@ class FullFlowTest(_RemoteControlHttpTestCase):
         browser_id = pending[0]["browser_id"]
 
         open_windows.approve_remote_device(browser_id, label="Salle 1 - Jean")
+        # Phase 4, "Sécurisation du Contrôle à distance" (2026-09-20) :
+        # l'approbation (niveau 1) ne suffit plus, à elle seule, à
+        # accéder à une route FONCTIONNELLE comme /players (voir
+        # resolve_role) — ce test vérifie le parcours d'approbation lui-
+        # même, donc un rôle ADMIN explicite ici (roster.get_group
+        # patché en ADMIN pour toute la classe, voir setUp).
+        open_windows.set_remote_device_owner(browser_id, "Test Admin")
 
         # /auth_status détecte l'approbation et pose rc_auth tout seul
         # (sondé toutes les 2s par /login côté téléphone en pratique).
@@ -132,7 +162,7 @@ class FullFlowTest(_RemoteControlHttpTestCase):
     def test_appareil_deja_approuve_nouveau_code_de_session_acces_immediat(self):
         """"appareil approuvé + nouveau code de session => accès à la
         nouvelle session" (test explicitement demandé)."""
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         status, body, _ = self._req("GET", "/players", jar)
         self.assertEqual(status, 200)
 
@@ -159,7 +189,7 @@ class FullFlowTest(_RemoteControlHttpTestCase):
 # =======================================================================
 class RevocationAndForgeryTest(_RemoteControlHttpTestCase):
     def test_revocation_coupe_immediatement_lacces_en_cours(self):
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         status, _, _ = self._req("GET", "/players", jar)
         self.assertEqual(status, 200)
 
@@ -174,7 +204,7 @@ class RevocationAndForgeryTest(_RemoteControlHttpTestCase):
         self.assertEqual(headers.get("Location"), "/login")
 
     def test_ancien_cookie_apres_revocation_reste_refuse_meme_reessaye(self):
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         browser_id = open_windows.list_approved_remote_devices()[0]["browser_id"]
         open_windows.revoke_remote_device(browser_id)
         for _ in range(3):
@@ -203,7 +233,7 @@ class RevocationAndForgeryTest(_RemoteControlHttpTestCase):
         self.assertEqual(status, 401)
 
     def test_jeton_dune_session_precedente_refuse(self):
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         status, _, _ = self._req("GET", "/players", jar)
         self.assertEqual(status, 200)
 
@@ -236,7 +266,7 @@ class RevocationAndForgeryTest(_RemoteControlHttpTestCase):
 # =======================================================================
 class TournamentSwitchPreservesAuthTest(_RemoteControlHttpTestCase):
     def test_selection_du_meme_tournoi_depuis_le_lobby_ne_redemande_pas_le_code(self):
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         own_pid = os.getpid()
         fake_list = [{"pid": own_pid, "port": self.port, "name": "Ceci"}]
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=fake_list):
@@ -248,7 +278,7 @@ class TournamentSwitchPreservesAuthTest(_RemoteControlHttpTestCase):
             self.assertEqual(status, 200, body)
 
     def test_lobbylist_reste_accessible_a_un_appareil_deja_authentifie(self):
-        jar = authenticated_jar(self.base, code=self.code)
+        jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=[]):
             status, _, _ = self._req("GET", "/lobbylist", jar)
             self.assertEqual(status, 200)
@@ -264,6 +294,8 @@ class TournamentSwitchPreservesAuthTest(_RemoteControlHttpTestCase):
         bid1 = {c.name: c.value for c in jar1}["rc_bid"]
         target = next(d for d in pending if d["browser_id"] == bid1)
         open_windows.approve_remote_device(target["browser_id"], label="Salle 1")
+        # Phase 4 (voir la remarque équivalente dans test_autoriser_donne_acces).
+        open_windows.set_remote_device_owner(target["browser_id"], "Test Admin")
 
         status, body, _ = self._req("GET", "/auth_status", jar1)
         self.assertEqual(json.loads(body)["status"], "approved")

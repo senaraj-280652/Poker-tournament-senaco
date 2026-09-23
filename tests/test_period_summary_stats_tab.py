@@ -75,6 +75,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 
@@ -82,6 +83,7 @@ import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -434,10 +436,17 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
     déclaré forfait (Database.withdraw_player — inscrit, blindes
     éventuellement prélevées pendant son absence, déclaré forfait au
     bout d'~1h) a bien participé ADMINISTRATIVEMENT à ce tournoi (il
-    reste dans "players", continue de peser sur total_bounty_won/total_
-    points/total_presence_assiduity exactement comme avant), mais ce tournoi ne
-    doit PLUS compter dans son nombre de tournois JOUÉS
-    (tournaments_played)."""
+    reste dans "players", continue de peser sur total_bounty_won/
+    total_points — bounty : mécanique de kills, non concernée), mais ce
+    tournoi ne doit PLUS compter dans son nombre de tournois JOUÉS
+    (tournaments_played).
+
+    total_presence_assiduity : règle DURCIE le 2026-09-18 (remplace le
+    comportement affirmé ci-dessus jusque-là — voir test_forfait_ne_
+    recoit_plus_prime_de_presence_ni_assiduite plus bas) : un forfait
+    "n'est jamais venu" et ne doit donc PLUS peser sur ce total du tout
+    — ni présence, ni assiduité, dans ce tournoi ou pour la série
+    d'assiduité d'un autre."""
 
     def test_joueur_normal_present_incremente_tournaments_played(self):
         """Joueur encore "active" en fin de tournoi (le vainqueur, ou
@@ -517,12 +526,14 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
             self.assertEqual(summary["tournaments"][0]["status"], "Terminé")
             self.assertEqual(summary["tournaments"][0]["winner"], "-")
 
-    def test_forfait_ne_change_ni_primes_ni_pts_pres_ass_deja_dues(self):
-        """Non-régression explicite (demande du 2026-09-15, "ne change pas
-        d'autres règles métier" ; mise à jour le 2026-09-18 après
-        suppression de total_cost) : total_bounty_won/total_points/
-        total_presence_assiduity d'un forfait restent calculés exactement
-        comme avant cette règle — seul tournaments_played change."""
+    def test_forfait_ne_recoit_plus_prime_de_presence_ni_assiduite(self):
+        """Règle métier DURCIE le 2026-09-18 (remplace l'ancienne attente
+        de ce test, voir git history — un forfait recevait auparavant sa
+        prime de présence) : "un forfait est un joueur inscrit qui n'est
+        jamais venu" — il ne doit donc RIEN recevoir en présence ni en
+        assiduité. tournaments_played reste à 0 (règle du 2026-09-15,
+        inchangée) ; total_bounty_won/total_ranking_points inchangés
+        (mécaniques non concernées par cette règle)."""
         with tempfile.TemporaryDirectory(prefix="stats_withdrawn_cost_") as tmp:
             db = _new_db(
                 tmp, "forfait3.tournoi", tournament_date="2026-01-24",
@@ -536,11 +547,11 @@ class ForfaitNeCompteJamaisCommeTournoiJoueTest(unittest.TestCase):
             summary = database.build_period_summary(tmp, recursive=False)
             bob = next(p for p in summary["players"] if p["name"] == "Bob")
             self.assertEqual(bob["tournaments_played"], 0)
-            # Prime de présence (5 pts) : get_presence_bonuses boucle sur
-            # TOUS les joueurs (voir sa docstring), forfait compris —
-            # inchangé par cette règle, qui ne touche QUE tournaments_played.
-            self.assertEqual(bob["total_points"], 5)
-            self.assertEqual(bob["total_presence_assiduity"], 5)  # même source
+            # Prime de présence (5 pts) : get_presence_bonuses EXCLUT
+            # désormais les forfaits (status='withdrawn') — voir sa
+            # docstring, règle métier validée le 2026-09-18.
+            self.assertEqual(bob["total_points"], 0)
+            self.assertEqual(bob["total_presence_assiduity"], 0)  # même source
             self.assertEqual(bob["total_ranking_points"], 0)  # jamais classé
             self.assertEqual(bob["total_bounty_won"], 0)  # aucun kill
 
@@ -833,7 +844,12 @@ class PeriodSummaryDialogUiTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : cls.root lui-même n'a pas de greffe directe
+        # ici (les cycles sont sur chaque self.dialog, PeriodSummaryDialog
+        # réel — voir tearDown de chaque test), mais reste une référence
+        # de classe jamais nulle sans ce correctif.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_ui_")
@@ -849,7 +865,16 @@ class PeriodSummaryDialogUiTestCase(unittest.TestCase):
             target.start()
 
         self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : lambda plutôt qu'une méthode liée capturée
+        # maintenant — relit self.dialog AU MOMENT du nettoyage, donc
+        # couvre aussi un second dialogue réaffecté en cours de test
+        # (voir test_filtre_club_change_affichage_sans_replanter_les_
+        # fichiers, où l'ancien self.addCleanup(self.dialog.destroy)
+        # capturait le PREMIER dialogue et ne nettoyait jamais le second).
+        # recursive_var.trace_add(...) (main.py) ferme un cycle sur le
+        # dialogue lui-même, réclamé par le gc.collect() de cleanup_tk.
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
 
     def _rows(self, tree, skip_total=True):
         children = list(tree.get_children())
@@ -1065,7 +1090,12 @@ class ClubFilterExportConsistencyTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : cls.root lui-même n'a pas de greffe directe
+        # ici (les cycles sont sur chaque self.dialog, PeriodSummaryDialog
+        # réel — voir tearDown de chaque test), mais reste une référence
+        # de classe jamais nulle sans ce correctif.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_export_fix_")
@@ -1087,7 +1117,16 @@ class ClubFilterExportConsistencyTest(unittest.TestCase):
         db.conn.close()
 
         self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : lambda plutôt qu'une méthode liée capturée
+        # maintenant — relit self.dialog AU MOMENT du nettoyage, donc
+        # couvre aussi un second dialogue réaffecté en cours de test
+        # (voir test_filtre_club_change_affichage_sans_replanter_les_
+        # fichiers, où l'ancien self.addCleanup(self.dialog.destroy)
+        # capturait le PREMIER dialogue et ne nettoyait jamais le second).
+        # recursive_var.trace_add(...) (main.py) ferme un cycle sur le
+        # dialogue lui-même, réclamé par le gc.collect() de cleanup_tk.
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
         self.dialog.folder_var.set(self._tmp.name)
         self.dialog._generate()
 
@@ -1209,10 +1248,10 @@ class PrimesPointsColumnsTest(unittest.TestCase):
     def _check_formula(self, formula):
         """3 joueurs, classement complet (1/2/3) — total_ranking_points
         de chacun comparé indépendamment à database.ranking_points(),
-        pour la formule `formula` précise. Couvre les 4 valeurs de
-        RANKING_FORMULA_LABELS (Aucun/Classique/Progressive/Sit & Go
-        CPC) : aucune n'est recalculée dans build_period_summary, ce
-        test le vérifie directement."""
+        pour la formule `formula` précise. Couvre les 5 valeurs de
+        RANKING_FORMULA_LABELS (Aucun/Classique/Progressive/Tournois
+        CPC/Sit & Go CPC) : aucune n'est recalculée dans
+        build_period_summary, ce test le vérifie directement."""
         db = _new_db(
             self._tmp.name, f"formule_{formula}.tournoi", tournament_date="2026-03-01",
             ranking_formula=formula,
@@ -1239,6 +1278,9 @@ class PrimesPointsColumnsTest(unittest.TestCase):
 
     def test_formule_progressive(self):
         self._check_formula(database.RANKING_FORMULA_PROGRESSIVE)
+
+    def test_formule_tournois_cpc(self):
+        self._check_formula(database.RANKING_FORMULA_TOURNOIS_CPC)
 
     def test_formule_sitngo_cpc(self):
         self._check_formula(database.RANKING_FORMULA_SITNGO_CPC)
@@ -1516,7 +1558,12 @@ class PtsColumnsRespectClubFilterUiTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : cls.root lui-même n'a pas de greffe directe
+        # ici (les cycles sont sur chaque self.dialog, PeriodSummaryDialog
+        # réel — voir tearDown de chaque test), mais reste une référence
+        # de classe jamais nulle sans ce correctif.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_pts_club_")
@@ -1542,7 +1589,16 @@ class PtsColumnsRespectClubFilterUiTest(unittest.TestCase):
         db.conn.close()
 
         self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : lambda plutôt qu'une méthode liée capturée
+        # maintenant — relit self.dialog AU MOMENT du nettoyage, donc
+        # couvre aussi un second dialogue réaffecté en cours de test
+        # (voir test_filtre_club_change_affichage_sans_replanter_les_
+        # fichiers, où l'ancien self.addCleanup(self.dialog.destroy)
+        # capturait le PREMIER dialogue et ne nettoyait jamais le second).
+        # recursive_var.trace_add(...) (main.py) ferme un cycle sur le
+        # dialogue lui-même, réclamé par le gc.collect() de cleanup_tk.
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
         self.dialog.folder_var.set(self._tmp.name)
         self.dialog._generate()
 

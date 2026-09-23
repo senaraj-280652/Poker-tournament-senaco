@@ -34,7 +34,8 @@ from database import (
     RESULT_COLUMNS, PAYOUT_COLUMNS, PLAYERS_TAB_COLUMNS, PRIMES_COLUMNS,
     BOUNTY_HISTORY_COLUMNS, BB_REBALANCE_PROMPT_PREF_KEY, MOVE_REASON_LABELS,
     RANKING_FORMULA_NONE, RANKING_FORMULA_CURRENT, RANKING_FORMULA_PROGRESSIVE,
-    RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
+    RANKING_FORMULA_TOURNOIS_CPC, RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
+    REMOTE_PERMISSION_LABELS,
     STATS_TOURNAMENT_TYPE_TOURNOIS, STATS_TOURNAMENT_TYPE_SITNGO, STATS_TOURNAMENT_TYPE_ALL,
     STATS_WEEKDAY_FOLDER_NAMES,
 )
@@ -243,6 +244,7 @@ RANKING_FORMULA_SHORT_TEXTS = {
     RANKING_FORMULA_NONE: "Aucun point attribué selon le classement.",
     RANKING_FORMULA_CURRENT: "100 × √N / P",
     RANKING_FORMULA_PROGRESSIVE: "100 × √N / √P",
+    RANKING_FORMULA_TOURNOIS_CPC: "Barème total N × 1000 pts (plus grands restes)",
     RANKING_FORMULA_SITNGO_CPC: "1000 + 100(N+1) - 200P",
 }
 # Placeholder affiché (jamais une des 4 vraies valeurs) quand ce tournoi
@@ -556,6 +558,13 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
             )
     return proc
 
+
+# Rétention des identifiants de requête déduplication (demande du
+# 2026-09-19, "bétonner la communication téléphone <-> PC") — voir
+# App._remote_eliminate_request/_prune_remote_action_dedup. 5 minutes :
+# largement suffisant pour couvrir un retry réseau réaliste (coupure
+# Wi-Fi, timeout), jamais une fuite mémoire sur une longue soirée.
+_REMOTE_ACTION_DEDUP_TTL_SECONDS = 300
 
 SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
 
@@ -1758,6 +1767,143 @@ def ask_club_dialog(master, title="Club", current_club=""):
     return result["club"]
 
 
+_ROSTER_GROUP_DISPLAY_NONE = "(Non classé)"
+_ROSTER_GROUP_DISPLAY_VALUES = [_ROSTER_GROUP_DISPLAY_NONE, roster.ROSTER_GROUP_ADMIN, roster.ROSTER_GROUP_DIRTO]
+
+
+def ask_group_dialog(master, title="Groupe", current_group=""):
+    """Petite fenêtre pour choisir le groupe ADMIN/DIRTO d'une personne
+    du répertoire, ou "non classé" (demande du 2026-09-20, chantier
+    "Sécurisation du Contrôle à distance"). Liste READONLY (jamais de
+    saisie libre, contrairement à ask_club_dialog ci-dessus) : "group"
+    est une valeur stricte parmi roster.ROSTER_GROUPS, jamais un texte
+    arbitraire — une personne appartient à UN SEUL groupe à la fois,
+    jamais les deux simultanément (décision explicite de l'utilisateur).
+    Renvoie "ADMIN", "DIRTO", "" (non classé), ou None si annulé."""
+    win = tk.Toplevel(master)
+    win.title(title)
+    win.configure(bg=FELT_DARK)
+    win.resizable(False, False)
+    win.transient(master)
+    win.grab_set()
+    result = {"group": None}
+
+    tk.Label(
+        win, bg=FELT_DARK, fg=CREAM,
+        text="Groupe (ADMIN ou DIRTO — jamais les deux) :",
+    ).pack(padx=16, pady=(16, 6))
+
+    display_current = current_group if current_group in roster.ROSTER_GROUPS else _ROSTER_GROUP_DISPLAY_NONE
+    var = tk.StringVar(value=display_current)
+    combo = ttk.Combobox(
+        win, textvariable=var, values=_ROSTER_GROUP_DISPLAY_VALUES,
+        width=20, state="readonly",
+    )
+    combo.pack(padx=16, pady=(0, 16))
+    combo.focus_set()
+
+    def confirm():
+        chosen = var.get()
+        result["group"] = "" if chosen == _ROSTER_GROUP_DISPLAY_NONE else chosen
+        win.destroy()
+
+    def cancel():
+        win.destroy()
+
+    combo_btns = ttk.Frame(win)
+    combo_btns.pack(pady=(0, 16))
+    ttk.Button(combo_btns, text="Annuler", command=cancel).pack(side="left", padx=5)
+    ttk.Button(combo_btns, text="Valider", command=confirm).pack(side="left", padx=5)
+
+    win.wait_window(win)
+    return result["group"]
+
+
+_DEVICE_OWNER_DISPLAY_NONE = "(Aucun — appareil non lié)"
+
+
+def ask_device_owner_dialog(master, title="Propriétaire de l'appareil", current_owner=""):
+    """Petite fenêtre pour attribuer (ou retirer, via "(Aucun...)") le
+    propriétaire d'un appareil approuvé du Contrôle à distance — Phase 2
+    du chantier "Sécurisation du Contrôle à distance" (2026-09-20).
+    Liste READONLY (comme ask_group_dialog) de toutes les personnes du
+    Répertoire appartenant au groupe ADMIN ou DIRTO (roster.list_by_
+    group), chacune annotée de son groupe pour lever toute ambiguïté à
+    l'écran ("Alice — ADMIN", "Bob — DIRTO") — jamais une saisie libre :
+    seule une personne RÉELLEMENT classée ADMIN/DIRTO dans le Répertoire
+    au moment de l'ouverture de cette fenêtre peut être choisie
+    (garantit, dès la source, qu'aucun nom hors Répertoire ni aucune
+    personne "non classée" ne puisse jamais devenir propriétaire d'un
+    appareil — la validation n'a donc pas besoin d'être refaite côté
+    open_windows.set_remote_device_owner, simple magasin de données).
+
+    Opération LOCALE Tkinter UNIQUEMENT (voir RosterManagerDialog/la
+    section Contrôle à distance de _build_settings_tab) : le DIRTO ne
+    choisit JAMAIS lui-même son identité depuis le téléphone.
+
+    Renvoie le NOM choisi (chaîne), "" (option "(Aucun...)" — retire la
+    liaison), ou None si annulé/fermé."""
+    win = tk.Toplevel(master)
+    win.title(title)
+    win.configure(bg=FELT_DARK)
+    win.resizable(False, False)
+    win.transient(master)
+    win.grab_set()
+    result = {"owner": None}
+
+    tk.Label(
+        win, bg=FELT_DARK, fg=CREAM,
+        text="Propriétaire (une personne ADMIN ou DIRTO du Répertoire) :",
+    ).pack(padx=16, pady=(16, 6))
+
+    admins = roster.list_by_group(roster.ROSTER_GROUP_ADMIN)
+    dirtos = roster.list_by_group(roster.ROSTER_GROUP_DIRTO)
+    # {libellé affiché -> nom brut} : le Combobox n'expose QUE le
+    # libellé annoté, jamais le nom seul (qui pourrait ambiguïser deux
+    # personnes de groupes différents partageant par hasard le même nom
+    # à l'écran) — la valeur RENVOYÉE par cette fonction reste bien le
+    # nom brut, via ce dict inverse.
+    display_to_name = {}
+    display_values = [_DEVICE_OWNER_DISPLAY_NONE]
+    for e in admins + dirtos:
+        display = f"{e['name']} — {e['group']}"
+        display_to_name[display] = e["name"]
+        display_values.append(display)
+
+    # Pré-remplissage : si le propriétaire actuel n'est plus ADMIN/DIRTO
+    # (reclassé, supprimé du Répertoire depuis l'attribution), retombe
+    # sur "(Aucun...)" plutôt que d'afficher un libellé qui ne
+    # correspondrait à aucune entrée de la liste.
+    display_current = _DEVICE_OWNER_DISPLAY_NONE
+    for display, name in display_to_name.items():
+        if name == current_owner:
+            display_current = display
+            break
+
+    var = tk.StringVar(value=display_current)
+    combo = ttk.Combobox(
+        win, textvariable=var, values=display_values, width=32, state="readonly",
+    )
+    combo.pack(padx=16, pady=(0, 16))
+    combo.focus_set()
+
+    def confirm():
+        chosen = var.get()
+        result["owner"] = "" if chosen == _DEVICE_OWNER_DISPLAY_NONE else display_to_name.get(chosen, "")
+        win.destroy()
+
+    def cancel():
+        win.destroy()
+
+    combo_btns = ttk.Frame(win)
+    combo_btns.pack(pady=(0, 16))
+    ttk.Button(combo_btns, text="Annuler", command=cancel).pack(side="left", padx=5)
+    ttk.Button(combo_btns, text="Valider", command=confirm).pack(side="left", padx=5)
+
+    win.wait_window(win)
+    return result["owner"]
+
+
 class RosterManagerDialog(ttk.Frame):
     """Onglet "Répertoire" de la fenêtre principale — gestion du
     répertoire de joueurs habituels, indépendante de tout tournoi en
@@ -1860,6 +2006,14 @@ class RosterManagerDialog(ttk.Frame):
         btns.pack(fill="x", padx=12, pady=(0, 4))
         ttk.Button(btns, text="Renommer...", command=self._rename).pack(side="left", padx=3)
         ttk.Button(btns, text="Modifier le club...", command=self._edit_club).pack(side="left", padx=3)
+        # Groupe/Téléphone/Mail (demande du 2026-09-20, chantier
+        # "Sécurisation du Contrôle à distance") : mêmes principes que
+        # "Modifier le club..." ci-dessus — un bouton dédié par champ,
+        # jamais un formulaire multi-champs (aucun n'existe dans cet
+        # onglet, style déjà établi champ par champ).
+        ttk.Button(btns, text="Modifier le groupe...", command=self._edit_group).pack(side="left", padx=3)
+        ttk.Button(btns, text="Modifier le téléphone...", command=self._edit_phone).pack(side="left", padx=3)
+        ttk.Button(btns, text="Modifier le mail...", command=self._edit_mail).pack(side="left", padx=3)
         fill_missing_btn = ttk.Button(
             btns, text="Modifier clubs pour tous...", command=self._apply_default_club_to_missing,
         )
@@ -1909,8 +2063,14 @@ class RosterManagerDialog(ttk.Frame):
         # une colonne de données ordinaire comme "club", même en pratique
         # positionnée après elle. Même contrainte, même solution que la
         # colonne Photo de l'onglet Joueurs (voir _refresh_players_tab).
+        # "group"/"phone"/"mail" (demande du 2026-09-20, chantier
+        # "Sécurisation du Contrôle à distance") : ajoutées à la suite de
+        # "club", sans rien retirer — une ancienne fiche sans ces champs
+        # (roster.load_roster_entries les garantit toujours présents,
+        # "" par défaut) s'affiche simplement avec ces 3 colonnes vides.
         self.roster_tree = ttk.Treeview(
-            list_frame, columns=("name", "club"), show="tree headings", selectmode="browse",
+            list_frame, columns=("name", "club", "group", "phone", "mail"),
+            show="tree headings", selectmode="browse",
         )
         self.roster_tree.heading("#0", text="Photo")
         # +32 (pas +16) : le libellé "Photo" de l'en-tête ne tenait pas
@@ -1919,8 +2079,14 @@ class RosterManagerDialog(ttk.Frame):
         self.roster_tree.column("#0", width=ROSTER_ROW_THUMB_SIZE + 32, stretch=False, anchor="center")
         self.roster_tree.heading("name", text="Nom", command=lambda: self._sort_roster_by("name"))
         self.roster_tree.heading("club", text="Club", command=lambda: self._sort_roster_by("club"))
+        self.roster_tree.heading("group", text="Groupe", command=lambda: self._sort_roster_by("group"))
+        self.roster_tree.heading("phone", text="Téléphone", command=lambda: self._sort_roster_by("phone"))
+        self.roster_tree.heading("mail", text="Mail", command=lambda: self._sort_roster_by("mail"))
         self.roster_tree.column("name", width=180, anchor="w")
         self.roster_tree.column("club", width=140, anchor="w")
+        self.roster_tree.column("group", width=80, anchor="center")
+        self.roster_tree.column("phone", width=120, anchor="w")
+        self.roster_tree.column("mail", width=180, anchor="w")
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.roster_tree.yview)
         self.roster_tree.configure(yscrollcommand=scrollbar.set)
         self.roster_tree.pack(side="left", fill="both", expand=True)
@@ -1962,7 +2128,7 @@ class RosterManagerDialog(ttk.Frame):
         self._refresh()
 
     def _update_roster_sort_headings(self):
-        labels = {"name": "Nom", "club": "Club"}
+        labels = {"name": "Nom", "club": "Club", "group": "Groupe", "phone": "Téléphone", "mail": "Mail"}
         for col, label in labels.items():
             if self.roster_sort["column"] == col:
                 arrow = " ▲" if self.roster_sort["ascending"] else " ▼"
@@ -1988,7 +2154,7 @@ class RosterManagerDialog(ttk.Frame):
                 self.roster_row_photo_images[e["name"]] = photo
             self.roster_tree.insert(
                 "", "end", iid=e["name"], image=photo if photo is not None else "",
-                values=(e["name"], e["club"]),
+                values=(e["name"], e["club"], e["group"], e["phone"], e["mail"]),
             )
         if selected and self.roster_tree.exists(selected):
             self.roster_tree.selection_set(selected)
@@ -2108,6 +2274,40 @@ class RosterManagerDialog(ttk.Frame):
         club = ask_club_dialog(self, title=f"Club de {name}", current_club=roster.get_club(name))
         if club is not None:
             roster.set_club(name, club)
+            self._refresh()
+
+    def _edit_group(self):
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
+            return
+        group = ask_group_dialog(self, title=f"Groupe de {name}", current_group=roster.get_group(name))
+        if group is not None:
+            roster.set_group(name, group)
+            self._refresh()
+
+    def _edit_phone(self):
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
+            return
+        phone = simpledialog.askstring(
+            "Téléphone", f"Téléphone de {name} :", initialvalue=roster.get_phone(name),
+        )
+        if phone is not None:
+            roster.set_phone(name, phone.strip())
+            self._refresh()
+
+    def _edit_mail(self):
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
+            return
+        mail = simpledialog.askstring(
+            "Mail", f"Mail de {name} :", initialvalue=roster.get_mail(name),
+        )
+        if mail is not None:
+            roster.set_mail(name, mail.strip())
             self._refresh()
 
     def _apply_default_club_to_missing(self):
@@ -2422,6 +2622,41 @@ class RosterManagerDialog(ttk.Frame):
             name = cells[0]
             club = cells[1] if len(cells) >= 2 and cells[1] else default_club
             roster.add_to_roster(name, club)
+            # GROUPE/TELEPHONE/MAIL (demande du 2026-09-20, complément
+            # CSV) : même principe déjà en place ci-dessus pour "club"
+            # (une cellule absente/vide -> `default_club`, qui vaut None
+            # hors mode "fichier à une seule colonne" -> add_to_roster
+            # conserve le club déjà connu, ne l'efface jamais) — étendu
+            # ici aux 3 nouveaux champs. Une colonne absente (ancien CSV
+            # à 1-2 colonnes) ou une cellule vide (nouveau CSV, valeur
+            # volontairement non renseignée pour cette ligne) ne touche
+            # donc JAMAIS une valeur déjà connue d'une personne déjà
+            # présente dans le répertoire, qu'il s'agisse d'un ancien
+            # CSV ou d'un nouveau : aucune perte accidentelle possible à
+            # l'import, dans aucun des deux formats.
+            #
+            # Groupe : uniquement "ADMIN"/"DIRTO" (insensible à la
+            # casse) déclenche une mise à jour — une cellule non vide
+            # mais INVALIDE (faute de frappe, colonne décalée...) est
+            # ignorée EXACTEMENT comme une cellule vide, jamais
+            # normalisée en "" à la place d'une classification déjà
+            # connue et valide (roster.set_group le ferait sinon
+            # silencieusement, voir sa docstring) : "Groupe doit rester
+            # strictement ADMIN, DIRTO ou vide" ne doit jamais devenir
+            # une façon accidentelle d'effacer un ADMIN/DIRTO existant.
+            group_cell = cells[2].upper() if len(cells) >= 3 and cells[2] else ""
+            if group_cell in roster.ROSTER_GROUPS:
+                roster.set_group(name, group_cell)
+            # Téléphone/mail : jamais reconvertis en nombre ni altérés
+            # (roster.set_phone/set_mail traitent déjà tout en chaîne,
+            # voir roster.py) — un zéro initial ("0102030405") survit
+            # donc intact à un aller-retour export -> import.
+            phone_cell = cells[3] if len(cells) >= 4 else ""
+            if phone_cell:
+                roster.set_phone(name, phone_cell)
+            mail_cell = cells[4] if len(cells) >= 5 else ""
+            if mail_cell:
+                roster.set_mail(name, mail_cell)
             added += 1
 
         self._refresh()
@@ -2445,12 +2680,23 @@ class RosterManagerDialog(ttk.Frame):
         )
         if not path:
             return
+        # GROUPE/TELEPHONE/MAIL (demande du 2026-09-20, complément CSV du
+        # chantier "Sécurisation du Contrôle à distance") : 3 colonnes
+        # ajoutées à la suite de NOM;CLUB, jamais insérées au milieu — un
+        # ancien import CSV (2 colonnes) reste ainsi structurellement
+        # compatible avec ce nouveau format en lecture (voir _import_csv,
+        # qui lit chaque colonne indépendamment selon ce qui est présent
+        # sur la ligne). csv.writer écrit chaque valeur comme du texte
+        # brut, jamais interprétée/convertie : un téléphone à zéro
+        # initial ("0102030405") est donc préservé tel quel dans le
+        # fichier — voir aussi _import_csv, qui ne le reconvertit jamais
+        # en nombre.
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow(["NOM", "CLUB"])
+                writer.writerow(["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL"])
                 for e in entries:
-                    writer.writerow([e["name"], e["club"]])
+                    writer.writerow([e["name"], e["club"], e["group"], e["phone"], e["mail"]])
         except OSError as e:
             messagebox.showerror("Erreur", f"Impossible d'écrire ce fichier :\n{e}", parent=self)
             return
@@ -4974,14 +5220,15 @@ class App(tk.Tk):
         # _on_remote_device_popup_approve/_refuse) sachent quel appareil
         # cibler sans avoir à rouvrir le registre partagé.
         self._remote_device_popup_current_browser_id = None
-        # Dernier état connu (onglet Paramètres actif ou non) — détecte
-        # la TRANSITION vers Paramètres (pas seulement "est actif
+        # Dernier état connu (onglet "CA/LOG" actif ou non — voir
+        # _is_ca_log_tab_active, ce bloc y a été déplacé le 2026-09-22)
+        # — détecte la TRANSITION vers CA/LOG (pas seulement "est actif
         # maintenant") pour ne vider _remote_device_snoozed_keys qu'au
         # moment où l'utilisateur y REVIENT, jamais en continu tant qu'il
         # y reste.
-        self._last_settings_tab_active = False
+        self._last_ca_log_tab_active = False
         # Dernier "instantané" affiché de la liste "Téléphones" de
-        # Paramètres (appareils APPROUVÉS uniquement désormais, voir
+        # l'onglet CA/LOG (appareils APPROUVÉS uniquement désormais, voir
         # _remote_devices_signature/_refresh_remote_devices_panel) :
         # None tant qu'elle n'a jamais été construite — toute valeur (y
         # compris un instantané "vide") est traitée comme différente
@@ -5005,6 +5252,21 @@ class App(tk.Tk):
         # remote_control.py, sondé via /clock_state comme _remote_clock_
         # paused ci-dessus, même principe thread-safe).
         self._remote_has_pending_moves = False
+        # Mouvements ACTUELLEMENT en attente (demande du 2026-09-19, page
+        # "Mouvements" du contrôle à distance) — liste de dicts {id,
+        # player_name, old_table_name, old_seat, new_table_name,
+        # new_seat}, même principe que _remote_players_cache ci-dessus :
+        # tenue à jour depuis le thread principal (voir _tick/_refresh_
+        # remote_moves_cache), jamais lue ni écrite depuis le thread du
+        # serveur web.
+        self._remote_moves_cache = []
+        # Permissions DIRTO accordées POUR CE TOURNOI (Phase 4,
+        # "Sécurisation du Contrôle à distance", 2026-09-20) — {dirto_name
+        # -> frozenset des clés REMOTE_PERMISSION_*}, même principe que
+        # _remote_players_cache ci-dessus : tenue à jour depuis le thread
+        # principal (voir _tick/_refresh_remote_dirto_permissions_cache),
+        # jamais lue ni écrite depuis le thread du serveur web.
+        self._remote_dirto_permissions_cache = {}
         # Positionné (côté thread du serveur web, voir _remote_upload_photo)
         # dès qu'une photo vient d'être envoyée depuis le téléphone, pour
         # que _tick rafraîchisse la colonne Photo (Répertoire/Joueurs) sans
@@ -5040,6 +5302,26 @@ class App(tk.Tk):
         # d'une clé à la fois, déjà sûr sous le GIL (même principe que
         # _remote_pending_rebalance ci-dessus, jamais verrouillé non plus).
         self._remote_elimination_results = {}
+        # Idempotence des actions distantes sensibles (demande du
+        # 2026-09-19, voir _remote_eliminate_request) : {client_request_
+        # id: {"ts": float, "result": dict|None}} — même principe (dict
+        # nu, jamais verrouillé) que _remote_elimination_results ci-
+        # dessus, purgé au fil de l'eau (voir _prune_remote_action_dedup),
+        # jamais persisté (repart à vide à chaque lancement, sans
+        # incidence : un identifiant n'a de sens que pendant la fenêtre
+        # d'un retry réseau, jamais au-delà).
+        self._remote_action_dedup = {}
+        # Résultat de chaque confirmation individuelle de mouvement
+        # demandée depuis le téléphone (demande du 2026-09-19) — même
+        # principe que _remote_elimination_results ci-dessus : {request_
+        # id: {"ok": bool, "all_done": bool}}, écrit par _remote_confirm_
+        # move (thread Tk) et lu/consommé par _remote_confirm_move_request
+        # (thread HTTP). Pas de dédoublonnage par client_request_id ici
+        # (contrairement à _remote_action_dedup) : confirm_seat_move est
+        # idempotent par nature (DELETE d'une ligne déjà supprimée ne fait
+        # rien), un double-tap ou un retry réseau ne présente donc aucun
+        # risque de double effet métier.
+        self._remote_move_confirm_results = {}
         # Synchronisation iPhone -> Mac SANS dépendre d'un Lobby ouvert
         # (voir _check_phone_selected_pid, appelé depuis _tick) : dernier
         # pid de tournoi déjà traité PAR CETTE fenêtre, même principe et
@@ -6176,6 +6458,13 @@ class App(tk.Tk):
         self.roster_tab = RosterManagerDialog(self.notebook, self)
         self.stats_tab = PeriodSummaryDialog(self.notebook, self)
         self.settings_tab = ttk.Frame(self.notebook)
+        # "CA/LOG" (demande du 2026-09-22, "réorganisation visuelle du
+        # contrôle à distance") : nouvel emplacement UNIQUE du bloc
+        # Contrôle à distance/Téléphones/Permissions DIRTO, retiré de
+        # Paramètres (voir _build_ca_log_tab) — la partie basse de cet
+        # onglet reste délibérément vide pour l'instant, réservée au
+        # futur Journal des actions (Phase 5, PAS commencée ici).
+        self.ca_log_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.players_tab, text="Joueurs")
         self.notebook.add(self.tables_tab, text="Tables")
@@ -6186,6 +6475,11 @@ class App(tk.Tk):
         self.notebook.add(self.payouts_tab, text="Classement")
         self.notebook.add(self.roster_tab, text="Répertoire")
         self.notebook.add(self.stats_tab, text="Statistiques")
+        # Ordre demandé le 2026-09-22 : CA/LOG immédiatement après
+        # Statistiques, avant Paramètres (Statistiques -> CA/LOG ->
+        # Paramètres) — uniquement l'ordre d'ajout au Notebook, aucun
+        # changement de contenu/logique.
+        self.notebook.add(self.ca_log_tab, text="CA/LOG")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
         self._build_players_tab()
@@ -6195,6 +6489,7 @@ class App(tk.Tk):
         self._build_clock_tab()
         self._build_blinds_tab()
         self._build_payouts_tab()
+        self._build_ca_log_tab()
         self._build_settings_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
@@ -7779,6 +8074,7 @@ class App(tk.Tk):
                 self._trigger_movement_alert(from_remote=from_remote)
         self._refresh_all()
         self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
         # Le rééquilibrage relancé par resolve_pending_rebalance a pu
         # poser une NOUVELLE question (écart encore présent ailleurs, ou
         # table suivante à son tour trop pleine) : l'affiche tout de suite
@@ -7963,6 +8259,8 @@ class App(tk.Tk):
             self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi"
         )
         self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
+        self._refresh_remote_dirto_permissions_cache()
         self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1 if self.db else True
         self._remote_has_pending_moves = self.db.count_seat_moves() > 0 if self.db else False
         server = remote_control.RemoteControlServer(
@@ -7971,6 +8269,8 @@ class App(tk.Tk):
             get_players=lambda: self._remote_players_cache,
             get_clock_paused=lambda: self._remote_clock_paused,
             get_has_pending_moves=lambda: self._remote_has_pending_moves,
+            get_pending_moves=lambda: self._remote_moves_cache,
+            on_confirm_move=self._remote_confirm_move_request,
             on_eliminate=self._remote_eliminate_request,
             on_upload_photo=self._remote_upload_photo,
             get_roster_players=self._remote_get_roster_players,
@@ -7981,6 +8281,14 @@ class App(tk.Tk):
                 ("rebalance_answer", request_id, seat)
             ),
             on_end_tournament=lambda: self.voice_command_queue.put(("end_tournament",)),
+            # Phase 4, "Sécurisation du Contrôle à distance", 2026-09-20 :
+            # voir _refresh_remote_dirto_permissions_cache — .strip() ici
+            # aussi (même normalisation que Database.set_dirto_
+            # authorization/get_remote_device_owner) pour ne jamais rater
+            # une correspondance à cause d'un espace superflu.
+            get_dirto_permissions=lambda dirto_name: self._remote_dirto_permissions_cache.get(
+                (dirto_name or "").strip(), frozenset()
+            ),
         )
         try:
             server.start()
@@ -8087,8 +8395,18 @@ class App(tk.Tk):
         CONDITION à chaque sondage (~2s) détruisait et recréait TOUS les
         widgets de la section, un scintillement permanent, y compris
         LONGTEMPS après qu'une demande ait été traitée, puisque rien
-        n'était jamais lié à un changement réel."""
-        return tuple((d["browser_id"], d.get("label"), d["ip_last_seen"]) for d in approved)
+        n'était jamais lié à un changement réel.
+
+        owner_name inclus (Phase 2, 2026-09-20) : une attribution/
+        réaffectation/retrait faite depuis UN AUTRE process (un autre
+        tournoi ouvert simultanément, même registre partagé — voir
+        open_windows.py) doit être détectée comme un changement par ce
+        sondage périodique, exactement comme label/ip_last_seen déjà
+        présents ici."""
+        return tuple(
+            (d["browser_id"], d.get("label"), d["ip_last_seen"], d.get("owner_name"))
+            for d in approved
+        )
 
     def _refresh_remote_devices_panel(self, approved=None):
         """Reconstruit la liste "Téléphones" de Paramètres — UNIQUEMENT
@@ -8127,8 +8445,15 @@ class App(tk.Tk):
             return
 
         for device in approved:
-            row = ttk.Frame(container)
-            row.pack(fill="x", pady=2, anchor="w")
+            # Cadre englobant les 2 lignes de CE téléphone (appareil +
+            # propriétaire) — pady plus généreux qu'avant (2 -> (2,6))
+            # pour bien séparer visuellement un appareil du suivant
+            # maintenant que chacun occupe 2 lignes.
+            device_frame = ttk.Frame(container)
+            device_frame.pack(fill="x", pady=(2, 6), anchor="w")
+
+            row = ttk.Frame(device_frame)
+            row.pack(fill="x", anchor="w")
             ttk.Label(row, text="✓", foreground="#1f6b3a").pack(side="left")
             label_var = tk.StringVar(value=device.get("label") or device["short_id"])
             entry = ttk.Entry(row, textvariable=label_var, width=20)
@@ -8147,6 +8472,391 @@ class App(tk.Tk):
                 command=lambda bid=device["browser_id"]: self._on_revoke_remote_device(bid),
             ).pack(side="left", padx=(8, 0))
 
+            # Propriétaire (Phase 2, "Sécurisation du Contrôle à
+            # distance", 2026-09-20) : owner_name stocké tel quel dans
+            # le registre (voir open_windows.list_approved_remote_
+            # devices) — le GROUPE, lui, est résolu EN DIRECT via
+            # roster.get_group() à CHAQUE affichage, jamais mis en
+            # cache : si le Répertoire a changé depuis l'attribution
+            # (personne reclassée ou supprimée), la conséquence est
+            # immédiate ici plutôt qu'un libellé figé qui pourrait
+            # devenir faux silencieusement.
+            owner_row = ttk.Frame(device_frame)
+            owner_row.pack(fill="x", anchor="w", padx=(20, 0), pady=(2, 0))
+            owner_name = device.get("owner_name")
+            owner_group = roster.get_group(owner_name) if owner_name else ""
+            if owner_name and owner_group:
+                owner_text = f"Propriétaire : {owner_name} ({owner_group})"
+            elif owner_name:
+                # Nom présent dans le registre mais qui n'est PLUS
+                # ADMIN/DIRTO du Répertoire au moment de l'affichage :
+                # jamais une exception, traité comme "à corriger" plutôt
+                # que silencieusement comme "non lié" pur (l'ADMIN doit
+                # voir qu'une action reste nécessaire).
+                owner_text = f"Propriétaire : {owner_name} (⚠ absent du Répertoire ADMIN/DIRTO)"
+            else:
+                owner_text = "Aucune fonction autorisée — contactez un ADMIN"
+            ttk.Label(
+                owner_row, text=owner_text, foreground=(GOLD if owner_name else MUTED),
+            ).pack(side="left")
+            ttk.Button(
+                owner_row, text=("Changer..." if owner_name else "Attribuer..."), width=12,
+                command=lambda bid=device["browser_id"], cur=owner_name or "":
+                    self._on_assign_remote_device_owner(bid, cur),
+            ).pack(side="left", padx=(8, 0))
+            if owner_name:
+                ttk.Button(
+                    owner_row, text="Retirer la liaison", width=16,
+                    command=lambda bid=device["browser_id"]: self._on_clear_remote_device_owner(bid),
+                ).pack(side="left", padx=(4, 0))
+
+    def _on_assign_remote_device_owner(self, browser_id, current_owner=""):
+        """Bouton "Attribuer.../Changer..." d'un appareil déjà approuvé
+        (voir _refresh_remote_devices_panel) — Phase 2, 2026-09-20.
+        Ouvre ask_device_owner_dialog (liste ADMIN/DIRTO du Répertoire
+        uniquement) : None (annulé/fermé) ne change rien ; "" (option
+        "(Aucun...)") retire la liaison, exactement comme _on_clear_
+        remote_device_owner ci-dessous — même action, deux chemins pour
+        y arriver (ce bouton, ou "Retirer la liaison" directement)."""
+        owner = ask_device_owner_dialog(self, current_owner=current_owner)
+        if owner is None:
+            return
+        if owner:
+            open_windows.set_remote_device_owner(browser_id, owner)
+        else:
+            open_windows.clear_remote_device_owner(browser_id)
+        self._refresh_remote_devices_panel()
+
+    def _on_clear_remote_device_owner(self, browser_id):
+        """Bouton "Retirer la liaison" : retire le propriétaire SANS
+        révoquer l'appareil (voir open_windows.clear_remote_device_
+        owner) — l'appareil reste "approved", continue de passer le
+        niveau 1 d'authentification normalement."""
+        open_windows.clear_remote_device_owner(browser_id)
+        self._refresh_remote_devices_panel()
+
+    # -- Permissions DIRTO PAR TOURNOI (Phase 3, "Sécurisation du
+    # Contrôle à distance", 2026-09-20) — voir database.py :
+    # remote_authorizations/REMOTE_PERMISSION_LABELS. Stockage dans LE
+    # TOURNOI COURANT (self.db) UNIQUEMENT : deux tournois ouverts
+    # simultanément ont chacun leur propre fichier .tournoi, donc
+    # structurellement leurs propres autorisations, sans le moindre code
+    # d'étanchéité à écrire ici — c'est l'architecture même de Database
+    # qui la garantit. -----------------------------------------------
+
+    def _build_remote_dirto_permissions_widgets(self, container):
+        """Construit UNE FOIS le formulaire "Permissions DIRTO" — les
+        Combobox ADMIN/DIRTO et la liste des autorisations déjà
+        accordées sont ensuite tenues à jour par le sondage périodique
+        déjà existant (~2s, voir _check_remote_device_requests, qui
+        appelle _refresh_remote_dirto_permissions_panel) plutôt que
+        reconstruites ici à chaque tick : voir sa docstring pour le
+        détail (values Combobox rafraîchies sans jamais perdre la
+        sélection/saisie en cours, liste des autorisations reconstruite
+        seulement si son contenu a RÉELLEMENT changé)."""
+        selector_row = ttk.Frame(container)
+        selector_row.pack(fill="x", anchor="w")
+
+        ttk.Label(selector_row, text="Autorisé par (ADMIN) :").grid(
+            row=0, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        self.remote_dirto_admin_var = tk.StringVar(value="")
+        self.remote_dirto_admin_combo = ttk.Combobox(
+            selector_row, textvariable=self.remote_dirto_admin_var, state="readonly", width=18,
+        )
+        self.remote_dirto_admin_combo.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=2)
+
+        ttk.Label(selector_row, text="Utilisateur autorisé (DIRTO) :").grid(
+            row=1, column=0, sticky="w", padx=(0, 4), pady=2
+        )
+        self.remote_dirto_user_var = tk.StringVar(value="")
+        self.remote_dirto_user_combo = ttk.Combobox(
+            selector_row, textvariable=self.remote_dirto_user_var, state="readonly", width=18,
+        )
+        self.remote_dirto_user_combo.grid(row=1, column=1, sticky="w", pady=2)
+        # Précharge les permissions DÉJÀ accordées à ce DIRTO pour ce
+        # tournoi (s'il y en a) dès qu'il est choisi — "Accorder /
+        # Modifier" modifie ainsi réellement l'existant plutôt que de
+        # toujours repartir d'un formulaire vide (voir "règle explicite :
+        # modification d'une autorisation existante").
+        self.remote_dirto_user_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._on_remote_dirto_user_selected(),
+        )
+
+        checks_frame = ttk.Frame(container)
+        checks_frame.pack(fill="x", anchor="w", pady=(8, 4))
+        # Une VRAIE fonction utilisateur par case (jamais une route
+        # technique isolée) : REMOTE_PERMISSION_LABELS regroupe déjà les
+        # routes en fonctions compréhensibles (voir database.py) —
+        # "Terminer le tournoi" n'y figure structurellement JAMAIS
+        # (absente du dict lui-même, pas seulement décochée), donc ne
+        # peut littéralement pas apparaître ici.
+        #
+        # Case et libellé dans DEUX widgets/colonnes de grille séparés
+        # (demande du 2026-09-22, "réorganisation visuelle du contrôle à
+        # distance") — plutôt qu'un unique ttk.Checkbutton portant son
+        # propre texte : garantit que les cases d'une même sous-colonne
+        # tombent TOUTES exactement sur la même coordonnée X, quelle que
+        # soit la longueur du libellé juste à côté. Cliquer le LIBELLÉ
+        # coche/décoche aussi la case (bind manuel), pour ne pas réduire
+        # la zone cliquable.
+        #
+        # DEUX colonnes de paires (case, libellé) — demande du
+        # 2026-09-24, "réorganisation Permissions DIRTO" : réduit
+        # fortement la hauteur occupée (7 lignes -> 4). Répartition
+        # "en colonne" (PAS 2 par 2 dans l'ordre de lecture) :
+        # les ceil(7/2)=4 premières permissions (dans l'ordre de
+        # REMOTE_PERMISSION_LABELS — eliminations/tables/moves/clock)
+        # descendent la colonne de GAUCHE, les 3 restantes (levels/
+        # photos/rebalance) descendent la colonne de DROITE — c'est bien
+        # ce qui place "Changer de niveau (blindes)" en tête de la
+        # colonne de droite, à côté de "Gérer les éliminations", comme
+        # demandé explicitement. self.remote_dirto_permission_vars
+        # reste un dict PLAT avec les 7 mêmes clés qu'avant (eliminations,
+        # tables, moves, clock, levels, photos, rebalance) — aucune
+        # variable ni clé renommée, seul leur PLACEMENT dans la grille
+        # change.
+        # Deux sous-frames INDÉPENDANTES (chacune sa propre grille à 2
+        # colonnes case/libellé) plutôt qu'une seule grille à 4 colonnes
+        # partagée (ajustement du 2026-09-24, "décaler la colonne de
+        # droite d'environ 1 cm vers la gauche", affiné le 2026-09-25
+        # pour un alignement plus précis avec les Combobox "Autorisé
+        # par"/"Utilisateur autorisé" juste au-dessus) : la position de
+        # la sous-colonne de droite devient ainsi un SEUL réglage
+        # explicite (padx=0 ci-dessous — la valeur la plus resserrée
+        # possible sans chevauchement), plutôt que de dépendre aussi, de
+        # façon peu prévisible, de la largeur naturelle du libellé le
+        # plus long de la colonne de gauche ("Chronomètre (pause /
+        # reprise)") au sein d'une grille partagée. Chaque sous-frame
+        # garde son alignement vertical PROPRE (row 0..3), inchangé —
+        # seule la POSITION HORIZONTALE de la sous-frame de droite, dans
+        # son ensemble, se décale.
+        #
+        # IMPORTANT (tenté puis retiré le 2026-09-25) : un alignement
+        # PIXEL-EXACT mesuré dynamiquement (winfo_x/winfo_reqwidth après
+        # update_idletasks()) a été essayé ici pour caler EXACTEMENT ce
+        # bord sur celui des Combobox — retiré aussitôt : update_
+        # idletasks(), sur CETTE combinaison macOS/Python/Tk, segfault
+        # de façon déterministe dès qu'un tk.Tk() a été créé PUIS détruit
+        # plus tôt dans le MÊME process — exactement le schéma de la
+        # sonde _TK_AVAILABLE présente dans TOUS les fichiers de tests
+        # Tk de cette suite (voir tests/test_clock_projo_movement_alert_
+        # drag.py pour le diagnostic complet de ce bug pré-existant,
+        # sans rapport avec ce chantier). Reproduit et confirmé ici même
+        # (tests/test_dirto_permissions_widget.py crashait tout le
+        # process dès qu'il construisait ce formulaire) — jamais un
+        # `update_idletasks()` ajouté à un chemin de code construit par
+        # cette suite, même si l'usage réel (une seule racine, jamais
+        # détruite puis recréée) serait probablement sûr : le risque
+        # pour la testabilité l'emporte sur la précision au pixel près.
+        #
+        # Correction finale du 2026-09-25 : la valeur exacte (-40 px) a
+        # été obtenue via un diagnostic TEMPORAIRE sûr (impression de
+        # winfo_rootx() différée par self.after() depuis un vrai
+        # évènement <<NotebookTabChanged>>, donc après mappage naturel
+        # par Tk — jamais un update_idletasks() forcé), lancé une seule
+        # fois dans l'app réelle puis entièrement retiré. Mesures
+        # relevées : combo_admin_x = 949, combo_dirto_x = 949,
+        # right_checkbox_x = 989 (avec padx=0) — d'où un décalage grid
+        # column=1 trop large de 40 px par rapport aux deux Combobox.
+        # grid() ne permet pas de padx négatif (chevauchement de
+        # colonnes interdit) : la sous-frame de droite est donc
+        # positionnée avec place(), relativement à left_checks
+        # (relx=1.0 = juste après son bord droit, x=-40 = 40 px plus à
+        # gauche que cette position), ce qui exprime directement "40 px
+        # à gauche de la position actuelle" sans aucune valeur absolue
+        # ni mesure dynamique.
+        self.remote_dirto_permission_vars = {}
+        items = list(REMOTE_PERMISSION_LABELS.items())
+        half = (len(items) + 1) // 2
+        left_checks = ttk.Frame(checks_frame)
+        left_checks.grid(row=0, column=0, sticky="nw")
+        right_checks = ttk.Frame(checks_frame)
+        right_checks.place(in_=left_checks, relx=1.0, x=-40, y=0, anchor="nw")
+        for group_frame, group_items in ((left_checks, items[:half]), (right_checks, items[half:])):
+            for row_idx, (key, label) in enumerate(group_items):
+                var = tk.BooleanVar(value=False)
+                self.remote_dirto_permission_vars[key] = var
+                cb = ttk.Checkbutton(group_frame, variable=var)
+                cb.grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=3)
+                label_lbl = ttk.Label(group_frame, text=label)
+                label_lbl.grid(row=row_idx, column=1, sticky="w", pady=3)
+                label_lbl.bind("<Button-1>", lambda e, v=var: v.set(not v.get()))
+
+        btns_row = ttk.Frame(container)
+        btns_row.pack(fill="x", anchor="w", pady=(4, 8))
+        ttk.Button(
+            btns_row, text="Accorder / Modifier", command=self._on_grant_remote_dirto_permissions,
+        ).pack(side="left")
+        ttk.Button(
+            btns_row, text="Retirer l'autorisation",
+            command=lambda: self._on_revoke_remote_dirto_permissions(),
+        ).pack(side="left", padx=(8, 0))
+
+        ttk.Label(
+            container, text="Autorisations déjà accordées pour ce tournoi :", foreground=MUTED,
+        ).pack(anchor="w", pady=(4, 2))
+        self.remote_dirto_list_container = ttk.Frame(container)
+        self.remote_dirto_list_container.pack(fill="x", anchor="w")
+
+        self._last_remote_dirto_signature = None
+        self._refresh_remote_dirto_permissions_panel()
+
+    @staticmethod
+    def _remote_dirto_signature(authorizations):
+        """Même principe que _remote_devices_signature : "instantané"
+        comparé à chaque sondage périodique pour ne reconstruire la
+        liste des autorisations affichées QUE si quelque chose a
+        RÉELLEMENT changé (jamais de scintillement pour rien, même bug
+        déjà corrigé une fois pour le panneau "Téléphones")."""
+        return tuple(
+            (a["dirto_name"], a["admin_name"], tuple(sorted(a["permissions"])))
+            for a in authorizations
+        )
+
+    def _refresh_remote_dirto_permissions_panel(self):
+        """Rafraîchit le formulaire "Permissions DIRTO" — appelée à la
+        construction ET à chaque sondage périodique (~2s, voir _check_
+        remote_device_requests), pour suivre les changements du
+        Répertoire (nouveaux ADMIN/DIRTO, personnes reclassées/
+        supprimées) SANS jamais perturber une saisie en cours :
+
+        - seule la liste `values` des deux Combobox est mise à jour
+          (opération non destructive : ne touche JAMAIS la sélection
+          déjà faite par l'ADMIN, contrairement à une reconstruction
+          complète des widgets) ;
+        - la LISTE des autorisations déjà accordées, elle, n'est
+          reconstruite que si son contenu a RÉELLEMENT changé (voir
+          _remote_dirto_signature) — jamais à chaque tick pour rien.
+
+        Ne fait rien si le conteneur n'existe pas encore/plus (onglet
+        Paramètres pas encore construit, ou fenêtre en cours de
+        fermeture) — jamais une exception qui remonterait jusqu'à
+        _tick, même principe que _refresh_remote_devices_panel."""
+        admin_combo = getattr(self, "remote_dirto_admin_combo", None)
+        if admin_combo is None or not admin_combo.winfo_exists():
+            return
+        admin_combo["values"] = [e["name"] for e in roster.list_by_group(roster.ROSTER_GROUP_ADMIN)]
+        self.remote_dirto_user_combo["values"] = [
+            e["name"] for e in roster.list_by_group(roster.ROSTER_GROUP_DIRTO)
+        ]
+
+        authorizations = self.db.list_dirto_authorizations() if self.db is not None else []
+        signature = self._remote_dirto_signature(authorizations)
+        if signature == self._last_remote_dirto_signature:
+            return
+        self._last_remote_dirto_signature = signature
+
+        container = self.remote_dirto_list_container
+        for child in container.winfo_children():
+            child.destroy()
+        if not authorizations:
+            ttk.Label(
+                container, text="Aucune autorisation DIRTO pour ce tournoi.", foreground=MUTED,
+            ).pack(anchor="w")
+            return
+        # Présentation par bloc (demande du 2026-09-24, "réorganisation
+        # Permissions DIRTO") : ligne d'identité "{dirto} — accordé par
+        # {admin}" + bouton "Retirer" (même fonction qu'avant, toujours
+        # lié à CE dirto_name précis — jamais à la sélection courante du
+        # Combobox, voir tests/test_dirto_permissions_widget.py::
+        # RetraitTest.test_retirer_via_bouton_dune_ligne_precise) sur la
+        # MÊME ligne, immédiatement à droite — plus "au bout" d'une
+        # longue ligne à virgules, dont la position dépendait du nombre
+        # de fonctions accordées. Permissions accordées affichées EN
+        # DESSOUS, groupées deux par ligne (jamais une chaîne à
+        # virgules) — dans l'ordre canonique de REMOTE_PERMISSION_LABELS
+        # (pas l'ordre de stockage, potentiellement différent), et
+        # UNIQUEMENT celles réellement accordées à ce DIRTO.
+        for auth in authorizations:
+            header_row = ttk.Frame(container)
+            header_row.pack(fill="x", anchor="w", pady=(6, 0))
+            ttk.Label(
+                header_row, text=f"{auth['dirto_name']} — accordé par {auth['admin_name']}",
+            ).pack(side="left")
+            ttk.Button(
+                header_row, text="Retirer", width=8,
+                command=lambda name=auth["dirto_name"]: self._on_revoke_remote_dirto_permissions(name),
+            ).pack(side="left", padx=(8, 0))
+
+            granted_labels = [
+                REMOTE_PERMISSION_LABELS[key] for key in REMOTE_PERMISSION_LABELS
+                if key in auth["permissions"]
+            ]
+            if not granted_labels:
+                ttk.Label(
+                    container, text="(aucune fonction cochée)", foreground=MUTED,
+                ).pack(anchor="w", padx=(14, 0), pady=(0, 4))
+                continue
+            perms_grid = ttk.Frame(container)
+            perms_grid.pack(fill="x", anchor="w", padx=(14, 0), pady=(0, 4))
+            for idx, perm_label in enumerate(granted_labels):
+                perm_row, perm_col = divmod(idx, 2)
+                ttk.Label(perms_grid, text=perm_label).grid(
+                    row=perm_row, column=perm_col, sticky="w", padx=(0, 20), pady=1
+                )
+
+    def _on_remote_dirto_user_selected(self):
+        """Quand l'ADMIN choisit un DIRTO dans « Utilisateur autorisé » :
+        précharge SES permissions déjà accordées pour CE tournoi (s'il y
+        en a). « Autorisé par » n'est JAMAIS préchargé ici, volontaire :
+        identifie qui effectue CETTE action précise, pas qui l'a
+        accordée la dernière fois — voir Database.set_dirto_
+        authorization, "changement d'ADMIN accordant les droits"."""
+        name = self.remote_dirto_user_var.get().strip()
+        auth = self.db.get_dirto_authorization(name) if (name and self.db is not None) else None
+        granted = set(auth["permissions"]) if auth else set()
+        for key, var in self.remote_dirto_permission_vars.items():
+            var.set(key in granted)
+
+    def _on_grant_remote_dirto_permissions(self):
+        """Bouton "Accorder / Modifier" : crée l'autorisation si elle
+        n'existait pas encore, ou la REMPLACE intégralement sinon (voir
+        Database.set_dirto_authorization) — les cases NON cochées sont
+        donc bien RETIRÉES si elles l'étaient avant, pas seulement les
+        nouvelles cases cochées AJOUTÉES."""
+        admin_name = self.remote_dirto_admin_var.get().strip()
+        dirto_name = self.remote_dirto_user_var.get().strip()
+        if not admin_name:
+            messagebox.showinfo("Info", "Choisissez d'abord un ADMIN dans « Autorisé par ».", parent=self)
+            return
+        if not dirto_name:
+            messagebox.showinfo(
+                "Info", "Choisissez d'abord un DIRTO dans « Utilisateur autorisé ».", parent=self,
+            )
+            return
+        permissions = [key for key, var in self.remote_dirto_permission_vars.items() if var.get()]
+        self.db.set_dirto_authorization(dirto_name, admin_name, permissions)
+        # Effet IMMÉDIAT côté téléphone, sans attendre le prochain tick
+        # (Phase 4, "Sécurisation du Contrôle à distance", 2026-09-20) —
+        # voir _refresh_remote_dirto_permissions_cache, également
+        # rafraîchi chaque seconde par _tick comme filet de sécurité.
+        self._refresh_remote_dirto_permissions_cache()
+        self._last_remote_dirto_signature = None  # force la reconstruction de la liste ci-dessous
+        self._refresh_remote_dirto_permissions_panel()
+
+    def _on_revoke_remote_dirto_permissions(self, dirto_name=None):
+        """Bouton "Retirer l'autorisation" (formulaire) ou "Retirer" (une
+        ligne précise de la liste, `dirto_name` alors fourni directement)
+        — retrait COMPLET (voir Database.clear_dirto_authorization),
+        jamais un simple décochage de cases laissé en base."""
+        dirto_name = dirto_name or self.remote_dirto_user_var.get().strip()
+        if not dirto_name:
+            messagebox.showinfo(
+                "Info", "Choisissez d'abord un DIRTO dans « Utilisateur autorisé ».", parent=self,
+            )
+            return
+        if self.db is not None:
+            self.db.clear_dirto_authorization(dirto_name)
+        # Effet IMMÉDIAT côté téléphone (voir la remarque équivalente
+        # dans _on_grant_remote_dirto_permissions ci-dessus).
+        self._refresh_remote_dirto_permissions_cache()
+        if self.remote_dirto_user_var.get().strip() == dirto_name:
+            for var in self.remote_dirto_permission_vars.values():
+                var.set(False)
+        self._last_remote_dirto_signature = None
+        self._refresh_remote_dirto_permissions_panel()
+
     def _on_revoke_remote_device(self, browser_id):
         """Bouton "Révoquer" d'un appareil déjà approuvé (voir _refresh_
         remote_devices_panel) : bascule en "revoked" côté open_windows
@@ -8161,34 +8871,42 @@ class App(tk.Tk):
             open_windows.approve_remote_device(browser_id, label=label)
         self._refresh_remote_devices_panel()
 
-    def _is_settings_tab_active(self):
-        """True si l'onglet Paramètres est actuellement affiché — testé
-        via son libellé RÉEL (voir _update_settings_tab_badge : peut
+    def _is_ca_log_tab_active(self):
+        """True si l'onglet "CA/LOG" est actuellement affiché — testé
+        via son libellé RÉEL (voir _update_ca_log_tab_badge : peut
         porter le suffixe "🔔", d'où startswith plutôt qu'une égalité
         stricte). TclError (fenêtre en cours de fermeture) traitée comme
-        "non actif", jamais une exception qui remonterait à _tick."""
+        "non actif", jamais une exception qui remonterait à _tick.
+
+        Renommée le 2026-09-22 ("réorganisation visuelle du contrôle à
+        distance") — s'appelait _is_settings_tab_active tant que ce bloc
+        vivait dans Paramètres ; comportement/mécanisme inchangés,
+        seul l'onglet surveillé a changé."""
         try:
-            return self.notebook.tab(self.notebook.select(), "text").startswith("Paramètres")
+            return self.notebook.tab(self.notebook.select(), "text").startswith("CA/LOG")
         except tk.TclError:
             return False
 
-    def _update_settings_tab_badge(self, has_pending):
-        """🔔 sur l'onglet "Paramètres" tant qu'AU MOINS UNE demande de
+    def _update_ca_log_tab_badge(self, has_pending):
+        """🔔 sur l'onglet "CA/LOG" tant qu'AU MOINS UNE demande de
         téléphone est en attente (demande du 2026-09-09, "avertir le
-        responsable même si Paramètres n'est pas ouvert") — reflète
+        responsable même si CA/LOG n'est pas ouvert") — reflète
         TOUJOURS l'ensemble des demandes pending, y compris celles
         actuellement masquées par "Plus tard" (voir _remote_device_
         snoozed_keys) : "Plus tard" ne doit JAMAIS faire disparaître ce
-        signal, seulement fermer la fenêtre flottante elle-même."""
+        signal, seulement fermer la fenêtre flottante elle-même.
+
+        Renommée le 2026-09-22 (voir _is_ca_log_tab_active) — s'appelait
+        _update_settings_tab_badge, ciblait self.settings_tab."""
         try:
-            current_label = self.notebook.tab(self.settings_tab, "text")
+            current_label = self.notebook.tab(self.ca_log_tab, "text")
         except tk.TclError:
             return
         base = current_label[:-2] if current_label.endswith(" 🔔") else current_label
         new_label = base + (" 🔔" if has_pending else "")
         if new_label != current_label:
             try:
-                self.notebook.tab(self.settings_tab, text=new_label)
+                self.notebook.tab(self.ca_log_tab, text=new_label)
             except tk.TclError:
                 pass
 
@@ -8214,8 +8932,11 @@ class App(tk.Tk):
         secret) si elle reste raisonnablement visible à l'écran actuel
         (voir _is_position_onscreen — se prémunit d'une ancienne
         position devenue hors écran après un changement de résolution/
-        moniteur), sinon une position par défaut raisonnable près de
-        CETTE fenêtre (Paramètres/fenêtre principale)."""
+        moniteur), sinon une position par défaut SOUS le bloc "Téléphones
+        autorisés" de l'onglet "CA/LOG" (Changer.../Retirer la liaison/
+        Révoquer — demande explicite du 2026-09-22, "réorganisation
+        visuelle du contrôle à distance") plutôt qu'un coin fixe de la
+        fenêtre principale."""
         x = export_prefs.load_value("remote_device_popup_x", None)
         y = export_prefs.load_value("remote_device_popup_y", None)
         if (
@@ -8223,6 +8944,18 @@ class App(tk.Tk):
             and self._is_position_onscreen(x, y, win.winfo_screenwidth(), win.winfo_screenheight())
         ):
             return x, y
+        container = getattr(self, "remote_devices_container", None)
+        if container is not None:
+            try:
+                if container.winfo_exists():
+                    return (
+                        container.winfo_rootx(),
+                        container.winfo_rooty() + container.winfo_height() + 10,
+                    )
+            except tk.TclError:
+                pass
+        # Repli (conteneur pas encore construit, ou fenêtre en cours de
+        # fermeture) : ancien calcul, jamais une exception.
         return (
             self.winfo_rootx() + max(self.winfo_width() - 300, 20),
             self.winfo_rooty() + 60,
@@ -8243,27 +8976,29 @@ class App(tk.Tk):
     def _refresh_remote_device_popup(self, pending=None):
         """Ouvre/repeuple/masque/ferme la fenêtre flottante de demande de
         téléphone (demande du 2026-09-09, abandon définitif de toute
-        intégration dans la grille de Paramètres) : présente la PLUS
-        ANCIENNE demande NON masquée par "Plus tard" (voir _remote_
+        intégration dans une grille de réglages ; déplacée dans l'onglet
+        "CA/LOG" le 2026-09-22, voir _build_ca_log_tab) : présente la
+        PLUS ANCIENNE demande NON masquée par "Plus tard" (voir _remote_
         device_snoozed_keys) — jamais deux à la fois, jamais la même
         demande que la section "Téléphones" (voir _refresh_remote_
         devices_panel, approuvés uniquement).
 
         VISIBILITÉ (demande du 2026-09-09, correction : "la fenêtre ne
-        doit apparaître au-dessus d'AUCUN autre onglet que Paramètres")
+        doit apparaître au-dessus d'AUCUN autre onglet que celui qui
+        héberge le contrôle à distance" — CA/LOG depuis le 2026-09-22)
         — règle appliquée à CHAQUE appel, qu'il vienne du sondage
         périodique (~2s, voir App._tick/_check_remote_device_requests)
         ou du changement d'onglet lui-même (voir _on_notebook_tab_
         changed, <<NotebookTabChanged>>, pour un affichage/masquage
         IMMÉDIAT au clic, sans attendre le prochain sondage) : VISIBLE
-        SI ET SEULEMENT SI l'onglet Paramètres est actuellement
-        sélectionné ET qu'il existe une telle demande. Sur tout AUTRE
-        onglet, la fenêtre déjà créée est seulement MASQUÉE (`withdraw`,
-        jamais détruite ni recréée) — elle retrouve donc sa position
-        EXACTE, sans le moindre recalcul, dès que Paramètres redevient
-        actif (`deiconify`) ; la demande elle-même n'est ni approuvée,
-        ni révoquée, ni "Plus tard"-ée par ce simple changement d'onglet
-        — seul le badge 🔔 (voir _update_settings_tab_badge, appelé
+        SI ET SEULEMENT SI l'onglet "CA/LOG" est actuellement sélectionné
+        ET qu'il existe une telle demande. Sur tout AUTRE onglet, la
+        fenêtre déjà créée est seulement MASQUÉE (`withdraw`, jamais
+        détruite ni recréée) — elle retrouve donc sa position EXACTE,
+        sans le moindre recalcul, dès que CA/LOG redevient actif
+        (`deiconify`) ; la demande elle-même n'est ni approuvée, ni
+        révoquée, ni "Plus tard"-ée par ce simple changement d'onglet —
+        seul le badge 🔔 (voir _update_ca_log_tab_badge, appelé
         séparément par l'appelant) reste alors le signal visible.
 
         Une fenêtre déjà EXISTANTE (visible ou masquée) est REPEUPLÉE en
@@ -8288,17 +9023,17 @@ class App(tk.Tk):
             self._close_remote_device_popup()
             return
 
-        settings_active = self._is_settings_tab_active()
+        ca_log_active = self._is_ca_log_tab_active()
         content_changed = current_key != self._remote_device_popup_current_key
         self._remote_device_popup_current_key = current_key
         self._remote_device_popup_current_browser_id = current["browser_id"]
 
         popup = self._remote_device_popup
-        if not settings_active:
+        if not ca_log_active:
             # Jamais créer ni réafficher la fenêtre sur un autre onglet
-            # que Paramètres — seule une fenêtre déjà existante peut
-            # avoir besoin d'être masquée ici (ex. l'utilisateur vient de
-            # quitter Paramètres pendant qu'elle était affichée).
+            # que CA/LOG — seule une fenêtre déjà existante peut avoir
+            # besoin d'être masquée ici (ex. l'utilisateur vient de
+            # quitter CA/LOG pendant qu'elle était affichée).
             if popup is not None and popup.winfo_exists():
                 try:
                     popup.withdraw()
@@ -8358,9 +9093,9 @@ class App(tk.Tk):
         UNIQUEMENT la fenêtre flottante pour CETTE demande — ne l'approuve
         ni ne la révoque (le téléphone reste "pending" côté serveur), et
         ne fait PAS disparaître le badge 🔔 de l'onglet (voir _update_
-        settings_tab_badge, basé sur la liste "pending" complète, jamais
-        filtrée par ce masquage). Redevient visible dès que Paramètres
-        est quitté PUIS rouvert (voir _is_settings_tab_active/_check_
+        ca_log_tab_badge, basé sur la liste "pending" complète, jamais
+        filtrée par ce masquage). Redevient visible dès que CA/LOG
+        est quitté PUIS rouvert (voir _is_ca_log_tab_active/_check_
         remote_device_requests, qui vide _remote_device_snoozed_keys à
         ce moment précis) — sans avoir besoin d'attendre une nouvelle
         tentative du téléphone (même browser_id/requested_at)."""
@@ -8377,29 +9112,30 @@ class App(tk.Tk):
         list_approved_remote_devices) — orchestre les trois éléments
         d'interface concernés par une demande de téléphone (demande du
         2026-09-09, retour définitif à une fenêtre flottante après
-        abandon de toute intégration dans la grille de Paramètres) :
+        abandon de toute intégration dans une grille de réglages ;
+        bloc déplacé dans l'onglet "CA/LOG" le 2026-09-22) :
 
         1. la fenêtre flottante (voir _refresh_remote_device_popup), qui
            présente la plus ancienne demande NON masquée par "Plus
            tard" ;
-        2. le badge 🔔 de l'onglet "Paramètres" (voir _update_settings_
-           tab_badge), reflet FIDÈLE de la liste "pending" complète —
+        2. le badge 🔔 de l'onglet "CA/LOG" (voir _update_ca_log_tab_
+           badge), reflet FIDÈLE de la liste "pending" complète —
            jamais affecté par "Plus tard" ;
         3. la liste "Téléphones" (appareils APPROUVÉS, voir _refresh_
            remote_devices_panel), reconstruite seulement si son contenu
            a changé (voir _remote_devices_signature).
 
-        Détecte aussi la TRANSITION vers l'onglet Paramètres (il était
-        affiché autre chose au sondage précédent, il affiche Paramètres
+        Détecte aussi la TRANSITION vers l'onglet "CA/LOG" (il était
+        affiché autre chose au sondage précédent, il affiche CA/LOG
         maintenant) pour vider _remote_device_snoozed_keys À CE moment
         précis — jamais en continu tant que l'utilisateur y reste (voir
-        _on_remote_device_popup_later) : revenir sur Paramètres fait
-        ainsi réapparaître une demande "Plus tard"-ée plus tôt, sans
-        attendre une nouvelle tentative du téléphone."""
-        settings_active_now = self._is_settings_tab_active()
-        if settings_active_now and not self._last_settings_tab_active:
+        _on_remote_device_popup_later) : revenir sur CA/LOG fait ainsi
+        réapparaître une demande "Plus tard"-ée plus tôt, sans attendre
+        une nouvelle tentative du téléphone."""
+        ca_log_active_now = self._is_ca_log_tab_active()
+        if ca_log_active_now and not self._last_ca_log_tab_active:
             self._remote_device_snoozed_keys.clear()
-        self._last_settings_tab_active = settings_active_now
+        self._last_ca_log_tab_active = ca_log_active_now
 
         try:
             pending = open_windows.list_pending_remote_devices()
@@ -8407,12 +9143,20 @@ class App(tk.Tk):
         except Exception:
             return
 
-        self._update_settings_tab_badge(bool(pending))
+        self._update_ca_log_tab_badge(bool(pending))
         self._refresh_remote_device_popup(pending=pending)
 
         signature = self._remote_devices_signature(approved)
         if signature != getattr(self, "_last_remote_devices_panel_signature", None):
             self._refresh_remote_devices_panel(approved=approved)
+
+        # Permissions DIRTO (Phase 3, 2026-09-20) : même sondage
+        # périodique, pour suivre les changements du Répertoire (nouveaux
+        # ADMIN/DIRTO...) — voir _refresh_remote_dirto_permissions_panel,
+        # qui ne perturbe jamais une saisie en cours (values Combobox
+        # rafraîchies sans toucher à la sélection, liste reconstruite
+        # seulement si son contenu a réellement changé).
+        self._refresh_remote_dirto_permissions_panel()
 
     def _poll_voice_queue(self):
         """Relève régulièrement les mots-clés (et éliminations décidées
@@ -8432,6 +9176,9 @@ class App(tk.Tk):
                 elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
                     _, request_id, seat = item
                     self._resolve_pending_rebalance(request_id, seat, from_remote=True)
+                elif isinstance(item, tuple) and item and item[0] == "confirm_move":
+                    _, move_id, request_id = item
+                    self._remote_confirm_move(move_id, request_id=request_id)
                 elif isinstance(item, tuple) and item and item[0] == "end_tournament":
                     self._remote_end_tournament()
                     # La fenêtre vient d'être détruite (ou l'a déjà été,
@@ -8451,11 +9198,12 @@ class App(tk.Tk):
             pass
         self.after(150, self._poll_voice_queue)
 
-    def _remote_eliminate_request(self, eliminated_id, eliminator_id):
+    def _remote_eliminate_request(self, eliminated_id, eliminator_id, client_request_id=None):
         """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
         contrôle à distance (voir remote_control.py: on_eliminate, passé
         tel quel au serveur) — PAS depuis le thread Tk. Génère un
-        request_id, dépose la demande dans voice_command_queue (traitée
+        request_id INTERNE (corrélation avec _remote_elimination_results,
+        inchangé), dépose la demande dans voice_command_queue (traitée
         plus tard par _remote_eliminate, sur le thread Tk, comme toujours
         pour tout accès à self.db) puis ATTEND (sondage borné, ~150 ms de
         délai habituel de _poll_voice_queue) le résultat écrit dans
@@ -8467,16 +9215,172 @@ class App(tk.Tk):
         message d'échec plutôt que de bloquer indéfiniment le thread HTTP
         (chaque requête téléphone a son propre thread, voir
         ThreadingHTTPServer : un dépassement ici n'affecte ni l'UI ni les
-        autres téléphones)."""
+        autres téléphones).
+
+        `client_request_id` (demande du 2026-09-19, "bétonner la
+        communication téléphone <-> PC" suite à l'incident réel en club) :
+        identifiant GÉNÉRÉ CÔTÉ TÉLÉPHONE pour CETTE tentative d'action
+        (voir remote_control.py: _ELIMINATE_PAGE, confirmElimination),
+        réutilisé TEL QUEL par le téléphone s'il rejoue la même requête
+        après avoir perdu la réponse HTTP (timeout, coupure Wi-Fi...).
+        Garantit l'IDEMPOTENCE côté SERVEUR (jamais seulement côté
+        JavaScript, demande explicite) via self._remote_action_dedup
+        ({client_request_id: {"ts": float, "result": dict|None}}) :
+        - premier appel avec cet identifiant : traité normalement,
+          résultat mémorisé une fois connu ;
+        - appel(s) suivant(s) avec le MÊME identifiant, résultat déjà
+          connu : renvoyé TEL QUEL, sans jamais réenfiler la moindre
+          action dans voice_command_queue (donc sans second appel à
+          Database.eliminate_player -> aucun second kill, aucun second
+          transfert de bounty, aucun second mouvement de table) ;
+        - appel(s) suivant(s) avec le MÊME identifiant mais résultat PAS
+          ENCORE connu (la première tentative est encore en cours de
+          traitement, cas d'un double-tap ou d'un retry très rapide) :
+          attend ce même résultat au lieu d'en déclencher un second
+          traitement — jamais deux passages dans voice_command_queue
+          pour un seul identifiant.
+        `client_request_id` absent (None) : comportement HISTORIQUE
+        strictement inchangé, aucun dédoublonnage (jamais imposé à un
+        appelant qui n'en fournit pas). Rétention limitée (voir
+        _REMOTE_ACTION_DEDUP_TTL_SECONDS et _prune_remote_action_dedup) :
+        un identifiant oublié après quelques minutes, largement suffisant
+        pour couvrir un retry réseau réaliste, jamais une fuite mémoire
+        sur une longue soirée."""
+        entry = None
+        if client_request_id:
+            self._prune_remote_action_dedup()
+            entry = self._remote_action_dedup.get(client_request_id)
+            if entry is not None:
+                if entry["result"] is not None:
+                    return entry["result"]
+                # Une tentative avec ce même identifiant est déjà en cours
+                # de traitement ailleurs : attend SON résultat, ne déclenche
+                # surtout pas un second passage dans voice_command_queue.
+                try:
+                    import remote_control as _remote_control_module
+                    _remote_control_module.log_remote_event(
+                        "duplicate_action_ignored", action="eliminate",
+                        client_request_id=client_request_id,
+                    )
+                except Exception:
+                    pass
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    if entry["result"] is not None:
+                        return entry["result"]
+                    time.sleep(0.03)
+                return {"ok": False, "message": "Délai dépassé, réessayez."}
+            entry = {"ts": time.time(), "result": None}
+            self._remote_action_dedup[client_request_id] = entry
+
         request_id = uuid.uuid4().hex
         self.voice_command_queue.put(("eliminate", eliminated_id, eliminator_id, request_id))
         deadline = time.monotonic() + 3.0
+        result = None
         while time.monotonic() < deadline:
             result = self._remote_elimination_results.pop(request_id, None)
             if result is not None:
-                return result
+                break
             time.sleep(0.03)
-        return {"ok": False, "message": "Délai dépassé, réessayez."}
+        if result is None:
+            result = {"ok": False, "message": "Délai dépassé, réessayez."}
+        if entry is not None:
+            entry["result"] = result
+            entry["ts"] = time.time()
+        return result
+
+    def _prune_remote_action_dedup(self):
+        """Retire de self._remote_action_dedup les identifiants plus
+        vieux que _REMOTE_ACTION_DEDUP_TTL_SECONDS — rétention limitée
+        demandée explicitement : un retry réseau réaliste se produit en
+        quelques secondes, jamais plusieurs minutes après coup ; purge à
+        chaque nouvel appel plutôt qu'un minuteur séparé, pour rester
+        aussi simple que le mécanisme déjà en place pour _remote_
+        elimination_results (dict nu, jamais verrouillé, voir sa
+        docstring)."""
+        now = time.time()
+        expired = [
+            rid for rid, v in self._remote_action_dedup.items()
+            if now - v["ts"] > _REMOTE_ACTION_DEDUP_TTL_SECONDS
+        ]
+        for rid in expired:
+            del self._remote_action_dedup[rid]
+
+    def _remote_confirm_move_request(self, move_id):
+        """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
+        contrôle à distance (voir remote_control.py: on_confirm_move) —
+        PAS depuis le thread Tk. Même principe que _remote_eliminate_
+        request (demande du 2026-09-19) : dépose la demande dans voice_
+        command_queue (traitée par _remote_confirm_move, sur le thread
+        Tk), puis ATTEND (sondage borné, ~150 ms de délai habituel de
+        _poll_voice_queue) le résultat écrit dans self._remote_move_
+        confirm_results, pour le renvoyer tel quel au téléphone.
+
+        Aucun dédoublonnage par client_request_id ici (contrairement à
+        _remote_eliminate_request) : confirm_seat_move est idempotent PAR
+        NATURE (un DELETE sur une ligne déjà supprimée ne fait rien) —
+        rejouer la même confirmation ne peut jamais produire un second
+        effet métier, donc rien à protéger de plus.
+
+        Renvoie toujours {"ok": bool, "all_done": bool} : "all_done" est
+        vrai si CE mouvement était le dernier en attente — dans ce cas,
+        _remote_confirm_move a déjà déclenché _finish_movement_alert
+        (exactement le mécanisme du bouton "Mouvements terminés", jamais
+        une fin réimplémentée à part). Un dépassement du délai (Tk
+        anormalement bloqué) renvoie un résultat d'échec plutôt que de
+        bloquer indéfiniment le thread HTTP."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("confirm_move", move_id, request_id))
+        deadline = time.monotonic() + 3.0
+        result = None
+        while time.monotonic() < deadline:
+            result = self._remote_move_confirm_results.pop(request_id, None)
+            if result is not None:
+                break
+            time.sleep(0.03)
+        if result is None:
+            result = {"ok": False, "message": "Délai dépassé, réessayez.", "all_done": False}
+        return result
+
+    def _remote_confirm_move(self, move_id, request_id=None):
+        """Traitement RÉEL d'une confirmation individuelle de mouvement
+        (demande du 2026-09-19) — appelé UNIQUEMENT depuis _poll_voice_
+        queue (thread Tk), jamais directement depuis le thread HTTP.
+
+        confirm_seat_move ne fait que retirer la ligne visée de seat_
+        moves : `players.table_id`/`seat` sont déjà, depuis le calcul du
+        rééquilibrage, la position réelle et définitive du joueur — rien
+        à "appliquer" ici (voir la docstring de Database.confirm_seat_
+        move pour le diagnostic complet).
+
+        Rafraîchissements IMMÉDIATS (jamais besoin d'un changement
+        d'onglet ni d'attendre le tick suivant, demande explicite) :
+        Joueurs et Plan des tables sont TOUJOURS rafraîchis explicitement
+        ici (ni _refresh_all — qui ne rafraîchit que l'onglet ACTUELLEMENT
+        affiché — ni _finish_movement_alert, plus bas, ne le font). S'il
+        restait au moins un mouvement, Mouvements et Chronomètre sont
+        aussi rafraîchis directement. S'il n'en restait aucun, c'est le
+        mécanisme NORMAL de fin (_finish_movement_alert, identique au
+        bouton "Mouvements terminés") qui s'en charge — jamais une fin
+        réimplémentée à part — et qui rafraîchit déjà Mouvements/
+        Chronomètre lui-même."""
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert.", "all_done": False}
+        else:
+            self.db.confirm_seat_move(move_id)
+            remaining = self.db.count_seat_moves()
+            self._refresh_remote_moves_cache()
+            self._remote_has_pending_moves = remaining > 0
+            if remaining == 0:
+                self._finish_movement_alert()
+            else:
+                self._refresh_moves_tab()
+                self._refresh_clock_tab()
+            self._refresh_players_tab()
+            self._refresh_tables_tab()
+            result = {"ok": True, "all_done": remaining == 0}
+        if request_id is not None:
+            self._remote_move_confirm_results[request_id] = result
 
     def _remote_eliminate(self, eliminated_id, eliminator_id, request_id=None):
         """Élimination décidée depuis la page "Éliminations" du contrôle
@@ -8562,6 +9466,7 @@ class App(tk.Tk):
             self._trigger_movement_alert(from_remote=True)
         self._refresh_all()
         self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
         if request_id is not None:
             self._remote_elimination_results[request_id] = {"ok": True, "message": ""}
         # Contrairement à une élimination faite directement dans l'onglet
@@ -8788,6 +9693,27 @@ class App(tk.Tk):
             self._tables_zoom_by(-self.TABLES_ZOOM_STEP)
         elif word == "tables_zoom_plus":
             self._tables_zoom_by(self.TABLES_ZOOM_STEP)
+        elif word == "mouvements_bas":
+            # Petites flèches ↓/↑ de part et d'autre de "Afficher
+            # Mouvements" sur le téléphone (demande du 2026-09-20) :
+            # déplacent UNIQUEMENT la position d'affichage du bandeau
+            # "Changement de tables en cours" sur le Chrono Projo — même
+            # mécanisme que le glisser souris (voir ClockWindow.nudge_
+            # movement_alert_position/_movement_alert_manual_y), jamais
+            # un second système de positionnement. Ne confirment, ne
+            # suppriment et ne modifient JAMAIS un mouvement lui-même :
+            # aucun accès à self.db ici, uniquement la fenêtre Chrono.
+            # y augmente vers le bas dans Tk : "bas" = pas positif.
+            if self.clock_window is not None and self.clock_window.winfo_exists():
+                self.clock_window.nudge_movement_alert_position(
+                    self.clock_window.MOVEMENT_ALERT_NUDGE_STEP_PX
+                )
+        elif word == "mouvements_haut":
+            # Voir "mouvements_bas" ci-dessus — "haut" = pas négatif.
+            if self.clock_window is not None and self.clock_window.winfo_exists():
+                self.clock_window.nudge_movement_alert_position(
+                    -self.clock_window.MOVEMENT_ALERT_NUDGE_STEP_PX
+                )
         elif word == "toggle_pause":
             # Petit bouton ON/OFF à côté de "Chronomètre" sur le
             # téléphone : bascule directement pause/reprise, sans passer
@@ -11708,7 +12634,7 @@ class App(tk.Tk):
         (mélanger place() avec les widgets pack()/grid() voisins, dans
         une zone qui se redessine — le Canvas défilable de cet onglet,
         voir _build_settings_tab — est un cas connu de fragilité Tk).
-        Les explications détaillées des 4 formules vivent aussi dans le
+        Les explications détaillées des 5 formules vivent aussi dans le
         manuel utilisateur (chapitre "Onglet Paramètres", section Primes
         en détail) — et, depuis le 2026-09-14, dans un Tooltip ordinaire
         sur `ranking_lbl` lui-même (même mécanisme que TOUS les autres
@@ -11738,7 +12664,7 @@ class App(tk.Tk):
         ranking_lbl = ttk.Label(parent, text="Système de points distribués :")
         ranking_lbl.grid(row=row, column=0, sticky="w", pady=4)
         # Tooltip sur le libellé (demande du 2026-09-14) : détail complet
-        # des 4 formules, au survol — jamais un bouton/popup séparé (voir
+        # des 5 formules, au survol — jamais un bouton/popup séparé (voir
         # la docstring ci-dessus sur le bouton "ⓘ" définitivement retiré).
         # Contenu EXACT demandé, texte identique à celui du manuel
         # utilisateur (chapitre "Onglet Paramètres", section Primes en
@@ -11756,6 +12682,15 @@ class App(tk.Tk):
             "(N = nombre de joueurs du tournoi, P = place finale du\n"
             "joueur). Réduit l'écart entre les premières places et\n"
             "récompense davantage la régularité.\n"
+            "\n"
+            "Tournois CPC — formule P(r,N) = 50 + 950×N ×\n"
+            "0,12×0,88^(r-1) / (1 − 0,88^N) (N = nombre de joueurs\n"
+            "du tournoi, r = place finale du joueur). Chaque joueur\n"
+            "apporte 1000 points au total distribué ; répartition\n"
+            "décroissante, appliquée identiquement quel que soit N.\n"
+            "Arrondi par la méthode des plus grands restes (jamais\n"
+            "indépendant par place) pour que la somme distribuée\n"
+            "reste toujours exactement N × 1000.\n"
             "\n"
             "Sit & Go CPC — formule 1000 + 100(N+1) − 200×P\n"
             "(N = nombre de joueurs du Sit & Go, P = place finale du\n"
@@ -12225,105 +13160,11 @@ class App(tk.Tk):
                 days_grid, text=day_name.capitalize(), variable=var,
             ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2)
 
-        # -- Durée du bandeau d'élimination (écran projecteur + onglet
-        # Chronomètre, voir _advance_elimination_banner) : même principe
-        # que "Dossier par défaut"/"Jours de tournoi" ci-dessus — propre à
-        # CE tournoi (self.db) mais repris par défaut pour le prochain
-        # (tournament_prefs). Un ancien fichier .tournoi sans ce réglage
-        # retombe proprement sur 5 (voir get_setting_int ci-dessous et
-        # dans _advance_elimination_banner). INDÉPENDANTE de la "Durée
-        # (ms)" du son "Son sortie d'un joueur" (fenêtre "Sons de fin de
-        # Round/Pause...") : deux réglages séparés, l'un pour la durée
-        # d'AFFICHAGE du bandeau, l'autre pour la durée du SON — y compris
-        # si aucun son n'est configuré du tout.
-        elim_row = days_row + 2
-        elim_lbl = ttk.Label(left, text="Durée du bandeau d'élimination (secondes) :")
-        elim_lbl.grid(row=elim_row, column=0, sticky="w", pady=(14, 4))
-        Tooltip(
-            elim_lbl,
-            "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
-            "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
-            "élimination — de 0 à 30 secondes, 5 par défaut. Indépendante\n"
-            "de la « Durée (ms) » du son « Son sortie d'un joueur »\n"
-            "(fenêtre « Sons de fin de Round/Pause... ») : deux réglages\n"
-            "séparés, même si aucun son n'est configuré. Pris en compte\n"
-            "dès la prochaine élimination, sans redémarrer.\n"
-            "Mettre 0 seconde pour désactiver l'affichage du bandeau\n"
-            "d'élimination (le son, réglage séparé, continue de jouer).",
-        )
-        elim_seconds_var = tk.IntVar(
-            value=max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
-        )
-        elim_spin = ttk.Spinbox(
-            left, from_=0, to=30, width=5, textvariable=elim_seconds_var,
-            command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),
-        )
-        elim_spin.grid(row=elim_row, column=1, sticky="w", padx=10, pady=(14, 4))
-        elim_spin.bind(
-            "<Return>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
-        )
-        elim_spin.bind(
-            "<FocusOut>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
-        )
-        # Tooltip propre à la Spinbox elle-même (demande du 2026-09-08) :
-        # jusqu'ici seul le libellé à sa gauche (elim_lbl ci-dessus) avait
-        # un tooltip — un survol direct de la Spinbox (zone de saisie ou
-        # flèches haut/bas, un seul widget ttk.Spinbox donc une seule
-        # zone de survol pour Tkinter) n'affichait rien. Texte volontai-
-        # rement plus court que celui du libellé, qui reste inchangé.
-        Tooltip(
-            elim_spin,
-            "Durée d'affichage du bandeau d'élimination, en secondes. "
-            "Si 0, le bandeau n'est pas affiché.",
-        )
-
-        # -- Timeout pour "Annule Eliminer" (demande du 2026-09-17) : sous
-        # "Durée du bandeau d'élimination" ci-dessus, même principe (CE
-        # tournoi + repris par défaut pour le prochain via tournament_
-        # prefs). Le contrôle réel du délai se fait dans Database.undo_
-        # last_elimination() (voir sa docstring) : ce réglage-ci ne pilote
-        # que l'AFFICHAGE (bouton grisé/clic droit sans effet une fois
-        # dépassé) — aucune voie d'appel ne peut donc jamais le contourner
-        # simplement parce que l'interface n'aurait pas encore été
-        # rafraîchie.
-        undo_timeout_row = elim_row + 1
-        undo_timeout_lbl = ttk.Label(left, text="Timeout pour Annuler Eliminer (m) :")
-        undo_timeout_lbl.grid(row=undo_timeout_row, column=0, sticky="w", pady=4)
-        Tooltip(
-            undo_timeout_lbl,
-            "Délai, en minutes, pendant lequel « Annule Eliminer » (onglet\n"
-            "Joueurs) reste disponible pour annuler la DERNIÈRE élimination\n"
-            "— décompté depuis l'heure exacte de cette élimination, jamais\n"
-            "seulement l'heure affichée (fiable même à cheval sur un\n"
-            "changement de minute/heure). Passé ce délai, le bouton se\n"
-            "grise et le clic droit sur ce joueur ne propose plus rien —\n"
-            "5 minutes par défaut. Mettre 0 minute pour DÉSACTIVER "
-            "complètement\n« Annule Eliminer » (0 ne signifie jamais "
-            "« illimité »).",
-        )
-        undo_timeout_var = tk.IntVar(
-            value=max(0, self.db.get_setting_int("undo_elimination_timeout_minutes", 5))
-        )
-        undo_timeout_spin = ttk.Spinbox(
-            left, from_=0, to=180, width=5, textvariable=undo_timeout_var,
-            command=lambda: self._save_undo_elimination_timeout_minutes(undo_timeout_var),
-        )
-        undo_timeout_spin.grid(row=undo_timeout_row, column=1, sticky="w", padx=10, pady=4)
-        undo_timeout_spin.bind(
-            "<Return>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
-        )
-        undo_timeout_spin.bind(
-            "<FocusOut>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
-        )
-        # Tooltip propre à la Spinbox elle-même (même principe que
-        # elim_spin ci-dessus) — rappelle explicitement le rôle de 0,
-        # demande complémentaire du 2026-09-17.
-        Tooltip(
-            undo_timeout_spin,
-            "Délai en minutes avant que « Annule Eliminer » ne soit plus "
-            "disponible.\nMettre 0 minute pour désactiver complètement "
-            "cette possibilité\n(0 ne signifie pas « illimité »).",
-        )
+        # "Durée du bandeau d'élimination"/"Timeout pour Annuler Eliminer" :
+        # déplacées le 2026-09-22 (correction de présentation) sous "Un
+        # seul tournoi à la fois", colonne droite — voir la fin de cette
+        # méthode. Ni valeur, ni variable, ni validation, ni tooltip,
+        # ni logique changée : uniquement leur position dans la grille.
 
         # -- Colonne droite : structure de blindes + primes --
         ttk.Label(
@@ -12613,124 +13454,20 @@ class App(tk.Tk):
             foreground=MUTED, wraplength=340, justify="left",
         ).grid(row=voice_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 10))
 
-        # -- Contrôle à distance depuis un téléphone (voir
-        # remote_control.py) : 3 mêmes actions (Élimination/Chronomètre/
-        # Terminé) accessibles depuis une page web ouverte sur un
-        # téléphone connecté au même wifi que cet ordinateur — rien à
-        # installer sur le téléphone.
-        remote_start_row = voice_start_row + 3
-        ttk.Separator(right, orient="horizontal").grid(
-            row=remote_start_row, column=0, columnspan=2, sticky="ew", pady=(0, 15)
-        )
-        remote_title = ttk.Label(
-            right, text="Contrôle à distance (téléphone)",
-            font=("Helvetica", 11, "bold"), foreground=GOLD,
-        )
-        remote_title.grid(row=remote_start_row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8))
-        Tooltip(
-            remote_title,
-            "Sert une petite page web (3 boutons : Élimination/\n"
-            "Chronomètre/Terminé, identiques aux raccourcis clavier)\n"
-            "consultable depuis n'importe quel téléphone connecté au\n"
-            "même réseau Wifi que cet ordinateur — rien à installer,\n"
-            "juste ouvrir l'adresse affichée dans un navigateur.",
-        )
-
-        # Case + "Code : XXXXXX" côte à côte (demande du 2026-09-09,
-        # "sécurisation du contrôle à distance") — MÊME technique que
-        # primes_header plus haut (sous-frame pack, pas grid) : évite le
-        # même écart disgracieux entre les deux qu'aurait provoqué une
-        # colonne de grille partagée avec les champs larges du reste de
-        # l'onglet.
-        remote_check_row = ttk.Frame(right)
-        remote_check_row.grid(row=remote_start_row + 2, column=0, columnspan=2, sticky="w", pady=(0, 6))
-
-        self.remote_control_enabled_var = tk.BooleanVar(
-            value=export_prefs.load_value("remote_control_enabled", False) is True
-        )
-        remote_check = ttk.Checkbutton(
-            remote_check_row, text="Activer le contrôle à distance",
-            variable=self.remote_control_enabled_var, command=self._on_remote_control_toggle,
-        )
-        remote_check.pack(side="left")
-
-        # Code à 6 chiffres de la session en cours (demande du
-        # 2026-09-09) : IDENTIQUE pour tous les tournois de cette
-        # session (voir open_windows.remote_session_code) — à
-        # communiquer de vive voix aux responsables dont le téléphone
-        # doit être approuvé ci-dessous. JAMAIS le code de test permanent
-        # 131261, qui ne doit jamais apparaître ici (voir open_windows.
-        # verify_remote_code). Déjà disponible dès la construction de cet
-        # onglet : App.__init__ a déjà enregistré ce tournoi (open_
-        # windows.register) avant d'arriver ici, la session existe donc
-        # forcément — pas besoin de rafraîchir ce libellé à chaque tick.
-        code = open_windows.remote_session_code()
-        self.remote_control_code_lbl = ttk.Label(
-            remote_check_row, text=(f"Code : {code}" if code else ""),
-            foreground=MUTED, font=("Helvetica", 10, "bold"),
-        )
-        self.remote_control_code_lbl.pack(side="left", padx=(14, 0))
-        Tooltip(
-            self.remote_control_code_lbl,
-            "Code à saisir sur le téléphone à la première connexion —\n"
-            "identique pour tous les tournois/Sit & Go ouverts en même\n"
-            "temps que celui-ci, change à chaque nouvelle session (tous\n"
-            "les tournois refermés puis l'application relancée). Le\n"
-            "téléphone devra ensuite être approuvé ci-dessous avant de\n"
-            "pouvoir contrôler quoi que ce soit.",
-        )
-
-        self.remote_control_status_lbl = ttk.Label(
-            right, foreground=MUTED, justify="left", wraplength=340,
-        )
-        self.remote_control_status_lbl.grid(
-            row=remote_start_row + 3, column=0, columnspan=2, sticky="w", pady=(0, 10)
-        )
-        self._refresh_remote_control_status()
-
-        # -- Téléphones APPROUVÉS (Révoquer/renommer) — demande du
-        # 2026-09-09, revue le même jour ("plus de popup séparée") : les
-        # demandes EN ATTENTE ont leur propre panneau intégré, tout en
-        # haut de la colonne de gauche (voir remote_pending_request_
-        # container, sous "Durée du bandeau d'élimination") — jamais
-        # affichées ici, pour ne jamais présenter la même demande à deux
-        # endroits de Paramètres. Conteneur UNIQUE gridé une seule fois
-        # (columnspan=2), tout son contenu (nombre variable de lignes
-        # selon le nombre de téléphones) empilé à l'intérieur via pack()
-        # — même raison que remote_check_row ci-dessus, mais pour une
-        # hauteur variable plutôt qu'une largeur : jamais besoin de
-        # renuméroter les lignes de grille suivantes (bb_prompt_row...)
-        # quand ce nombre change.
-        remote_devices_title = ttk.Label(
-            right, text="Téléphones autorisés", font=("Helvetica", 10, "bold"), foreground=GOLD,
-        )
-        remote_devices_title.grid(
-            row=remote_start_row + 4, column=0, columnspan=2, sticky="w", pady=(2, 4)
-        )
-        Tooltip(
-            remote_devices_title,
-            "Appareils déjà approuvés — l'approbation reste valable aux\n"
-            "prochaines sessions, contrairement au code, qui change à\n"
-            "chaque fois. Une NOUVELLE demande de téléphone apparaît en\n"
-            "haut de la colonne de gauche (sous « Durée du bandeau\n"
-            "d'élimination »), avec un badge 🔔 sur cet onglet tant\n"
-            "qu'elle n'a pas été traitée.",
-        )
-        self.remote_devices_container = ttk.Frame(right)
-        self.remote_devices_container.grid(
-            row=remote_start_row + 5, column=0, columnspan=2, sticky="ew", pady=(0, 10)
-        )
-        self._refresh_remote_devices_panel()
+        # -- Contrôle à distance depuis un téléphone : déplacé dans son
+        # propre onglet "CA/LOG" (demande du 2026-09-22, "réorganisation
+        # visuelle du contrôle à distance") — voir _build_ca_log_tab.
+        # Emplacement UNIQUE désormais : plus aucun widget de ce bloc
+        # (activation, code, Téléphones autorisés, Permissions DIRTO)
+        # n'est construit ici, pour ne jamais créer de doublon ni un
+        # second état indépendant.
 
         # -- Rééquilibrage simple guidé par la grosse blinde (version TEST,
         # voir database.py: rebalance_tables/_bb_rebalance_prompt_enabled) :
-        # préférence GLOBALE (comme "Activer le contrôle à distance" juste
-        # au-dessus, pas une donnée du tournoi). Fait partie du CONTENU
+        # préférence GLOBALE (comme le bloc contrôle à distance, déplacé
+        # dans l'onglet CA/LOG ci-dessus). Fait partie du CONTENU
         # DÉFILANT de l'onglet, comme le reste des réglages de "right"
-        # (grid, même colonne 0, même sticky="w") : défile avec l'ascenseur
-        # et reste alignée horizontalement avec "Activer le contrôle à
-        # distance" pour la même raison qu'elle — pas de place() ni
-        # d'ancrage indépendant du défilement.
+        # (grid, même colonne 0, même sticky="w").
         #
         # Libellé/tooltip mis à jour (clé de stockage BB_REBALANCE_PROMPT_
         # PREF_KEY et comportement INCHANGÉS, pour rester compatible avec
@@ -12742,7 +13479,10 @@ class App(tk.Tk):
         # (_legacy_pick_mover, voir database.py: rebalance_tables) — elle
         # a donc toujours une utilité propre, indépendante de tout
         # affichage Mac.
-        bb_prompt_row = remote_start_row + 6  # +4/+5 pris par le titre/conteneur "Téléphones" ci-dessus
+        # Reprend directement la ligne libérée par le bloc contrôle à
+        # distance (déplacé dans CA/LOG, demande du 2026-09-22) — plus
+        # aucun décalage +4/+5/+6/+7 à ajouter ici.
+        bb_prompt_row = voice_start_row + 3
         self.bb_rebalance_prompt_var = tk.BooleanVar(
             value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
         )
@@ -12791,6 +13531,365 @@ class App(tk.Tk):
             "erreur. Désactivée : comportement multi-tournoi habituel,\n"
             "inchangé.",
         )
+
+        # -- Durée du bandeau d'élimination (écran projecteur + onglet
+        # Chronomètre, voir _advance_elimination_banner) — déplacée le
+        # 2026-09-22 (correction de présentation, demande explicite)
+        # immédiatement sous "Un seul tournoi à la fois" : valeur,
+        # variable, validation, tooltip et logique INCHANGÉS, seule la
+        # position dans la grille change (colonne "right" désormais,
+        # plus "left"). Propre à CE tournoi (self.db) mais reprise par
+        # défaut pour le prochain (tournament_prefs). Un ancien fichier
+        # .tournoi sans ce réglage retombe proprement sur 5 (voir
+        # get_setting_int ci-dessous et dans _advance_elimination_
+        # banner). INDÉPENDANTE de la "Durée (ms)" du son "Son sortie
+        # d'un joueur" (fenêtre "Sons de fin de Round/Pause...") : deux
+        # réglages séparés, l'un pour la durée d'AFFICHAGE du bandeau,
+        # l'autre pour la durée du SON — y compris si aucun son n'est
+        # configuré du tout.
+        #
+        # Alignement demandé explicitement (libellés à gauche, Spinbox
+        # alignées à droite sur la MÊME coordonnée X, même largeur) :
+        # déjà garanti structurellement par la grille — les deux
+        # libellés en column=0/sticky="w", les deux Spinbox en
+        # column=1/sticky="w"/width=5 identique, comme tous les autres
+        # champs de cette colonne (voir blind_fields plus haut, même
+        # principe) — la longueur du texte du libellé ne peut donc
+        # jamais déplacer la Spinbox, chaque colonne de grille étant
+        # indépendante de la largeur du contenu des autres lignes.
+        elim_row = single_tournament_row + 1
+        elim_lbl = ttk.Label(right, text="Durée du bandeau d'élimination (secondes) :")
+        elim_lbl.grid(row=elim_row, column=0, sticky="w", pady=(14, 4))
+        Tooltip(
+            elim_lbl,
+            "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
+            "l'écran projecteur (voir onglet Chronomètre) après chaque\n"
+            "élimination — de 0 à 30 secondes, 5 par défaut. Indépendante\n"
+            "de la « Durée (ms) » du son « Son sortie d'un joueur »\n"
+            "(fenêtre « Sons de fin de Round/Pause... ») : deux réglages\n"
+            "séparés, même si aucun son n'est configuré. Pris en compte\n"
+            "dès la prochaine élimination, sans redémarrer.\n"
+            "Mettre 0 seconde pour désactiver l'affichage du bandeau\n"
+            "d'élimination (le son, réglage séparé, continue de jouer).",
+        )
+        elim_seconds_var = tk.IntVar(
+            value=max(0, min(30, self.db.get_setting_int("elimination_banner_seconds", 5)))
+        )
+        elim_spin = ttk.Spinbox(
+            right, from_=0, to=30, width=5, textvariable=elim_seconds_var,
+            command=lambda: self._save_elimination_banner_seconds(elim_seconds_var),
+        )
+        elim_spin.grid(row=elim_row, column=1, sticky="w", padx=10, pady=(14, 4))
+        elim_spin.bind(
+            "<Return>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+        elim_spin.bind(
+            "<FocusOut>", lambda e: self._save_elimination_banner_seconds(elim_seconds_var)
+        )
+        # Tooltip propre à la Spinbox elle-même (demande du 2026-09-08) :
+        # jusqu'ici seul le libellé à sa gauche (elim_lbl ci-dessus) avait
+        # un tooltip — un survol direct de la Spinbox (zone de saisie ou
+        # flèches haut/bas, un seul widget ttk.Spinbox donc une seule
+        # zone de survol pour Tkinter) n'affichait rien. Texte volontai-
+        # rement plus court que celui du libellé, qui reste inchangé.
+        Tooltip(
+            elim_spin,
+            "Durée d'affichage du bandeau d'élimination, en secondes. "
+            "Si 0, le bandeau n'est pas affiché.",
+        )
+
+        # -- Timeout pour "Annule Eliminer" (demande du 2026-09-17) : sous
+        # "Durée du bandeau d'élimination" ci-dessus, même principe (CE
+        # tournoi + repris par défaut pour le prochain via tournament_
+        # prefs). Le contrôle réel du délai se fait dans Database.undo_
+        # last_elimination() (voir sa docstring) : ce réglage-ci ne pilote
+        # que l'AFFICHAGE (bouton grisé/clic droit sans effet une fois
+        # dépassé) — aucune voie d'appel ne peut donc jamais le contourner
+        # simplement parce que l'interface n'aurait pas encore été
+        # rafraîchie.
+        undo_timeout_row = elim_row + 1
+        undo_timeout_lbl = ttk.Label(right, text="Timeout pour Annuler Eliminer (m) :")
+        undo_timeout_lbl.grid(row=undo_timeout_row, column=0, sticky="w", pady=4)
+        Tooltip(
+            undo_timeout_lbl,
+            "Délai, en minutes, pendant lequel « Annule Eliminer » (onglet\n"
+            "Joueurs) reste disponible pour annuler la DERNIÈRE élimination\n"
+            "— décompté depuis l'heure exacte de cette élimination, jamais\n"
+            "seulement l'heure affichée (fiable même à cheval sur un\n"
+            "changement de minute/heure). Passé ce délai, le bouton se\n"
+            "grise et le clic droit sur ce joueur ne propose plus rien —\n"
+            "5 minutes par défaut. Mettre 0 minute pour DÉSACTIVER "
+            "complètement\n« Annule Eliminer » (0 ne signifie jamais "
+            "« illimité »).",
+        )
+        undo_timeout_var = tk.IntVar(
+            value=max(0, self.db.get_setting_int("undo_elimination_timeout_minutes", 5))
+        )
+        undo_timeout_spin = ttk.Spinbox(
+            right, from_=0, to=180, width=5, textvariable=undo_timeout_var,
+            command=lambda: self._save_undo_elimination_timeout_minutes(undo_timeout_var),
+        )
+        undo_timeout_spin.grid(row=undo_timeout_row, column=1, sticky="w", padx=10, pady=4)
+        undo_timeout_spin.bind(
+            "<Return>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
+        )
+        undo_timeout_spin.bind(
+            "<FocusOut>", lambda e: self._save_undo_elimination_timeout_minutes(undo_timeout_var)
+        )
+        # Tooltip propre à la Spinbox elle-même (même principe que
+        # elim_spin ci-dessus) — rappelle explicitement le rôle de 0,
+        # demande complémentaire du 2026-09-17.
+        Tooltip(
+            undo_timeout_spin,
+            "Délai en minutes avant que « Annule Eliminer » ne soit plus "
+            "disponible.\nMettre 0 minute pour désactiver complètement "
+            "cette possibilité\n(0 ne signifie pas « illimité »).",
+        )
+
+    # -----------------------------------------------------------------
+    # Onglet "CA/LOG" (demande du 2026-09-22, "réorganisation visuelle du
+    # contrôle à distance") : emplacement UNIQUE du bloc Contrôle à
+    # distance/Téléphones autorisés/Permissions DIRTO — retiré de
+    # Paramètres (voir _build_settings_tab, qui ne construit plus rien de
+    # ce bloc) pour ne jamais créer de doublon ni un second état
+    # indépendant. Fonctionnement STRICTEMENT préservé (aucune logique
+    # réécrite, seulement son ancrage/sa position) : mêmes noms
+    # d'attributs qu'avant (remote_control_enabled_var, remote_control_
+    # code_lbl, remote_control_status_lbl, remote_devices_container,
+    # remote_dirto_container...), lus/écrits par les mêmes méthodes
+    # déjà existantes (_on_remote_control_toggle, _refresh_remote_
+    # control_status, _refresh_remote_devices_panel, _refresh_remote_
+    # control_code_label, _build_remote_dirto_permissions_widgets...).
+    # -----------------------------------------------------------------
+    def _build_ca_log_tab(self):
+        """Deux zones CÔTE À CÔTE occupant toute la largeur disponible
+        (gauche : Contrôle à distance/Téléphones ; droite : Permissions
+        DIRTO), au même niveau vertical. La partie basse de cet onglet
+        reste délibérément VIDE pour l'instant — réservée au futur
+        Journal des actions (Phase 5 : filtres + tableau + Export, PAS
+        commencée ici, ni sa base SQLite).
+
+        La fenêtre flottante d'autorisation (RemoteDeviceRequestWindow)
+        n'est plus visible que sur CET onglet (voir _is_ca_log_tab_active,
+        _refresh_remote_device_popup) et se positionne par défaut SOUS
+        remote_devices_container (voir _remote_device_popup_position) —
+        jamais recréée/réécrite, seulement son ancrage adapté."""
+        top = ttk.Frame(self.ca_log_tab)
+        top.pack(padx=20, pady=20, anchor="nw", fill="x")
+        left = ttk.Frame(top)
+        left.pack(side="left", anchor="n", padx=(0, 50))
+        right = ttk.Frame(top)
+        right.pack(side="left", anchor="n")
+
+        # ================================================================
+        # ZONE GAUCHE — Contrôle à distance / Téléphones
+        # ================================================================
+        remote_title = ttk.Label(
+            left, text="Contrôle à distance (téléphone)",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        remote_title.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        Tooltip(
+            remote_title,
+            "Sert une petite page web (Éliminations, Plan des tables,\n"
+            "Mouvements, Chronomètre, Niveaux, Photos, rééquilibrage)\n"
+            "consultable depuis n'importe quel téléphone connecté au\n"
+            "même réseau Wifi que cet ordinateur — rien à installer,\n"
+            "juste ouvrir l'adresse affichée dans un navigateur.",
+        )
+
+        # Case + "Code : XXXXXX" côte à côte (sous-frame pack, pas grid) :
+        # évite un écart disgracieux entre les deux.
+        remote_check_row = ttk.Frame(left)
+        remote_check_row.grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        self.remote_control_enabled_var = tk.BooleanVar(
+            value=export_prefs.load_value("remote_control_enabled", False) is True
+        )
+        remote_check = ttk.Checkbutton(
+            remote_check_row, text="Activer le contrôle à distance",
+            variable=self.remote_control_enabled_var, command=self._on_remote_control_toggle,
+        )
+        remote_check.pack(side="left")
+
+        # Code à 6 chiffres de la session en cours (demande du
+        # 2026-09-09) : IDENTIQUE pour tous les tournois de cette
+        # session (voir open_windows.remote_session_code) — à
+        # communiquer de vive voix aux responsables dont le téléphone
+        # doit être approuvé ci-dessous. JAMAIS le code de test permanent
+        # 131261, qui ne doit jamais apparaître ici (voir open_windows.
+        # verify_remote_code). Déjà disponible dès la construction de cet
+        # onglet : App.__init__ a déjà enregistré ce tournoi (open_
+        # windows.register) avant d'arriver ici, la session existe donc
+        # forcément. Valeur initiale seulement : si le fichier partagé
+        # est un jour régénéré (incident du 2026-09-19) pendant que ce
+        # tournoi reste ouvert, ce libellé est tenu à jour par
+        # _refresh_remote_control_code_label, appelée depuis _tick tant
+        # que cet onglet est affiché (voir _is_ca_log_tab_active) —
+        # jamais à chaque tick de chaque fenêtre, pour rester négligeable.
+        code = open_windows.remote_session_code()
+        self.remote_control_code_lbl = ttk.Label(
+            remote_check_row, text=(f"Code : {code}" if code else ""),
+            foreground=MUTED, font=("Helvetica", 10, "bold"),
+        )
+        self.remote_control_code_lbl.pack(side="left", padx=(14, 0))
+        Tooltip(
+            self.remote_control_code_lbl,
+            "Code à saisir sur le téléphone à la première connexion —\n"
+            "identique pour tous les tournois/Sit & Go ouverts en même\n"
+            "temps que celui-ci, change à chaque nouvelle session (tous\n"
+            "les tournois refermés puis l'application relancée). Le\n"
+            "téléphone devra ensuite être approuvé ci-dessous avant de\n"
+            "pouvoir contrôler quoi que ce soit.",
+        )
+
+        self.remote_control_status_lbl = ttk.Label(
+            left, foreground=MUTED, justify="left", wraplength=340,
+        )
+        self.remote_control_status_lbl.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self._refresh_remote_control_status()
+
+        # -- Téléphones APPROUVÉS (Révoquer/renommer) : les demandes EN
+        # ATTENTE ont leur propre fenêtre flottante (voir RemoteDevice
+        # RequestWindow, positionnée SOUS ce conteneur), jamais affichées
+        # ici, pour ne jamais présenter la même demande à deux endroits.
+        remote_devices_title = ttk.Label(
+            left, text="Téléphones autorisés", font=("Helvetica", 10, "bold"), foreground=GOLD,
+        )
+        remote_devices_title.grid(row=3, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        Tooltip(
+            remote_devices_title,
+            "Appareils déjà approuvés — l'approbation reste valable aux\n"
+            "prochaines sessions, contrairement au code, qui change à\n"
+            "chaque fois. Une NOUVELLE demande de téléphone apparaît\n"
+            "dans une fenêtre flottante sous cette liste, avec un badge\n"
+            "🔔 sur cet onglet tant qu'elle n'a pas été traitée.",
+        )
+        self.remote_devices_container = ttk.Frame(left)
+        self.remote_devices_container.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        self._refresh_remote_devices_panel()
+
+        # -- Journal des actions : ZONE VISUELLE UNIQUEMENT pour l'instant
+        # (demande du 2026-09-24, "préparation visuelle de la partie LOG")
+        # — critères de recherche PRÉPARATOIRES, sous "Téléphones
+        # autorisés" (jamais sous Permissions DIRTO, colonne de droite,
+        # volontairement intacte). AUCUNE recherche réelle câblée ici,
+        # AUCUN accès à une base de données de LOG (qui n'existe pas
+        # encore), AUCUN tableau de résultats (emplacement/colonnes
+        # décidés après validation visuelle de ce premier bloc) — voir
+        # la demande explicite de ne pas commencer l'implémentation
+        # fonctionnelle. Un trait horizontal sépare clairement cette
+        # future zone de la gestion des téléphones juste au-dessus.
+        ttk.Separator(left, orient="horizontal").grid(
+            row=5, column=0, columnspan=2, sticky="ew", pady=(14, 12)
+        )
+        self._build_log_search_criteria_placeholder(left, row=6)
+
+        # ================================================================
+        # ZONE DROITE — Permissions DIRTO (pour ce tournoi)
+        # ================================================================
+        remote_dirto_title = ttk.Label(
+            right, text="Permissions DIRTO (pour ce tournoi)", font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        remote_dirto_title.grid(row=0, column=0, sticky="w", pady=(0, 8))
+        Tooltip(
+            remote_dirto_title,
+            "Un DIRTO ne dispose, sur son téléphone, QUE des fonctions\n"
+            "cochées ici — propres à CE tournoi (un autre tournoi ouvert\n"
+            "simultanément a ses propres permissions, indépendantes).\n"
+            "« Terminer le tournoi » n'apparaît jamais dans cette liste :\n"
+            "réservée aux ADMIN, jamais accordable à un DIRTO.\n"
+            "Un ADMIN garde de toute façon un accès total, sans avoir\n"
+            "besoin d'être également DIRTO.",
+        )
+        self.remote_dirto_container = ttk.Frame(right)
+        self.remote_dirto_container.grid(row=1, column=0, sticky="new")
+        self._build_remote_dirto_permissions_widgets(self.remote_dirto_container)
+
+        # ================================================================
+        # Partie basse — réservée au futur TABLEAU de résultats du
+        # Journal des actions (les critères de recherche, eux, sont déjà
+        # posés plus haut à gauche — voir _build_log_search_criteria_
+        # placeholder). Emplacement/colonnes du tableau, Export, et la
+        # base SQLite du LOG : PAS commencés ici. Volontairement vide.
+        # ================================================================
+        ttk.Frame(self.ca_log_tab).pack(fill="both", expand=True)
+
+    def _build_log_search_criteria_placeholder(self, parent, row):
+        """Critères de recherche du futur Journal des actions — ZONE
+        VISUELLE UNIQUEMENT (demande du 2026-09-24, "préparation
+        visuelle de la partie LOG") : aucune recherche réelle câblée
+        (aucun `command`/`trace_add` vers une quelconque logique), aucun
+        accès à une base de données de LOG (qui n'existe pas encore),
+        aucun tableau de résultats (emplacement/colonnes décidés après
+        validation visuelle de ce premier bloc — voir la demande
+        explicite de ne pas commencer l'implémentation fonctionnelle).
+
+        Une seule grille PARTAGÉE par les 4 lignes (jamais une grille
+        par ligne) : "Du"/"Utilisateur"/"Joueur" tombent tous en
+        colonne 0, "Au"/"Fonction" en colonne 2 — même mécanisme
+        d'alignement par colonne que "Permissions DIRTO" juste à droite
+        (voir _build_remote_dirto_permissions_widgets)."""
+        criteria = ttk.Frame(parent)
+        criteria.grid(row=row, column=0, columnspan=2, sticky="w")
+
+        # Ligne 1 : Du / Au / Tournoi
+        ttk.Label(criteria, text="Du :").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=(0, 6))
+        self.log_date_from_var = tk.StringVar(value="")
+        ttk.Entry(criteria, textvariable=self.log_date_from_var, width=12).grid(
+            row=0, column=1, sticky="w", padx=(0, 16), pady=(0, 6)
+        )
+        ttk.Label(criteria, text="Au :").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=(0, 6))
+        self.log_date_to_var = tk.StringVar(value="")
+        ttk.Entry(criteria, textvariable=self.log_date_to_var, width=12).grid(
+            row=0, column=3, sticky="w", padx=(0, 16), pady=(0, 6)
+        )
+        ttk.Label(criteria, text="Tournoi :").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=(0, 6))
+        self.log_tournament_var = tk.StringVar(value="Tous")
+        ttk.Combobox(
+            criteria, textvariable=self.log_tournament_var, state="readonly", width=14,
+            values=("Tous",),
+        ).grid(row=0, column=5, sticky="w", pady=(0, 6))
+
+        # Ligne 2 : Utilisateur / Fonction
+        ttk.Label(criteria, text="Utilisateur :").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(0, 6))
+        self.log_user_var = tk.StringVar(value="Tous")
+        ttk.Combobox(
+            criteria, textvariable=self.log_user_var, state="readonly", width=14,
+            values=("Tous",),
+        ).grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(0, 6))
+        ttk.Label(criteria, text="Fonction :").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(0, 6))
+        self.log_function_var = tk.StringVar(value="Toutes")
+        ttk.Combobox(
+            criteria, textvariable=self.log_function_var, state="readonly", width=14,
+            values=("Toutes",),
+        ).grid(row=1, column=3, sticky="w", pady=(0, 6))
+
+        # Ligne 3 : Joueur, puis Réinitialiser / Rechercher / Exporter
+        # SUR LA MÊME LIGNE (demande du 2026-09-24, précision apportée
+        # le même jour) — sous-frame packée (jamais une grille dédiée)
+        # pour aligner les 3 boutons côte à côte sans avoir à gérer
+        # 3 colonnes de grille supplémentaires.
+        ttk.Label(criteria, text="Joueur :").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(0, 10))
+        self.log_player_var = tk.StringVar(value="Tous")
+        ttk.Combobox(
+            criteria, textvariable=self.log_player_var, state="readonly", width=14,
+            values=("Tous",),
+        ).grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(0, 10))
+
+        log_actions_row = ttk.Frame(criteria)
+        log_actions_row.grid(row=2, column=2, columnspan=4, sticky="w", pady=(0, 10))
+        # Aucun des 3 boutons n'a de `command` pour l'instant —
+        # strictement préparatoires, comme demandé : ni recherche réelle
+        # (Rechercher/Réinitialiser), ni export de fichier quel qu'il
+        # soit — CSV/Excel/PDF — (Exporter, ajouté à droite de
+        # Rechercher, lui aussi totalement inerte).
+        self.log_reset_btn = ttk.Button(log_actions_row, text="Réinitialiser")
+        self.log_reset_btn.pack(side="left")
+        self.log_search_btn = ttk.Button(log_actions_row, text="🔍 Rechercher")
+        self.log_search_btn.pack(side="left", padx=(8, 0))
+        self.log_export_btn = ttk.Button(log_actions_row, text="Exporter")
+        self.log_export_btn.pack(side="left", padx=(8, 0))
 
     def _on_single_tournament_toggle(self):
         export_prefs.save_value(SINGLE_TOURNAMENT_PREF_KEY, self.single_tournament_var.get())
@@ -13522,6 +14621,19 @@ class App(tk.Tk):
                 # une action qui rafraîchirait cet onglet pour une autre
                 # raison (voir _update_undo_elimination_button_state).
                 self._update_undo_elimination_button_state()
+            elif current.startswith("CA/LOG"):
+                # Libellé "Code : XXXXXX" (demande du 2026-09-19, suite à
+                # un incident où ce code avait été régénéré — pollution de
+                # tests — pendant qu'un tournoi restait ouvert : le
+                # libellé, calculé une seule fois à la construction de
+                # l'onglet, restait alors périment affiché sans que le
+                # responsable ne puisse le savoir) : revérifié ici,
+                # UNIQUEMENT tant que l'onglet "CA/LOG" est affiché
+                # (déplacé depuis Paramètres le 2026-09-22 — jamais à
+                # chaque tick de CHAQUE fenêtre ouverte, pour ne pas
+                # relire ce fichier partagé inutilement) — voir
+                # _refresh_remote_control_code_label.
+                self._refresh_remote_control_code_label()
             if self._remote_photo_uploaded:
                 # Une photo vient d'être envoyée depuis le téléphone (voir
                 # _remote_upload_photo) : rafraîchit la colonne Photo de
@@ -13538,6 +14650,8 @@ class App(tk.Tk):
             if self.remote_control_server is not None and self.db is not None:
                 self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
                 self._refresh_remote_players_cache()
+                self._refresh_remote_moves_cache()
+                self._refresh_remote_dirto_permissions_cache()
                 self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
                 self._remote_has_pending_moves = self.db.count_seat_moves() > 0
                 self._maybe_reclaim_default_remote_port()
@@ -13636,6 +14750,42 @@ class App(tk.Tk):
         if phone_pid == os.getpid():
             open_windows.bring_pid_to_front(phone_pid)
 
+    def _refresh_remote_control_code_label(self):
+        """Tient à jour le libellé "Code : XXXXXX" de Paramètres (demande
+        du 2026-09-19) : ce code est calculé une seule fois à la
+        construction de l'onglet (voir _build_tabs, commentaire "pas
+        besoin de rafraîchir ce libellé à chaque tick" — hypothèse
+        invalidée par un incident réel où le fichier partagé avait été
+        régénéré, avec un code différent, pendant qu'un tournoi restait
+        ouvert : le libellé affichait alors un code périmé sans que le
+        responsable ne puisse s'en rendre compte).
+
+        Continue d'utiliser open_windows.remote_session_code() — la
+        SEULE source de vérité déjà partagée par /authenticate (voir
+        open_windows.verify_remote_code) — jamais un cache/état séparé
+        recréé ici : simple lecture, jamais une régénération (remote_
+        session_code() ne régénère que si le fichier a disparu, ce qui
+        n'est jamais provoqué par une simple lecture).
+
+        Appelé depuis _tick UNIQUEMENT tant que l'onglet Paramètres est
+        affiché (jamais à chaque tick de CHAQUE fenêtre ouverte, pour
+        rester un travail négligeable : une lecture d'un petit fichier
+        JSON sous verrou, pas plus coûteuse que les autres lectures déjà
+        faites à ce rythme ailleurs dans _tick), et ne touche le widget
+        que si le texte a réellement changé."""
+        code_lbl = getattr(self, "remote_control_code_lbl", None)
+        if code_lbl is None:
+            return
+        try:
+            if not code_lbl.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        code = open_windows.remote_session_code()
+        new_text = f"Code : {code}" if code else ""
+        if code_lbl.cget("text") != new_text:
+            code_lbl.config(text=new_text)
+
     def _refresh_remote_players_cache(self):
         """Reconstruit self._remote_players_cache (liste de joueurs actifs
         pour la page "Éliminations" du contrôle à distance) depuis le
@@ -13659,6 +14809,54 @@ class App(tk.Tk):
             }
             for p in self.db.list_players(status="active")
         ]
+
+    def _refresh_remote_moves_cache(self):
+        """Reconstruit self._remote_moves_cache (mouvements ACTUELLEMENT
+        en attente pour la page "Mouvements" du contrôle à distance)
+        depuis le thread principal — jamais depuis le thread du serveur
+        web. Même source que l'onglet Mouvements (self.db.get_seat_moves,
+        déjà "pending only" par construction : une ligne confirmée, via
+        confirm_seat_move, ou tout le lot via clear_seat_moves, disparaît
+        immédiatement de cette même table — aucune logique séparée)."""
+        if not self.db:
+            self._remote_moves_cache = []
+            return
+        self._remote_moves_cache = [
+            {
+                "id": m["id"],
+                "player_name": m["player_name"],
+                "old_table_name": m["old_table_name"],
+                "old_seat": m["old_seat"],
+                "new_table_name": m["new_table_name"],
+                "new_seat": m["new_seat"],
+            }
+            for m in self.db.get_seat_moves()
+        ]
+
+    def _refresh_remote_dirto_permissions_cache(self):
+        """Reconstruit self._remote_dirto_permissions_cache (Phase 4,
+        "Sécurisation du Contrôle à distance", 2026-09-20) — {dirto_name
+        (tel que stocké, voir Database.set_dirto_authorization) ->
+        frozenset des clés REMOTE_PERMISSION_* accordées POUR CE
+        TOURNOI} — depuis le thread principal, jamais depuis le thread
+        du serveur de contrôle à distance (même remarque que _refresh_
+        remote_players_cache/_refresh_remote_moves_cache : self.db ne
+        doit JAMAIS être touché depuis ce dernier). Lu par remote_
+        control.py via get_dirto_permissions, appelé UNIQUEMENT quand le
+        propriétaire résolu de l'appareil est classé DIRTO au
+        Répertoire. Appelée au démarrage du serveur ET à chaque tick
+        (voir _tick) — une modification/un retrait fait depuis l'onglet
+        Paramètres (voir _on_grant_remote_dirto_permissions/_on_revoke_
+        remote_dirto_permissions, qui l'appellent aussi immédiatement)
+        prend donc effet pour le téléphone sans nouvelle authentification,
+        au plus tard au tick suivant (~1s)."""
+        if not self.db:
+            self._remote_dirto_permissions_cache = {}
+            return
+        self._remote_dirto_permissions_cache = {
+            auth["dirto_name"]: frozenset(auth["permissions"])
+            for auth in self.db.list_dirto_authorizations()
+        }
 
     def _cancel_tick(self):
         after_id = getattr(self, "_tick_after_id", None)

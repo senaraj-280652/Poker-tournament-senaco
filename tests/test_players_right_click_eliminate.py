@@ -53,12 +53,14 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 from tkinter import ttk  # noqa: E402
 
 import database  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -318,7 +320,12 @@ class PlayersTreeRightClickTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : cls.root lui-même n'a pas de cycle direct ici
+        # (les cycles de cette classe sont sur self.win, un SimpleNamespace
+        # distinct — voir setUp), mais reste une référence de classe
+        # jamais nulle sans ce correctif.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="players_right_click_test_")
@@ -327,7 +334,6 @@ class PlayersTreeRightClickTest(unittest.TestCase):
         self.addCleanup(self.db.conn.close)
 
         self.tree = ttk.Treeview(self.root, columns=("name",), show="headings")
-        self.addCleanup(self.tree.destroy)
         self.tree.heading("name", text="Nom")
         self.tree.pack()
 
@@ -352,6 +358,12 @@ class PlayersTreeRightClickTest(unittest.TestCase):
         self.win._on_players_tree_right_click = types.MethodType(
             main.App._on_players_tree_right_click, self.win
         )
+        # cleanup_tk (voir tests/_tk_cleanup.py) : self.win (SimpleNamespace)
+        # ferme un cycle avec self (TestCase, via fake_eliminate/fake_undo
+        # qui closent sur self) et avec lui-même (_on_players_tree_right_
+        # click liée à self.win) — remplace l'ancien addCleanup(self.tree.
+        # destroy) séparé, "tree" est traité ici avec "win".
+        self.addCleanup(lambda: cleanup_tk(self, "tree", "win"))
 
     def _insert_row(self, pid, name):
         self.tree.insert("", "end", iid=str(pid), values=(name,))

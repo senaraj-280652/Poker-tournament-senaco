@@ -31,12 +31,14 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
 
 import database  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -76,7 +78,11 @@ class PendingRebalanceMacBadgeTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : les 4 méthodes de main.App greffées sur
+        # cls.root dans setUp forment chacune un cycle (méthode liée dont
+        # __self__ est cls.root) que seul gc.collect() peut réclamer.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         prefs_patcher = patch.object(database.export_prefs, "load_value", return_value=True)
@@ -124,6 +130,7 @@ class PendingRebalanceMacBadgeTest(unittest.TestCase):
         )
         self.win._refresh_all = MagicMock()
         self.win._refresh_remote_players_cache = MagicMock()
+        self.win._refresh_remote_moves_cache = MagicMock()
         self.win._trigger_movement_alert = MagicMock()
         self.win._finish_movement_alert = MagicMock()
 

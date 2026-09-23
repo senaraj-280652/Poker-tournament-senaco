@@ -54,12 +54,14 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 
 import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -84,7 +86,17 @@ class AskEliminatorPositionUnitTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (demande du 2026-09-19, chantier "crash Tcl/Tk") :
+        # destroy() seul ne détruit que le côté Tcl — les 3 méthodes de
+        # main.App greffées sur cls.root dans setUp (_is_position_
+        # onscreen, _ask_eliminator_position, _save_ask_eliminator_
+        # position, _on_ask_eliminator_window_configure, chacune une
+        # méthode liée dont __self__ est cls.root lui-même) forment
+        # chacune un cycle de références que seul le ramasse-miettes
+        # cyclique peut réclamer. cleanup_tk force ce ramassage ICI, sur
+        # le thread principal, avant qu'un thread HTTP d'un test
+        # ultérieur ne puisse s'en charger par hasard.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="ask_eliminator_position_test_")

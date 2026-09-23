@@ -32,6 +32,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
@@ -40,6 +41,7 @@ import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import open_windows  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -54,7 +56,11 @@ class TickNeverStopsSchedulingTest(unittest.TestCase):
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.addCleanup(self.root.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : plusieurs méthodes de main.App greffées plus
+        # bas sur self.win (= self.root) forment chacune un cycle,
+        # réclamé ici par gc.collect() sur le thread principal.
+        self.addCleanup(lambda: cleanup_tk(self, "root", "win"))
 
         self._tmp = tempfile.TemporaryDirectory(prefix="tick_robustness_test_")
         self.addCleanup(self._tmp.cleanup)

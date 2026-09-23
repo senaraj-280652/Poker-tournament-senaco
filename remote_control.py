@@ -104,20 +104,96 @@ l'onglet Joueurs — rien de destructeur, rien qui touche aux données du
 tournoi autrement que par une élimination normale.
 """
 import json
+import logging
+import logging.handlers
 import os
 import re
 import secrets
 import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import open_windows
+import roster
 import version
 
 DEFAULT_PORT = 8765
+
+# =====================================================================
+# Journal DIAGNOSTIQUE du contrôle à distance (demande du 2026-09-19,
+# "bétonner la communication téléphone <-> PC", suite à un incident réel
+# en club où la page Joueurs/Éliminations avait cessé de communiquer
+# sans qu'aucune trace n'existe nulle part pour le diagnostiquer après
+# coup). Volontairement SOBRE : uniquement les événements ANORMAUX (401,
+# 502/proxy injoignable, requête dupliquée ignorée) — jamais une ligne
+# par requête réussie (voir Handler.log_message plus bas, délibérément
+# silencieux depuis l'origine de ce module, pour rester bruyant à ce
+# seul endroit et nulle part ailleurs).
+#
+# Emplacement (identique Mac ET Windows, même convention que crash.log/
+# menu_principal_child.log dans main.py) :
+#   ~/.poker_tournament/remote_control.log
+# soit concrètement :
+#   Mac     : /Users/<compte>/.poker_tournament/remote_control.log
+#   Windows : %USERPROFILE%\.poker_tournament\remote_control.log
+#
+# Rotation automatique (RotatingFileHandler, bibliothèque standard) :
+# 1 Mo par fichier, 2 fichiers de sauvegarde conservés au maximum
+# (remote_control.log, .log.1, .log.2) — 3 Mo au total au pire, jamais
+# une croissance illimitée sur des mois d'utilisation du club.
+#
+# JAMAIS journalisé ici : mot de passe, code d'accès à 6 chiffres,
+# cookie (rc_bid/rc_auth/selected_pid), ou tout autre secret — les
+# appelants ne passent en `fields` que method/path/status/port/pid/type
+# d'erreur, jamais self.headers ni une valeur de cookie brute (voir
+# chaque site d'appel ci-dessous).
+_LOG_DIR = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+_LOG_PATH = os.path.join(_LOG_DIR, "remote_control.log")
+_LOG_MAX_BYTES = 1_000_000
+_LOG_BACKUP_COUNT = 2
+_logger = None
+
+
+def _get_remote_logger():
+    global _logger
+    if _logger is not None:
+        return _logger
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    logger = logging.getLogger("poker_tournament.remote_control")
+    logger.setLevel(logging.INFO)
+    for old_handler in list(logger.handlers):
+        old_handler.close()
+        logger.removeHandler(old_handler)
+    handler = logging.handlers.RotatingFileHandler(
+        _LOG_PATH, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUP_COUNT, encoding="utf-8"
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    _logger = logger
+    return _logger
+
+
+def log_remote_event(event, **fields):
+    """Ajoute une ligne au journal diagnostique ci-dessus pour un
+    événement ANORMAL du contrôle à distance — jamais pour une requête
+    réussie. `fields` : uniquement des valeurs déjà sûres à écrire en
+    clair (method, path, status, port, pid, type d'erreur...) — QUE
+    l'appelant est responsable de choisir : cette fonction ne filtre
+    rien elle-même, elle fait confiance à ses appelants (tous internes à
+    ce fichier ou à main.py) pour ne jamais lui passer un cookie ou un
+    code d'accès. N'échoue JAMAIS : un souci d'écriture du journal
+    (disque plein, permissions...) ne doit jamais faire échouer la
+    requête HTTP réelle qui a déclenché cet appel."""
+    try:
+        parts = " ".join(f"{k}={v}" for k, v in fields.items())
+        _get_remote_logger().info("%s %s", event, parts)
+    except Exception:
+        pass
 
 # Les 3 actions possibles, identiques à celles des raccourcis clavier
 # (voir App._bind_voice_command_shortcuts) — un mot en dehors de cette
@@ -126,7 +202,251 @@ _VALID_ACTIONS = {
     "elimination", "chronometre", "terminer",
     "tables", "mouvements", "toggle_pause", "niveau_precedent", "niveau_suivant",
     "tables_zoom_moins", "tables_zoom_plus",
+    "mouvements_bas", "mouvements_haut",
 }
+
+# =====================================================================
+# Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à distance",
+# 2026-09-20) — application RÉELLE des autorisations accordées par
+# Phase 3 (voir database.py: REMOTE_PERMISSION_LABELS/remote_
+# authorizations). Les 7 chaînes ci-dessous sont dupliquées ici en
+# LITTÉRAUX plutôt qu'importées de database.py : remote_control.py reste
+# volontairement sans dépendance vers ce module (voir la docstring de
+# RemoteControlServer — chaque callback isole ce fichier de SQLite/
+# Tkinter) ; elles forment un contrat stable, déjà gravé dans le JSON
+# persisté par Database.set_dirto_authorization.
+_PERM_ELIMINATIONS = "eliminations"
+_PERM_TABLES = "tables"
+_PERM_MOVES = "moves"
+_PERM_CLOCK = "clock"
+_PERM_LEVELS = "levels"
+_PERM_PHOTOS = "photos"
+_PERM_REBALANCE = "rebalance"
+
+# Accès total (rôle ADMIN) : un objet distinct de "toutes les clés
+# valides actuellement" n'aurait aucun sens ici — un ADMIN n'est jamais
+# limité par cette liste, elle sert uniquement à satisfaire les mêmes
+# tests d'appartenance ("permission in permissions") que pour un DIRTO,
+# sans dupliquer la logique de vérification par rôle.
+_ALL_PERMISSIONS = frozenset({
+    _PERM_ELIMINATIONS, _PERM_TABLES, _PERM_MOVES, _PERM_CLOCK,
+    _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE,
+})
+
+# "elimination" (bouton "⏸ Joueurs" de la page principale, PAS la page
+# "Gérer les éliminations") : bascule l'onglet Joueurs du Mac au premier
+# plan et met le chrono en pause (voir App._voice_start_elimination) —
+# corrigé le 2026-09-22 (anomalie constatée en test réel iPhone) : cette
+# commande n'a JAMAIS fait partie de l'inventaire des 7 permissions
+# établi en Phase 3 (voir database.py: REMOTE_PERMISSION_LABELS —
+# "eliminations" n'y couvre QUE /eliminate et /players, jamais cette
+# action) et reste totalement INDÉPENDANTE de GET /players / POST
+# /eliminate (la page "Gérer les éliminations" du téléphone ne déclenche
+# jamais /action/elimination, voir _ELIMINATE_PAGE). Comme "Terminer le
+# tournoi", elle est donc réservée à l'ADMIN, structurellement absente de
+# _ACTION_PERMISSION ci-dessous — vérifiée séparément par rôle (voir
+# do_POST), jamais par appartenance à `permissions`.
+_ADMIN_ONLY_ACTIONS = frozenset({"elimination"})
+
+# Mapping EXACT mot-clé (/action/<mot>) -> permission requise. Couvre les
+# 11 clés de _VALID_ACTIONS RESTANTES (12 moins "elimination" ci-dessus,
+# voir App._on_voice_word dans main.py pour ce que fait réellement
+# chaque mot — c'est cette implémentation, jamais son seul nom, qui fixe
+# le regroupement) : "terminer"/"mouvements"/"mouvements_bas"/
+# "mouvements_haut" agissent tous sur le bandeau/la file des mouvements ;
+# "chronometre"/"toggle_pause" sur le chrono ; "tables"/"tables_zoom_
+# moins"/"tables_zoom_plus" sur le Plan des tables ; "niveau_precedent"/
+# "niveau_suivant" sur la structure de blindes.
+_ACTION_PERMISSION = {
+    "chronometre": _PERM_CLOCK,
+    "terminer": _PERM_MOVES,
+    "tables": _PERM_TABLES,
+    "mouvements": _PERM_MOVES,
+    "toggle_pause": _PERM_CLOCK,
+    "niveau_precedent": _PERM_LEVELS,
+    "niveau_suivant": _PERM_LEVELS,
+    "tables_zoom_moins": _PERM_TABLES,
+    "tables_zoom_plus": _PERM_TABLES,
+    "mouvements_bas": _PERM_MOVES,
+    "mouvements_haut": _PERM_MOVES,
+}
+
+# Mapping route GET -> permission requise (pages ET données JSON qu'elles
+# consomment — voir l'inventaire de database.py: REMOTE_PERMISSION_LABELS,
+# établi avant codage en Phase 3). "/", "/index.html", "/lobbylist",
+# "/select_tournament", "/login", "/auth_status", "/authenticate" sont
+# volontairement ABSENTES : traitées avant résolution du rôle (voir
+# do_GET/do_POST) ou par un rendu propre au rôle (page d'accueil).
+_GET_ROUTE_PERMISSION = {
+    "/eliminate": _PERM_ELIMINATIONS, "/eliminate.html": _PERM_ELIMINATIONS,
+    "/players": _PERM_ELIMINATIONS,
+    "/photos": _PERM_PHOTOS, "/photos.html": _PERM_PHOTOS,
+    "/roster_players": _PERM_PHOTOS, "/photo_image": _PERM_PHOTOS,
+    "/moves": _PERM_MOVES, "/moves.html": _PERM_MOVES,
+    "/moves_pending": _PERM_MOVES,
+    "/rebalance_pending": _PERM_REBALANCE,
+}
+
+# "/clock_state" : cas particulier volontairement absent de _GET_ROUTE_
+# PERMISSION — alimente à la fois l'indicateur pause/lecture (clock) ET
+# le clignotement "Afficher Mouvements" (moves) sur TOUTES les pages ;
+# accessible dès que l'une des deux est accordée, jamais une 8e
+# permission séparée (le cahier des charges en exige exactement 7).
+_CLOCK_STATE_PERMISSIONS = frozenset({_PERM_CLOCK, _PERM_MOVES})
+
+# Mapping route POST -> permission requise. "/action/<mot>" est traité à
+# part (voir _ACTION_PERMISSION) ; "/authenticate" et "/end_tournament"
+# sont volontairement absentes (la première est pré-niveau-1, la seconde
+# est réservée ADMIN par construction — voir do_POST).
+_POST_ROUTE_PERMISSION = {
+    "/eliminate": _PERM_ELIMINATIONS,
+    "/confirm_move": _PERM_MOVES,
+    "/upload_photo": _PERM_PHOTOS,
+    "/delete_photo": _PERM_PHOTOS,
+    "/rebalance_answer": _PERM_REBALANCE,
+}
+
+# Message affiché/renvoyé tel quel (page d'accueil ET réponses JSON de
+# refus) pour un appareil SANS propriétaire ou un DIRTO sans la moindre
+# autorisation pour CE tournoi (règle Phase 3 : "aucune autorisation
+# existante" = zéro permission, jamais distingué ici d'un DIRTO
+# explicitement autorisé mais dont les 7 cases ont été décochées — même
+# traitement, même message, décision explicite de simplicité/sûreté).
+_NO_PERMISSION_MESSAGE = "Aucune fonction autorisée — contactez un ADMIN."
+
+
+def _strip_permission_sections(html, permissions):
+    """Retire de `html` chaque bloc <!--PERM:X-->...<!--/PERM:X--> dont
+    X n'est pas dans `permissions` ; les blocs conservés perdent
+    uniquement leurs marqueurs (jamais leur contenu). Simple recherche
+    de sous-chaînes (jamais une regex sur du HTML arbitraire) : les
+    marqueurs sont des littéraux fixes posés à la main dans
+    _PAGE_TEMPLATE, pas du contenu utilisateur. N'est JAMAIS LA
+    protection réelle (voir la docstring de _resolve_role plus bas) —
+    seulement l'ergonomie "n'afficher que les fonctions autorisées" de
+    la Phase 4 ; le contrôle qui compte est refait côté serveur pour
+    chaque route, que ce bloc ait été retiré ou non de ce qui a été
+    affiché."""
+    for key in (
+        _PERM_ELIMINATIONS, _PERM_TABLES, _PERM_MOVES, _PERM_CLOCK,
+        _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE,
+    ):
+        open_tag = f"<!--PERM:{key}-->"
+        close_tag = f"<!--/PERM:{key}-->"
+        if key in permissions:
+            html = html.replace(open_tag, "").replace(close_tag, "")
+        else:
+            result = []
+            i = 0
+            while True:
+                start = html.find(open_tag, i)
+                if start == -1:
+                    result.append(html[i:])
+                    break
+                result.append(html[i:start])
+                end = html.index(close_tag, start) + len(close_tag)
+                i = end
+            html = "".join(result)
+    return html
+
+
+def _strip_admin_only_sections(html, is_admin):
+    """Retire de `html` chaque bloc <!--ADMIN_ONLY-->...<!--/ADMIN_ONLY-->
+    si `is_admin` est faux (bloc entier omis) ; sinon les deux
+    marqueurs sont simplement effacés, le contenu reste. Utilisé pour
+    la section "Fin de la partie" : jamais accordable à un DIRTO, quel
+    que soit l'état de ses permissions (voir _resolve_role)."""
+    open_tag = "<!--ADMIN_ONLY-->"
+    close_tag = "<!--/ADMIN_ONLY-->"
+    if is_admin:
+        return html.replace(open_tag, "").replace(close_tag, "")
+    result = []
+    i = 0
+    while True:
+        start = html.find(open_tag, i)
+        if start == -1:
+            result.append(html[i:])
+            break
+        result.append(html[i:start])
+        end = html.index(close_tag, start) + len(close_tag)
+        i = end
+    html = "".join(result)
+    return html
+
+
+# Petite page affichée à la place de l'accueil normal pour un appareil
+# SANS propriétaire ou un DIRTO à zéro permission pour ce tournoi — voir
+# _NO_PERMISSION_MESSAGE. Pas de bouton, pas de sondage périodique :
+# rien à afficher tant que ce statut n'a pas changé sur le PC (voir
+# _refresh_remote_dirto_permissions_cache dans main.py). Le bouton 🔄
+# reste présent (voir _RELOAD_SCRIPT) pour recharger après qu'un ADMIN a
+# accordé une autorisation, sans devoir couper/rouvrir Safari.
+_NO_ACCESS_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Contrôle à distance</title>
+<style>
+  body {{
+    margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    text-align: center;
+  }}
+  #btn-reload {{
+    position: fixed; top: 14px; right: 14px; width: 40px; height: 40px;
+    max-width: 40px; margin: 0; padding: 0; border-radius: 50%;
+    background: #1c3d2c; font-size: 18px; line-height: 40px; border: none;
+    color: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.4);
+  }}
+  h1 {{ font-size: 17px; color: #e8c468; margin: 0 0 2px; }}
+  .tournoi {{ color: #b9ad8f; font-size: 13px; margin: 0 0 26px; }}
+  p.msg {{ color: #d98a5f; font-size: 16px; max-width: 320px; margin: 0 auto; }}
+</style>
+</head>
+<body>
+  <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
+  <h1>🎙 Contrôle à distance</h1>
+  <p class="tournoi">{tournament_name}</p>
+  <p class="msg">{message}</p>
+<script>
+{auth_redirect_script}
+{reload_script}
+</script>
+</body>
+</html>
+"""
+
+# Page de refus générique pour une PAGE (GET /eliminate, /photos, /moves)
+# demandée sans la permission requise — jamais utilisée pour l'accueil
+# lui-même (voir _NO_ACCESS_PAGE ci-dessus) ni pour une route de données
+# JSON (voir _send_permission_denied, qui renvoie du JSON dans ce cas).
+_FORBIDDEN_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Contrôle à distance</title>
+<style>
+  body {{
+    margin: 0; padding: 40px 20px; min-height: 100vh; box-sizing: border-box;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    text-align: center;
+  }}
+  h1 {{ font-size: 17px; color: #e8c468; margin: 0 0 26px; }}
+  p.msg {{ color: #d98a5f; font-size: 16px; max-width: 320px; margin: 0 auto 26px; }}
+  a {{ color: #8fc4d6; }}
+</style>
+</head>
+<body>
+  <h1>🎙 Contrôle à distance</h1>
+  <p class="msg">{message}</p>
+  <p><a href="/">← Retour à l'accueil</a></p>
+</body>
+</html>
+"""
 
 # Petit bouton 🔄 en haut à droite de chaque page (voir #btn-reload dans
 # chacun des templates ci-dessous) : recharge la page avec un paramètre
@@ -183,7 +503,8 @@ _AUTH_EXEMPT_PATHS = {"/login", "/authenticate", "/auth_status"}
 # rediriger lui-même vers /login.
 _AUTH_PAGE_PATHS = {
     "/", "/index.html", "/eliminate", "/eliminate.html",
-    "/photos", "/photos.html", "/lobbylist", "/select_tournament",
+    "/photos", "/photos.html", "/moves", "/moves.html",
+    "/lobbylist", "/select_tournament",
 }
 
 
@@ -203,15 +524,38 @@ def _parse_cookie(cookie_header, name):
 _BROWSER_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 # Injecté en tout début du <script> de chaque page accessible une fois
-# authentifié (voir _PAGE_TEMPLATE/_ELIMINATE_PAGE/_PHOTOS_PAGE) : dès
-# qu'une session serveur devient invalide (nouvelle session côté PC,
-# donc nouveau code/jetons — voir open_windows._ensure_remote_session_
-# auth_locked — OU appareil révoqué entre-temps), toute réponse 401
-# d'un fetch() quelconque de la page renvoie directement au formulaire
-# de code plutôt que de laisser la page continuer à afficher des
-# données obsolètes/vides silencieusement. Une seule interception
-# centrale plutôt que de modifier individuellement chaque .then() de
-# chaque page (il y en a une bonne dizaine, réparties sur 4 templates).
+# authentifié (voir _PAGE_TEMPLATE/_ELIMINATE_PAGE/_PHOTOS_PAGE/
+# _MOVES_PAGE/_NO_ACCESS_PAGE) : dès qu'une session serveur devient
+# invalide (nouvelle session côté PC, donc nouveau code/jetons — voir
+# open_windows._ensure_remote_session_auth_locked — OU appareil révoqué
+# entre-temps), toute réponse 401 d'un fetch() quelconque de la page
+# renvoie directement au formulaire de code plutôt que de laisser la
+# page continuer à afficher des données obsolètes/vides silencieusement.
+# Une seule interception centrale plutôt que de modifier individuel-
+# lement chaque .then() de chaque page (il y en a une bonne dizaine,
+# réparties sur plusieurs templates).
+#
+# Sondage automatique du rôle/des permissions (demande du 2026-09-24,
+# "synchronisation automatique permissions" — incident réel : MARIE,
+# DIRTO, restait bloquée sur "Aucune fonction autorisée" après que RAJ
+# lui a accordé "Gérer les éliminations", sans qu'aucun mécanisme ne
+# revérifie jamais l'autorisation d'une page déjà ouverte) : interroge
+# GET /permission_state toutes les 3s (même cadence que /clock_state,
+# déjà établie dans cette page) — accessible à TOUT appareil authentifié
+# niveau 1, quel que soit son rôle/ses permissions actuels (voir do_GET,
+# jamais gardée par une permission : sinon un appareil qui vient de
+# tout perdre ne pourrait justement plus détecter qu'il a tout perdu).
+# Ne fait QUE comparer une signature (rôle + permissions triées) à celle
+# du sondage précédent — jamais mise en cache comme autorité (voir la
+# docstring de resolve_role côté serveur, seule source de vérité réelle,
+# revérifiée à CHAQUE requête) : un écart déclenche un simple
+# rechargement complet de la page (reloadApp(), avec le même paramètre
+# anti-cache que le bouton 🔄 manuel), qui redemande alors un rendu
+# entièrement neuf au serveur — jamais une modification du DOM en place
+# à partir de données côté client. Le tout premier sondage ne fait
+# qu'enregistrer la référence (jamais de rechargement au chargement de
+# la page elle-même) ; un échec réseau ponctuel est ignoré en silence,
+# retenté au sondage suivant.
 _AUTH_REDIRECT_SCRIPT = (
     "(function() {\n"
     "  var _origFetch = window.fetch;\n"
@@ -224,6 +568,26 @@ _AUTH_REDIRECT_SCRIPT = (
     "      return response;\n"
     "    });\n"
     "  };\n"
+    "})();\n"
+    "(function() {\n"
+    "  var lastPermissionSignature = null;\n"
+    "  function pollPermissionState() {\n"
+    "    fetch('/permission_state').then(function(r) {\n"
+    "      if (!r.ok) throw new Error('permission_state_unavailable');\n"
+    "      return r.json();\n"
+    "    }).then(function(data) {\n"
+    "      var perms = (data.permissions || []).slice().sort();\n"
+    "      var signature = data.role + '|' + perms.join(',');\n"
+    "      if (lastPermissionSignature === null) {\n"
+    "        lastPermissionSignature = signature;\n"
+    "        return;\n"
+    "      }\n"
+    "      if (signature !== lastPermissionSignature) {\n"
+    "        reloadApp();\n"
+    "      }\n"
+    "    }).catch(function() { /* réseau/tournoi momentanément indisponible : retenté au prochain sondage */ });\n"
+    "  }\n"
+    "  setInterval(pollPermissionState, 3000);\n"
     "})();"
 )
 
@@ -422,6 +786,15 @@ _PAGE_TEMPLATE = """<!doctype html>
   #btn-tables-zoom-moins, #btn-tables-zoom-plus {{
     flex: 0 0 52px; background: #4a4a4a; font-size: 14px; padding: 0;
   }}
+  /* Petites flèches ↓/↑ de part et d'autre de "Afficher Mouvements"
+     (demande du 2026-09-20) — même principe que .zoom-row ci-dessus,
+     réutilisée telle quelle (voir le <div class="zoom-row"> du bouton
+     #btn-mouvements plus bas) : ne déplacent QUE le bandeau du Chrono
+     Projo, ne confirment/suppriment jamais un mouvement. */
+  #btn-mouvements {{ flex: 1; }}
+  #btn-mouvements-bas, #btn-mouvements-haut {{
+    flex: 0 0 52px; background: #4a4a4a; font-size: 14px; padding: 0;
+  }}
   #status {{
     max-width: 420px; margin: 20px auto 0; min-height: 22px;
     color: #b9ad8f; font-size: 15px;
@@ -451,28 +824,48 @@ _PAGE_TEMPLATE = """<!doctype html>
   <p class="version">v{app_version}</p>
 
   {lobby_button}
+  <!--PERM:eliminations-->
   <button id="btn-eliminations" onclick="window.location.href='/eliminate'">🎯 Gérer les éliminations</button>
+  <!--/PERM:eliminations-->
+  <!--PERM:tables-->
   <div class="zoom-row">
     <button id="btn-tables-zoom-moins" onclick="sendAction('tables_zoom_moins', this)" title="Rétrécir l'écran Tables sur le PC">Z−</button>
     <button id="btn-tables" onclick="sendAction('tables', this)">🗺 Plan des tables</button>
     <button id="btn-tables-zoom-plus" onclick="sendAction('tables_zoom_plus', this)" title="Agrandir l'écran Tables sur le PC">Z+</button>
   </div>
-  <button id="btn-mouvements" onclick="sendAction('mouvements', this)">📋 Afficher Mouvements</button>
+  <!--/PERM:tables-->
+  <!--PERM:moves-->
+  <div class="zoom-row">
+    <button id="btn-mouvements-bas" onclick="sendAction('mouvements_bas', this)" title="Descendre le bandeau Mouvements sur le PC">↓</button>
+    <button id="btn-mouvements" onclick="showMoves()">📋 Afficher Mouvements</button>
+    <button id="btn-mouvements-haut" onclick="sendAction('mouvements_haut', this)" title="Monter le bandeau Mouvements sur le PC">↑</button>
+  </div>
   <button id="btn-terminer" onclick="sendAction('terminer', this)">✅ Mouvements terminés</button>
+  <!--/PERM:moves-->
+  <!--PERM:clock-->
   <div class="chrono-row">
     <button id="btn-chronometre" onclick="sendAction('chronometre', this)">▶ Chronomètre</button>
     <button id="btn-pause-toggle" onclick="togglePause()" title="Met en pause / relance le chrono">OFF</button>
   </div>
+  <!--/PERM:clock-->
+  <!--PERM:levels-->
   <button id="btn-niveau-precedent" onclick="sendAction('niveau_precedent', this)">⏮ Niveau Précédent</button>
   <button id="btn-niveau-suivant" onclick="sendAction('niveau_suivant', this)">⏭ Niveau Suivant</button>
+  <!--/PERM:levels-->
+  <!--ADMIN_ONLY-->
   <button id="btn-elimination" onclick="sendAction('elimination', this)">⏸ Joueurs</button>
+  <!--/ADMIN_ONLY-->
+  <!--PERM:photos-->
   <button id="btn-photos" onclick="window.location.href='/photos'">📷 Photos des joueurs</button>
+  <!--/PERM:photos-->
 
   <p id="status"></p>
 
+  <!--ADMIN_ONLY-->
   <div id="end-tournament-section">
     <button id="btn-end-tournament" onclick="confirmEndTournament()">⛔ Fin de la partie</button>
   </div>
+  <!--/ADMIN_ONLY-->
 
 <script>
 {auth_redirect_script}
@@ -567,6 +960,19 @@ function sendAction(action, btn) {{
     .catch(function(e) {{
       status.textContent = 'Échec (' + e.message + ') — vérifiez le wifi.';
     }});
+}}
+// "Afficher Mouvements" (demande du 2026-09-19) : continue de ramener
+// l'onglet Mouvements au premier plan sur le Mac (comportement
+// historique inchangé, voir on_word('mouvements')) ET navigue en plus
+// le téléphone vers la nouvelle page listant chaque mouvement avec son
+// propre bouton [OK]. keepalive:true (au lieu de sendAction/fetch
+// classique) : garantit que cette requête POST est bien envoyée même si
+// la navigation qui suit l'interrompt avant qu'elle n'ait eu le temps de
+// se terminer normalement — un fetch() ordinaire risquerait d'être
+// annoncé par le navigateur au moment du changement de page.
+function showMoves() {{
+  fetch('/action/mouvements', {{ method: 'POST', keepalive: true }}).catch(function() {{}});
+  window.location.href = '/moves';
 }}
 
 // Petit bouton ON/OFF à côté de "Chronomètre" : reflète et bascule
@@ -697,6 +1103,22 @@ _ELIMINATE_PAGE = """<!doctype html>
     padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
   }}
   #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  /* Indicateur de communication (demande du 2026-09-19, "bétonner la
+     communication téléphone <-> PC") : discret (petit point + texte
+     court), jamais un popup — l'utilisateur doit pouvoir d'un coup
+     d'œil savoir si la liste affichée est fraîche ou potentiellement
+     périmée, sans qu'un message ne s'impose à chaque sondage raté. */
+  #conn-indicator {{
+    display: flex; align-items: center; gap: 5px; font-size: 11px;
+    color: #9fb8a8; padding: 2px 0;
+  }}
+  #conn-indicator .dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #4caf6d; flex: none;
+  }}
+  #conn-indicator.conn-reconnecting .dot {{ background: #e8c468; }}
+  #conn-indicator.conn-lost .dot {{ background: #d9534f; }}
+  #conn-indicator.conn-reconnecting {{ color: #e8c468; }}
+  #conn-indicator.conn-lost {{ color: #d9534f; }}
   /* "← Retour" : un vrai bouton tactile (fond plein, coins arrondis,
      zone de frappe confortable), pas un simple lien texte discret —
      pour qu'il soit immédiatement identifiable comme actionnable sur un
@@ -712,13 +1134,28 @@ _ELIMINATE_PAGE = """<!doctype html>
     background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
     padding: 0; -webkit-tap-highlight-color: transparent;
   }}
-  #columns {{ display: flex; height: calc(100% - 46px); min-height: 0; }}
+  /* 46px de #topbar + ~18px de #conn-indicator (ajouté le 2026-09-19) :
+     évite que #columns ne déborde sous overflow:hidden. */
+  #columns {{ display: flex; height: calc(100% - 64px); min-height: 0; }}
   .col {{ flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }}
   .col-left {{ border-right: 2px solid #294235; }}
   .col h2 {{
     margin: 0; padding: 10px; font-size: 15px; text-align: center;
     background: #0b1c15; color: #e8c468; position: sticky; top: 0;
   }}
+  /* "ÉLIMINÉ"/"ÉLIMINATEUR" en majuscules et en couleur distincte de
+     part et d'autre (demande du 2026-09-20) : text-transform plutôt que
+     retaper le texte en dur, pour ne jamais risquer une faute d'accent
+     sur la version majuscule. Teintes dérivées de la palette rouge/bleu
+     déjà utilisée ailleurs dans cette page (#b5442e "Éliminations" /
+     #2c6e8a "Niveau"), mais éclaircies : ces deux couleurs d'origine
+     sont pensées comme fond de bouton (texte blanc par-dessus), pas
+     comme texte directement sur le fond très sombre #0b1c15 de ce
+     bandeau — contraste vérifié ≥ 4,5:1 (WCAG AA) avec les teintes
+     choisies ici, très en dessous avec les couleurs d'origine (~3.2:1),
+     important pour une lecture rapide en pleine partie. */
+  .col-left h2 {{ color: #d9614a; text-transform: uppercase; }}
+  .col-right h2 {{ color: #5fa8cc; text-transform: uppercase; }}
   /* min-height: 0 est essentiel ici : par défaut, un enfant flexible ne
      peut pas se réduire en dessous de la taille de son propre contenu
      (min-height: auto implicite), donc cette liste s'étirait pour
@@ -769,6 +1206,7 @@ _ELIMINATE_PAGE = """<!doctype html>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
+  <div id="conn-indicator" class="conn-ok"><span class="dot"></span><span id="conn-text">Connecté</span></div>
   <div id="columns">
     <div class="col col-left">
       <h2>Éliminé — glisser vers →</h2>
@@ -787,11 +1225,67 @@ var players = [];
 var lastSignature = null;
 var pending = null;    // candidat de glissement pas encore confirmé : {{id, label, sub, el, startX, startY, engaged}}
 var hoverTarget = null;
-var refreshTimer = null;
+var pollTimer = null;
 // Distance (px) à partir de laquelle on tranche entre "c'est un défilement"
 // (mouvement surtout vertical) et "c'est un glissement" (mouvement surtout
 // horizontal, colonne de gauche vers colonne de droite) — voir onTouchMove.
 var DRAG_THRESHOLD = 10;
+
+// ===================================================================
+// Fiabilité de la communication (demande du 2026-09-19, suite à un
+// incident réel en club où cette page était devenue muette sans le
+// moindre signe visible) : indicateur d'état, timeout explicite,
+// backoff raisonnable, distinction 401/502/réseau, jamais de catch vide.
+// ===================================================================
+var pollDelayMs = 4000;
+var POLL_DELAY_MIN_MS = 4000;
+var POLL_DELAY_MAX_MS = 20000;
+var consecutiveFailures = 0;
+var connState = 'ok';  // 'ok' | 'reconnecting' | 'lost'
+
+function setConnState(state) {{
+  if (state === connState) return;
+  connState = state;
+  var el = document.getElementById('conn-indicator');
+  var txt = document.getElementById('conn-text');
+  if (!el || !txt) return;
+  el.className = state === 'ok' ? 'conn-ok' : (state === 'reconnecting' ? 'conn-reconnecting' : 'conn-lost');
+  txt.textContent = state === 'ok' ? 'Connecté' : (state === 'reconnecting' ? 'Reconnexion…' : 'Connexion perdue');
+}}
+
+// AbortController : disponible sur Safari iOS depuis longtemps (iOS
+// 11.3+), donc sur toute cible réelle de ce contrôle à distance — un
+// timeout EXPLICITE évite qu'une connexion dégradée ne laisse un bouton
+// "en l'air" indéfiniment (sans lui, on dépendrait du timeout par
+// défaut du navigateur, très long et variable).
+function fetchWithTimeout(url, options, timeoutMs) {{
+  var opts = options || {{}};
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  if (controller) opts.signal = controller.signal;
+  var timer = controller ? setTimeout(function() {{ controller.abort(); }}, timeoutMs) : null;
+  var clear = function() {{ if (timer) clearTimeout(timer); }};
+  return fetch(url, opts).then(function(r) {{ clear(); return r; }}, function(e) {{ clear(); throw e; }});
+}}
+
+function scheduleNextPoll(ok) {{
+  if (pollTimer) clearTimeout(pollTimer);
+  // Backoff raisonnable sur échecs successifs (jamais de boucle
+  // agressive) : repart immédiatement à l'intervalle normal dès le
+  // premier succès retrouvé.
+  pollDelayMs = ok ? POLL_DELAY_MIN_MS : Math.min(pollDelayMs * 1.5, POLL_DELAY_MAX_MS);
+  pollTimer = setTimeout(loadPlayers, pollDelayMs);
+}}
+
+function tryRecoverViaLobby() {{
+  // 502/proxy injoignable de façon PERSISTANTE (demande du 2026-09-19,
+  // "si le tournoi n'existe réellement plus, revenir proprement au
+  // Lobby") : /lobbylist est TOUJOURS traité localement par ce serveur
+  // (jamais relayé, voir do_GET) — encore joignable même si le tournoi
+  // SÉLECTIONNÉ ne l'est plus. Réutilise l'architecture existante telle
+  // quelle (aucune deuxième route/mécanisme créé) : une simple
+  // navigation, exactement ce que fait déjà le bouton "🏛 Lobby".
+  window.location.href = '/lobbylist';
+}}
 
 function fmtLabel(p) {{
   return p.name;
@@ -805,15 +1299,71 @@ function fmtSub(p) {{
 
 function loadPlayers() {{
   // Ne pas rafraîchir pendant un glissement en cours : ça décrocherait
-  // l'élément suivi sous le doigt. Le prochain tic (4s après) rattrapera.
-  if (pending && pending.engaged) return;
-  fetch('/players').then(function(r) {{ return r.json(); }}).then(function(data) {{
+  // l'élément suivi sous le doigt. Le prochain sondage rattrapera.
+  if (pending && pending.engaged) {{ scheduleNextPoll(true); return; }}
+  fetchWithTimeout('/players', {{}}, 6000).then(function(r) {{
+    // 401 : le script d'interception globale de fetch() injecté en tête
+    // de cette page (voir _AUTH_REDIRECT_SCRIPT côté serveur) a DÉJÀ
+    // intercepté cette réponse avant que ce .then() ne s'exécute et
+    // déclenché la redirection vers /login — jamais traité comme une
+    // liste de joueurs ici, voir son propre code.
+    // 409 + tournament_gone (demande du 2026-09-19, correctif du
+    // routage silencieux vers un AUTRE tournoi) : le tournoi
+    // EXPLICITEMENT sélectionné par ce téléphone a disparu — signal
+    // DÉFINITIF, jamais une panne passagère, donc retour au Lobby
+    // IMMÉDIAT, sans attendre le seuil d'échecs consécutifs prévu pour
+    // un 502 transitoire (voir SELECTION_VANISHED côté serveur).
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{
+          setConnState('reconnecting');
+          tryRecoverViaLobby();
+        }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    // 502 (_proxy, tournoi cible injoignable) : jamais du JSON valide
+    // (page d'erreur HTML de send_error) — distingué explicitement,
+    // jamais transmis tel quel à .json().
+    if (r.status === 502) {{
+      consecutiveFailures++;
+      setConnState('reconnecting');
+      if (consecutiveFailures >= 5) {{ tryRecoverViaLobby(); }}
+      throw new Error('proxy_unreachable');
+    }}
+    if (!r.ok) {{ throw new Error('http_' + r.status); }}
+    return r.json();
+  }}).then(function(data) {{
+    if (!Array.isArray(data)) {{ throw new Error('format_inattendu'); }}
+    consecutiveFailures = 0;
+    setConnState('ok');
     var sig = JSON.stringify(data);
-    if (sig === lastSignature) return;  // rien n'a changé : pas de re-rendu (évite le clignotement et perd le défilement en cours)
-    lastSignature = sig;
-    players = data;
-    renderLists();
-  }}).catch(function() {{ /* réseau momentanément indisponible : on retentera */ }});
+    if (sig !== lastSignature) {{  // rien n'a changé : pas de re-rendu (évite le clignotement et perd le défilement en cours)
+      lastSignature = sig;
+      players = data;
+      renderLists();
+    }}
+    scheduleNextPoll(true);
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{
+      // Redirection déjà engagée par auth_redirect_script : rien de
+      // plus à faire ici qu'exposer l'état visuel le temps qu'elle
+      // prenne effet.
+      setConnState('lost');
+      return;
+    }}
+    if (e && e.message === 'tournament_gone') {{
+      // Navigation vers /lobbylist déjà engagée (voir ci-dessus) : rien
+      // de plus à faire, surtout pas reprogrammer un sondage sur cette
+      // page qu'on est en train de quitter.
+      return;
+    }}
+    consecutiveFailures++;
+    if (connState !== 'lost') {{
+      setConnState(consecutiveFailures >= 2 ? 'lost' : 'reconnecting');
+    }}
+    scheduleNextPoll(false);
+  }});
 }}
 
 function renderLists() {{
@@ -1023,6 +1573,41 @@ function onTouchEnd(e) {{
   }}
 }}
 
+// Identifiant de requête réutilisé pour un RETRY de la MÊME action
+// (demande du 2026-09-19) : évite qu'une élimination ne soit appliquée
+// deux fois côté serveur (voir main.py: App._remote_eliminate_request,
+// SEULE garantie réelle — jamais uniquement ce JavaScript) simplement
+// parce que l'utilisateur retente après un échec réseau. Une paire
+// (éliminé, éliminateur) DIFFÉRENTE obtient toujours un identifiant
+// différent ; la MÊME paire, retentée dans les 30s suivant un échec,
+// réutilise le même identifiant — passé cette fenêtre, une nouvelle
+// tentative est traitée comme une action neuve (rétention côté serveur
+// elle-même bornée à 5 minutes, voir _REMOTE_ACTION_DEDUP_TTL_SECONDS).
+var lastRequestIdByPair = {{}};
+var REQUEST_ID_REUSE_WINDOW_MS = 30000;
+
+function genRequestId() {{
+  if (window.crypto && typeof window.crypto.randomUUID === 'function') {{
+    return window.crypto.randomUUID();
+  }}
+  // Repli pour un Safari plus ancien sans crypto.randomUUID (iOS <
+  // 15.4) : suffisamment unique pour ce seul usage (dédoublonnage
+  // court terme côté serveur), jamais un secret.
+  return 'r' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}}
+
+function requestIdFor(eliminatedId, eliminatorId) {{
+  var key = eliminatedId + '|' + eliminatorId;
+  var now = Date.now();
+  var existing = lastRequestIdByPair[key];
+  if (existing && (now - existing.ts) < REQUEST_ID_REUSE_WINDOW_MS) {{
+    return existing.id;
+  }}
+  var id = genRequestId();
+  lastRequestIdByPair[key] = {{id: id, ts: now}};
+  return id;
+}}
+
 function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, eliminatedId, eliminatedLabel, eliminatedSub) {{
   var elimText = eliminatedLabel + (eliminatedSub ? ' ' + eliminatedSub : '');
   var elorText = eliminatorLabel + (eliminatorSub ? ' ' + eliminatorSub : '');
@@ -1031,11 +1616,23 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
   // salle de poker (on note d'abord qui est éliminé, puis par qui).
   var msg = elimText + '\\nest éliminé par\\n' + elorText + ' ?';
   if (!window.confirm(msg)) return;
-  fetch('/eliminate', {{
+  var requestId = requestIdFor(eliminatedId, eliminatorId);
+  fetchWithTimeout('/eliminate', {{
     method: 'POST',
     headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{eliminated_id: eliminatedId, eliminator_id: eliminatorId}})
-  }}).then(function(r) {{
+    body: JSON.stringify({{eliminated_id: eliminatedId, eliminator_id: eliminatorId, request_id: requestId}})
+  }}, 8000).then(function(r) {{
+    // 409 + tournament_gone (demande du 2026-09-19) : ce tournoi a
+    // disparu — cette élimination n'a JAMAIS pu être appliquée nulle
+    // part (voir SELECTION_VANISHED côté serveur, vérifié AVANT tout
+    // traitement métier). Message explicite, jamais confondu avec un
+    // simple problème réseau, puis retour immédiat au Lobby.
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ throw new Error('tournament_gone'); }}
+        throw new Error('erreur ' + r.status);
+      }});
+    }}
     if (!r.ok) throw new Error('erreur ' + r.status);
     return r.json();
   }}).then(function(data) {{
@@ -1047,15 +1644,30 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
       window.alert(data.message || 'Élimination refusée.');
       return;
     }}
+    setConnState('ok');
+    consecutiveFailures = 0;
     lastSignature = null;  // forcer le prochain rendu même si la liste redevient identique entre-temps
     loadPlayers();
   }}).catch(function(e) {{
-    window.alert('Échec : ' + e.message + ' — vérifiez le wifi.');
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{
+      window.alert("Ce tournoi n'est plus disponible — retour au Lobby. Cette élimination n'a été appliquée nulle part.");
+      tryRecoverViaLobby();
+      return;
+    }}
+    // Message volontairement rassurant sur la sécurité d'un nouvel essai
+    // (demande du 2026-09-19) : le mécanisme d'idempotence ci-dessus
+    // garantit qu'un retry de CETTE même action ne l'appliquera jamais
+    // deux fois, même si la première tentative a en réalité réussi côté
+    // serveur et que seule sa réponse a été perdue.
+    window.alert(
+      'Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.\\n'
+      + 'Vous pouvez retenter sans risque : cette action ne sera jamais appliquée deux fois.'
+    );
   }});
 }}
 
 loadPlayers();
-refreshTimer = setInterval(loadPlayers, 4000);
 {reload_script}
 </script>
 {rebalance_widget}
@@ -1460,6 +2072,303 @@ setInterval(loadPlayers, 4000);
 </html>
 """
 
+# Page "Mouvements" (demande du 2026-09-19, "ergonomie iPhone" — bouton
+# [OK] par ligne, en complément du bouton "Mouvements terminés" conservé
+# tel quel) : liste, une ligne par mouvement ENCORE en attente (via
+# /moves_pending, même source que get_has_pending_moves/count_seat_moves,
+# aucune logique séparée), triée par table de départ. Un OK confirme
+# UNIQUEMENT cette ligne (POST /confirm_move) — elle disparaît
+# immédiatement, les autres restent affichées. Le bouton "Mouvements
+# terminés" (bas de page, fixe) reste le MÊME /action/terminer que sur la
+# page principale, inchangé. Dès que la liste devient vide (dernier OK
+# individuel, ou "Mouvements terminés"), message bref puis retour
+# automatique à l'accueil — le même mécanisme normal de fin
+# (_finish_movement_alert) a déjà tout arrêté côté serveur à ce moment-là
+# (voir App._remote_confirm_move), jamais réimplémenté ici.
+_MOVES_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Mouvements</title>
+<style>
+  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
+  html, body {{
+    margin: 0; padding: 0; min-height: 100%;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  }}
+  #topbar {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
+  }}
+  #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  #conn-indicator {{
+    display: flex; align-items: center; gap: 5px; font-size: 11px;
+    color: #9fb8a8; padding: 2px 14px;
+  }}
+  #conn-indicator .dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #4caf6d; flex: none;
+  }}
+  #conn-indicator.conn-reconnecting .dot {{ background: #e8c468; }}
+  #conn-indicator.conn-lost .dot {{ background: #d9534f; }}
+  #conn-indicator.conn-reconnecting {{ color: #e8c468; }}
+  #conn-indicator.conn-lost {{ color: #d9534f; }}
+  #btn-back {{
+    border: none; border-radius: 8px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 9px 16px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
+  #btn-reload {{
+    width: 32px; height: 32px; border: none; border-radius: 50%;
+    background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
+    padding: 0; -webkit-tap-highlight-color: transparent;
+  }}
+  /* 90px de marge basse : dégage la place du bouton "Mouvements
+     terminés", fixe en bas d'écran (voir #footer), pour que la dernière
+     ligne de la liste ne se retrouve jamais cachée derrière lui. */
+  #moves-list {{ padding: 10px 14px 90px; overflow-y: auto; -webkit-overflow-scrolling: touch; }}
+  .move-row {{
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 12px 14px; margin-bottom: 8px; border-radius: 10px;
+    background: #1c3d2c; font-size: 15px; line-height: 1.35;
+  }}
+  .move-row .move-text {{ flex: 1; }}
+  .move-row button.btn-ok {{
+    flex: none; border: none; border-radius: 8px; background: #1f6b3a; color: #fff;
+    font-size: 15px; font-weight: 700; padding: 10px 18px;
+  }}
+  .move-row button.btn-ok:active {{ transform: scale(0.95); }}
+  #empty {{ text-align: center; color: #b9ad8f; padding: 40px 16px; font-size: 15px; }}
+  #footer {{
+    position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 14px;
+    background: #0b1c15; border-top: 1px solid #294235;
+  }}
+  #btn-terminer {{
+    display: block; width: 100%; border: none; border-radius: 10px;
+    background: #8a6d1f; color: #fff; font-size: 16px; font-weight: 700; padding: 12px 10px;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-terminer:active {{ transform: scale(0.98); }}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
+    <span class="tournoi">{tournament_name}</span>
+    <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
+  </div>
+  <div id="conn-indicator" class="conn-ok"><span class="dot"></span><span id="conn-text">Connecté</span></div>
+  <div id="moves-list"></div>
+  <div id="footer">
+    <button id="btn-terminer" onclick="confirmAllMoves()">✅ Mouvements terminés</button>
+  </div>
+
+<script>
+{auth_redirect_script}
+var moves = [];
+var lastSignature = null;
+var pollTimer = null;
+var pollDelayMs = 4000;
+var POLL_DELAY_MIN_MS = 4000;
+var POLL_DELAY_MAX_MS = 20000;
+var consecutiveFailures = 0;
+var connState = 'ok';
+var leavingPage = false;  // liste vidée : plus aucun sondage/rendu après ça
+
+function setConnState(state) {{
+  if (state === connState) return;
+  connState = state;
+  var el = document.getElementById('conn-indicator');
+  var txt = document.getElementById('conn-text');
+  if (!el || !txt) return;
+  el.className = state === 'ok' ? 'conn-ok' : (state === 'reconnecting' ? 'conn-reconnecting' : 'conn-lost');
+  txt.textContent = state === 'ok' ? 'Connecté' : (state === 'reconnecting' ? 'Reconnexion…' : 'Connexion perdue');
+}}
+
+function fetchWithTimeout(url, options, timeoutMs) {{
+  var opts = options || {{}};
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  if (controller) opts.signal = controller.signal;
+  var timer = controller ? setTimeout(function() {{ controller.abort(); }}, timeoutMs) : null;
+  var clear = function() {{ if (timer) clearTimeout(timer); }};
+  return fetch(url, opts).then(function(r) {{ clear(); return r; }}, function(e) {{ clear(); throw e; }});
+}}
+
+function scheduleNextPoll(ok) {{
+  if (pollTimer) clearTimeout(pollTimer);
+  pollDelayMs = ok ? POLL_DELAY_MIN_MS : Math.min(pollDelayMs * 1.5, POLL_DELAY_MAX_MS);
+  pollTimer = setTimeout(loadMoves, pollDelayMs);
+}}
+
+function tryRecoverViaLobby() {{
+  window.location.href = '/lobbylist';
+}}
+
+// Tri "naturel" par table de départ (demande du 2026-09-19) : un simple
+// tri alphabétique mettrait "Table 10" avant "Table 2" — on extrait le
+// nombre final du nom de table pour trier dans l'ordre attendu par le
+// responsable qui parcourt la salle table par table.
+function tableSortKey(name) {{
+  if (!name) return [1, '', 0];
+  var m = /^(.*?)(\\d+)\\s*$/.exec(name);
+  if (m) return [0, m[1], parseInt(m[2], 10)];
+  return [0, name, 0];
+}}
+function compareMoves(a, b) {{
+  var ka = tableSortKey(a.old_table_name), kb = tableSortKey(b.old_table_name);
+  if (ka[0] !== kb[0]) return ka[0] - kb[0];
+  if (ka[1] !== kb[1]) return ka[1] < kb[1] ? -1 : 1;
+  if (ka[2] !== kb[2]) return ka[2] - kb[2];
+  return (a.old_seat || 0) - (b.old_seat || 0);
+}}
+
+// Tous les mouvements confirmés (dernier OK individuel, ou "Mouvements
+// terminés" depuis cette page) : message bref puis retour automatique à
+// l'accueil (demande du 2026-09-19) — le mécanisme normal de fin a déjà
+// tout arrêté côté serveur à ce moment-là (alerte, clignotement,
+// affichage Projo, chrono repris).
+function showAllConfirmedThenGoHome() {{
+  leavingPage = true;
+  if (pollTimer) clearTimeout(pollTimer);
+  document.getElementById('moves-list').innerHTML = '<div id="empty">Tous les mouvements sont confirmés.</div>';
+  document.getElementById('footer').style.display = 'none';
+  setTimeout(function() {{ window.location.href = '/'; }}, 1500);
+}}
+
+function loadMoves() {{
+  if (leavingPage) return;
+  fetchWithTimeout('/moves_pending', {{}}, 6000).then(function(r) {{
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ setConnState('reconnecting'); tryRecoverViaLobby(); }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    if (r.status === 502) {{
+      consecutiveFailures++;
+      setConnState('reconnecting');
+      if (consecutiveFailures >= 5) {{ tryRecoverViaLobby(); }}
+      throw new Error('proxy_unreachable');
+    }}
+    if (!r.ok) {{ throw new Error('http_' + r.status); }}
+    return r.json();
+  }}).then(function(data) {{
+    if (!Array.isArray(data)) {{ throw new Error('format_inattendu'); }}
+    consecutiveFailures = 0;
+    setConnState('ok');
+    var sig = JSON.stringify(data);
+    if (sig !== lastSignature) {{
+      lastSignature = sig;
+      moves = data;
+      renderMoves();
+    }}
+    if (moves.length === 0) {{ showAllConfirmedThenGoHome(); return; }}
+    scheduleNextPoll(true);
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{ return; }}
+    consecutiveFailures++;
+    if (connState !== 'lost') {{
+      setConnState(consecutiveFailures >= 2 ? 'lost' : 'reconnecting');
+    }}
+    scheduleNextPoll(false);
+  }});
+}}
+
+function renderMoves() {{
+  var list = document.getElementById('moves-list');
+  list.innerHTML = '';
+  if (moves.length === 0) {{
+    list.innerHTML = '<div id="empty">Aucun mouvement en attente.</div>';
+    return;
+  }}
+  moves.slice().sort(compareMoves).forEach(function(m) {{
+    var row = document.createElement('div');
+    row.className = 'move-row';
+    var text = document.createElement('span');
+    text.className = 'move-text';
+    text.textContent = m.player_name + ' — ' + (m.old_table_name || '—') + ', siège ' + (m.old_seat || '—')
+      + ' → ' + (m.new_table_name || '—') + ', siège ' + (m.new_seat || '—');
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-ok';
+    btn.textContent = 'OK';
+    btn.addEventListener('click', function() {{ confirmMove(m.id, row); }});
+    row.appendChild(text);
+    row.appendChild(btn);
+    list.appendChild(row);
+  }});
+}}
+
+function confirmMove(moveId, row) {{
+  fetchWithTimeout('/confirm_move', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{move_id: moveId}}),
+  }}, 8000).then(function(r) {{
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ setConnState('reconnecting'); tryRecoverViaLobby(); }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    if (!data.ok) {{
+      window.alert(data.message || 'Confirmation refusée.');
+      return;
+    }}
+    // Disparition IMMÉDIATE de cette ligne (demande explicite), sans
+    // attendre le prochain sondage — les autres restent affichées.
+    if (row && row.parentNode) {{ row.parentNode.removeChild(row); }}
+    moves = moves.filter(function(m) {{ return m.id !== moveId; }});
+    lastSignature = JSON.stringify(moves);
+    if (data.all_done || moves.length === 0) {{
+      showAllConfirmedThenGoHome();
+      return;
+    }}
+    if (document.getElementById('moves-list').children.length === 0) {{ renderMoves(); }}
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{ return; }}
+    window.alert(
+      'Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.\\n'
+      + 'Vous pouvez retenter sans risque : cette confirmation n\\'a aucun effet en double.'
+    );
+  }});
+}}
+
+function confirmAllMoves() {{
+  if (!window.confirm('Confirmer tous les mouvements encore affichés ?')) return;
+  fetchWithTimeout('/action/terminer', {{ method: 'POST' }}, 8000).then(function(r) {{
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ setConnState('reconnecting'); tryRecoverViaLobby(); }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.json();
+  }}).then(function() {{
+    showAllConfirmedThenGoHome();
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{ return; }}
+    window.alert('Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.');
+  }});
+}}
+
+loadMoves();
+{reload_script}
+</script>
+{rebalance_widget}
+</body>
+</html>
+"""
+
 
 # Widget "Équilibrage des tables" (question "quel siège est actuellement
 # grosse blinde ?" — version TEST, voir database.py: rebalance_tables /
@@ -1587,20 +2496,37 @@ def local_ip():
     return "127.0.0.1"
 
 
+def _extract_selected_pid(cookie_header):
+    """Valeur entière du cookie "selected_pid" dans `cookie_header`, ou
+    None si absent/invalide — dernier "selected_pid=" du header
+    l'emporte en cas de doublon (comportement HISTORIQUE, inchangé au
+    caractère près : c'était l'analyse inline de resolve_current_pid
+    avant le 2026-09-19, simplement extraite ici pour être réutilisée
+    par resolve_proxy_port ci-dessous SANS dupliquer cette analyse —
+    voir sa docstring pour pourquoi il en a besoin séparément)."""
+    selected_pid = None
+    for part in (cookie_header or "").split(";"):
+        part = part.strip()
+        if part.startswith("selected_pid="):
+            try:
+                selected_pid = int(part.split("=", 1)[1])
+            except ValueError:
+                selected_pid = None
+    return selected_pid
+
+
 def resolve_current_pid(cookie_header, own_pid, live_tournaments):
     """Pid du tournoi actuellement COURANT pour un téléphone donné —
     celui que /lobbylist doit marquer "(celui-ci)" (voir
-    RemoteControlServer.start: _handle_lobbylist) et celui vers lequel
-    les pages de contenu doivent être servies/relayées (voir
-    resolve_proxy_port). Notion délibérément INDÉPENDANTE de `own_pid`
-    (le tournoi qui héberge physiquement le port 8765, un simple relais
-    réseau pour les autres — voir la docstring de RemoteControlServer) :
-    avant ce correctif, une sélection absente ou invalide retombait
-    silencieusement sur `own_pid`, confondant "détient le routeur" et
-    "est le tournoi courant" — symptôme observé : un tournoi ouvert en
-    premier (et devenu routeur) restait affiché "(celui-ci)" même après
-    l'ouverture de tournois plus récents jamais sélectionnés depuis un
-    téléphone.
+    RemoteControlServer.start: _handle_lobbylist). Notion délibérément
+    INDÉPENDANTE de `own_pid` (le tournoi qui héberge physiquement le
+    port 8765, un simple relais réseau pour les autres — voir la
+    docstring de RemoteControlServer) : avant ce correctif, une
+    sélection absente ou invalide retombait silencieusement sur
+    `own_pid`, confondant "détient le routeur" et "est le tournoi
+    courant" — symptôme observé : un tournoi ouvert en premier (et
+    devenu routeur) restait affiché "(celui-ci)" même après l'ouverture
+    de tournois plus récents jamais sélectionnés depuis un téléphone.
 
     Priorité :
     1. le cookie "selected_pid" de CE téléphone (posé par
@@ -1616,20 +2542,54 @@ def resolve_current_pid(cookie_header, own_pid, live_tournaments):
     `live_tournaments` : liste au format de open_windows.
     list_remote_tournaments(), passée par l'appelant plutôt que relue
     ici, pour ne jamais la relire deux fois inutilement dans le même
-    traitement de requête."""
-    selected_pid = None
-    for part in (cookie_header or "").split(";"):
-        part = part.strip()
-        if part.startswith("selected_pid="):
-            try:
-                selected_pid = int(part.split("=", 1)[1])
-            except ValueError:
-                selected_pid = None
+    traitement de requête.
+
+    ATTENTION (demande du 2026-09-19) : cette fonction reste, à dessein,
+    UNIQUEMENT un affichage ("(celui-ci)" dans le Lobby) — depuis ce
+    correctif, elle n'est PLUS utilisée pour décider où router/relayer
+    une requête de CONTENU (voir resolve_proxy_port ci-dessous, qui a sa
+    propre logique dédiée pour cette décision-là, avec des conséquences
+    de sécurité que ce simple affichage n'a pas)."""
+    selected_pid = _extract_selected_pid(cookie_header)
     if selected_pid is not None and any(t["pid"] == selected_pid for t in live_tournaments):
         return selected_pid
     if not live_tournaments:
         return own_pid
     return max(live_tournaments, key=lambda t: t.get("registered_at", 0))["pid"]
+
+
+class _SelectionVanished:
+    """Sentinel renvoyé par resolve_proxy_port (demande du 2026-09-19,
+    diagnostic du 2026-09-19 : une action destinée à un tournoi B fermé
+    pouvait être exécutée sur un tournoi A resté ouvert) quand le
+    téléphone a explicitement sélectionné un tournoi (cookie
+    "selected_pid" présent) qui n'est PLUS dans le registre partagé.
+    Distinct de None (qui signifie "sers/traite localement, cette
+    requête EST pour ce tournoi-ci") et de tout port entier (relais vers
+    un AUTRE tournoi encore vivant) : une classe dédiée plutôt qu'une
+    chaîne ou -1 pour qu'aucune comparaison accidentelle (`==`) ne
+    puisse jamais le confondre avec une vraie valeur de retour."""
+
+    def __repr__(self):
+        return "SELECTION_VANISHED"
+
+
+SELECTION_VANISHED = _SelectionVanished()
+
+
+# Budget TOTAL (jamais par thread) laissé à RemoteControlServer.stop()/
+# try_reclaim_default_port() pour attendre la fin des threads de requêtes
+# encore en cours avant de considérer l'arrêt terminé (demande du
+# 2026-09-19, suite au crash natif reproductible de la suite complète —
+# voir _ExclusiveThreadingHTTPServer.join_request_threads pour le
+# mécanisme complet). Largement au-dessus des délais internes déjà
+# bornés à 3s de App._remote_eliminate_request/_remote_confirm_move_
+# request : une requête légitime en cours a tout le temps de se terminer
+# normalement. Jamais indéfini : un client réellement figé (ex. corps de
+# requête jamais envoyé en entier) ne peut donc jamais bloquer stop()
+# au-delà de ce budget — voir tests/test_remote_control_server_stop_
+# joins_threads.py::ServerStopNeverBlocksIndefinitelyTest.
+_STOP_REQUEST_THREADS_TIMEOUT_SECONDS = 5.0
 
 
 class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
@@ -1638,6 +2598,26 @@ class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
     reproduit sur Windows le 2026-09-15 (voir tests/test_remote_control_
     windows_port_collision.py pour le diagnostic complet et sa
     reproduction).
+
+    Suit aussi elle-même ses threads de requêtes (demande du 2026-09-19,
+    correctif d'une course diagnostiquée par un crash natif reproductible
+    de la suite complète — voir join_request_threads) : http.server.
+    ThreadingHTTPServer pose `daemon_threads = True`, ce qui fait que
+    socketserver._Threads.append() (utilisée par le join interne de
+    ThreadingMixIn.server_close(), block_on_close=True jamais modifié)
+    IGNORE SILENCIEUSEMENT chaque thread créé — `if thread.daemon: return`
+    avant tout ajout. Le join que server_close() appelle bien s'exécute
+    donc sur une liste qui n'a jamais rien contenu : RemoteControlServer.
+    stop() pouvait ainsi rendre la main alors qu'un thread de requête
+    tournait encore, capable d'exécuter du code (y compris appeler des
+    fonctions dépatchées entre-temps par un test suivant) bien après.
+
+    daemon_threads N'EST PAS modifié ici (resterait `True`, hérité de
+    ThreadingHTTPServer) : le passer à `False` ferait qu'un thread
+    réellement bloqué (client lent/figé) empêcherait le PROCESS entier de
+    quitter — un risque strictement pire que la course corrigée. Le
+    suivi ci-dessous est donc entièrement SÉPARÉ du mécanisme _Threads/
+    daemon_threads de la bibliothèque standard, jamais mélangé avec lui.
 
     http.server.HTTPServer (dont hérite ThreadingHTTPServer) pose
     `allow_reuse_address = True`, donc SO_REUSEADDR avant chaque bind()
@@ -1689,6 +2669,42 @@ class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
         else:
             super().server_bind()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._request_threads = []
+
+    def process_request(self, request, client_address):
+        """Identique à ThreadingMixIn.process_request (classe mère),
+        SAUF que le thread créé est TOUJOURS suivi ici — contrairement à
+        self._threads (stdlib), qui ignore silencieusement les threads
+        daemon (voir la docstring de cette classe). `reap()` retire au
+        passage les threads déjà terminés, pour ne jamais laisser cette
+        liste grossir indéfiniment sur une longue session."""
+        self._request_threads = [t for t in self._request_threads if t.is_alive()]
+        t = threading.Thread(target=self.process_request_thread, args=(request, client_address))
+        t.daemon = self.daemon_threads
+        self._request_threads.append(t)
+        t.start()
+
+    def join_request_threads(self, timeout):
+        """Attend la fin des threads de requêtes actuellement suivis,
+        avec un budget TOTAL borné (jamais par thread, jamais indéfini)
+        — voir RemoteControlServer.stop()/try_reclaim_default_port(),
+        appelés entre shutdown() (plus aucune NOUVELLE requête acceptée)
+        et server_close() (ferme le socket d'écoute) : au moment précis
+        où la liste des threads suivis est déjà définitive. Un thread qui
+        n'a pas fini dans le budget imparti reste simplement suivi (et
+        continue de tourner, daemon — voir la docstring de la classe) ;
+        ce budget écoulé, cette méthode rend la main sans jamais attendre
+        davantage."""
+        deadline = time.monotonic() + timeout
+        for t in list(self._request_threads):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            t.join(timeout=remaining)
+        self._request_threads = [t for t in self._request_threads if t.is_alive()]
+
 
 class RemoteControlServer:
     """Petit serveur HTTP embarqué (bibliothèque standard uniquement),
@@ -1711,14 +2727,23 @@ class RemoteControlServer:
       habituels (pas seulement ceux actifs dans le tournoi en cours), pour
       la page Photos — liste de dicts {name, club, has_photo}, sans id
       numérique (voir on_upload_photo ci-dessous).
-    - `on_eliminate(eliminated_id, eliminator_id)` : élimination décidée
-      depuis la page Éliminations (eliminator_id peut être None). Appelé
-      DIRECTEMENT sur le thread HTTP de la requête (voir ThreadingHTTPServer
-      plus bas) — PAS le thread Tk — et doit renvoyer {"ok": bool,
-      "message": str} : "ok" indique si l'élimination a bien eu lieu,
-      "message" est affiché tel quel sur le téléphone si "ok" est faux
-      (ex. refus PKO sans éliminateur désigné, demande du 2026-09-08) —
-      jamais un échec silencieux.
+    - `on_eliminate(eliminated_id, eliminator_id, client_request_id)` :
+      élimination décidée depuis la page Éliminations (eliminator_id peut
+      être None). Appelé DIRECTEMENT sur le thread HTTP de la requête
+      (voir ThreadingHTTPServer plus bas) — PAS le thread Tk — et doit
+      renvoyer {"ok": bool, "message": str} : "ok" indique si
+      l'élimination a bien eu lieu, "message" est affiché tel quel sur le
+      téléphone si "ok" est faux (ex. refus PKO sans éliminateur désigné,
+      demande du 2026-09-08) — jamais un échec silencieux.
+      `client_request_id` (demande du 2026-09-19, "bétonner la
+      communication téléphone <-> PC") : identifiant généré côté
+      téléphone pour CETTE tentative, réutilisé tel quel en cas de
+      retry — None si absent (ancien client, ou appelant qui n'en fournit
+      pas, comportement historique inchangé). L'implémentation DOIT
+      garantir l'idempotence pour un même identifiant (voir App._remote_
+      eliminate_request dans main.py, seule implémentation réelle) :
+      jamais un second effet métier pour deux appels avec le même
+      client_request_id.
     - `get_clock_paused()` : True si le chrono est actuellement en pause
       — pour le petit bouton ON/OFF à côté de "Chronomètre".
     - `get_has_pending_moves()` : True s'il existe au moins un mouvement en
@@ -1746,20 +2771,54 @@ class RemoteControlServer:
       vérifié que le pid envoyé par le téléphone correspond à CE
       processus-ci (voir /end_tournament dans start()) ; ne prend aucun
       argument, ne fait que déposer la demande dans la file d'attente
-      thread-safe existante (voir App._start_remote_control_if_enabled)."""
+      thread-safe existante (voir App._start_remote_control_if_enabled).
+    - `get_pending_moves()` : renvoie la liste des mouvements ACTUELLEMENT
+      en attente (demande du 2026-09-19, page "Mouvements" du contrôle à
+      distance) — liste de dicts {id, player_name, old_table_name,
+      old_seat, new_table_name, new_seat}, même source que get_has_
+      pending_moves (self.db.get_seat_moves(), aucune logique séparée),
+      tenue à jour depuis le thread principal (voir App._refresh_remote_
+      moves_cache), jamais lue/écrite depuis ce thread-ci.
+    - `on_confirm_move(move_id)` : confirmation INDIVIDUELLE d'un
+      mouvement (bouton [OK] d'une ligne sur la page "Mouvements") —
+      comme on_eliminate, ne fait que déposer la demande dans la file
+      d'attente thread-safe (voir App._remote_confirm_move_request, seule
+      implémentation réelle) : ce thread ne touche JAMAIS self.db ni
+      Tkinter directement. Renvoie {"ok": bool, "all_done": bool} :
+      "all_done" indique si c'était le DERNIER mouvement en attente (le
+      téléphone affiche alors "Tous les mouvements sont confirmés" puis
+      revient à l'accueil, voir _MOVES_PAGE) — dans ce cas, App._remote_
+      confirm_move a déjà déclenché le même mécanisme de fin que le
+      bouton "Mouvements terminés" (_finish_movement_alert), jamais une
+      fin réimplémentée à part.
+    - `get_dirto_permissions(dirto_name)` (Phase 4, "Sécurisation du
+      Contrôle à distance", 2026-09-20) : renvoie l'ensemble (frozenset)
+      des clés REMOTE_PERMISSION_* accordées à `dirto_name` POUR CE
+      TOURNOI — frozenset() vide si aucune autorisation n'existe (voir
+      Database.get_dirto_authorization, "aucune autorisation existante =
+      aucune permission DIRTO"). Appelé UNIQUEMENT quand le propriétaire
+      résolu de l'appareil (voir open_windows.get_remote_device_owner)
+      est classé "DIRTO" au Répertoire (jamais pour un ADMIN, qui a
+      accès total par construction) — même remarque thread-safe que
+      get_players/get_pending_moves : DOIT provenir d'un cache tenu à
+      jour par le thread principal (voir App._refresh_remote_dirto_
+      permissions_cache dans main.py), jamais d'une lecture directe de
+      self.db depuis ce thread-ci."""
 
     def __init__(self, on_word, get_tournament_name=None, get_players=None,
                  on_eliminate=None, get_clock_paused=None, on_upload_photo=None,
                  get_roster_players=None, get_photo_image=None, on_delete_photo=None,
                  get_pending_rebalance=None, on_rebalance_answer=None,
                  on_end_tournament=None, get_has_pending_moves=None,
+                 get_pending_moves=None, on_confirm_move=None,
+                 get_dirto_permissions=None,
                  port=DEFAULT_PORT):
         self.on_word = on_word
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
         self.get_players = get_players or (lambda: [])
         self.get_roster_players = get_roster_players or (lambda: [])
         self.on_eliminate = on_eliminate or (
-            lambda eliminated_id, eliminator_id: {"ok": True, "message": ""}
+            lambda eliminated_id, eliminator_id, client_request_id=None: {"ok": True, "message": ""}
         )
         self.get_clock_paused = get_clock_paused or (lambda: True)
         self.get_has_pending_moves = get_has_pending_moves or (lambda: False)
@@ -1783,6 +2842,19 @@ class RemoteControlServer:
         # d'aucune logique d'identification supplémentaire (voir
         # App._start_remote_control_if_enabled dans main.py).
         self.on_end_tournament = on_end_tournament or (lambda: None)
+        self.get_pending_moves = get_pending_moves or (lambda: [])
+        self.on_confirm_move = on_confirm_move or (lambda move_id: {"ok": True, "all_done": False})
+        # Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à
+        # distance", 2026-09-20) : dirto_name -> frozenset de clés
+        # REMOTE_PERMISSION_* accordées à CE DIRTO pour CE tournoi,
+        # frozenset() vide si aucune autorisation n'existe (voir
+        # Database.get_dirto_authorization — "aucune autorisation
+        # existante = aucune permission DIRTO"). Comme get_players/
+        # get_pending_moves, DOIT être alimenté depuis un cache tenu à
+        # jour par le thread principal (voir App._refresh_remote_dirto_
+        # permissions_cache dans main.py) — jamais une lecture directe
+        # de self.db depuis ce thread-ci.
+        self.get_dirto_permissions = get_dirto_permissions or (lambda dirto_name: frozenset())
         self.port = port
         self._httpd = None
         self._thread = None
@@ -1803,22 +2875,95 @@ class RemoteControlServer:
         get_pending_rebalance = self.get_pending_rebalance
         on_rebalance_answer = self.on_rebalance_answer
         on_end_tournament = self.on_end_tournament
+        get_pending_moves = self.get_pending_moves
+        on_confirm_move = self.on_confirm_move
+        get_dirto_permissions = self.get_dirto_permissions
         own_pid = os.getpid()
 
+        def resolve_role(handler):
+            """(role, permissions) pour la requête `handler` en cours —
+            appelée UNIQUEMENT après authentification niveau 1 (garantie
+            par l'appelant) ET après relais éventuel vers le tournoi
+            réellement visé (voir resolve_proxy_port/_proxy juste
+            au-dessus dans do_GET/do_POST) : une permission n'est donc
+            jamais vérifiée contre un autre tournoi que celui qui va
+            RÉELLEMENT traiter cette requête — si `_proxy` a relayé la
+            requête, C'EST le processus cible qui exécute cette même
+            fonction, avec SON PROPRE get_dirto_permissions (donc SA
+            PROPRE base), jamais celui-ci (Phase 4, "Sécurisation du
+            Contrôle à distance", 2026-09-20).
+
+            role : "ADMIN" (accès total, y compris "Terminer le
+            tournoi"), "DIRTO" (accès limité à `permissions`) ou "NONE"
+            (appareil non lié à un propriétaire, OU propriétaire qui
+            n'est plus classé ADMIN/DIRTO au Répertoire depuis l'octroi
+            — traité comme non lié, JAMAIS comme son ancien rôle :
+            roster.get_group est résolu EN DIRECT ici, à chaque requête,
+            jamais mis en cache, même principe que le panneau
+            "Propriétaire" de main.py). permissions : _ALL_PERMISSIONS
+            pour ADMIN, l'ensemble accordé à ce DIRTO POUR CE TOURNOI
+            pour DIRTO (frozenset vide si jamais autorisé ici), toujours
+            frozenset() pour NONE."""
+            browser_id = _parse_cookie(handler.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+            owner_name = open_windows.get_remote_device_owner(browser_id)
+            if not owner_name:
+                return "NONE", frozenset()
+            group = roster.get_group(owner_name)
+            if group == roster.ROSTER_GROUP_ADMIN:
+                return "ADMIN", _ALL_PERMISSIONS
+            if group == roster.ROSTER_GROUP_DIRTO:
+                return "DIRTO", frozenset(get_dirto_permissions(owner_name) or ())
+            return "NONE", frozenset()
+
         def resolve_proxy_port(handler):
-            """Port du tournoi actuellement COURANT pour CE téléphone (voir
-            resolve_current_pid — cookie "selected_pid" revalidé, ou à
-            défaut le plus récemment ouvert, jamais own_pid par défaut),
-            s'il diffère de ce tournoi-ci. None si le tournoi courant EST
-            ce tournoi-ci (traité localement) — y compris quand aucune
+            """Port du tournoi actuellement COURANT pour CE téléphone, s'il
+            diffère de ce tournoi-ci. None si le tournoi courant EST ce
+            tournoi-ci (traité localement) — y compris quand aucune
             sélection valide n'existe et que CE tournoi-ci s'avère être
-            lui-même le plus récemment ouvert."""
-            current_pid = resolve_current_pid(
-                handler.headers.get("Cookie", ""), own_pid, open_windows.list_remote_tournaments()
-            )
+            lui-même le plus récemment ouvert. SELECTION_VANISHED (demande
+            du 2026-09-19) si CE téléphone a explicitement sélectionné un
+            tournoi (cookie "selected_pid") qui n'est PLUS dans le
+            registre partagé — voir la docstring de SELECTION_VANISHED.
+
+            Priorité ABSOLUE à une sélection EXPLICITE encore présente
+            dans le cookie, revalidée ICI (pas seulement dans resolve_
+            current_pid, dont l'usage se limite désormais à l'affichage
+            "(celui-ci)" du Lobby — voir sa docstring) : si son tournoi a
+            disparu ET qu'un AUTRE tournoi est encore vivant, retourne
+            SELECTION_VANISHED SANS JAMAIS consulter le repli "plus
+            récemment ouvert" — c'est précisément ce repli silencieux
+            qui permettait qu'une action destinée à un tournoi B fermé
+            soit exécutée sur un tournoi A resté ouvert (diagnostic du
+            2026-09-19, tests/test_remote_selected_tournament_vanished.
+            py). Si en revanche le registre est totalement VIDE (aucun
+            AUTRE tournoi vers lequel on aurait pu router par erreur),
+            le repli historique "servi localement par ce process-ci"
+            reste inoffensif et est conservé tel quel (non-régression
+            explicite : tests/test_remote_control_reliability.py::
+            ProxyUnreachableTest::test_tournoi_disparu_du_registre_ne_
+            declenche_aucun_proxy). Le cas SANS sélection explicite
+            (cookie absent/invalide) reste, lui, entièrement délégué à
+            resolve_current_pid — comportement HISTORIQUE inchangé."""
+            cookie_header = handler.headers.get("Cookie", "")
+            live_tournaments = open_windows.list_remote_tournaments()
+
+            selected_pid = _extract_selected_pid(cookie_header)
+            if selected_pid is not None:
+                if not any(t["pid"] == selected_pid for t in live_tournaments):
+                    if live_tournaments:
+                        return SELECTION_VANISHED
+                    return None  # aucun autre survivant : servi localement, comme avant
+                if selected_pid == own_pid:
+                    return None
+                for t in live_tournaments:
+                    if t["pid"] == selected_pid:
+                        return t["port"]
+                return None  # inatteignable : déjà vérifié par le any() ci-dessus
+
+            current_pid = resolve_current_pid(cookie_header, own_pid, live_tournaments)
             if current_pid == own_pid:
                 return None
-            for t in open_windows.list_remote_tournaments():
+            for t in live_tournaments:
                 if t["pid"] == current_pid:
                     return t["port"]
             return None
@@ -1827,16 +2972,28 @@ class RemoteControlServer:
             def log_message(self, fmt, *args):
                 pass  # pas de log console à chaque requête (bruyant)
 
-            def _send_html(self, html, extra_headers=None):
+            def _send_html(self, html, extra_headers=None, status=200):
                 # extra_headers : liste de (nom, valeur) — PAS un dict,
                 # justement pour pouvoir poser PLUSIEURS "Set-Cookie"
                 # dans la même réponse (ex. rc_bid + rc_auth à la fois,
                 # voir _handle_authenticate) : un dict ne peut porter
-                # qu'une seule valeur par nom d'en-tête.
+                # qu'une seule valeur par nom d'en-tête. status=200 par
+                # défaut (comportement historique inchangé pour tous les
+                # appelants existants) — 403 utilisé par Phase 4 pour une
+                # page HTML de refus de permission (voir _FORBIDDEN_PAGE/
+                # _NO_ACCESS_PAGE). Cache-Control: no-store (demande du
+                # 2026-09-24, "synchronisation automatique permissions") :
+                # sans cet en-tête, Safari iOS peut servir une copie mise
+                # en cache de "/" même sur une actualisation MANUELLE —
+                # symptôme observé en club ("le bon écran n'apparaît pas
+                # systématiquement" après recharger la page) — cette page
+                # reflète un rôle/des permissions qui peuvent changer à
+                # tout moment côté Mac, jamais un contenu statique.
                 body = html.encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
                 if extra_headers:
                     for name, value in extra_headers:
                         self.send_header(name, value)
@@ -1852,11 +3009,41 @@ class RemoteControlServer:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
                 if extra_headers:
                     for name, value in extra_headers:
                         self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _send_permission_denied(self, method, path, role, is_page=False):
+                """Refus explicite d'une route/action pour laquelle le
+                rôle résolu (voir resolve_role, appelé par l'appelant)
+                n'a pas la permission requise (Phase 4, "Sécurisation
+                du Contrôle à distance", 2026-09-20) — JAMAIS un simple
+                masquage HTML : c'est CE contrôle, et lui seul, qui
+                empêche réellement l'action, que le bouton/lien
+                correspondant ait été affiché ou non au téléphone (voir
+                _strip_permission_sections, qui n'est qu'ergonomie).
+                Journalisé comme les refus d'authentification niveau 1
+                (voir _is_authenticated ci-dessous, même mécanisme
+                log_remote_event déjà existant — pas un nouveau système
+                de journalisation, la Phase 5 LOG n'est pas commencée
+                ici). `is_page` : True pour une page HTML destinée à
+                être NAVIGUÉE (GET /eliminate, /moves, /photos) — répond
+                alors avec _FORBIDDEN_PAGE plutôt que du JSON, plus
+                lisible en cas d'ouverture directe/marque-page périmé."""
+                log_remote_event(
+                    "permission_denied", method=method, path=path, role=role,
+                    port=self.server.server_port,
+                )
+                if is_page:
+                    self._send_html(
+                        _FORBIDDEN_PAGE.format(message=_NO_PERMISSION_MESSAGE),
+                        status=403,
+                    )
+                else:
+                    self._send_json({"ok": False, "message": _NO_PERMISSION_MESSAGE}, status=403)
 
             def _client_ip(self):
                 return self.client_address[0]
@@ -2028,8 +3215,48 @@ class RemoteControlServer:
                         self.send_header("Content-Length", str(len(data)))
                         self.end_headers()
                         self.wfile.write(data)
-                except (OSError, urllib.error.URLError):
+                except (OSError, urllib.error.URLError) as e:
+                    # Journalisé AVANT send_error (demande du 2026-09-19) :
+                    # target_port suffit à savoir QUEL tournoi était visé
+                    # sans avoir besoin de relire own_pid/le registre ici
+                    # (déjà fait par resolve_proxy_port juste avant l'appel
+                    # à _proxy — pas la peine de le refaire pour un simple
+                    # log). Jamais de cookie/en-tête journalisé, juste le
+                    # chemin, le port cible et le type d'erreur réseau.
+                    log_remote_event(
+                        "proxy_unreachable", method=self.command,
+                        path=self.path.split("?", 1)[0], target_port=target_port,
+                        error=type(e).__name__,
+                    )
                     self.send_error(502, "Ce tournoi n'est momentanément plus joignable")
+
+            def _send_tournament_gone(self, method, path):
+                """Réponse pour resolve_proxy_port() is SELECTION_VANISHED
+                (demande du 2026-09-19) : le tournoi EXPLICITEMENT
+                sélectionné par CE téléphone (cookie "selected_pid") n'est
+                plus dans le registre partagé — jamais un routage
+                silencieux vers un AUTRE tournoi encore vivant (voir la
+                docstring de resolve_proxy_port pour le risque exact que
+                ceci corrige : une action destinée à ce tournoi disparu
+                appliquée par erreur à un autre).
+
+                409 (Conflict) plutôt que 404/410 : le CHEMIN demandé
+                existe bel et bien quelque part, seule la ressource visée
+                par LA SÉLECTION de ce téléphone a disparu — sémantique la
+                plus proche disponible en HTTP standard pour "l'état côté
+                client ne correspond plus à l'état réel côté serveur".
+                `tournament_gone: true` : champ explicite pour que le
+                JavaScript n'ait pas à interpréter le code HTTP lui-même
+                (voir loadPlayers/confirmElimination, qui appellent
+                tryRecoverViaLobby() immédiatement dans ce cas précis,
+                sans attendre les échecs consécutifs prévus pour un 502
+                transitoire — ce signal-ci est définitif, jamais une
+                panne passagère)."""
+                log_remote_event("selected_tournament_vanished", method=method, path=path)
+                self._send_json(
+                    {"ok": False, "message": "Ce tournoi n'est plus disponible.", "tournament_gone": True},
+                    status=409,
+                )
 
             def _handle_lobbylist(self):
                 # X-Own-Pid (voir confirmEndTournament/waitForDifferent
@@ -2133,6 +3360,7 @@ class RemoteControlServer:
                         self.send_header("Location", "/login")
                         self.end_headers()
                     else:
+                        log_remote_event("auth_required", method="GET", path=path, port=self.server.server_port)
                         self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
                     return
 
@@ -2147,17 +3375,42 @@ class RemoteControlServer:
                     return
 
                 target_port = resolve_proxy_port(self)
+                if target_port is SELECTION_VANISHED:
+                    self._send_tournament_gone("GET", path)
+                    return
                 if target_port is not None:
                     self._proxy(target_port)
                     return
 
+                # Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à
+                # distance", 2026-09-20) — résolues ICI, jamais avant :
+                # voir resolve_role, qui garantit que c'est TOUJOURS le
+                # tournoi réellement servi par CE processus qui est
+                # vérifié (le relais ci-dessus est déjà passé).
+                role, permissions = resolve_role(self)
+
                 if path in ("/", "/index.html"):
+                    # "aucune autorisation existante pour ce tournoi =
+                    # aucune permission" (règle Phase 3) reçoit ICI le
+                    # même traitement qu'un appareil non lié : les deux
+                    # cas signifient concrètement la même chose pour le
+                    # responsable ("rien n'est utilisable, voyez un
+                    # ADMIN"), un seul message clair plutôt que deux
+                    # présentations différentes pour un même résultat.
+                    if role == "NONE" or (role == "DIRTO" and not permissions):
+                        self._send_html(_NO_ACCESS_PAGE.format(
+                            tournament_name=_escape_html(get_name()),
+                            message=_NO_PERMISSION_MESSAGE,
+                            reload_script=_RELOAD_SCRIPT,
+                            auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
+                        ))
+                        return
                     tournaments = open_windows.list_remote_tournaments()
                     lobby_button = (
                         '<button id="btn-lobby" onclick="window.location.href=\'/lobbylist\'">🏛 Lobby</button>'
                         if len(tournaments) > 1 else ""
                     )
-                    self._send_html(_PAGE_TEMPLATE.format(
+                    page_html = _PAGE_TEMPLATE.format(
                         tournament_name=_escape_html(get_name()),
                         # tournament_name_json : même nom que ci-dessus,
                         # mais échappé pour être injecté tel quel comme
@@ -2174,8 +3427,38 @@ class RemoteControlServer:
                         rebalance_widget=_REBALANCE_WIDGET,
                         auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                         own_pid=own_pid,
-                    ))
-                elif path in ("/eliminate", "/eliminate.html"):
+                    )
+                    # "Fin de la partie" : jamais pour un DIRTO, quelles
+                    # que soient ses permissions (voir requirement 8) —
+                    # retiré ici pour tout rôle qui n'est pas ADMIN.
+                    # Ergonomie uniquement (voir _strip_admin_only_
+                    # sections) : /end_tournament refuse de toute façon
+                    # tout appelant non-ADMIN, y compris un appel direct.
+                    page_html = _strip_admin_only_sections(page_html, is_admin=(role == "ADMIN"))
+                    if role == "DIRTO":
+                        page_html = _strip_permission_sections(page_html, permissions)
+                    self._send_html(page_html)
+                    return
+
+                if path == "/photo_image":
+                    # Réponse de refus SPÉCIFIQUE (403 nu, pas de corps) :
+                    # cette route renvoie normalement des octets d'image,
+                    # jamais du JSON/HTML (voir _send_permission_denied,
+                    # pensée pour les deux autres cas).
+                    if _GET_ROUTE_PERMISSION["/photo_image"] not in permissions:
+                        self.send_error(403)
+                        return
+                elif path in _GET_ROUTE_PERMISSION:
+                    if _GET_ROUTE_PERMISSION[path] not in permissions:
+                        is_page = path in ("/eliminate", "/eliminate.html", "/photos", "/photos.html", "/moves", "/moves.html")
+                        self._send_permission_denied("GET", path, role, is_page=is_page)
+                        return
+                elif path == "/clock_state":
+                    if not (permissions & _CLOCK_STATE_PERMISSIONS):
+                        self._send_permission_denied("GET", path, role)
+                        return
+
+                if path in ("/eliminate", "/eliminate.html"):
                     self._send_html(_ELIMINATE_PAGE.format(
                         tournament_name=_escape_html(get_name()),
                         reload_script=_RELOAD_SCRIPT,
@@ -2189,11 +3472,32 @@ class RemoteControlServer:
                         rebalance_widget=_REBALANCE_WIDGET,
                         auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
+                elif path in ("/moves", "/moves.html"):
+                    self._send_html(_MOVES_PAGE.format(
+                        tournament_name=_escape_html(get_name()),
+                        reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
+                    ))
                 elif path == "/players":
                     self._send_json(get_players())
+                elif path == "/moves_pending":
+                    # Mouvements ACTUELLEMENT en attente (demande du
+                    # 2026-09-19) — même principe que /players : simple
+                    # lecture d'un cache tenu à jour par le thread
+                    # principal (voir get_pending_moves), jamais self.db
+                    # touché depuis ce thread-ci.
+                    self._send_json(get_pending_moves())
                 elif path == "/roster_players":
                     self._send_json(get_roster_players())
                 elif path == "/photo_image":
+                    # Permission déjà vérifiée ci-dessus (send_error(403)
+                    # si "photos" manquante) — la permission requise est
+                    # dans _GET_ROUTE_PERMISSION comme les autres routes
+                    # "photos", seule la FORME de la réponse de refus
+                    # diffère (403 nu plutôt que JSON/HTML, cette route
+                    # renvoyant normalement des octets d'image).
+                    #
                     # Miniature affichée à côté du nom sur la page Photos
                     # (voir _PHOTOS_PAGE) : identifié par NOM, comme
                     # /upload_photo et /delete_photo — le répertoire n'a
@@ -2224,6 +3528,23 @@ class RemoteControlServer:
                     self._send_json({
                         "paused": bool(get_clock_paused()),
                         "has_pending_moves": bool(get_has_pending_moves()),
+                    })
+                elif path == "/permission_state":
+                    # Sondage léger (Phase 4bis, "synchronisation
+                    # automatique permissions", 2026-09-24 — voir
+                    # _AUTH_REDIRECT_SCRIPT côté client, sondé toutes les
+                    # 3s) : accessible à TOUT appareil authentifié
+                    # niveau 1, JAMAIS gardée par une permission (`role`/
+                    # `permissions` déjà résolus plus haut par resolve_
+                    # role, contre CE tournoi précisément — voir sa
+                    # docstring) — c'est justement le rôle NONE, ou un
+                    # DIRTO qui vient de tout perdre, qui doit pouvoir
+                    # détecter son propre état ici. Ne fait jamais rien
+                    # d'autre que RENVOYER l'état actuel : aucune
+                    # mutation, aucun effet de bord.
+                    self._send_json({
+                        "role": role,
+                        "permissions": sorted(permissions),
                     })
                 elif path == "/rebalance_pending":
                     # Sondé toutes les 2s par TOUS les téléphones, sur
@@ -2273,22 +3594,47 @@ class RemoteControlServer:
                     self._handle_authenticate()
                     return
                 if not self._is_authenticated():
+                    log_remote_event("auth_required", method="POST", path=path, port=self.server.server_port)
                     self._send_json({"ok": False, "message": "Authentification requise."}, status=401)
                     return
 
                 target_port = resolve_proxy_port(self)
+                if target_port is SELECTION_VANISHED:
+                    self._send_tournament_gone("POST", path)
+                    return
                 if target_port is not None:
                     self._proxy(target_port)
                     return
+
+                # Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à
+                # distance", 2026-09-20) — voir resolve_role et son
+                # équivalent dans do_GET : résolues ICI, après le relais
+                # éventuel ci-dessus, donc toujours contre le tournoi
+                # réellement visé par CE processus.
+                role, permissions = resolve_role(self)
 
                 if path.startswith("/action/"):
                     action = path[len("/action/"):]
                     if action not in _VALID_ACTIONS:
                         self.send_error(400, "Action inconnue")
                         return
+                    # "elimination" (bouton "⏸ Joueurs") : ADMIN uniquement,
+                    # jamais par appartenance à `permissions` — voir
+                    # _ADMIN_ONLY_ACTIONS (même traitement que /end_tournament,
+                    # corrigé le 2026-09-22).
+                    if action in _ADMIN_ONLY_ACTIONS:
+                        if role != "ADMIN":
+                            self._send_permission_denied("POST", path, role)
+                            return
+                    elif _ACTION_PERMISSION[action] not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
                     on_word(action)
                     self._send_json({"ok": True})
                 elif path == "/eliminate":
+                    if _PERM_ELIMINATIONS not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
                     length = int(self.headers.get("Content-Length", 0) or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     try:
@@ -2296,6 +3642,20 @@ class RemoteControlServer:
                         eliminated_id = int(data["eliminated_id"])
                         eliminator_raw = data.get("eliminator_id")
                         eliminator_id = int(eliminator_raw) if eliminator_raw not in (None, "") else None
+                        # request_id (demande du 2026-09-19) : identifiant
+                        # généré côté téléphone pour CETTE tentative
+                        # d'élimination, réutilisé tel quel par lui en cas
+                        # de retry — voir App._remote_eliminate_request
+                        # (main.py), seul endroit qui garantit réellement
+                        # l'idempotence. Optionnel : un ancien client (ou
+                        # un appel de test) qui n'en fournit pas garde le
+                        # comportement historique, jamais de dédoublonnage
+                        # imposé. Chaîne brève et bornée (jamais confiée
+                        # telle quelle à une requête SQL ou un chemin de
+                        # fichier) : simple clé de dict côté Python.
+                        client_request_id = data.get("request_id")
+                        if client_request_id is not None:
+                            client_request_id = str(client_request_id)[:64] or None
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
@@ -2304,9 +3664,35 @@ class RemoteControlServer:
                     # téléphone, qui affiche "message" si "ok" est faux
                     # (ex. refus PKO sans éliminateur désigné) — jamais un
                     # échec silencieux, voir sa docstring plus haut.
-                    result = on_eliminate(eliminated_id, eliminator_id)
+                    result = on_eliminate(eliminated_id, eliminator_id, client_request_id)
+                    self._send_json(result)
+                elif path == "/confirm_move":
+                    # Confirmation INDIVIDUELLE d'un mouvement (bouton
+                    # [OK] d'une ligne, voir _MOVES_PAGE) — comme
+                    # /eliminate, ne fait que déposer la demande dans la
+                    # file d'attente thread-safe (voir on_confirm_move/
+                    # App._remote_confirm_move_request) : ce thread ne
+                    # touche jamais self.db. Idempotent par nature
+                    # (DELETE d'une ligne déjà supprimée ne fait rien) :
+                    # jamais besoin d'un request_id de dédoublonnage
+                    # comme pour /eliminate.
+                    if _PERM_MOVES not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        move_id = int(data["move_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    result = on_confirm_move(move_id)
                     self._send_json(result)
                 elif path == "/upload_photo":
+                    if _PERM_PHOTOS not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
                     from urllib.parse import parse_qs, urlparse
                     query = parse_qs(urlparse(self.path).query)
                     # Identifié par NOM (pas par id) : la page Photos liste
@@ -2327,6 +3713,9 @@ class RemoteControlServer:
                     ok, message = on_upload_photo(player_name, image_bytes)
                     self._send_json({"ok": ok, "message": message})
                 elif path == "/delete_photo":
+                    if _PERM_PHOTOS not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
                     from urllib.parse import parse_qs, urlparse
                     query = parse_qs(urlparse(self.path).query)
                     player_name_values = query.get("player_name")
@@ -2352,6 +3741,9 @@ class RemoteControlServer:
                     # principal (voir database.py: resolve_pending_
                     # rebalance) — jamais ici, pour rester sans accès à
                     # self.db.
+                    if _PERM_REBALANCE not in permissions:
+                        self._send_permission_denied("POST", path, role)
+                        return
                     length = int(self.headers.get("Content-Length", 0) or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     try:
@@ -2388,6 +3780,18 @@ class RemoteControlServer:
                     # sur un AUTRE tournoi resté ouvert), on refuse net —
                     # jamais fermer ce tournoi-ci à la place d'un autre
                     # sur la seule foi d'un identifiant devenu obsolète.
+                    #
+                    # ADMIN uniquement (requirement 8, Phase 4) : JAMAIS
+                    # accordable à un DIRTO, quelles que soient ses
+                    # permissions — "end_tournament" n'existe même pas
+                    # dans REMOTE_PERMISSION_LABELS (voir database.py),
+                    # donc `permissions` ne peut structurellement jamais
+                    # le contenir ; ce contrôle sur `role` est un second
+                    # filet explicite, jamais retiré même si un futur bug
+                    # ailleurs venait à peupler `permissions` par erreur.
+                    if role != "ADMIN":
+                        self._send_permission_denied("POST", path, role)
+                        return
                     length = int(self.headers.get("Content-Length", 0) or 0)
                     raw = self.rfile.read(length) if length else b"{}"
                     try:
@@ -2439,6 +3843,13 @@ class RemoteControlServer:
     def stop(self):
         if self._httpd is not None:
             self._httpd.shutdown()
+            # Attend (budget borné, voir _STOP_REQUEST_THREADS_TIMEOUT_
+            # SECONDS) la fin des threads de requêtes déjà en cours AVANT
+            # server_close() — demande du 2026-09-19, correctif de la
+            # course qui laissait de tels threads survivre indéfiniment
+            # au retour de stop() (voir _ExclusiveThreadingHTTPServer.
+            # join_request_threads pour le mécanisme complet).
+            self._httpd.join_request_threads(_STOP_REQUEST_THREADS_TIMEOUT_SECONDS)
             self._httpd.server_close()
             self._httpd = None
         self._thread = None
@@ -2473,6 +3884,10 @@ class RemoteControlServer:
             return False  # toujours pris (par un autre tournoi, ou perdu la course) : on garde notre port actuel
         old_httpd = self._httpd
         old_httpd.shutdown()
+        # Même correctif que stop() ci-dessus (demande du 2026-09-19) :
+        # attend la fin des threads de requêtes de l'ANCIEN serveur avant
+        # de fermer son socket, budget borné identique.
+        old_httpd.join_request_threads(_STOP_REQUEST_THREADS_TIMEOUT_SECONDS)
         old_httpd.server_close()
         self._httpd = new_httpd
         self.port = DEFAULT_PORT

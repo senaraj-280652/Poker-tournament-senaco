@@ -39,12 +39,14 @@ import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
 
 import database  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -66,7 +68,11 @@ class PrimesSectionRankingComboboxStateTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : _build_ranking_formula_widget (main.py) crée
+        # un tk.StringVar avec trace_add fermée sur cls.root, ainsi qu'un
+        # main.Tooltip lié au label — cycles réclamés ici par gc.collect().
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="primes_ranking_combo_state_test_")

@@ -575,10 +575,19 @@ class PrimesSessionStartedTest(unittest.TestCase):
         lock_path = os.path.join(self._tmpdir_ctx.name, "primes_session_started.json")
         patcher1 = patch.object(main.open_windows, "_registry_path", return_value=registry_path)
         patcher2 = patch.object(main.open_windows, "_primes_session_lock_path", return_value=lock_path)
+        # _remote_control_dir (demande du 2026-09-19, incident réel où ce
+        # test — register()/unregister() sur un registre isolé devenu
+        # vide — a effacé le VRAI remote_control_auth.json de
+        # l'utilisateur via _clear_remote_control_session_files(), qui ne
+        # dépend jamais de _registry_path()) : voir tests/test_remote_
+        # control_dir_isolation.py pour le mécanisme complet.
+        patcher3 = patch.object(main.open_windows, "_remote_control_dir", return_value=self._tmpdir_ctx.name)
         self.addCleanup(patcher1.stop)
         self.addCleanup(patcher2.stop)
+        self.addCleanup(patcher3.stop)
         patcher1.start()
         patcher2.start()
+        patcher3.start()
 
     def test_rien_d_ouvert_jamais_verrouille(self):
         self.assertFalse(main.open_windows.primes_session_started())
@@ -739,6 +748,9 @@ class PrimesEnabledProposedResetsAcrossSessionsTest(unittest.TestCase):
             patch.object(export_prefs, "_prefs_path", return_value=export_prefs_path),
             patch.object(main.open_windows, "_registry_path", return_value=registry_path),
             patch.object(main.open_windows, "_primes_session_lock_path", return_value=lock_path),
+            # _remote_control_dir (demande du 2026-09-19) : voir le même
+            # commentaire dans PrimesSessionStartedTest.setUp ci-dessus.
+            patch.object(main.open_windows, "_remote_control_dir", return_value=self._tmpdir_ctx.name),
         ):
             self.addCleanup(target.stop)
             target.start()

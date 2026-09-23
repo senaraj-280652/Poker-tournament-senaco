@@ -25,6 +25,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
@@ -33,6 +34,7 @@ import database  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
 import player_photos  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -60,7 +62,11 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : 9 méthodes greffées + 2 main.Tooltip (liés à
+        # delete_player_btn/eliminate_player_btn) forment chacun un
+        # cycle sur cls.root, réclamé ici par gc.collect().
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         # Jamais le vrai répertoire/index de photos de ce Mac (voir la

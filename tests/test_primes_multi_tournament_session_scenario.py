@@ -169,6 +169,14 @@ class PrimesMultiTournamentSessionScenarioTest(unittest.TestCase):
             patch.object(export_prefs, "_prefs_path", return_value=export_prefs_path),
             patch.object(open_windows, "_registry_path", return_value=registry_path),
             patch.object(open_windows, "_primes_session_lock_path", return_value=lock_path),
+            # _remote_control_dir (demande du 2026-09-19, incident réel où
+            # ce genre de test — register()/unregister() sur un registre
+            # isolé devenu vide — a effacé le VRAI remote_control_auth.
+            # json de l'utilisateur, _clear_remote_control_session_files()
+            # ne dépendant jamais de _registry_path()) : voir tests/
+            # test_remote_control_dir_isolation.py pour le mécanisme
+            # complet.
+            patch.object(open_windows, "_remote_control_dir", return_value=self.tmpdir),
         ):
             self.addCleanup(target.stop)
             target.start()

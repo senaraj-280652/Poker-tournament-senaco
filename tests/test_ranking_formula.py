@@ -1,9 +1,21 @@
 # -*- coding: utf-8 -*-
 """Tests du système de points distribués (classement, demande du
-2026-09-10) — remplace l'ancien champ "Montant de la prime de classement"
-(ranking_bonus_points) par une liste déroulante à 4 choix : Aucun,
-Classique, Progressive, Sit & Go CPC (réglage ranking_formula, propre à
-chaque tournoi).
+2026-09-10, étendu le 2026-09-20 avec "Tournois CPC") — remplace l'ancien
+champ "Montant de la prime de classement" (ranking_bonus_points) par une
+liste déroulante à 5 choix : Aucun, Classique, Progressive, Tournois CPC,
+Sit & Go CPC (réglage ranking_formula, propre à chaque tournoi).
+
+"Tournois CPC" (règle définitive du club, formule et valeurs de contrôle
+fournies le 2026-09-20) : P(r,N) = 50 + 950×N × [0,12×0,88^(r-1)] /
+[1 − 0,88^N], appliquée SANS EXCEPTION quel que soit N (y compris hors du
+barème documenté 15-45 joueurs). Arrondi par la méthode des PLUS GRANDS
+RESTES (jamais un round() indépendant par place) : partie entière de
+chaque valeur théorique, puis distribution des points manquants pour
+atteindre EXACTEMENT N×1000 aux places ayant les plus grands restes
+décimaux, départagées par la place r la plus petite en cas d'égalité
+stricte — voir database.ranking_points_table pour l'implémentation
+(fractions.Fraction, exactitude totale) et sa docstring pour la preuve
+algébrique que la somme théorique vaut toujours exactement N×1000.
 
 RÈGLE DE COMPATIBILITÉ (validée explicitement par l'utilisateur avant
 codage — voir database.py: Database.resolve_ranking_formula) :
@@ -26,6 +38,7 @@ import os
 import sys
 import tempfile
 import unittest
+from fractions import Fraction
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -105,10 +118,165 @@ class RankingPointsFormulaFunctionTest(unittest.TestCase):
             self.assertEqual(total, n * 1000, f"N={n}")
 
     def test_place_ou_n_invalides_renvoient_zero_quelle_que_soit_la_formule(self):
-        for formula in ("none", "current", "progressive", "sitngo_cpc"):
+        for formula in ("none", "current", "progressive", "tournois_cpc", "sitngo_cpc"):
             self.assertEqual(database.ranking_points(0, 10, formula), 0)
             self.assertEqual(database.ranking_points(None, 10, formula), 0)
             self.assertEqual(database.ranking_points(1, 0, formula), 0)
+
+
+class RankingPointsTournoisCpcTest(unittest.TestCase):
+    """"Tournois CPC" — règle définitive du club (2026-09-20) : formule
+    P(r,N) = 50 + 950×N × [0,12×0,88^(r-1)] / [1 − 0,88^N], arrondie par
+    la méthode des plus grands restes. Tests obligatoires demandés
+    explicitement : somme exacte, N<15, 15<=N<=45, N>45, départage
+    déterministe, valeurs de contrôle du document, non-régression des
+    formules existantes."""
+
+    def test_valeurs_de_controle_du_document(self):
+        # Document fourni par le club : vainqueur (place 1) pour
+        # N=15/30/45 — vérifié par calcul indépendant (fractions.Fraction)
+        # avant codage, voir l'échange du 2026-09-20.
+        self.assertEqual(database.ranking_points(1, 15, "tournois_cpc"), 2055)
+        self.assertEqual(database.ranking_points(1, 30, "tournois_cpc"), 3545)
+        self.assertEqual(database.ranking_points(1, 45, "tournois_cpc"), 5196)
+
+    def test_somme_exacte_egale_a_n_fois_1000(self):
+        # Garantie obligatoire explicite du club : la somme distribuée
+        # doit TOUJOURS valoir exactement N×1000, quel que soit N.
+        for n in (1, 2, 3, 5, 10, 14, 15, 16, 30, 45, 46, 60, 100, 200):
+            total = sum(database.ranking_points(p, n, "tournois_cpc") for p in range(1, n + 1))
+            self.assertEqual(total, n * 1000, f"N={n}")
+
+    def test_n_inferieur_a_15_meme_formule_sans_blocage(self):
+        # Confirmation explicite du club : aucune limitation, aucun
+        # blocage, aucun changement de formule hors de la plage 15-45.
+        table_14 = database.ranking_points_table(14, "tournois_cpc")
+        self.assertEqual(table_14[0], 1966)  # vainqueur, calculé indépendamment
+        self.assertEqual(sum(table_14), 14000)
+        self.assertEqual(len(table_14), 14)
+
+    def test_n_entre_15_et_45(self):
+        for n, winner in ((15, 2055), (30, 3545), (45, 5196)):
+            table = database.ranking_points_table(n, "tournois_cpc")
+            self.assertEqual(table[0], winner, f"N={n}")
+            self.assertEqual(sum(table), n * 1000, f"N={n}")
+
+    def test_n_superieur_a_45_meme_formule_sans_blocage(self):
+        table_46 = database.ranking_points_table(46, "tournois_cpc")
+        self.assertEqual(table_46[0], 5309)  # vainqueur, calculé indépendamment
+        self.assertEqual(sum(table_46), 46000)
+        self.assertEqual(len(table_46), 46)
+
+    def test_suite_strictement_decroissante(self):
+        # Une place moins bonne ne doit jamais rapporter plus de points
+        # qu'une meilleure place, quel que soit N.
+        for n in (1, 14, 15, 30, 45, 46, 100):
+            table = database.ranking_points_table(n, "tournois_cpc")
+            for i in range(len(table) - 1):
+                self.assertGreaterEqual(table[i], table[i + 1], f"N={n}, r={i+1}")
+
+    def test_aucune_egalite_reelle_de_reste_dans_la_formule(self):
+        """Vérifie, par calcul exact (fractions.Fraction, aucune
+        imprécision possible), qu'AUCUNE paire de places de 1 à 300
+        joueurs n'a jamais un reste décimal rigoureusement identique
+        dans cette formule géométrique — la règle de départage "r le
+        plus petit gagne" (voir test_departage_deterministe_regle_du_
+        club ci-dessous) est donc une garantie DÉFENSIVE qui ne se
+        déclenche jamais en pratique avec CETTE formule précise, mais
+        doit rester correcte si jamais un cas limite apparaissait
+        (implémentation générique, pas spécifique à cette absence
+        d'égalité constatée)."""
+        q = Fraction(88, 100)
+        for n in (14, 15, 30, 45, 46, 100, 200):
+            one_minus_q = 1 - q
+            denom = 1 - q ** n
+            raw = [
+                50 + Fraction(950 * n) * (one_minus_q * q ** (r - 1)) / denom
+                for r in range(1, n + 1)
+            ]
+            remainders = [v - int(v) for v in raw]
+            self.assertEqual(len(remainders), len(set(remainders)), f"N={n}")
+
+    def test_departage_deterministe_regle_du_club(self):
+        """Règle explicite du club : "en cas d'égalité exacte de reste,
+        utiliser la meilleure place (r le plus petit) comme départage
+        déterministe." La formule réelle ne produit jamais d'égalité
+        exacte (voir test ci-dessus) — ce test vérifie donc directement
+        l'ALGORITHME de départage utilisé par ranking_points_table
+        (tri par reste décroissant, puis par index croissant :
+        `sorted(range(n), key=lambda i: (-remainders[i], i))`, voir sa
+        docstring/implémentation dans database.py), sur un jeu de
+        restes SYNTHÉTIQUE construit avec une égalité délibérée entre
+        les places 3 et 5 — reproduit exactement le même algorithme que
+        la production, pas la formule elle-même."""
+        remainders = [
+            Fraction(9, 10),   # place 1 (r=1, index 0)
+            Fraction(1, 10),   # place 2
+            Fraction(5, 10),   # place 3 -- égalité exacte avec la place 5
+            Fraction(2, 10),   # place 4
+            Fraction(5, 10),   # place 5 -- même reste que la place 3
+        ]
+        # missing=2 : juste assez pour la place 1 (0.9, la meilleure) ET
+        # UNE SEULE des deux places à égalité (0.5 chacune) -- c'est
+        # précisément ce qui force le départage à jouer un rôle : avec
+        # missing=3 les deux places à égalité passeraient toutes les
+        # deux, sans jamais exercer la règle de départage elle-même.
+        missing = 2
+        order = sorted(range(len(remainders)), key=lambda i: (-remainders[i], i))
+        bonus_places = sorted(i + 1 for i in order[:missing])  # 1-indexé, pour lisibilité
+        # Plus grands restes : place 1 (0.9) d'abord, puis l'égalité
+        # places 3/5 (0.5 chacune) départagée par r le plus petit ->
+        # place 3 choisie, place 5 exclue (un seul emplacement restant).
+        self.assertEqual(bonus_places, [1, 3])
+
+    def test_reproductibilite_stricte(self):
+        """Deux appels indépendants avec les mêmes arguments donnent
+        TOUJOURS exactement le même résultat, place par place —
+        condition nécessaire à un départage déterministe (un tri
+        instable romprait une égalité de façon aléatoire d'un appel à
+        l'autre)."""
+        for n in (14, 15, 30, 45, 46):
+            first = database.ranking_points_table(n, "tournois_cpc")
+            second = database.ranking_points_table(n, "tournois_cpc")
+            self.assertEqual(first, second, f"N={n}")
+
+    def test_ranking_points_et_ranking_points_table_coherents(self):
+        """Les deux chemins d'accès (ranking_points par place isolée, et
+        ranking_points_table pour tout le barème) doivent TOUJOURS
+        renvoyer exactement les mêmes valeurs — cohérence entre les deux
+        chemins d'accès, demande explicite du club."""
+        for n in (1, 14, 15, 30, 45, 46, 60):
+            table = database.ranking_points_table(n, "tournois_cpc")
+            for r in range(1, n + 1):
+                self.assertEqual(
+                    database.ranking_points(r, n, "tournois_cpc"), table[r - 1],
+                    f"N={n}, r={r}",
+                )
+
+    def test_place_hors_bornes_renvoie_zero(self):
+        self.assertEqual(database.ranking_points(16, 15, "tournois_cpc"), 0)
+
+    def test_non_regression_formules_existantes_inchangees(self):
+        """L'ajout de "tournois_cpc" ne doit rien changer aux 4 formules
+        existantes — mêmes valeurs qu'avant ce chantier."""
+        self.assertEqual(database.ranking_points(1, 27, "current"), round(100 * (27 ** 0.5) / 1))
+        self.assertEqual(
+            database.ranking_points(4, 20, "progressive"),
+            round(100 * (20 ** 0.5) / (4 ** 0.5)),
+        )
+        self.assertEqual(database.ranking_points(1, 7, "sitngo_cpc"), 1600)
+        self.assertEqual(database.ranking_points(7, 7, "sitngo_cpc"), 400)
+        self.assertEqual(database.ranking_points(3, 10, "none"), 0)
+        self.assertEqual(
+            database.ranking_points_table(7, "sitngo_cpc"),
+            [1600, 1400, 1200, 1000, 800, 600, 400],
+        )
+
+    def test_ordre_des_libelles_dans_ranking_formula_labels(self):
+        self.assertEqual(
+            list(database.RANKING_FORMULA_LABELS.values()),
+            ["Aucun", "Classique", "Progressive", "Tournois CPC", "Sit & Go CPC"],
+        )
 
 
 class ResolveRankingFormulaCompatibiliteTest(unittest.TestCase):
@@ -210,6 +378,17 @@ class GetRankingBonusesIntegrationTest(unittest.TestCase):
         self.assertEqual(sum(r["valeur"] for r in ranking.values()), 7000)
         self.assertEqual(ranking[names[-1]]["valeur"], 1600)  # vainqueur, N=7
 
+    def test_tournois_cpc_valeurs_calculees_et_somme(self):
+        db = _new_db(self._tmp.name, {"ranking_formula": "tournois_cpc"})
+        names = [f"P{i}" for i in range(15)]
+        ranking = _eliminate_all_and_get_ranking(db, names)
+        self.assertEqual(sum(r["valeur"] for r in ranking.values()), 15000)
+        self.assertEqual(ranking[names[-1]]["valeur"], 2055)  # vainqueur, N=15
+        # get_primes_summary hérite bien de la même source (même
+        # vérification que pour les 4 formules existantes).
+        summary = {r["name"]: r for r in db.get_primes_summary()}
+        self.assertEqual(summary[names[-1]]["cl_montant"], 2055)
+
     def test_ancien_ranking_bonus_points_positif_preserve_dans_get_ranking_bonuses(self):
         db = _new_db(self._tmp.name, {"ranking_bonus_points": 55})
         db.conn.execute("DELETE FROM settings WHERE key='ranking_formula'")
@@ -268,7 +447,7 @@ class SauvegardeReouvertureTest(unittest.TestCase):
         self.path = os.path.join(self._tmp.name, "A.tournoi")
 
     def test_chaque_choix_survit_a_une_fermeture_reouverture(self):
-        for formula in ("none", "current", "progressive", "sitngo_cpc"):
+        for formula in ("none", "current", "progressive", "tournois_cpc", "sitngo_cpc"):
             db = database.Database(self.path)
             db.set_settings({"ranking_formula": formula})
             db.conn.close()

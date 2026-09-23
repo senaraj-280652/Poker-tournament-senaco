@@ -44,6 +44,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 from tkinter import ttk  # noqa: E402
@@ -52,6 +53,7 @@ import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -190,11 +192,13 @@ class CalendarGridTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self.frame = ttk.Frame(self.root)
-        self.addCleanup(self.frame.destroy)
+        self.addCleanup(lambda: cleanup_tk(self, "frame"))
 
     def _day_button(self, day):
         for w in self.frame.winfo_children():
@@ -417,11 +421,13 @@ class ApplySortArrowsTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self.tree = ttk.Treeview(self.root, columns=("name", "date"), show="headings")
-        self.addCleanup(self.tree.destroy)
+        self.addCleanup(lambda: cleanup_tk(self, "tree"))
         self.headers = {"name": "Tournoi", "date": "Date"}
 
     def test_colonne_active_porte_la_fleche_croissante(self):
@@ -453,7 +459,9 @@ class StatsUiTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_ui_type_sort_")
@@ -467,7 +475,11 @@ class StatsUiTestCase(unittest.TestCase):
             self.addCleanup(target.stop)
             target.start()
         self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py) : lambda relit self.dialog
+        # au moment du nettoyage — couvre aussi les sous-classes qui
+        # réaffectent self.dialog en cours de test (voir TournamentsSortUiTest/
+        # PlayersSortUiTest plus bas).
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
         self.dialog.folder_var.set(self._tmp.name)
 
     def _rows(self, tree, skip_total=True):

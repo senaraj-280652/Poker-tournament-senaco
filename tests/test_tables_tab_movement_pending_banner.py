@@ -37,12 +37,14 @@ import unittest
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
 
 import database  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -64,7 +66,10 @@ class TablesTabMovementPendingTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : les nombreuses méthodes de main.App greffées
+        # sur cls.root dans setUp forment chacune un cycle, réclamé ici.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         prefs_patcher = patch.object(database.export_prefs, "load_value", return_value=1.0)

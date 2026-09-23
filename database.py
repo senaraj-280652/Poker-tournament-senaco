@@ -13,6 +13,7 @@ import json
 import shutil
 import random
 import uuid
+from fractions import Fraction
 
 import export_prefs
 
@@ -223,6 +224,27 @@ CREATE TABLE IF NOT EXISTS bounty_events (
     -- élimination supplémentaire, eliminator_name reste NULL dans ce cas).
     event_type TEXT NOT NULL DEFAULT 'elimination'
 );
+
+-- Autorisations DIRTO du Contrôle à distance (Phase 3, "Sécurisation du
+-- Contrôle à distance", 2026-09-20) : PAR TOURNOI (ce fichier .tournoi
+-- précis), jamais globales — voir REMOTE_PERMISSION_LABELS plus bas
+-- pour la liste des fonctions accordables et Database.set_dirto_
+-- authorization/get_dirto_authorization/list_dirto_authorizations/
+-- clear_dirto_authorization pour les opérations. dirto_name en clé
+-- PRIMAIRE : au plus UNE autorisation par DIRTO pour CE tournoi (une
+-- réattribution REMPLACE, ne s'ajoute jamais). CREATE TABLE IF NOT
+-- EXISTS (comme le reste de ce schéma, exécuté à CHAQUE ouverture, voir
+-- Database.__init__) : un ancien fichier .tournoi qui n'a jamais connu
+-- cette table l'obtient automatiquement, vide, à la prochaine ouverture
+-- — "aucune autorisation existante" en est donc la conséquence directe,
+-- jamais un cas spécial à coder.
+CREATE TABLE IF NOT EXISTS remote_authorizations (
+    dirto_name TEXT PRIMARY KEY,
+    admin_name TEXT NOT NULL,
+    permissions TEXT NOT NULL DEFAULT '[]',  -- JSON, liste de clés REMOTE_PERMISSION_*
+    granted_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -274,28 +296,101 @@ DEFAULT_SETTINGS = {
 RANKING_FORMULA_NONE = "none"
 RANKING_FORMULA_CURRENT = "current"
 RANKING_FORMULA_PROGRESSIVE = "progressive"
+RANKING_FORMULA_TOURNOIS_CPC = "tournois_cpc"
 RANKING_FORMULA_SITNGO_CPC = "sitngo_cpc"
 
 # Libellés affichés dans la liste déroulante de l'onglet Paramètres (voir
-# main.py: _build_settings_tab) — ordre exact demandé : Aucun, Classique,
-# Progressive, Sit & Go CPC. dict Python : ordre d'insertion préservé
-# (garanti depuis Python 3.7), donc .values() respecte cet ordre.
+# main.py: _build_settings_tab) — ordre exact demandé (2026-09-20) : Aucun,
+# Classique, Progressive, Tournois CPC, Sit & Go CPC. dict Python : ordre
+# d'insertion préservé (garanti depuis Python 3.7), donc .values() respecte
+# cet ordre — AUCUNE autre partie du code ne dépend d'une position
+# numérique (Combobox readonly peuplé directement par .values(), résolution
+# par comparaison de libellé, jamais par index).
 RANKING_FORMULA_LABELS = {
     RANKING_FORMULA_NONE: "Aucun",
     RANKING_FORMULA_CURRENT: "Classique",
     RANKING_FORMULA_PROGRESSIVE: "Progressive",
+    RANKING_FORMULA_TOURNOIS_CPC: "Tournois CPC",
     RANKING_FORMULA_SITNGO_CPC: "Sit & Go CPC",
+}
+
+
+# =====================================================================
+# Permissions DIRTO du Contrôle à distance (Phase 3, "Sécurisation du
+# Contrôle à distance", 2026-09-20) — voir la table remote_authorizations
+# ci-dessus (PAR TOURNOI) et Database.set_dirto_authorization/get_dirto_
+# authorization/list_dirto_authorizations/clear_dirto_authorization.
+#
+# Chaque clé représente une VRAIE fonction utilisateur du téléphone
+# (jamais une route HTTP isolée) — inventaire exhaustif établi avant
+# codage (voir l'échange du 2026-09-20) : plusieurs routes techniques
+# sont regroupées sous UNE seule permission compréhensible, exactement
+# comme un utilisateur les perçoit sur son téléphone :
+#   - "eliminations" : page Éliminations (glisser-déposer) + liste des
+#     joueurs qu'elle affiche (/eliminate, /players) ;
+#   - "tables" : Plan de tables + ses boutons de zoom (/action/tables,
+#     /action/tables_zoom_moins, /action/tables_zoom_plus) ;
+#   - "moves" : page Mouvements, sa liste, la confirmation individuelle
+#     et "Mouvements terminés" (/moves, /moves_pending, /confirm_move,
+#     /action/terminer, /action/mouvements(_bas/_haut)) ;
+#   - "clock" : pause/reprise du chronomètre (/action/chronometre,
+#     /action/toggle_pause) ;
+#   - "levels" : niveau précédent/suivant (/action/niveau_precedent,
+#     /action/niveau_suivant) ;
+#   - "photos" : page Photos, prise/import/suppression (/photos,
+#     /upload_photo, /delete_photo, /photo_image, /roster_players) ;
+#   - "rebalance" : réponse "quel siège est grosse blinde ?"
+#     (/rebalance_pending, /rebalance_answer).
+#
+# "Terminer le tournoi" (/end_tournament) est DÉLIBÉRÉMENT ABSENT de ce
+# dict — décision explicite et non négociable de l'utilisateur : cette
+# fonction ne doit JAMAIS apparaître dans la liste des permissions
+# accordables à un DIRTO, réservée aux ADMIN (accès total, hors de ce
+# mécanisme de permissions). Ce n'est pas seulement une case décochée
+# par défaut : c'est l'ABSENCE de toute clé "end_tournament" ici qui
+# rend structurellement impossible de l'accorder — voir set_dirto_
+# authorization, qui filtre toute clé absente de ce dict (donc aussi
+# "end_tournament" si jamais présentée par erreur) avant d'écrire en
+# base, en plus de l'UI qui ne la propose jamais.
+#
+# dict Python (ordre d'insertion préservé, comme RANKING_FORMULA_LABELS
+# ci-dessus) : c'est cet ordre qui peuple la liste à cocher de l'onglet
+# Paramètres (voir main.py).
+REMOTE_PERMISSION_ELIMINATIONS = "eliminations"
+REMOTE_PERMISSION_TABLES = "tables"
+REMOTE_PERMISSION_MOVES = "moves"
+REMOTE_PERMISSION_CLOCK = "clock"
+REMOTE_PERMISSION_LEVELS = "levels"
+REMOTE_PERMISSION_PHOTOS = "photos"
+REMOTE_PERMISSION_REBALANCE = "rebalance"
+
+REMOTE_PERMISSION_LABELS = {
+    REMOTE_PERMISSION_ELIMINATIONS: "Gérer les éliminations",
+    REMOTE_PERMISSION_TABLES: "Plan de tables",
+    REMOTE_PERMISSION_MOVES: "Afficher Mouvements",
+    REMOTE_PERMISSION_CLOCK: "Chronomètre (pause / reprise)",
+    REMOTE_PERMISSION_LEVELS: "Changer de niveau (blindes)",
+    REMOTE_PERMISSION_PHOTOS: "Photos des joueurs",
+    REMOTE_PERMISSION_REBALANCE: "Répondre au rééquilibrage (grosse blinde)",
 }
 
 
 def ranking_points(place, n_players, formula=RANKING_FORMULA_NONE):
     """Valeur en points de la prime de classement pour un rang `place`
-    parmi `n_players` joueurs au total. `formula` : une des 4 valeurs de
+    parmi `n_players` joueurs au total. `formula` : une des 5 valeurs de
     RANKING_FORMULA_LABELS —
     - "none" : aucun point (0), quel que soit le rang ;
     - "current" ("Classique") : 100×√N/P — favorise les premières places ;
     - "progressive" : 100×√N/√P — récompense davantage la régularité,
       écart entre les premières places plus faible que "Classique" ;
+    - "tournois_cpc" : voir ranking_points_table (barème à somme fixe
+      N×1000, méthode des plus grands restes — CE rang seul ne peut pas
+      être calculé isolément, contrairement aux 3 formules ci-dessus :
+      cette branche délègue donc à ranking_points_table, qui recalcule
+      le barème COMPLET à chaque appel — acceptable pour un appel
+      isolé/un test, jamais dans une boucle par joueur, voir
+      get_ranking_bonuses qui appelle directement ranking_points_table
+      une seule fois par tournoi) ;
     - "sitngo_cpc" : 1000 + 100×(N+1) - 200×P — chaque joueur apporte
       1000 points au total distribué, places espacées de 200 points
       (ex. N=7 : 1600/1400/1200/1000/800/600/400, somme = 7000 = N×1000).
@@ -313,11 +408,90 @@ def ranking_points(place, n_players, formula=RANKING_FORMULA_NONE):
         return round(100 * math.sqrt(n_players) / place)
     if formula == RANKING_FORMULA_PROGRESSIVE:
         return round(100 * math.sqrt(n_players) / math.sqrt(place))
+    if formula == RANKING_FORMULA_TOURNOIS_CPC:
+        if place > n_players:
+            return 0
+        return ranking_points_table(n_players, formula)[place - 1]
     if formula == RANKING_FORMULA_SITNGO_CPC:
         # Arithmétique entière exacte (pas de round() nécessaire ni
         # souhaitable : 100×(N+1) et 200×P sont toujours des entiers).
         return 1000 + 100 * (n_players + 1) - 200 * place
     return 0  # "none", ou toute valeur inconnue/future : aucun point.
+
+
+def ranking_points_table(n_players, formula=RANKING_FORMULA_NONE):
+    """Barème COMPLET des points de classement d'un tournoi de
+    `n_players` joueurs, sous forme de liste de `n_players` entiers
+    (index 0 = place 1, ..., index n_players-1 = place n_players) — 0 si
+    n_players <= 0.
+
+    Pour "current"/"progressive"/"sitngo_cpc"/"none" : simple wrapper
+    de ranking_points() pour chaque place — mathématiquement identique
+    à des appels individuels, aucun changement de résultat (ces 3
+    formules calculent chaque place indépendamment des autres).
+
+    Pour "tournois_cpc" (demande du 2026-09-20, règle définitive du
+    club — voir aussi la docstring de ranking_points), CALCULE le
+    barème entier en une seule fois : contrairement aux formules
+    ci-dessus, la méthode des plus grands restes exige de connaître la
+    répartition COMPLÈTE des valeurs théoriques avant de savoir quelles
+    places reçoivent le point de complément — un rang ne peut donc
+    jamais être déterminé isolément pour cette formule.
+
+    Formule théorique (avant arrondi), pour chaque place r de 1 à N :
+        P(r,N) = 50 + 950×N × [0,12 × 0,88^(r-1)] / [1 - 0,88^N]
+    Appliquée SANS EXCEPTION ni changement de formule, y compris hors
+    du barème documenté 15-45 joueurs (demande explicite du club :
+    "aucune limitation, aucun blocage et aucun changement de formule
+    hors de la plage 15-45").
+
+    Arrondi par la méthode des PLUS GRANDS RESTES (jamais un round()
+    indépendant par place, qui ne garantirait pas une somme exacte) :
+    1. partie entière de chaque valeur théorique ;
+    2. points manquants pour atteindre EXACTEMENT N×1000 = somme des
+       valeurs théoriques (démontré algébriquement : la série
+       géométrique se simplifie exactement à 950N + 50N = 1000N,
+       quel que soit N) ;
+    3. ces points manquants sont distribués un par un aux places ayant
+       les plus grands restes décimaux, départagées par la place r la
+       plus petite en cas d'égalité stricte du reste (règle explicite
+       du club).
+
+    Utilise fractions.Fraction (0,88 = 22/25 est rationnel, donc toute
+    la formule l'est) plutôt que float/Decimal : exactitude totale, ni
+    imprécision flottante sur les restes, ni risque qu'un départage
+    soit faussé par une erreur d'arrondi — la somme finale vaut donc
+    PROUVABLEMENT exactement n_players × 1000, jamais approximativement
+    (assertion de sécurité ci-dessous, qui ne devrait jamais se
+    déclencher d'après la preuve algébrique ci-dessus)."""
+    if n_players <= 0:
+        return []
+    if formula != RANKING_FORMULA_TOURNOIS_CPC:
+        return [ranking_points(r, n_players, formula) for r in range(1, n_players + 1)]
+
+    q = Fraction(88, 100)
+    one_minus_q = 1 - q
+    denom = 1 - q ** n_players
+    raw_values = [
+        50 + Fraction(950 * n_players) * (one_minus_q * q ** (r - 1)) / denom
+        for r in range(1, n_players + 1)
+    ]
+    floors = [int(v) for v in raw_values]  # int() tronque vers 0 : = floor() pour une valeur positive
+    remainders = [v - f for v, f in zip(raw_values, floors)]
+    target = n_players * 1000
+    missing = target - sum(floors)
+    # Plus grands restes d'abord ; départage par r le plus petit
+    # (index i = r-1, donc tri croissant sur i) en cas d'égalité
+    # stricte du reste — règle explicite du club.
+    order = sorted(range(n_players), key=lambda i: (-remainders[i], i))
+    table = list(floors)
+    for i in order[:missing]:
+        table[i] += 1
+    assert sum(table) == target, (
+        f"Tournois CPC : somme des points de classement != N×1000 "
+        f"pour N={n_players} ({sum(table)} != {target})"
+    )
+    return table
 
 
 def bounty_unit_value(n_players, flat_value=0):
@@ -574,6 +748,118 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
+        self.conn.commit()
+
+    # -- Autorisations DIRTO du Contrôle à distance (Phase 3, "Sécurisation
+    # du Contrôle à distance", 2026-09-20) — table remote_authorizations,
+    # voir SCHEMA et REMOTE_PERMISSION_LABELS plus haut. PAR TOURNOI : ce
+    # fichier .tournoi précis uniquement, jamais partagé avec un autre. ---
+
+    @staticmethod
+    def _decode_permissions(raw_json):
+        """Décodage défensif (jamais une exception, même sur une valeur
+        corrompue) — et filtre systématiquement contre REMOTE_PERMISSION_
+        LABELS : une clé qui existait dans une version antérieure de
+        l'application mais plus aujourd'hui (ou, impossible en pratique
+        mais par principe, "end_tournament" si jamais présente) disparaît
+        silencieusement plutôt que d'être accordée par erreur."""
+        try:
+            values = json.loads(raw_json) if raw_json else []
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(values, list):
+            return []
+        return [v for v in dict.fromkeys(values) if v in REMOTE_PERMISSION_LABELS]
+
+    @staticmethod
+    def _row_to_dirto_authorization(row):
+        return {
+            "dirto_name": row["dirto_name"],
+            "admin_name": row["admin_name"],
+            "permissions": Database._decode_permissions(row["permissions"]),
+            "granted_at": row["granted_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_dirto_authorization(self, dirto_name):
+        """dict {dirto_name, admin_name, permissions (liste de clés
+        REMOTE_PERMISSION_*), granted_at, updated_at} pour CE DIRTO dans
+        CE tournoi, ou None si aucune autorisation n'existe — "aucune
+        autorisation existante = aucune permission DIRTO" (règle
+        explicite) découle directement de ce None : voir son futur
+        usage en Phase 4 (remote_control.py), jamais codé ici."""
+        dirto_name = (dirto_name or "").strip()
+        if not dirto_name:
+            return None
+        row = self.conn.execute(
+            "SELECT * FROM remote_authorizations WHERE dirto_name = ?", (dirto_name,)
+        ).fetchone()
+        return self._row_to_dirto_authorization(row) if row is not None else None
+
+    def list_dirto_authorizations(self):
+        """Toutes les autorisations DIRTO de CE tournoi, triées par nom
+        (insensible à la casse) — pour l'écran Paramètres (voir main.py),
+        qui doit pouvoir afficher/modifier chacune, pas seulement celle
+        du DIRTO actuellement sélectionné dans le formulaire."""
+        rows = self.conn.execute(
+            "SELECT * FROM remote_authorizations ORDER BY dirto_name COLLATE NOCASE"
+        ).fetchall()
+        return [self._row_to_dirto_authorization(row) for row in rows]
+
+    def set_dirto_authorization(self, dirto_name, admin_name, permissions):
+        """Crée (ou REMPLACE intégralement — jamais un ajout partiel,
+        jamais deux lignes pour le même DIRTO, dirto_name est la clé
+        PRIMAIRE de la table) l'autorisation de `dirto_name` pour CE
+        tournoi, accordée/modifiée par `admin_name`. `admin_name` est
+        toujours écrasé par la valeur donnée ici, y compris lors d'une
+        simple MODIFICATION d'une autorisation déjà existante : reflète
+        "changement d'ADMIN accordant les droits" (règle explicite) —
+        c'est TOUJOURS le dernier ADMIN à avoir agi sur cette
+        autorisation, jamais celui qui l'a créée à l'origine en premier
+        (`granted_at`, lui, est préservé tel quel lors d'une
+        modification — seul `updated_at` change).
+
+        `permissions` : itérable de clés — filtré contre REMOTE_
+        PERMISSION_LABELS (voir _decode_permissions) et dédoublonné
+        avant stockage ; toute clé invalide/inconnue (donc aussi
+        "end_tournament", qui n'existe pas dans ce dict) est
+        silencieusement écartée — DERNIER filet de sécurité, en plus de
+        l'interface qui ne la propose de toute façon jamais.
+
+        Ne fait rien si `dirto_name`/`admin_name` est vide après
+        nettoyage — jamais une ligne orpheline sans identité claire."""
+        dirto_name = (dirto_name or "").strip()
+        admin_name = (admin_name or "").strip()
+        if not dirto_name or not admin_name:
+            return
+        clean_permissions = [p for p in dict.fromkeys(permissions or []) if p in REMOTE_PERMISSION_LABELS]
+        now = time.time()
+        existing = self.conn.execute(
+            "SELECT granted_at FROM remote_authorizations WHERE dirto_name = ?", (dirto_name,)
+        ).fetchone()
+        granted_at = existing["granted_at"] if existing is not None else now
+        self.conn.execute(
+            "INSERT INTO remote_authorizations "
+            "(dirto_name, admin_name, permissions, granted_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(dirto_name) DO UPDATE SET "
+            "admin_name=excluded.admin_name, permissions=excluded.permissions, "
+            "updated_at=excluded.updated_at",
+            (dirto_name, admin_name, json.dumps(clean_permissions), granted_at, now),
+        )
+        self.conn.commit()
+
+    def clear_dirto_authorization(self, dirto_name):
+        """Retrait COMPLET de l'autorisation de `dirto_name` pour CE
+        tournoi (règle explicite) — supprime la ligne, ne la vide/
+        désactive pas : get_dirto_authorization renverra ensuite None,
+        exactement comme si ce DIRTO n'avait jamais été autorisé.
+        Silencieux si `dirto_name` n'a aucune autorisation (rien à
+        retirer)."""
+        dirto_name = (dirto_name or "").strip()
+        if not dirto_name:
+            return
+        self.conn.execute("DELETE FROM remote_authorizations WHERE dirto_name = ?", (dirto_name,))
         self.conn.commit()
 
     def get_tournament_date(self):
@@ -2525,6 +2811,28 @@ class Database:
         self.conn.execute("DELETE FROM seat_moves")
         self.conn.commit()
 
+    def confirm_seat_move(self, move_id):
+        """Confirmation INDIVIDUELLE d'un mouvement (demande du
+        2026-09-19, bouton [OK] par ligne sur la page "Mouvements" du
+        contrôle à distance) : retire uniquement CETTE ligne, les autres
+        mouvements en attente restent inchangés.
+
+        N'applique jamais rien à `players` : `table_id`/`seat` sont déjà,
+        depuis le calcul même du rééquilibrage (rebalance_tables/
+        resolve_pending_rebalance/undo_last_elimination), la position
+        RÉELLE et définitive du joueur — bien avant que cette ligne
+        seat_moves n'existe. Confirmer un mouvement ne fait donc que
+        retirer son entrée du journal/affichage, exactement comme
+        clear_seat_moves() pour le lot entier (voir App._finish_movement_
+        alert, jamais modifiée par cette fonction).
+
+        Idempotent : un id déjà confirmé (ligne déjà supprimée) ou
+        totalement inconnu ne lève jamais d'exception et n'a aucun
+        effet — un double-tap ou un retry réseau côté téléphone reste
+        donc toujours sans risque."""
+        self.conn.execute("DELETE FROM seat_moves WHERE id=?", (move_id,))
+        self.conn.commit()
+
     # ---------- primes (bounty) ----------
     def get_bounty_events(self, limit=500):
         """Historique des primes gagnées (le plus récent en premier), pour
@@ -2553,13 +2861,26 @@ class Database:
         fait d'avoir participé à ce tournoi, 0 si le réglage est nul.
         Renvoie {nom: points}.
 
+        Un forfait (status='withdrawn') est EXCLU depuis la règle métier
+        validée le 2026-09-18 : "un joueur inscrit qui n'est jamais venu"
+        ne doit pas recevoir de prime de présence — remplace le
+        comportement antérieur (forfait compris, voir git history). Un
+        joueur 'eliminated' (a réellement joué) reste, lui, pleinement
+        éligible, exactement comme 'active' : seul le statut 'withdrawn'
+        est exclu ici, jamais 'eliminated'. Get_primes_summary (seul
+        appelant) lit ce dict via `.get(name, 0)` : un forfait absent
+        d'ici y apparaît donc naturellement avec 0, sans autre
+        changement nécessaire là-bas.
+
         Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
         aucun calcul, {} inconditionnellement — court-circuit à la
         source, pas un simple masquage à l'affichage."""
         if not self._primes_enabled():
             return {}
         points = self.get_setting_int("attendance_bonus_points", 0)
-        return {p["name"]: points for p in self.list_players()}
+        return {
+            p["name"]: points for p in self.list_players() if p["status"] != "withdrawn"
+        }
 
     def get_assiduity_bonuses(self):
         """Calcule la prime d'assiduité (en points) de chaque joueur du
@@ -2570,11 +2891,26 @@ class Database:
           requises, ce tournoi inclus (0/nul = prime désactivée aussi). 2
           = présent ce tournoi-ci ET le précédent ; 3 = ce tournoi-ci et
           les 2 précédents ; etc.
-        Un joueur est éligible s'il figure dans TOUS les
+        Un joueur est éligible s'il a été RÉELLEMENT présent (statut
+        'active' ou 'eliminated', jamais 'withdrawn' — règle métier
+        validée le 2026-09-18) dans CE tournoi ET dans TOUS les
         (`assiduity_consecutive_days` - 1) fichiers .tournoi précédents
-        immédiats (même dossier, non récursif) — s'il manque ne serait-ce
-        qu'un de ces tournois dans son historique, ou qu'il n'y a pas
-        encore assez de tournois précédents, il n'est pas éligible.
+        immédiats (même dossier, non récursif — recherche de fichiers
+        elle-même INCHANGÉE, voir find_previous_tournament_files) —
+        s'il manque ne serait-ce qu'un de ces tournois dans son
+        historique, s'il y était forfait, s'il est lui-même forfait
+        MAINTENANT, ou qu'il n'y a pas encore assez de tournois
+        précédents, il n'est pas éligible. Un forfait, dans un tournoi
+        antérieur OU dans celui-ci, casse donc la série exactement comme
+        une absence pure — ni ne la maintient pour lui-même, ni pour les
+        autres joueurs du même tournoi antérieur.
+
+        Utilise _read_present_player_names_from_file (jamais
+        read_player_names_from_file, réservée à un usage général sans
+        rapport avec les primes — voir sa docstring) pour les fichiers
+        précédents : cette fonction dédiée exclut déjà les forfaits à la
+        source.
+
         Renvoie une liste de dicts {name, present_previous, points} triée
         par nom ; liste vide si la prime est désactivée (l'un des deux
         réglages à 0) ou si `_primes_enabled` est faux (interrupteur
@@ -2586,10 +2922,18 @@ class Database:
         if points <= 0 or consecutive_days <= 0:
             return []
 
+        # Joueurs réellement présents dans CE tournoi (jamais un forfait) —
+        # seule cette liste peut prétendre au bonus, quelle que soit son
+        # historique : un forfait AUJOURD'HUI n'en bénéficie jamais, même
+        # s'il remplissait la condition les fois précédentes.
+        present_now = {
+            p["name"].strip().lower() for p in self.list_players() if p["status"] != "withdrawn"
+        }
+
         needed_previous = consecutive_days - 1
         if needed_previous == 0:
             # 1 seule présence "consécutive" requise : ce tournoi-ci suffit.
-            eligible_names = {p["name"].strip().lower() for p in self.list_players()}
+            eligible_names = present_now
         else:
             prev_files = find_previous_tournament_files(
                 self.path, self.get_tournament_date(), count=needed_previous
@@ -2597,11 +2941,8 @@ class Database:
             if len(prev_files) < needed_previous:
                 eligible_names = set()  # pas encore assez d'historique
             else:
-                name_sets = [
-                    {n.strip().lower() for n in read_player_names_from_file(fp)}
-                    for fp in prev_files
-                ]
-                eligible_names = set.intersection(*name_sets)
+                name_sets = [_read_present_player_names_from_file(fp) for fp in prev_files]
+                eligible_names = present_now.intersection(*name_sets)
 
         result = [
             {
@@ -2623,7 +2964,7 @@ class Database:
         Aucun", qui aurait rétroactivement mis à zéro les points de
         classement de tout ancien tournoi n'ayant jamais touché ce champ) :
 
-        1. `ranking_formula` déjà présent (l'une des 4 valeurs de
+        1. `ranking_formula` déjà présent (l'une des 5 valeurs de
            RANKING_FORMULA_LABELS, y compris "none") : utilisé tel quel.
            C'est le cas de tout NOUVEAU tournoi (stampé "none" dès sa
            création, voir App._choose_tournament_file) et de tout
@@ -2644,7 +2985,7 @@ class Database:
            ne rien changer rétroactivement.
 
         Renvoie (formula, legacy_flat_value) : `formula` est toujours
-        l'une des 4 valeurs de RANKING_FORMULA_LABELS ; `legacy_flat_value`
+        l'une des 5 valeurs de RANKING_FORMULA_LABELS ; `legacy_flat_value`
         est None sauf dans le cas 2 ci-dessus, où il prime absolument sur
         `formula` (voir get_ranking_bonuses — jamais les deux appliqués
         à la fois)."""
@@ -2669,9 +3010,10 @@ class Database:
 
         Utilise resolve_ranking_formula() (voir sa docstring pour la
         règle de compatibilité complète avec l'ancien ranking_bonus_points)
-        — SEUL point d'appel de ranking_points() dans tout le fichier :
-        onglet Primes, exports CSV/XLSX/PDF et synthèse multi-tournois en
-        découlent tous automatiquement via get_primes_summary()."""
+        — SEUL point d'appel de ranking_points_table() dans tout le
+        fichier : onglet Primes, exports CSV/XLSX/PDF et synthèse
+        multi-tournois en découlent tous automatiquement via
+        get_primes_summary()."""
         if not self._primes_enabled():
             return []
         formula, legacy_flat_value = self.resolve_ranking_formula()
@@ -2679,6 +3021,14 @@ class Database:
         all_players = self.list_players()
         active = [p for p in all_players if p["status"] == "active"]
         finished = len(active) == 1
+        # Barème calculé UNE SEULE FOIS pour tout le tournoi (voir
+        # ranking_points_table), jamais un appel par joueur : nécessaire
+        # pour "tournois_cpc" (plus grands restes, exige la répartition
+        # complète de tous les rangs) et neutre en résultat pour les
+        # autres formules (simple wrapper, voir sa docstring). Inutile
+        # si legacy_flat_value prime (ancien réglage "valeur fixe") :
+        # on évite alors totalement ce calcul.
+        points_table = None if legacy_flat_value is not None else ranking_points_table(n_players, formula)
 
         result = []
         for p in all_players:
@@ -2692,7 +3042,12 @@ class Database:
             # legacy_flat_value (ancien réglage "valeur fixe") prime
             # absolument sur la formule si présent — voir
             # resolve_ranking_formula, cas 2.
-            valeur = legacy_flat_value if legacy_flat_value is not None else ranking_points(place, n_players, formula)
+            if legacy_flat_value is not None:
+                valeur = legacy_flat_value
+            elif 0 < place <= len(points_table):
+                valeur = points_table[place - 1]
+            else:
+                valeur = 0
             result.append({
                 "name": p["name"], "place": place,
                 "nombre": 1, "valeur": valeur, "montant": valeur,
@@ -3686,6 +4041,31 @@ def read_player_names_from_file(path):
         conn.close()
 
 
+def _read_present_player_names_from_file(path):
+    """Comme read_player_names_from_file ci-dessus, mais EXCLUT les
+    forfaits (status='withdrawn') — usage RÉSERVÉ à Database.get_
+    assiduity_bonuses (règle métier validée le 2026-09-18 : un forfait
+    est un joueur inscrit qui n'est jamais venu, il ne doit ni bénéficier
+    d'une série d'assiduité, ni la maintenir pour les autres joueurs
+    d'un tournoi antérieur). Ne remplace PAS read_player_names_from_file
+    pour son propre usage (reprise de la liste des joueurs d'un tournoi
+    précédent dans un nouveau tournoi, voir main.py) — volontairement
+    inchangée, fonction séparée pour ne jamais risquer d'effet de bord
+    sur cet autre appelant. Renvoie un set de noms en minuscules/sans
+    espaces superflus (déjà normalisés pour l'intersection faite par
+    get_assiduity_bonuses, qui compare toujours sur cette forme)."""
+    uri = f"file:{os.path.abspath(path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT name FROM players WHERE status != 'withdrawn' "
+            "ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+        return {row[0].strip().lower() for row in rows if row[0] and row[0].strip()}
+    finally:
+        conn.close()
+
+
 # =====================================================================
 # Synthèse multi-tournois par période (parcourt plusieurs fichiers
 # .tournoi d'un dossier). Contrairement au reste de ce module, ces
@@ -4081,14 +4461,17 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
     EXCLUSIVEMENT ces valeurs, jamais une formule dupliquée ici.
     "total_ranking_points" (remplace l'ancien "total_gain" en euros) =
     somme de cl_montant de get_primes_summary() — donc déjà correct pour
-    les 4 formules de classement (Aucun/Classique/Progressive/Sit & Go
-    CPC, voir resolve_ranking_formula/ranking_points, jamais recalculées
-    ici) et pour l'ancien réglage "valeur fixe" hérité. Comme presence/
-    assiduite (voir get_presence_bonuses/get_assiduity_bonuses, qui
-    bouclent sur TOUS les joueurs sans filtre de statut), un forfait
-    continue de peser sur "total_presence_assiduity" pour ce tournoi ;
-    "total_ranking_points" reste, lui, naturellement à 0 pour un forfait
-    (get_ranking_bonuses ne lui attribue jamais de place). Primes
+    les 5 formules de classement (Aucun/Classique/Progressive/Tournois
+    CPC/Sit & Go CPC, voir resolve_ranking_formula/ranking_points,
+    jamais recalculées ici) et pour l'ancien réglage "valeur fixe"
+    hérité, naturellement à 0 pour un forfait (get_ranking_bonuses ne
+    lui attribue jamais de place). "total_presence_assiduity" : depuis
+    la règle métier validée le 2026-09-18 ("un forfait est un joueur
+    inscrit qui n'est jamais venu"),
+    get_presence_bonuses/get_assiduity_bonuses EXCLUENT
+    désormais les forfaits (status='withdrawn') — un forfait ne contribue
+    donc plus du tout à "total_presence_assiduity" pour ce tournoi
+    (remplace le comportement antérieur, voir git history). Primes
     désactivées pour un tournoi (_primes_enabled faux) : get_primes_
     summary() renvoie [], donc aucune contribution de ce tournoi à ces
     deux totaux, exactement comme pour total_bounty_won/total_points.
@@ -4098,15 +4481,17 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
     bien participé ADMINISTRATIVEMENT à ce tournoi (inscrit, blindes
     éventuellement prélevées avant sa déclaration de forfait ~1h après le
     début) — il reste donc dans "players" et continue de peser sur
-    "total_bounty_won"/"total_points" (et désormais "total_presence_
-    assiduity") exactement comme avant cette règle — mais ce tournoi ne
-    doit PAS compter dans son nombre de tournois JOUÉS : "tournaments_
-    played" n'est incrémenté que pour un joueur resté "active" (encore
-    en jeu, y compris le vainqueur) ou "eliminated" (a réellement joué
-    jusqu'à son élimination), jamais pour "withdrawn". "wins"/"best_place"
-    restent, eux, déjà inatteignables pour un forfait de toute façon
-    (aucune "place" ne lui est jamais attribuée, voir la boucle plus
-    bas) — inchangé par cette règle.
+    "total_bounty_won"/"total_points" (bounty : mécanique de kills,
+    volontairement non touchée par la règle du 2026-09-18 ci-dessus — un
+    forfait ayant éliminé un adversaire AVANT sa propre déclaration de
+    forfait garde ce bounty) — mais ce tournoi ne doit PAS compter dans
+    son nombre de tournois JOUÉS : "tournaments_played" n'est incrémenté
+    que pour un joueur resté "active" (encore en jeu, y compris le
+    vainqueur) ou "eliminated" (a réellement joué jusqu'à son
+    élimination), jamais pour "withdrawn". "wins"/"best_place" restent,
+    eux, déjà inatteignables pour un forfait de toute façon (aucune
+    "place" ne lui est jamais attribuée, voir la boucle plus bas) —
+    inchangé par cette règle.
 
     SUPPRIMÉ le 2026-09-18 (demande explicite, plus aucun usage ailleurs
     dans le projet — vérifié) : "total_cost"/"total_gain" (€, calculés à
@@ -4203,8 +4588,9 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 # utilisée pour bounty_won/points ci-dessous, voir la
                 # docstring de cette fonction) : jamais une formule
                 # dupliquée pour presence/assiduite/cl_montant — ces
-                # valeurs sont déjà correctes pour les 4 formules de
-                # classement (Aucun/Classique/Progressive/Sit & Go CPC)
+                # valeurs sont déjà correctes pour les 5 formules de
+                # classement (Aucun/Classique/Progressive/Tournois CPC/
+                # Sit & Go CPC)
                 # et pour un tournoi "primes désactivées" (prime_row is
                 # None -> 0 partout, comme bounty_won/points).
                 prime_row = primes_by_name.get(p["name"])

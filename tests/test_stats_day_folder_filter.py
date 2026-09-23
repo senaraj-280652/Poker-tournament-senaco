@@ -31,6 +31,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk  # noqa: E402
 
@@ -38,6 +39,7 @@ import database  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
 import roster  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -267,7 +269,9 @@ class PeriodSummaryDialogDayCheckboxesUiTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : force gc.collect() sur le thread principal.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="stats_day_ui_")
@@ -281,7 +285,9 @@ class PeriodSummaryDialogDayCheckboxesUiTest(unittest.TestCase):
             self.addCleanup(target.stop)
             target.start()
         self.dialog = main.PeriodSummaryDialog(self.root, _StubApp())
-        self.addCleanup(self.dialog.destroy)
+        # cleanup_tk (voir tests/_tk_cleanup.py) : recursive_var.trace_add
+        # (main.py) ferme un cycle sur le dialogue lui-même.
+        self.addCleanup(lambda: cleanup_tk(self, "dialog"))
         # Aucune borne de période par défaut : évite toute interférence
         # avec les dates synthétiques choisies ci-dessous (même précaution
         # que le reste du chantier Statistiques).

@@ -125,6 +125,17 @@ class AlignPrimesEnabledOnOpenTest(unittest.TestCase):
             patch.object(export_prefs, "_prefs_path", return_value=export_prefs_path),
             patch.object(main.open_windows, "_registry_path", return_value=registry_path),
             patch.object(main.open_windows, "_primes_session_lock_path", return_value=lock_path),
+            # _remote_control_dir (demande du 2026-09-19, incident réel où
+            # ce test a effacé le VRAI remote_control_auth.json de
+            # l'utilisateur) : register()/unregister() appellent
+            # _clear_remote_control_session_files() quand le registre
+            # (isolé ci-dessus) devient vide, mais cette fonction cible
+            # remote_control_auth.json/remote_control_ratelimit.json via
+            # _remote_control_dir(), jamais via _registry_path() — isoler
+            # l'un sans l'autre laisse ces deux fichiers pointer vers le
+            # vrai ~/.poker_tournament. Voir tests/test_remote_control_
+            # dir_isolation.py pour la preuve et le mécanisme complet.
+            patch.object(main.open_windows, "_remote_control_dir", return_value=self._tmpdir_ctx.name),
         ):
             self.addCleanup(target.stop)
             target.start()

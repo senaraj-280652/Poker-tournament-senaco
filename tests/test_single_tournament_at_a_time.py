@@ -53,9 +53,11 @@ import tkinter as tk
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import export_prefs  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -425,15 +427,19 @@ class LaunchButtonsStateTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : force gc.collect() sur
+        # le thread principal après destroy().
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self.win = tk.Toplevel(self.root)
         self.buttons = [ttk.Button(self.win) for _ in range(3)]
 
     def tearDown(self):
-        if self.win.winfo_exists():
-            self.win.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : gère déjà le cas
+        # "fenêtre déjà détruite" (test_ne_se_reprogramme_pas_si_la_
+        # fenetre_est_deja_detruite) via son propre garde-fou interne.
+        cleanup_tk(self, "win", "buttons")
 
     def _states(self):
         return [str(b.cget("state")) for b in self.buttons]
@@ -541,7 +547,9 @@ class ManualScenarioReproductionTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : force gc.collect() sur
+        # le thread principal après destroy().
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._open_paths = []
@@ -567,8 +575,9 @@ class ManualScenarioReproductionTest(unittest.TestCase):
         self.mock_showinfo = patcher4.start()
 
     def tearDown(self):
-        if self.win.winfo_exists():
-            self.win.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : force gc.collect() sur
+        # le thread principal après destroy().
+        cleanup_tk(self, "win", "buttons")
 
     def _refresh(self):
         """Simule "je reviens/j'affiche le Menu principal" : appelle
@@ -710,7 +719,9 @@ class PreferenceSyncAcrossProcessesTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : force gc.collect() sur
+        # le thread principal après destroy().
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._store = {}  # tient lieu de export_prefs.json
@@ -735,8 +746,9 @@ class PreferenceSyncAcrossProcessesTest(unittest.TestCase):
         self.launch_buttons = [ttk.Button(self.win) for _ in range(3)]
 
     def tearDown(self):
-        if self.win.winfo_exists():
-            self.win.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py) : force gc.collect() sur
+        # le thread principal après destroy().
+        cleanup_tk(self, "win", "launch_buttons")
 
     def _refresh_menu_principal(self):
         main._refresh_launch_buttons_state(self.win, self.launch_buttons)

@@ -31,12 +31,14 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import tkinter as tk
 from tkinter import ttk
 
 import database  # noqa: E402
 import main  # noqa: E402
+from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -59,7 +61,10 @@ class RankingFormulaWidgetTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : _build_ranking_formula_widget crée un cycle
+        # StringVar/trace_add + Tooltip/bind sur cls.root, réclamé ici.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="ranking_formula_widget_test_")
@@ -105,6 +110,11 @@ class RankingFormulaWidgetTest(unittest.TestCase):
         self.assertEqual(self._short_text(), "1000 + 100(N+1) - 200P")
         self.assertEqual(self.win.settings_vars["ranking_formula"].get(), "sitngo_cpc")
 
+    def test_selection_tournois_cpc_texte_court_correct(self):
+        self._select("Tournois CPC")
+        self.assertEqual(self._short_text(), "Barème total N × 1000 pts (plus grands restes)")
+        self.assertEqual(self.win.settings_vars["ranking_formula"].get(), "tournois_cpc")
+
     def test_selection_aucun_texte_court_correct(self):
         self._select("Aucun")
         self.assertEqual(self._short_text(), "Aucun point attribué selon le classement.")
@@ -132,7 +142,10 @@ class RankingFormulaWidgetValeurFixeHistoriqueTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : _build_ranking_formula_widget crée un cycle
+        # StringVar/trace_add + Tooltip/bind sur cls.root, réclamé ici.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="ranking_formula_widget_legacy_test_")
@@ -172,8 +185,9 @@ class RankingFormulaWidgetValeurFixeHistoriqueTest(unittest.TestCase):
 
 # =======================================================================
 # Tooltip sur le libellé "Système de points distribués" (demande du
-# 2026-09-14) — contenu détaillé des 4 formules au survol, JAMAIS un
-# nouveau bouton/popup (le bouton "ⓘ" reste définitivement retiré).
+# 2026-09-14, étendu le 2026-09-20 pour "Tournois CPC") — contenu
+# détaillé des 5 formules au survol, JAMAIS un nouveau bouton/popup (le
+# bouton "ⓘ" reste définitivement retiré).
 # =======================================================================
 _EXPECTED_TOOLTIP_LINES = [
     "Aucun — aucun point n'est attribué en fonction du",
@@ -184,6 +198,14 @@ _EXPECTED_TOOLTIP_LINES = [
     "Progressive — formule 100 × √N / √P",
     "joueur). Réduit l'écart entre les premières places et",
     "récompense davantage la régularité.",
+    "Tournois CPC — formule P(r,N) = 50 + 950×N ×",
+    "0,12×0,88^(r-1) / (1 − 0,88^N) (N = nombre de joueurs",
+    "du tournoi, r = place finale du joueur). Chaque joueur",
+    "apporte 1000 points au total distribué ; répartition",
+    "décroissante, appliquée identiquement quel que soit N.",
+    "Arrondi par la méthode des plus grands restes (jamais",
+    "indépendant par place) pour que la somme distribuée",
+    "reste toujours exactement N × 1000.",
     "Sit & Go CPC — formule 1000 + 100(N+1) − 200×P",
     "(N = nombre de joueurs du Sit & Go, P = place finale du",
     "joueur). Chaque joueur apporte 1000 points au total",
@@ -204,7 +226,10 @@ class RankingLabelTooltipTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.root.destroy()
+        # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
+        # du 2026-09-19) : _build_ranking_formula_widget crée un cycle
+        # StringVar/trace_add + Tooltip/bind sur cls.root, réclamé ici.
+        cleanup_tk(cls, "root")
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="ranking_label_tooltip_test_")
@@ -248,6 +273,25 @@ class RankingLabelTooltipTest(unittest.TestCase):
         self.assertEqual(len(label_tooltips), 1, "un seul Tooltip attendu sur ranking_lbl")
         self.tooltip = label_tooltips[0]
         self.addCleanup(self.tooltip._hide)
+        # cleanup_tk (voir tests/_tk_cleanup.py) : self.tooltip forme un
+        # cycle avec ranking_lbl (Tooltip.widget <-> bind() sur ce même
+        # widget) INDÉPENDANT de cls.root — self.tooltip/_created_tooltips
+        # sont des attributs de CE TestCase (self), pas de cls.root,
+        # jamais nettoyés par tearDownClass. Enregistré ICI (donc avant
+        # self.addCleanup(self.tooltip._hide) juste au-dessus dans l'ordre
+        # d'exécution LIFO : _hide tourne avant ce nettoyage complet).
+        # "win" est VOLONTAIREMENT absent de cette liste : self.win est
+        # ICI le même objet que cls.root (racine PARTAGÉE par toute la
+        # classe, voir setUp) — le détruire à la fin de CE test casserait
+        # les tests suivants de la même classe. Seuls les widgets/objets
+        # RECRÉÉS À CHAQUE test (ranking_lbl et consorts, tooltip) sont
+        # listés ; cls.root n'est nettoyée qu'une fois, dans
+        # tearDownClass.
+        self.addCleanup(lambda: cleanup_tk(
+            self, "tooltip", "_created_tooltips",
+            "ranking_lbl", "ranking_row", "ranking_combo",
+            "ranking_short_lbl", "ranking_legacy_note",
+        ))
 
     def test_un_seul_tooltip_pose_uniquement_sur_le_libelle(self):
         # Contrainte explicite : tooltip UNIQUEMENT sur le libellé, pas
