@@ -14,6 +14,15 @@ _REFERENCE_STEPS = [
 _REFERENCE_BB_LEVEL1 = _REFERENCE_STEPS[0][1]  # 50
 _DEFAULT_ANTE_RATIO = 0.125  # ante ≈ 12,5 % du big blind (repère par défaut)
 
+# Nombre de rounds DE JEU réellement produits par generate_blind_structure
+# (jamais plus, jamais moins — une ligne de _REFERENCE_STEPS = un round de
+# jeu, les pauses s'ajoutent en plus sans en faire partie). Exposé
+# publiquement (chantier "Paramètres > Structure des blindes", 2026-09-24)
+# pour que main.py puisse valider qu'une pause "Après Round" désigne bien
+# un round qui existera réellement, sans dépendre de la variable privée
+# _REFERENCE_STEPS.
+GENERATED_ROUNDS_COUNT = len(_REFERENCE_STEPS)
+
 
 def _round_to_chip(value):
     """Arrondit à une dénomination de jeton plausible (5 en dessous de
@@ -25,10 +34,36 @@ def _round_to_chip(value):
     return max(rounded, step)
 
 
+def _duration_for_round(i, schedule, fallback_duration):
+    """Durée (minutes) du round de jeu `i` (1-indexé, jamais les pauses —
+    voir la boucle principale) selon `schedule` — liste de (durée,
+    nb_rounds_ou_None), chantier "Paramètres > Structure des blindes"
+    (2026-09-24). `count=None` s'applique IMMÉDIATEMENT et pour TOUJOURS
+    (les paliers suivants du barème, s'il y en a, ne sont alors jamais
+    atteints) — c'est exactement la règle demandée : une ligne 1 sans
+    "Nb Rounds" s'applique à tout le tournoi, une ligne 2 sans "Nb
+    Rounds" s'applique à tout le reste. Si `i` dépasse la somme des
+    compteurs chiffrés SANS qu'aucune ligne ouverte (count=None) n'ait
+    été rencontrée (décision explicite du 2026-09-24) : prolonge la
+    DERNIÈRE durée du barème pour tous les rounds restants, plutôt que
+    de lever une erreur ou de retomber sur `fallback_duration`."""
+    if not schedule:
+        return fallback_duration
+    cumulative = 0
+    for duration, count in schedule:
+        if count is None:
+            return duration
+        cumulative += count
+        if i <= cumulative:
+            return duration
+    return schedule[-1][0]
+
+
 def generate_blind_structure(start_small_blind=25, start_big_blind=50,
                              ante_start_level=4, start_ante=25,
                              duration_minutes=15, break_duration_minutes=None,
-                             break_every=4):
+                             break_every=4,
+                             duration_schedule=None, break_schedule=None):
     """Génère une structure de blindes complète à partir du small/big blind
     du niveau 1, du niveau à partir duquel les antes s'appliquent et de la
     valeur de l'ante à ce niveau-là.
@@ -45,7 +80,23 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
     - `break_duration_minutes` fixe la durée des pauses, indépendamment de
       `duration_minutes` (durée des niveaux de blindes). Par défaut, égale
       à `duration_minutes` si non précisée.
-    """
+
+    `duration_schedule`/`break_schedule` (chantier "Paramètres > Structure
+    des blindes — durées variables + 2 pauses programmables", 2026-09-24)
+    — OPTIONNELS, `None` par défaut : dans ce cas, comportement
+    STRICTEMENT INCHANGÉ (`duration_minutes` flat + pause toutes les
+    `break_every` niveaux, exactement comme avant ce chantier — voir
+    default_blind_structure/blind_templates.py, jamais impactés).
+
+    - `duration_schedule` : liste de `(durée_minutes, nb_rounds_ou_None)`
+      — voir _duration_for_round ci-dessus pour la règle exacte
+      (count=None = "jusqu'à la fin", barème épuisé = prolonge la
+      dernière durée).
+    - `break_schedule` : liste de `(durée_pause_minutes, après_round)` —
+      `après_round` désigne le numéro du ROUND DE JEU (jamais une pause)
+      après lequel insérer cette pause ; remplace entièrement `break_every`
+      quand fourni (une pause précise par ligne, plus une pause
+      automatique toutes les N rounds)."""
     start_small_blind = max(1, int(start_small_blind))
     start_big_blind = max(start_small_blind + 1, int(start_big_blind))
     ante_start_level = max(1, int(ante_start_level))
@@ -53,6 +104,17 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
     if break_duration_minutes is None:
         break_duration_minutes = duration_minutes
     scale = start_big_blind / _REFERENCE_BB_LEVEL1
+
+    # break_map : {après_round: durée_pause} — construit une seule fois,
+    # jamais recalculé dans la boucle. Une entrée invalide/incomplète ne
+    # doit jamais arriver ici (validée en amont par l'appelant, voir
+    # App._generate_custom_blind_structure) mais reste ignorée sans
+    # lever si elle survenait malgré tout (défensif, jamais bloquant).
+    break_map = {}
+    if break_schedule:
+        for minutes, after_round in break_schedule:
+            if minutes and after_round:
+                break_map[int(after_round)] = int(minutes)
 
     # 1) Squelette des niveaux (blindes + pauses), sans ante pour l'instant.
     #    La position dans cette liste (1-indexée) correspond exactement au
@@ -66,11 +128,28 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
             sb = _round_to_chip(ref_sb * scale)
             if sb >= bb:
                 sb = max(_round_to_chip(bb / 2), 1)
+        this_duration = (
+            _duration_for_round(i, duration_schedule, duration_minutes)
+            if duration_schedule is not None else duration_minutes
+        )
         rows.append({
             "small_blind": sb, "big_blind": bb, "ante": 0,
-            "duration_minutes": duration_minutes, "is_break": False,
+            "duration_minutes": this_duration, "is_break": False,
         })
-        if break_every and i % break_every == 0:
+        # "is not None" (jamais juste `if break_schedule:`) : une liste
+        # VIDE ([], "aucune pause configurée") doit se comporter
+        # différemment de `None` ("aucun échéancier fourni du tout,
+        # appelant historique") — sinon les deux se confondraient et une
+        # régénération avec les 2 lignes de pause délibérément vidées
+        # retomberait à tort sur l'ancien break_every=4.
+        if break_schedule is not None:
+            if i in break_map:
+                rows.append({
+                    "small_blind": sb, "big_blind": bb, "ante": 0,
+                    "duration_minutes": break_map[i], "is_break": True,
+                    "break_label": "Pause",
+                })
+        elif break_every and i % break_every == 0:
             rows.append({
                 "small_blind": sb, "big_blind": bb, "ante": 0,
                 "duration_minutes": break_duration_minutes, "is_break": True,

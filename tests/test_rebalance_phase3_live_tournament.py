@@ -73,9 +73,12 @@ class _TwoTablesLiveTournamentTestCase(unittest.TestCase):
 
 
 class GuidageAvecReponseTest(_TwoTablesLiveTournamentTestCase):
-    """4. Après démarrage, guidage BB actif + téléphone répond : le
-    mouvement guidé s'applique normalement (comportement existant,
-    non-régression de cette architecture)."""
+    """4. Après démarrage, guidage UTG actif + téléphone désigne
+    directement le joueur à déplacer : le mouvement s'applique
+    normalement (comportement existant, non-régression de cette
+    architecture — chantier "sélection directe du joueur UTG",
+    2026-09-24 : le téléphone envoie désormais player_id, plus un numéro
+    de siège à interpréter)."""
 
     def setUp(self):
         super().setUp()
@@ -89,8 +92,11 @@ class GuidageAvecReponseTest(_TwoTablesLiveTournamentTestCase):
         self.assertIsNotNone(pending)
         self.assertEqual(pending["table_id"], self.t1_id)
 
-        answered_seat = pending["seats"][0]
-        moves = self.db.resolve_pending_rebalance(pending["request_id"], answered_seat)
+        # Joueur désigné = celui assis au premier siège occupé de la
+        # table source (t1_players est indexé par siège-1, voir setUp).
+        designated_seat = pending["seats"][0]
+        designated_player_id = self.t1_players[designated_seat - 1]
+        moves = self.db.resolve_pending_rebalance(pending["request_id"], designated_player_id)
 
         self.assertTrue(moves)
         c1, c2 = self._counts()

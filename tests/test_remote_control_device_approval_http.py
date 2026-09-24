@@ -369,7 +369,7 @@ class AllSensitiveRoutesProtectedTest(_RemoteControlHttpTestCase):
             ("POST", "/eliminate", {"eliminated_id": 1, "eliminator_id": None}),
             ("POST", "/upload_photo?player_name=Alice", None),
             ("POST", "/delete_photo?player_name=Alice", None),
-            ("POST", "/rebalance_answer", {"request_id": "x", "seat": None}),
+            ("POST", "/rebalance_answer", {"request_id": "x", "player_id": None}),
             ("POST", "/end_tournament", {"pid": os.getpid()}),
             ("GET", "/players", None),
             ("GET", "/roster_players", None),

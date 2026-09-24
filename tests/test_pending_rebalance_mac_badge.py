@@ -1,21 +1,25 @@
 # -*- coding: utf-8 -*-
 """Tests ciblés du "point à étudier" de la PHASE 3 (demande du
 2026-09-10) : une indication discrète dans l'onglet Tables quand un
-rééquilibrage attend une réponse "grosse blinde" (voir main.py:
-_update_pending_rebalance_badge), et un bouton "Continuer sans indiquer
-la BB" permettant au responsable de débloquer CE mouvement précis depuis
-le Mac (voir _continue_pending_rebalance_without_bb) — SANS reproduire
-l'ancienne fenêtre intrusive, et SANS toucher à la préférence globale
-"Équilibrage guidé par la grosse blinde" (contrairement à
+rééquilibrage attend qu'on désigne le joueur UTG à déplacer (voir
+main.py: _update_pending_rebalance_badge), et un bouton "Continuer sans
+désigner le joueur" permettant au responsable de débloquer CE mouvement
+précis depuis le Mac (voir _continue_pending_rebalance_without_bb) —
+SANS reproduire l'ancienne fenêtre intrusive, et SANS toucher à la
+préférence globale "Équilibrage guidé par UTG" (contrairement à
 _on_bb_rebalance_prompt_toggle, qui la décoche en plus de résoudre la
-demande en cours).
+demande en cours). Textes mis à jour le 2026-09-24 (chantier "sélection
+directe du joueur UTG") — mécanisme et assertions inchangés : ce fichier
+n'exerce que le chemin "Continuer sans désigner" (player_id=None),
+jamais la sélection d'un joueur précis.
 
 Vérifie :
 1. le badge/bouton sont masqués tant qu'aucun rééquilibrage n'est en
    attente, et apparaissent dès qu'un pending_rebalance existe ;
-2. le bouton "Continuer sans indiquer la BB" résout UNIQUEMENT la
+2. le bouton "Continuer sans désigner le joueur" résout UNIQUEMENT la
    demande courante (via database.py: resolve_pending_rebalance,
-   seat=None — le même mécanisme qu'une réponse téléphone équivalente) ;
+   player_id=None — le même mécanisme qu'une réponse téléphone
+   équivalente) ;
 3. la préférence globale bb_rebalance_prompt_var n'est jamais modifiée
    par ce bouton ;
 4. le badge disparaît une fois la demande résolue.
@@ -159,7 +163,7 @@ class PendingRebalanceMacBadgeTest(unittest.TestCase):
 
         # La demande a bien été consommée (résolue), et un mouvement a
         # été décidé (mécanisme historique _legacy_pick_mover, exactement
-        # comme "Continuer sans indiquer la BB" depuis un téléphone).
+        # comme "Continuer sans désigner le joueur" depuis un téléphone).
         self.win._trigger_movement_alert.assert_called_once()
         c1 = self.db.conn.execute(
             "SELECT COUNT(*) c FROM players WHERE table_id=? AND status='active'", (self.t1_id,)

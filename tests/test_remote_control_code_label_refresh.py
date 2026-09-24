@@ -191,21 +191,23 @@ class TickWiringStructurelTest(unittest.TestCase):
         )
         self.assertTrue(calls_refresh, "_tick doit appeler _refresh_remote_control_code_label")
 
-    def test_refresh_du_code_est_conditionne_a_laffichage_de_calog(self):
+    def test_refresh_du_code_est_conditionne_a_laffichage_de_ca(self):
         """Le coeur de la contrainte "travail négligeable à chaque tick" :
         l'appel doit se trouver dans une branche testant `current`
         (l'onglet actuellement affiché), jamais inconditionnel. Onglet
         "CA/LOG" depuis le 2026-09-22 ("réorganisation visuelle du
-        contrôle à distance") — auparavant "Paramètres"."""
+        contrôle à distance"), scindé en "CA" + "LOG" le 2026-09-24 — le
+        libellé du code, lui, reste conditionné à "CA" uniquement
+        (jamais "LOG", qui ne commence pas par "CA")."""
         tick = self._find_method("App", "_tick")
         src = ast.unparse(tick)
         call_pos = src.index("_refresh_remote_control_code_label(")
         guard_pos = src.index("startswith")
-        self.assertIn("CA/LOG", src[guard_pos:guard_pos + 40])
+        self.assertIn("CA", src[guard_pos:guard_pos + 40])
         self.assertLess(
             guard_pos, call_pos,
             "_refresh_remote_control_code_label doit être appelée après (donc à l'intérieur "
-            "de) la condition sur l'onglet CA/LOG affiché",
+            "de) la condition sur l'onglet CA affiché",
         )
 
 

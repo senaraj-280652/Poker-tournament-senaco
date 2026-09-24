@@ -509,7 +509,7 @@ class BBGuidedPendingTest(unittest.TestCase):
         pending = self.db.pending_rebalance
         self.assertIsNotNone(pending)
 
-        self.db.resolve_pending_rebalance(pending["request_id"], None)  # "Continuer sans indiquer la BB"
+        self.db.resolve_pending_rebalance(pending["request_id"], None)  # "Continuer sans désigner le joueur"
 
         with self.assertRaises(ValueError):
             self.db.undo_last_elimination()

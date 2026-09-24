@@ -117,6 +117,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import action_log
 import open_windows
 import roster
 import version
@@ -2390,10 +2391,10 @@ _REBALANCE_WIDGET = """
   <div style="background:#10241a; border:2px solid #e8c468; border-radius:14px; padding:22px 20px; max-width:360px; width:100%; min-width:0; box-sizing:border-box; text-align:center; box-shadow:0 6px 24px rgba(0,0,0,.5);">
     <h2 style="color:#e8c468; font-size:16px; margin:0 0 10px; letter-spacing:.02em;">ÉQUILIBRAGE DES TABLES</h2>
     <p id="rebalance-table-msg" style="color:#f5efe0; font-size:15px; font-weight:700; margin:0 0 10px;"></p>
-    <p style="color:#b9ad8f; font-size:14px; margin:0 0 4px;">Quel siège est actuellement grosse blinde ?</p>
-    <p style="color:#8a7f66; font-size:12px; margin:0 0 14px;">Le joueur juste après changera de table.</p>
+    <p style="color:#b9ad8f; font-size:14px; margin:0 0 4px;">Quel joueur est UTG ?</p>
+    <p style="color:#8a7f66; font-size:12px; margin:0 0 14px;">Sélectionnez le joueur qui doit être déplacé.</p>
     <div id="rebalance-seats" style="display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:8px 10px; margin-bottom:16px;"></div>
-    <button id="rebalance-skip" type="button" style="width:100%; padding:12px; border:none; border-radius:10px; background:#4a4a4a; color:#fff; font-size:14px; font-weight:700; -webkit-tap-highlight-color:transparent;">Continuer sans indiquer la BB</button>
+    <button id="rebalance-skip" type="button" style="width:100%; padding:12px; border:none; border-radius:10px; background:#4a4a4a; color:#fff; font-size:14px; font-weight:700; -webkit-tap-highlight-color:transparent;">Continuer sans désigner le joueur</button>
   </div>
 </div>
 <script>
@@ -2411,15 +2412,15 @@ _REBALANCE_WIDGET = """
       document.getElementById('rebalance-table-msg').textContent = data.table_name + ' doit donner un joueur';
       var seatsDiv = document.getElementById('rebalance-seats');
       seatsDiv.innerHTML = '';
-      var seatPlayers = data.seat_players || {};
-      data.seats.forEach(function(s) {
+      // "players" (chantier "sélection directe du joueur UTG", 2026-09-24) :
+      // liste de {player_id, name, seat} déjà triée par siège par le
+      // serveur (voir GET /rebalance_pending) — un bouton par joueur, le
+      // clic envoie directement player_id, plus jamais un numéro de siège
+      // à interpréter côté serveur.
+      (data.players || []).forEach(function(p) {
         var b = document.createElement('button');
         b.type = 'button';
-        // Nom du joueur assis à ce siège quand connu (voir seat_players,
-        // /rebalance_pending) — sinon repli sur le seul numéro de siège,
-        // comme avant cet ajout.
-        var playerName = seatPlayers[s];
-        b.textContent = playerName ? (playerName + ' [' + s + ']') : ('[' + s + ']');
+        b.textContent = p.name + ' — Siège ' + p.seat;
         // 2 boutons par ligne (voir grid-template-columns du conteneur
         // ci-dessus) : width:100% + box-sizing:border-box pour que
         // chaque bouton remplisse exactement sa colonne sans jamais
@@ -2430,13 +2431,13 @@ _REBALANCE_WIDGET = """
         // seul si le texte prend 2 lignes, tout en gardant une bonne
         // zone de clic même pour un texte court sur 1 seule ligne).
         b.style.cssText = 'width:100%; min-width:0; box-sizing:border-box; padding:12px 8px; border:none; border-radius:10px; background:#1f6b6b; color:#fff; font-size:15px; font-weight:700; line-height:1.25; min-height:48px; white-space:normal; word-break:break-word; text-align:center; -webkit-tap-highlight-color:transparent;';
-        b.addEventListener('click', function() { answerRebalance(data.request_id, s); });
+        b.addEventListener('click', function() { answerRebalance(data.request_id, p.player_id); });
         seatsDiv.appendChild(b);
       });
       overlay.style.display = 'flex';
     }).catch(function() { /* réseau momentanément indisponible : le prochain sondage rattrapera */ });
   }
-  function answerRebalance(requestId, seat) {
+  function answerRebalance(requestId, playerId) {
     // Masquée tout de suite (optimiste), sans attendre la réponse du
     // serveur : si la requête échoue (wifi), le prochain sondage la
     // réaffichera automatiquement tant que la demande est toujours en
@@ -2446,7 +2447,7 @@ _REBALANCE_WIDGET = """
     fetch('/rebalance_answer', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({request_id: requestId, seat: seat})
+      body: JSON.stringify({request_id: requestId, player_id: playerId})
     }).catch(function() { /* le prochain sondage rattrapera si besoin */ });
   }
   document.getElementById('rebalance-skip').addEventListener('click', function() {
@@ -2811,10 +2812,19 @@ class RemoteControlServer:
                  get_pending_rebalance=None, on_rebalance_answer=None,
                  on_end_tournament=None, get_has_pending_moves=None,
                  get_pending_moves=None, on_confirm_move=None,
-                 get_dirto_permissions=None,
+                 get_dirto_permissions=None, get_tournament_path=None,
                  port=DEFAULT_PORT):
         self.on_word = on_word
         self.get_tournament_name = get_tournament_name or (lambda: "Tournoi")
+        # Identifiant STABLE du tournoi (chemin du fichier .tournoi),
+        # UNIQUEMENT pour le journal LOG (action_log.py, chantier "LOG",
+        # 2026-09-24) — jamais pour une décision de permission/routage,
+        # qui continue de reposer entièrement sur resolve_role/
+        # resolve_proxy_port, inchangés. None si non fourni (ancien
+        # appelant, ou test qui n'en a pas besoin) : dans ce cas,
+        # action_log.log_action reçoit simplement une chaîne vide,
+        # jamais une exception.
+        self.get_tournament_path = get_tournament_path or (lambda: None)
         self.get_players = get_players or (lambda: [])
         self.get_roster_players = get_roster_players or (lambda: [])
         self.on_eliminate = on_eliminate or (
@@ -2878,6 +2888,7 @@ class RemoteControlServer:
         get_pending_moves = self.get_pending_moves
         on_confirm_move = self.on_confirm_move
         get_dirto_permissions = self.get_dirto_permissions
+        get_tournament_path = self.get_tournament_path
         own_pid = os.getpid()
 
         def resolve_role(handler):
@@ -2914,6 +2925,59 @@ class RemoteControlServer:
             if group == roster.ROSTER_GROUP_DIRTO:
                 return "DIRTO", frozenset(get_dirto_permissions(owner_name) or ())
             return "NONE", frozenset()
+
+        def resolve_log_identity(handler):
+            """(device_id, user_name, device_label) pour le journal LOG
+            UNIQUEMENT (action_log.py, chantier "LOG", 2026-09-24) —
+            JAMAIS pour une décision de permission (resolve_role reste la
+            SEULE source de vérité pour ça, entièrement inchangée). Même
+            lecture directe, non mise en cache, que resolve_role — device_
+            label est volontairement résolu ICI, au moment de l'action
+            (voir open_windows.get_remote_device_label) : un renommage/
+            une révocation ultérieurs de cet appareil ne doivent jamais
+            modifier rétroactivement une ligne déjà écrite."""
+            browser_id = _parse_cookie(handler.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+            user_name = open_windows.get_remote_device_owner(browser_id) if browser_id else None
+            device_label = open_windows.get_remote_device_label(browser_id) if browser_id else None
+            return browser_id, user_name, device_label
+
+        # Actions "/action/<mot>" réellement journalisées (chantier "LOG",
+        # Phase 1, 2026-09-24 — liste validée explicitement) : exclut la
+        # navigation/le zoom (tables, tables_zoom_moins, tables_zoom_plus)
+        # et le positionnement visuel du bandeau mouvements (mouvements,
+        # mouvements_bas, mouvements_haut), qui ne modifient jamais l'état
+        # du tournoi (voir App._on_voice_word) — jamais journalisés, ni en
+        # ACCEPTED ni en DENIED, pour ne pas noyer le journal sous du
+        # bruit de navigation.
+        _LOGGED_FIRE_AND_FORGET_ACTIONS = frozenset({
+            "terminer", "toggle_pause", "chronometre",
+            "niveau_precedent", "niveau_suivant", "elimination",
+        })
+
+        def log_action_event(handler, role, category, action, result, player_name=None, message=None):
+            """Point d'appel UNIQUE vers action_log.log_action depuis ce
+            module (chantier "LOG", Phase 1) — n'échoue JAMAIS (déjà
+            garanti par log_action lui-même, doublé ici par prudence :
+            resolve_log_identity ci-dessus reste une lecture fichier sous
+            verrou, jamais censée lever, mais une panne ici ne doit, elle
+            non plus, jamais empêcher la réponse HTTP réelle)."""
+            try:
+                device_id, user_name, device_label = resolve_log_identity(handler)
+                action_log.log_action(
+                    tournament_name=get_name(),
+                    tournament_path=get_tournament_path(),
+                    role=role,
+                    category=category,
+                    action=action,
+                    result=result,
+                    user_name=user_name,
+                    device_id=device_id,
+                    device_label=device_label,
+                    player_name=player_name,
+                    message=message,
+                )
+            except Exception:
+                pass
 
         def resolve_proxy_port(handler):
             """Port du tournoi actuellement COURANT pour CE téléphone, s'il
@@ -3549,33 +3613,37 @@ class RemoteControlServer:
                 elif path == "/rebalance_pending":
                     # Sondé toutes les 2s par TOUS les téléphones, sur
                     # toutes les pages (voir _REBALANCE_WIDGET) : renvoie
-                    # null s'il n'y a aucune question "grosse blinde" en
-                    # attente en ce moment.
+                    # null s'il n'y a aucune question "quel joueur est
+                    # UTG ?" en attente en ce moment.
                     pending = get_pending_rebalance()
                     if pending is None:
                         self._send_json(None)
                     else:
-                        # seat_players : {siège: nom du joueur actuellement
-                        # assis là} pour LA SEULE table concernée (pending
-                        # ["table_name"]) — enrichit l'affichage (le
-                        # téléphone montre "Alice [3]" plutôt qu'un simple
-                        # numéro de siège), sans rien changer au calcul :
-                        # simple lecture de get_players() (déjà exposé pour
-                        # la page Éliminations), jointe ici uniquement pour
-                        # cette réponse JSON. Absent de la requête si le nom
-                        # n'a pas pu être retrouvé (siège occupé mais
-                        # joueur introuvable dans le cache, cas limite) —
-                        # le téléphone affiche alors juste le numéro de
-                        # siège, comme avant cet ajout.
-                        seat_players = {
-                            p["seat"]: p["name"] for p in get_players()
-                            if p.get("table") == pending["table_name"] and p.get("seat") in pending["seats"]
-                        }
+                        # "players" (chantier "sélection directe du joueur
+                        # UTG", 2026-09-24 — remplace seats/seat_players) :
+                        # liste de {player_id, name, seat} pour LA SEULE
+                        # table concernée (pending["table_name"]), triée
+                        # par siège — c'est désormais player_id, jamais le
+                        # siège, qui identifie le joueur choisi par le
+                        # téléphone (voir /rebalance_answer). Même source
+                        # qu'avant (get_players(), déjà exposé pour la page
+                        # Éliminations) et même filtre qu'avant (table +
+                        # siège encore listé dans pending["seats"], le
+                        # champ pending_rebalance lui-même est INCHANGÉ,
+                        # voir database.py: rebalance_tables) — seule la
+                        # FORME de la réponse JSON change.
+                        players = sorted(
+                            (
+                                {"player_id": p["id"], "name": p["name"], "seat": p["seat"]}
+                                for p in get_players()
+                                if p.get("table") == pending["table_name"] and p.get("seat") in pending["seats"]
+                            ),
+                            key=lambda p: p["seat"],
+                        )
                         self._send_json({
                             "request_id": pending["request_id"],
                             "table_name": pending["table_name"],
-                            "seats": pending["seats"],
-                            "seat_players": seat_players,
+                            "players": players,
                         })
                 else:
                     self.send_error(404)
@@ -3622,17 +3690,30 @@ class RemoteControlServer:
                     # jamais par appartenance à `permissions` — voir
                     # _ADMIN_ONLY_ACTIONS (même traitement que /end_tournament,
                     # corrigé le 2026-09-22).
+                    log_category = "admin_only" if action in _ADMIN_ONLY_ACTIONS else _ACTION_PERMISSION[action]
                     if action in _ADMIN_ONLY_ACTIONS:
                         if role != "ADMIN":
+                            if action in _LOGGED_FIRE_AND_FORGET_ACTIONS:
+                                log_action_event(self, role, log_category, action, action_log.RESULT_DENIED)
                             self._send_permission_denied("POST", path, role)
                             return
                     elif _ACTION_PERMISSION[action] not in permissions:
+                        if action in _LOGGED_FIRE_AND_FORGET_ACTIONS:
+                            log_action_event(self, role, log_category, action, action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     on_word(action)
+                    if action in _LOGGED_FIRE_AND_FORGET_ACTIONS:
+                        # ACCEPTED, jamais SUCCESS : ce thread ne fait que
+                        # déposer l'action dans voice_command_queue et ne
+                        # sait jamais si son traitement réel (thread Tk,
+                        # _on_voice_word) a produit un effet — voir
+                        # log_action_event/action_log.RESULT_ACCEPTED.
+                        log_action_event(self, role, log_category, action, action_log.RESULT_ACCEPTED)
                     self._send_json({"ok": True})
                 elif path == "/eliminate":
                     if _PERM_ELIMINATIONS not in permissions:
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "eliminate", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     length = int(self.headers.get("Content-Length", 0) or 0)
@@ -3659,12 +3740,28 @@ class RemoteControlServer:
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
+                    # Nom du joueur concerné : résolu AVANT d'appeler
+                    # on_eliminate (chantier "LOG", 2026-09-24) — get_players()
+                    # ne liste que les joueurs encore ACTIFS, or ce même
+                    # joueur ne le sera plus une fois l'élimination traitée
+                    # par le thread Tk (le résultat n'arrive qu'APRÈS coup,
+                    # voir on_eliminate ci-dessous) : le résoudre après coup
+                    # échouerait systématiquement pour le joueur éliminé.
+                    eliminated_name = next(
+                        (p["name"] for p in get_players() if p["id"] == eliminated_id), None
+                    )
                     # on_eliminate renvoie {"ok": bool, "message": str}
                     # (demande du 2026-09-08) : renvoyé tel quel au
                     # téléphone, qui affiche "message" si "ok" est faux
                     # (ex. refus PKO sans éliminateur désigné) — jamais un
                     # échec silencieux, voir sa docstring plus haut.
                     result = on_eliminate(eliminated_id, eliminator_id, client_request_id)
+                    log_action_event(
+                        self, role, _PERM_ELIMINATIONS, "eliminate",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=eliminated_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
                     self._send_json(result)
                 elif path == "/confirm_move":
                     # Confirmation INDIVIDUELLE d'un mouvement (bouton
@@ -3677,6 +3774,7 @@ class RemoteControlServer:
                     # jamais besoin d'un request_id de dédoublonnage
                     # comme pour /eliminate.
                     if _PERM_MOVES not in permissions:
+                        log_action_event(self, role, _PERM_MOVES, "confirm_move", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     length = int(self.headers.get("Content-Length", 0) or 0)
@@ -3687,10 +3785,25 @@ class RemoteControlServer:
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
+                    # Nom du joueur concerné : résolu AVANT d'appeler
+                    # on_confirm_move (chantier "LOG", 2026-09-24) — ce
+                    # mouvement disparaît du cache get_pending_moves() une
+                    # fois confirmé, même raison que pour /eliminate ci-
+                    # dessus.
+                    moved_player_name = next(
+                        (m["player_name"] for m in get_pending_moves() if m["id"] == move_id), None
+                    )
                     result = on_confirm_move(move_id)
+                    log_action_event(
+                        self, role, _PERM_MOVES, "confirm_move",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=moved_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
                     self._send_json(result)
                 elif path == "/upload_photo":
                     if _PERM_PHOTOS not in permissions:
+                        log_action_event(self, role, _PERM_PHOTOS, "upload_photo", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     from urllib.parse import parse_qs, urlparse
@@ -3711,9 +3824,15 @@ class RemoteControlServer:
                     player_name = player_name_values[0].strip()
                     image_bytes = self.rfile.read(length)
                     ok, message = on_upload_photo(player_name, image_bytes)
+                    log_action_event(
+                        self, role, _PERM_PHOTOS, "upload_photo",
+                        action_log.RESULT_SUCCESS if ok else action_log.RESULT_ERROR,
+                        player_name=player_name, message=None if ok else message,
+                    )
                     self._send_json({"ok": ok, "message": message})
                 elif path == "/delete_photo":
                     if _PERM_PHOTOS not in permissions:
+                        log_action_event(self, role, _PERM_PHOTOS, "delete_photo", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     from urllib.parse import parse_qs, urlparse
@@ -3722,26 +3841,35 @@ class RemoteControlServer:
                     if not player_name_values or not player_name_values[0].strip():
                         self.send_error(400, "Requête invalide")
                         return
-                    ok, message = on_delete_photo(player_name_values[0].strip())
+                    deleted_player_name = player_name_values[0].strip()
+                    ok, message = on_delete_photo(deleted_player_name)
+                    log_action_event(
+                        self, role, _PERM_PHOTOS, "delete_photo",
+                        action_log.RESULT_SUCCESS if ok else action_log.RESULT_ERROR,
+                        player_name=deleted_player_name, message=None if ok else message,
+                    )
                     self._send_json({"ok": ok, "message": message})
                 elif path == "/rebalance_answer":
-                    # Réponse à la question "quel siège est grosse
-                    # blinde ?" — comme /eliminate, ne fait que déposer la
+                    # Réponse à la question "quel joueur est UTG ?"
+                    # (chantier "sélection directe du joueur UTG",
+                    # 2026-09-24 — remplace l'ancienne réponse par numéro
+                    # de siège) — comme /eliminate, ne fait que déposer la
                     # réponse dans la file d'attente thread-safe côté
                     # appelant (voir on_rebalance_answer/voice_command_
                     # queue) : ce thread ne touche JAMAIS self.db ni
-                    # Tkinter directement. `seat` absent/null/vide =
-                    # "Continuer sans indiquer la BB". La PREMIÈRE RÉPONSE
-                    # VALIDE traitée (PC ou téléphone) à une demande donnée
-                    # gagne ; une réponse invalide (siège obsolète, demande
-                    # déjà remplacée...) ne consomme rien, et toute réponse
-                    # supplémentaire à la MÊME demande (même request_id)
-                    # une fois celle-ci résolue est ignorée proprement —
-                    # cette validation/consommation a lieu côté thread
-                    # principal (voir database.py: resolve_pending_
-                    # rebalance) — jamais ici, pour rester sans accès à
-                    # self.db.
+                    # Tkinter directement. `player_id` absent/null/vide =
+                    # "Continuer sans désigner le joueur". La PREMIÈRE
+                    # RÉPONSE VALIDE traitée (PC ou téléphone) à une
+                    # demande donnée gagne ; une réponse invalide (joueur
+                    # obsolète/plus actif/plus à cette table, demande déjà
+                    # remplacée...) ne consomme rien et ne déplace
+                    # personne par substitution — cette validation/
+                    # consommation a lieu côté thread principal (voir
+                    # database.py: resolve_pending_rebalance/
+                    # _player_still_at_table) — jamais ici, pour rester
+                    # sans accès à self.db.
                     if _PERM_REBALANCE not in permissions:
+                        log_action_event(self, role, _PERM_REBALANCE, "rebalance_answer", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     length = int(self.headers.get("Content-Length", 0) or 0)
@@ -3749,12 +3877,29 @@ class RemoteControlServer:
                     try:
                         data = json.loads(raw.decode("utf-8"))
                         request_id = str(data["request_id"])
-                        seat_raw = data.get("seat")
-                        seat = int(seat_raw) if seat_raw not in (None, "") else None
+                        player_id_raw = data.get("player_id")
+                        player_id = int(player_id_raw) if player_id_raw not in (None, "") else None
                     except (ValueError, KeyError, TypeError):
                         self.send_error(400, "Requête invalide")
                         return
-                    on_rebalance_answer(request_id, seat)
+                    # Nom du joueur désigné : résolu AVANT d'appeler
+                    # on_rebalance_answer, pour le message du LOG
+                    # uniquement (même principe que /eliminate/
+                    # confirm_move ci-dessus — aucun effet sur la
+                    # revalidation réelle, qui a lieu côté thread
+                    # principal contre l'état courant, jamais ce cache).
+                    designated_name = None
+                    if player_id is not None:
+                        designated_name = next(
+                            (p["name"] for p in get_players() if p["id"] == player_id), None
+                        )
+                    on_rebalance_answer(request_id, player_id)
+                    log_action_event(
+                        self, role, _PERM_REBALANCE, "rebalance_answer", action_log.RESULT_ACCEPTED,
+                        player_name=designated_name,
+                        message=(designated_name or f"joueur #{player_id}") if player_id is not None
+                        else "Continuer sans désigner le joueur",
+                    )
                     self._send_json({"ok": True})
                 elif path == "/end_tournament":
                     # Bouton "Fin de la partie" (tout en bas de la page
@@ -3790,6 +3935,7 @@ class RemoteControlServer:
                     # filet explicite, jamais retiré même si un futur bug
                     # ailleurs venait à peupler `permissions` par erreur.
                     if role != "ADMIN":
+                        log_action_event(self, role, "admin_only", "end_tournament", action_log.RESULT_DENIED)
                         self._send_permission_denied("POST", path, role)
                         return
                     length = int(self.headers.get("Content-Length", 0) or 0)
@@ -3801,6 +3947,10 @@ class RemoteControlServer:
                         self.send_error(400, "Requête invalide")
                         return
                     if requested_pid != own_pid:
+                        log_action_event(
+                            self, role, "admin_only", "end_tournament", action_log.RESULT_ERROR,
+                            message="Ce tournoi n'est plus disponible ici. Rechargez la page.",
+                        )
                         self._send_json({
                             "ok": False,
                             "message": "Ce tournoi n'est plus disponible ici. Rechargez la page.",
@@ -3821,6 +3971,7 @@ class RemoteControlServer:
                         t["pid"] != own_pid for t in open_windows.list_remote_tournaments()
                     )
                     on_end_tournament()
+                    log_action_event(self, role, "admin_only", "end_tournament", action_log.RESULT_ACCEPTED)
                     self._send_json({"ok": True, "other_tournaments_remain": other_remain})
                 else:
                     self.send_error(404)

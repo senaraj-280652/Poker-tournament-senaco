@@ -31,6 +31,25 @@ PERSISTED_KEYS = [
     "ante_start_level",
     "start_ante",
     "break_duration_minutes",
+    # Durées variables + 2 pauses programmables (chantier "Paramètres >
+    # Structure des blindes", 2026-09-24) : mêmes principe/traitement
+    # génériques que les 4 réglages de structure ci-dessus. round_
+    # duration_minutes (ligne 1, clé historique jamais renommée) est
+    # ajoutée ICI MÊME : absente de cette liste jusqu'ici (lacune
+    # préexistante, sans rapport avec ce chantier) — mais désormais
+    # nécessaire pour que l'héritage reste cohérent : sans elle, un
+    # nouveau tournoi aurait repris round_count_1/round_duration_
+    # minutes_2/round_count_2 hérités mais PAS la durée de la ligne 1
+    # elle-même, un état incohérent que ce chantier introduirait sinon
+    # pour la première fois.
+    "round_duration_minutes",
+    "round_count_1",
+    "round_duration_minutes_2",
+    "round_count_2",
+    "break_minutes_1",
+    "break_after_round_1",
+    "break_minutes_2",
+    "break_after_round_2",
     "movement_signal_duration_ms",
     "bounty_amount",
     "pko_mode",

@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import uuid
 import calendar
+import re
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
@@ -39,7 +40,10 @@ from database import (
     STATS_TOURNAMENT_TYPE_TOURNOIS, STATS_TOURNAMENT_TYPE_SITNGO, STATS_TOURNAMENT_TYPE_ALL,
     STATS_WEEKDAY_FOLDER_NAMES,
 )
-from structures import default_blind_structure, standard_payout_structure, generate_blind_structure
+from structures import (
+    default_blind_structure, standard_payout_structure, generate_blind_structure,
+    GENERATED_ROUNDS_COUNT,
+)
 from clock_window import ClockWindow
 import roster
 import tournament_prefs
@@ -52,6 +56,7 @@ import player_photos
 import sound_signal
 import remote_control
 import open_windows
+import action_log
 import backup_restore
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
@@ -568,10 +573,25 @@ _REMOTE_ACTION_DEDUP_TTL_SECONDS = 300
 
 SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
 
+# Onglet LOG (chantier "LOG", Phase 2, 2026-09-24) : format de saisie
+# strict JJ/MM/AAAA pour "Du"/"Au" — validé AVANT strptime, jamais
+# seulement délégué à lui : "%Y" de strptime accepte aussi une année à
+# 1-3 chiffres ("01/01/26" serait alors interprété comme l'an 26), ce
+# que cette regex exclut d'abord.
+_LOG_DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+
+# Ancien plafond de 500 lignes affichées/exportées par une recherche LOG
+# (décision du 2026-09-24) — ABANDONNÉ le 2026-09-25 ("CE QUI CORRESPOND
+# AUX FILTRES = CE QUI EST AFFICHÉ = CE QUI EST EXPORTÉ = CE QUI PEUT
+# ÊTRE PURGÉ") : _refresh_log_tab appelle désormais action_log.
+# search_actions avec limit=None (aucune troncature). Voir _refresh_log_
+# tab/_log_count_label_text pour le compteur "N opération(s) affichée(s)"
+# qui remplace l'ancien message de troncature.
+
 
 def _single_tournament_pref_enabled():
     """Préférence globale "Un seul tournoi à la fois" (onglet Paramètres,
-    juste sous "Équilibrage guidé par la grosse blinde") — cochée par
+    juste sous "Équilibrage guidé par UTG") — cochée par
     défaut, mémorisée indépendamment de chaque tournoi (voir
     export_prefs, déjà utilisé pour d'autres préférences globales
     comparables, ex : le délai de "Son prochain changement Blindes").
@@ -4919,6 +4939,162 @@ class PrimesExportDialog(tk.Toplevel):
         open_file_with_default_app(path)
 
 
+class LogExportDialog(tk.Toplevel):
+    """Export du Journal des actions (onglet LOG, correction du
+    2026-09-24 — remplace l'export CSV direct implémenté un peu plus tôt
+    le même jour) : même principe visuel que PrimesExportDialog ci-dessus
+    (Format + Colonnes à exporter + Exporter.../Annuler), réutilisant
+    autant que possible ses mêmes mécanismes (export_prefs.load_format/
+    save_format/load_columns/save_columns, show_missing_export_module,
+    open_file_with_default_app) — SANS section "Tableau à exporter" :
+    Primes en a deux (Récapitulatif/Historique), LOG n'a qu'UN seul
+    tableau, cette section n'a donc pas de sens ici.
+
+    `rows` : instantané FIGÉ des lignes actuellement affichées dans
+    self.log_tree, construit par App._on_log_export AVANT l'ouverture de
+    cette fenêtre — jamais relu ni requêté à nouveau ici, ni même à
+    l'export ("Exporter...") : "ce que je vois dans le tableau LOG = ce
+    qui peut être exporté" (demande explicite), donc aussi les mêmes
+    libellés français déjà affichés (NONE -> Non lié, SUCCESS -> Réussi,
+    etc. — voir App._populate_log_tree) et jamais device_id/
+    tournament_path, qui ne font structurellement pas partie des
+    colonnes exportables (voir action_log.LOG_EXPORT_COLUMNS).
+
+    `criteria_line` (ajouté le 2026-09-24 pour le PDF uniquement, étendu
+    à CSV/Excel le 2026-09-25 — "les 3 formats doivent afficher les
+    mêmes critères et le même nombre d'opérations") : ligne
+    "Critères : ..." déjà construite par App._on_log_export (voir
+    action_log.format_log_export_criteria) à partir des MÊMES widgets de
+    filtre que `rows`, donc forcément cohérente avec eux. Transmise
+    désormais aux 3 fonctions action_log.export_csv/export_xlsx/
+    export_pdf (voir _do_export) ; chacune y ajoute aussi "Nombre
+    d'opérations : N", calculé depuis `rows` DANS la fonction d'export
+    elle-même — jamais un compte séparé qui pourrait diverger du
+    contenu réel du fichier."""
+
+    def __init__(self, master, rows, criteria_line=None):
+        super().__init__(master)
+        self.rows = rows
+        self.criteria_line = criteria_line
+        self.title("Exporter le LOG")
+        self.configure(bg=FELT_DARK)
+        self.geometry("420x420")
+        self.transient(master)
+        self.grab_set()
+
+        self.format_var = tk.StringVar(value=export_prefs.load_format("log"))
+
+        saved_cols = export_prefs.load_columns("log", [k for k, _ in action_log.LOG_EXPORT_COLUMNS])
+        self.col_vars = {
+            key: tk.BooleanVar(value=key in saved_cols) for key, _ in action_log.LOG_EXPORT_COLUMNS
+        }
+
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="PDF", variable=self.format_var, value="pdf").pack(
+            side="left", padx=10, pady=6
+        )
+
+        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
+        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = ttk.Frame(cols_frame)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(cols_frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header) in enumerate(action_log.LOG_EXPORT_COLUMNS):
+            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        export_prefs.save_columns("log", keys)
+        export_prefs.save_format("log", self.format_var.get())
+
+        columns = action_log.selected_log_export_columns(keys)
+        fmt = self.format_var.get()
+        ext = {"csv": ".csv", "xlsx": ".xlsx", "pdf": ".pdf"}[fmt]
+        filetypes = {
+            "csv": [("Fichier CSV", "*.csv")],
+            "xlsx": [("Fichier Excel", "*.xlsx")],
+            "pdf": [("Fichier PDF", "*.pdf")],
+        }[fmt]
+        path = filedialog.asksaveasfilename(
+            title="Exporter le LOG",
+            defaultextension=ext,
+            filetypes=filetypes,
+            initialfile=f"journal_actions_{datetime.now():%Y%m%d_%H%M%S}{ext}",
+        )
+        if not path:
+            return
+
+        try:
+            if fmt == "xlsx":
+                action_log.export_xlsx(
+                    path, columns, self.rows, title="Journal des actions",
+                    criteria_line=self.criteria_line,
+                )
+            elif fmt == "pdf":
+                action_log.export_pdf(
+                    path, columns, self.rows, title="Journal des actions",
+                    criteria_line=self.criteria_line,
+                )
+            else:
+                action_log.export_csv(
+                    path, columns, self.rows, title="Journal des actions",
+                    criteria_line=self.criteria_line,
+                )
+        except ImportError:
+            show_missing_export_module(fmt)
+            return
+        except Exception as e:
+            # Diagnostic du 2026-09-24 : une exception D'EXPORT autre
+            # qu'ImportError (ex. FPDFUnicodeEncodingException, avant le
+            # correctif général de action_log._pdf_text) remontait
+            # jusqu'à Tkinter et se retrouvait AVALÉE par le gestionnaire
+            # par défaut — aucun fichier créé, aucun message, la fenêtre
+            # restait juste plantée là. En l'interceptant nous-mêmes ici,
+            # elle n'atteint plus JAMAIS App.report_callback_exception
+            # (voir sa docstring) : on appelle donc _log_exception()
+            # explicitement pour ne rien perdre du journal de plantage
+            # habituel (~/.poker_tournament/crash.log), EN PLUS d'un
+            # message clair affiché à l'utilisateur. Fenêtre gardée
+            # OUVERTE (pas de self.destroy()) et fichier JAMAIS ouvert
+            # (pas d'open_file_with_default_app) : l'export a échoué,
+            # rien ne doit laisser croire le contraire.
+            _log_exception(type(e), e, e.__traceback__)
+            messagebox.showerror(
+                "Erreur d'export",
+                f"L'export {fmt.upper()} a échoué :\n{e}",
+            )
+            return
+        self.destroy()
+        open_file_with_default_app(path)
+
+
 class ActivationDialog(tk.Toplevel):
     """Fenêtre d'activation de licence, affichée au démarrage tant que ce
     poste n'a pas encore été activé (voir license.py). Bloque le
@@ -5183,6 +5359,14 @@ class App(tk.Tk):
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
+        # Identifiant STABLE du tournoi pour le journal LOG (action_log.py,
+        # chantier "LOG", 2026-09-24) — même principe/même prudence que
+        # _remote_control_tournament_name juste au-dessus (simple attribut
+        # tenu à jour depuis le thread principal, jamais self.db lu
+        # directement depuis le thread du serveur web) : le NOM affiché
+        # d'un tournoi peut changer ou se répéter d'un fichier à l'autre,
+        # jamais le chemin de son fichier .tournoi.
+        self._remote_control_tournament_path = None
         # Approbation des téléphones (demande du 2026-09-09 ; disposition
         # définitivement fixée le même jour, après plusieurs essais
         # d'intégration dans la grille de Paramètres tous abandonnés :
@@ -5220,15 +5404,18 @@ class App(tk.Tk):
         # _on_remote_device_popup_approve/_refuse) sachent quel appareil
         # cibler sans avoir à rouvrir le registre partagé.
         self._remote_device_popup_current_browser_id = None
-        # Dernier état connu (onglet "CA/LOG" actif ou non — voir
-        # _is_ca_log_tab_active, ce bloc y a été déplacé le 2026-09-22)
-        # — détecte la TRANSITION vers CA/LOG (pas seulement "est actif
-        # maintenant") pour ne vider _remote_device_snoozed_keys qu'au
-        # moment où l'utilisateur y REVIENT, jamais en continu tant qu'il
-        # y reste.
-        self._last_ca_log_tab_active = False
+        # Dernier état connu (onglet "CA" actif ou non — voir
+        # _is_ca_tab_active) — détecte la TRANSITION vers CA (pas
+        # seulement "est actif maintenant") pour ne vider _remote_device_
+        # snoozed_keys qu'au moment où l'utilisateur y REVIENT, jamais en
+        # continu tant qu'il y reste. Renommé le 2026-09-24 (chantier
+        # "séparation CA/LOG en CA + LOG") — s'appelait _last_ca_log_tab_
+        # active tant que CA et LOG partageaient le même onglet ; même
+        # mécanisme, seul l'onglet surveillé (CA seul, jamais LOG) a
+        # changé.
+        self._last_ca_tab_active = False
         # Dernier "instantané" affiché de la liste "Téléphones" de
-        # l'onglet CA/LOG (appareils APPROUVÉS uniquement désormais, voir
+        # l'onglet CA (appareils APPROUVÉS uniquement désormais, voir
         # _remote_devices_signature/_refresh_remote_devices_panel) :
         # None tant qu'elle n'a jamais été construite — toute valeur (y
         # compris un instantané "vide") est traitée comme différente
@@ -6458,13 +6645,21 @@ class App(tk.Tk):
         self.roster_tab = RosterManagerDialog(self.notebook, self)
         self.stats_tab = PeriodSummaryDialog(self.notebook, self)
         self.settings_tab = ttk.Frame(self.notebook)
-        # "CA/LOG" (demande du 2026-09-22, "réorganisation visuelle du
-        # contrôle à distance") : nouvel emplacement UNIQUE du bloc
-        # Contrôle à distance/Téléphones/Permissions DIRTO, retiré de
-        # Paramètres (voir _build_ca_log_tab) — la partie basse de cet
-        # onglet reste délibérément vide pour l'instant, réservée au
-        # futur Journal des actions (Phase 5, PAS commencée ici).
-        self.ca_log_tab = ttk.Frame(self.notebook)
+        # "CA" (chantier "séparation CA/LOG en CA + LOG", 2026-09-24 —
+        # s'appelait "CA/LOG" et hébergeait aussi les critères LOG tant
+        # que les deux partageaient le même onglet, voir l'historique du
+        # 2026-09-22) : emplacement UNIQUE du bloc Contrôle à distance/
+        # Téléphones/Permissions DIRTO, retiré de Paramètres (voir
+        # _build_ca_tab) — présentation/positions/logique STRICTEMENT
+        # inchangées, seuls les critères de recherche LOG en sont
+        # retirés (déplacés vers leur propre onglet "LOG" ci-dessous).
+        self.ca_tab = ttk.Frame(self.notebook)
+        # "LOG" (nouveau, même chantier du 2026-09-24) : reçoit les
+        # critères de recherche préparatoires déjà existants (voir
+        # _build_log_tab/_build_log_search_criteria_placeholder,
+        # RÉUTILISÉE telle quelle, jamais dupliquée) — aucune logique
+        # fonctionnelle pour l'instant (Phase 2 LOG, PAS commencée ici).
+        self.log_tab = ttk.Frame(self.notebook)
 
         self.notebook.add(self.players_tab, text="Joueurs")
         self.notebook.add(self.tables_tab, text="Tables")
@@ -6475,11 +6670,13 @@ class App(tk.Tk):
         self.notebook.add(self.payouts_tab, text="Classement")
         self.notebook.add(self.roster_tab, text="Répertoire")
         self.notebook.add(self.stats_tab, text="Statistiques")
-        # Ordre demandé le 2026-09-22 : CA/LOG immédiatement après
-        # Statistiques, avant Paramètres (Statistiques -> CA/LOG ->
-        # Paramètres) — uniquement l'ordre d'ajout au Notebook, aucun
-        # changement de contenu/logique.
-        self.notebook.add(self.ca_log_tab, text="CA/LOG")
+        # Ordre demandé le 2026-09-22 (CA/LOG immédiatement après
+        # Statistiques, avant Paramètres), affiné le 2026-09-24 avec la
+        # séparation en 2 onglets distincts, dans le MÊME emplacement :
+        # Statistiques -> CA -> LOG -> Paramètres — uniquement l'ordre
+        # d'ajout au Notebook, aucun changement de contenu/logique.
+        self.notebook.add(self.ca_tab, text="CA")
+        self.notebook.add(self.log_tab, text="LOG")
         self.notebook.add(self.settings_tab, text="Paramètres")
 
         self._build_players_tab()
@@ -6489,7 +6686,8 @@ class App(tk.Tk):
         self._build_clock_tab()
         self._build_blinds_tab()
         self._build_payouts_tab()
-        self._build_ca_log_tab()
+        self._build_ca_tab()
+        self._build_log_tab()
         self._build_settings_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
@@ -8001,12 +8199,12 @@ class App(tk.Tk):
 
     def _update_pending_rebalance_badge(self):
         """Affiche/masque, dans le bandeau du haut de l'onglet Tables,
-        l'indication discrète qu'un rééquilibrage attend une réponse
-        "grosse blinde" (voir _build_tables_tab et database.py:
+        l'indication discrète qu'un rééquilibrage attend qu'on désigne le
+        joueur UTG à déplacer (voir _build_tables_tab et database.py:
         pending_rebalance) — disparaît dès que la demande est résolue,
         d'où qu'elle le soit (téléphone ou le bouton "Continuer sans
-        indiquer la BB" ci-dessous). Ne fait rien si l'onglet Tables n'est
-        pas encore construit (tout début de App.__init__, avant
+        désigner le joueur" ci-dessous). Ne fait rien si l'onglet Tables
+        n'est pas encore construit (tout début de App.__init__, avant
         _build_tabs)."""
         frame = getattr(self, "_pending_rebalance_frame", None)
         if frame is None or not frame.winfo_exists():
@@ -8016,7 +8214,7 @@ class App(tk.Tk):
             frame.pack_forget()
             return
         self._pending_rebalance_label.configure(
-            text=f"⏳ {pending['table_name']} : rééquilibrage en attente de la grosse blinde"
+            text=f"⏳ {pending['table_name']} : rééquilibrage en attente du joueur à déplacer"
         )
         # winfo_manager() (pas winfo_ismapped()) : reflète si ce frame est
         # actuellement sous gestion pack, indépendamment de la visibilité
@@ -8028,43 +8226,44 @@ class App(tk.Tk):
             frame.pack(side="left", padx=(15, 3))
 
     def _continue_pending_rebalance_without_bb(self):
-        """Bouton "Continuer sans indiquer la BB" de l'onglet Tables (voir
-        _build_tables_tab/_update_pending_rebalance_badge) — POINT À
-        ÉTUDIER de la demande du 2026-09-10 : permet au responsable de
-        débloquer CE rééquilibrage précis depuis le Mac, sans téléphone,
-        en utilisant exactement le même mécanisme que la réponse
-        équivalente envoyée depuis un téléphone (seat=None, voir
-        database.py: resolve_pending_rebalance, règle 5) — donc le même
-        traitement que _on_bb_rebalance_prompt_toggle, à une différence
-        près et volontaire : ce bouton ne touche PAS à la préférence
-        globale "Équilibrage guidé par la grosse blinde" (self.
+        """Bouton "Continuer sans désigner le joueur" de l'onglet Tables
+        (voir _build_tables_tab/_update_pending_rebalance_badge) — permet
+        au responsable de débloquer CE rééquilibrage précis depuis le
+        Mac, sans téléphone, en utilisant exactement le même mécanisme
+        que la réponse équivalente envoyée depuis un téléphone
+        (player_id=None, voir database.py: resolve_pending_rebalance,
+        règle 5) — donc le même traitement que _on_bb_rebalance_prompt_
+        toggle, à une différence près et volontaire : ce bouton ne touche
+        PAS à la préférence globale "Équilibrage guidé par UTG" (self.
         bb_rebalance_prompt_var reste inchangée), donc le PROCHAIN
         rééquilibrage reposera de nouveau la question normalement — ce
-        bouton ne résout QUE la demande actuellement affichée."""
+        bouton ne résout QUE la demande actuellement affichée. Nom de
+        méthode historique (chantier "grosse blinde") volontairement
+        inchangé : usage interne uniquement, jamais affiché."""
         if not self.db or self.db.pending_rebalance is None:
             return
         self._resolve_pending_rebalance(
             self.db.pending_rebalance["request_id"], None, from_remote=False
         )
 
-    def _resolve_pending_rebalance(self, request_id, seat, from_remote):
-        """Traite une réponse à la question "quel siège est grosse
-        blinde ?" — reçue d'un téléphone (POST /rebalance_answer, relayé
-        ici par _poll_voice_queue, from_remote=True), ou déclenchée
-        localement quand la préférence "Équilibrage guidé par la grosse
-        blinde" (Paramètres) est décochée alors qu'une demande est en
-        attente (voir _on_bb_rebalance_prompt_toggle, from_remote=False —
-        aucune fenêtre Mac n'est impliquée dans ce second cas, seulement
-        ce même traitement de réponse). La mutation réelle passe par
-        database.py:resolve_pending_rebalance, qui revalide tout avant
-        d'agir (request_id encore valide, table source toujours active,
-        siège toujours occupé par un joueur actif — voir sa docstring) :
-        ici, on se contente d'enchaîner les mêmes suites qu'une
+    def _resolve_pending_rebalance(self, request_id, player_id, from_remote):
+        """Traite une réponse à la question "quel joueur est UTG ?" —
+        reçue d'un téléphone (POST /rebalance_answer, relayé ici par
+        _poll_voice_queue, from_remote=True), ou déclenchée localement
+        quand la préférence "Équilibrage guidé par UTG" (Paramètres) est
+        décochée alors qu'une demande est en attente (voir _on_bb_
+        rebalance_prompt_toggle, from_remote=False — aucune fenêtre Mac
+        n'est impliquée dans ce second cas, seulement ce même traitement
+        de réponse). La mutation réelle passe par database.py:resolve_
+        pending_rebalance, qui revalide tout avant d'agir (request_id
+        encore valide, table source toujours active, joueur toujours
+        actif à cette table — voir sa docstring et _player_still_at_
+        table) : ici, on se contente d'enchaîner les mêmes suites qu'une
         élimination normale (alerte de mouvement, rafraîchissements) sur
         le résultat qu'elle renvoie."""
         if not self.db:
             return
-        moves = self.db.resolve_pending_rebalance(request_id, seat)
+        moves = self.db.resolve_pending_rebalance(request_id, player_id)
         if moves:
             if len(self.db.list_players(status="active")) <= 1:
                 if (self.db.get_setting_int("movement_alert_active", 0) == 1
@@ -8258,6 +8457,7 @@ class App(tk.Tk):
         self._remote_control_tournament_name = (
             self.db.get_setting("tournament_name", "Tournoi") if self.db else "Tournoi"
         )
+        self._remote_control_tournament_path = self.db.path if self.db else None
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
         self._refresh_remote_dirto_permissions_cache()
@@ -8266,6 +8466,7 @@ class App(tk.Tk):
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
+            get_tournament_path=lambda: self._remote_control_tournament_path,
             get_players=lambda: self._remote_players_cache,
             get_clock_paused=lambda: self._remote_clock_paused,
             get_has_pending_moves=lambda: self._remote_has_pending_moves,
@@ -8277,8 +8478,8 @@ class App(tk.Tk):
             get_photo_image=self._remote_get_photo_image,
             on_delete_photo=self._remote_delete_photo,
             get_pending_rebalance=lambda: self._remote_pending_rebalance,
-            on_rebalance_answer=lambda request_id, seat: self.voice_command_queue.put(
-                ("rebalance_answer", request_id, seat)
+            on_rebalance_answer=lambda request_id, player_id: self.voice_command_queue.put(
+                ("rebalance_answer", request_id, player_id)
             ),
             on_end_tournament=lambda: self.voice_command_queue.put(("end_tournament",)),
             # Phase 4, "Sécurisation du Contrôle à distance", 2026-09-20 :
@@ -8871,42 +9072,47 @@ class App(tk.Tk):
             open_windows.approve_remote_device(browser_id, label=label)
         self._refresh_remote_devices_panel()
 
-    def _is_ca_log_tab_active(self):
-        """True si l'onglet "CA/LOG" est actuellement affiché — testé
-        via son libellé RÉEL (voir _update_ca_log_tab_badge : peut
-        porter le suffixe "🔔", d'où startswith plutôt qu'une égalité
-        stricte). TclError (fenêtre en cours de fermeture) traitée comme
-        "non actif", jamais une exception qui remonterait à _tick.
+    def _is_ca_tab_active(self):
+        """True si l'onglet "CA" est actuellement affiché — testé via
+        son libellé RÉEL (voir _update_ca_tab_badge : peut porter le
+        suffixe "🔔", d'où startswith plutôt qu'une égalité stricte).
+        TclError (fenêtre en cours de fermeture) traitée comme "non
+        actif", jamais une exception qui remonterait à _tick.
 
-        Renommée le 2026-09-22 ("réorganisation visuelle du contrôle à
-        distance") — s'appelait _is_settings_tab_active tant que ce bloc
-        vivait dans Paramètres ; comportement/mécanisme inchangés,
-        seul l'onglet surveillé a changé."""
+        Renommée le 2026-09-24 (chantier "séparation CA/LOG en CA +
+        LOG") — s'appelait _is_ca_log_tab_active tant que CA et LOG
+        partageaient le même onglet (elle-même issue de _is_settings_
+        tab_active, voir l'historique du 2026-09-22) ; comportement/
+        mécanisme inchangés, seul l'onglet surveillé a changé. L'onglet
+        "LOG", lui, ne doit JAMAIS être considéré comme "CA actif" —
+        son libellé ne commence pas par "CA", ce startswith l'exclut
+        donc déjà naturellement."""
         try:
-            return self.notebook.tab(self.notebook.select(), "text").startswith("CA/LOG")
+            return self.notebook.tab(self.notebook.select(), "text").startswith("CA")
         except tk.TclError:
             return False
 
-    def _update_ca_log_tab_badge(self, has_pending):
-        """🔔 sur l'onglet "CA/LOG" tant qu'AU MOINS UNE demande de
-        téléphone est en attente (demande du 2026-09-09, "avertir le
-        responsable même si CA/LOG n'est pas ouvert") — reflète
-        TOUJOURS l'ensemble des demandes pending, y compris celles
-        actuellement masquées par "Plus tard" (voir _remote_device_
-        snoozed_keys) : "Plus tard" ne doit JAMAIS faire disparaître ce
-        signal, seulement fermer la fenêtre flottante elle-même.
+    def _update_ca_tab_badge(self, has_pending):
+        """🔔 sur l'onglet "CA" tant qu'AU MOINS UNE demande de téléphone
+        est en attente (demande du 2026-09-09, "avertir le responsable
+        même si CA n'est pas ouvert") — reflète TOUJOURS l'ensemble des
+        demandes pending, y compris celles actuellement masquées par
+        "Plus tard" (voir _remote_device_snoozed_keys) : "Plus tard" ne
+        doit JAMAIS faire disparaître ce signal, seulement fermer la
+        fenêtre flottante elle-même.
 
-        Renommée le 2026-09-22 (voir _is_ca_log_tab_active) — s'appelait
-        _update_settings_tab_badge, ciblait self.settings_tab."""
+        Renommée le 2026-09-24 (voir _is_ca_tab_active) — s'appelait
+        _update_ca_log_tab_badge tant que CA et LOG partageaient le même
+        onglet (elle-même issue de _update_settings_tab_badge)."""
         try:
-            current_label = self.notebook.tab(self.ca_log_tab, "text")
+            current_label = self.notebook.tab(self.ca_tab, "text")
         except tk.TclError:
             return
         base = current_label[:-2] if current_label.endswith(" 🔔") else current_label
         new_label = base + (" 🔔" if has_pending else "")
         if new_label != current_label:
             try:
-                self.notebook.tab(self.ca_log_tab, text=new_label)
+                self.notebook.tab(self.ca_tab, text=new_label)
             except tk.TclError:
                 pass
 
@@ -8933,7 +9139,7 @@ class App(tk.Tk):
         (voir _is_position_onscreen — se prémunit d'une ancienne
         position devenue hors écran après un changement de résolution/
         moniteur), sinon une position par défaut SOUS le bloc "Téléphones
-        autorisés" de l'onglet "CA/LOG" (Changer.../Retirer la liaison/
+        autorisés" de l'onglet "CA" (Changer.../Retirer la liaison/
         Révoquer — demande explicite du 2026-09-22, "réorganisation
         visuelle du contrôle à distance") plutôt qu'un coin fixe de la
         fenêtre principale."""
@@ -8977,29 +9183,32 @@ class App(tk.Tk):
         """Ouvre/repeuple/masque/ferme la fenêtre flottante de demande de
         téléphone (demande du 2026-09-09, abandon définitif de toute
         intégration dans une grille de réglages ; déplacée dans l'onglet
-        "CA/LOG" le 2026-09-22, voir _build_ca_log_tab) : présente la
-        PLUS ANCIENNE demande NON masquée par "Plus tard" (voir _remote_
-        device_snoozed_keys) — jamais deux à la fois, jamais la même
-        demande que la section "Téléphones" (voir _refresh_remote_
-        devices_panel, approuvés uniquement).
+        "CA/LOG" le 2026-09-22, puis dans l'onglet "CA" seul le
+        2026-09-24 lors de la séparation CA/LOG en CA + LOG — voir
+        _build_ca_tab) : présente la PLUS ANCIENNE demande NON masquée
+        par "Plus tard" (voir _remote_device_snoozed_keys) — jamais deux
+        à la fois, jamais la même demande que la section "Téléphones"
+        (voir _refresh_remote_devices_panel, approuvés uniquement).
 
         VISIBILITÉ (demande du 2026-09-09, correction : "la fenêtre ne
         doit apparaître au-dessus d'AUCUN autre onglet que celui qui
-        héberge le contrôle à distance" — CA/LOG depuis le 2026-09-22)
-        — règle appliquée à CHAQUE appel, qu'il vienne du sondage
+        héberge le contrôle à distance" — CA seul depuis le 2026-09-24,
+        LOG n'est JAMAIS considéré comme cet onglet même si les deux
+        étaient encore réunis au moment de cette demande initiale) —
+        règle appliquée à CHAQUE appel, qu'il vienne du sondage
         périodique (~2s, voir App._tick/_check_remote_device_requests)
         ou du changement d'onglet lui-même (voir _on_notebook_tab_
         changed, <<NotebookTabChanged>>, pour un affichage/masquage
         IMMÉDIAT au clic, sans attendre le prochain sondage) : VISIBLE
-        SI ET SEULEMENT SI l'onglet "CA/LOG" est actuellement sélectionné
-        ET qu'il existe une telle demande. Sur tout AUTRE onglet, la
-        fenêtre déjà créée est seulement MASQUÉE (`withdraw`, jamais
-        détruite ni recréée) — elle retrouve donc sa position EXACTE,
-        sans le moindre recalcul, dès que CA/LOG redevient actif
+        SI ET SEULEMENT SI l'onglet "CA" est actuellement sélectionné ET
+        qu'il existe une telle demande. Sur tout AUTRE onglet (y compris
+        "LOG"), la fenêtre déjà créée est seulement MASQUÉE (`withdraw`,
+        jamais détruite ni recréée) — elle retrouve donc sa position
+        EXACTE, sans le moindre recalcul, dès que CA redevient actif
         (`deiconify`) ; la demande elle-même n'est ni approuvée, ni
         révoquée, ni "Plus tard"-ée par ce simple changement d'onglet —
-        seul le badge 🔔 (voir _update_ca_log_tab_badge, appelé
-        séparément par l'appelant) reste alors le signal visible.
+        seul le badge 🔔 (voir _update_ca_tab_badge, appelé séparément
+        par l'appelant) reste alors le signal visible.
 
         Une fenêtre déjà EXISTANTE (visible ou masquée) est REPEUPLÉE en
         place pour la demande suivante plutôt que détruite/recréée
@@ -9023,17 +9232,17 @@ class App(tk.Tk):
             self._close_remote_device_popup()
             return
 
-        ca_log_active = self._is_ca_log_tab_active()
+        ca_active = self._is_ca_tab_active()
         content_changed = current_key != self._remote_device_popup_current_key
         self._remote_device_popup_current_key = current_key
         self._remote_device_popup_current_browser_id = current["browser_id"]
 
         popup = self._remote_device_popup
-        if not ca_log_active:
+        if not ca_active:
             # Jamais créer ni réafficher la fenêtre sur un autre onglet
-            # que CA/LOG — seule une fenêtre déjà existante peut avoir
-            # besoin d'être masquée ici (ex. l'utilisateur vient de
-            # quitter CA/LOG pendant qu'elle était affichée).
+            # que CA (y compris LOG) — seule une fenêtre déjà existante
+            # peut avoir besoin d'être masquée ici (ex. l'utilisateur
+            # vient de quitter CA pendant qu'elle était affichée).
             if popup is not None and popup.winfo_exists():
                 try:
                     popup.withdraw()
@@ -9093,9 +9302,9 @@ class App(tk.Tk):
         UNIQUEMENT la fenêtre flottante pour CETTE demande — ne l'approuve
         ni ne la révoque (le téléphone reste "pending" côté serveur), et
         ne fait PAS disparaître le badge 🔔 de l'onglet (voir _update_
-        ca_log_tab_badge, basé sur la liste "pending" complète, jamais
-        filtrée par ce masquage). Redevient visible dès que CA/LOG
-        est quitté PUIS rouvert (voir _is_ca_log_tab_active/_check_
+        ca_tab_badge, basé sur la liste "pending" complète, jamais
+        filtrée par ce masquage). Redevient visible dès que CA
+        est quitté PUIS rouvert (voir _is_ca_tab_active/_check_
         remote_device_requests, qui vide _remote_device_snoozed_keys à
         ce moment précis) — sans avoir besoin d'attendre une nouvelle
         tentative du téléphone (même browser_id/requested_at)."""
@@ -9113,29 +9322,32 @@ class App(tk.Tk):
         d'interface concernés par une demande de téléphone (demande du
         2026-09-09, retour définitif à une fenêtre flottante après
         abandon de toute intégration dans une grille de réglages ;
-        bloc déplacé dans l'onglet "CA/LOG" le 2026-09-22) :
+        bloc déplacé dans l'onglet "CA/LOG" le 2026-09-22, puis dans
+        l'onglet "CA" seul le 2026-09-24 lors de la séparation CA/LOG en
+        CA + LOG — l'onglet "LOG" n'est concerné par RIEN de ce qui
+        suit) :
 
         1. la fenêtre flottante (voir _refresh_remote_device_popup), qui
            présente la plus ancienne demande NON masquée par "Plus
            tard" ;
-        2. le badge 🔔 de l'onglet "CA/LOG" (voir _update_ca_log_tab_
-           badge), reflet FIDÈLE de la liste "pending" complète —
-           jamais affecté par "Plus tard" ;
+        2. le badge 🔔 de l'onglet "CA" (voir _update_ca_tab_badge),
+           reflet FIDÈLE de la liste "pending" complète — jamais affecté
+           par "Plus tard" ;
         3. la liste "Téléphones" (appareils APPROUVÉS, voir _refresh_
            remote_devices_panel), reconstruite seulement si son contenu
            a changé (voir _remote_devices_signature).
 
-        Détecte aussi la TRANSITION vers l'onglet "CA/LOG" (il était
-        affiché autre chose au sondage précédent, il affiche CA/LOG
-        maintenant) pour vider _remote_device_snoozed_keys À CE moment
-        précis — jamais en continu tant que l'utilisateur y reste (voir
-        _on_remote_device_popup_later) : revenir sur CA/LOG fait ainsi
-        réapparaître une demande "Plus tard"-ée plus tôt, sans attendre
-        une nouvelle tentative du téléphone."""
-        ca_log_active_now = self._is_ca_log_tab_active()
-        if ca_log_active_now and not self._last_ca_log_tab_active:
+        Détecte aussi la TRANSITION vers l'onglet "CA" (il était affiché
+        autre chose au sondage précédent, il affiche CA maintenant) pour
+        vider _remote_device_snoozed_keys À CE moment précis — jamais en
+        continu tant que l'utilisateur y reste (voir _on_remote_device_
+        popup_later) : revenir sur CA fait ainsi réapparaître une
+        demande "Plus tard"-ée plus tôt, sans attendre une nouvelle
+        tentative du téléphone."""
+        ca_active_now = self._is_ca_tab_active()
+        if ca_active_now and not self._last_ca_tab_active:
             self._remote_device_snoozed_keys.clear()
-        self._last_ca_log_tab_active = ca_log_active_now
+        self._last_ca_tab_active = ca_active_now
 
         try:
             pending = open_windows.list_pending_remote_devices()
@@ -9143,7 +9355,7 @@ class App(tk.Tk):
         except Exception:
             return
 
-        self._update_ca_log_tab_badge(bool(pending))
+        self._update_ca_tab_badge(bool(pending))
         self._refresh_remote_device_popup(pending=pending)
 
         signature = self._remote_devices_signature(approved)
@@ -9174,8 +9386,8 @@ class App(tk.Tk):
                     _, eliminated_id, eliminator_id, request_id = item
                     self._remote_eliminate(eliminated_id, eliminator_id, request_id=request_id)
                 elif isinstance(item, tuple) and item and item[0] == "rebalance_answer":
-                    _, request_id, seat = item
-                    self._resolve_pending_rebalance(request_id, seat, from_remote=True)
+                    _, request_id, player_id = item
+                    self._resolve_pending_rebalance(request_id, player_id, from_remote=True)
                 elif isinstance(item, tuple) and item and item[0] == "confirm_move":
                     _, move_id, request_id = item
                     self._remote_confirm_move(move_id, request_id=request_id)
@@ -10077,12 +10289,12 @@ class App(tk.Tk):
             top, text="🔍+ Zoom", width=9, command=lambda: self._tables_zoom_by(self.TABLES_ZOOM_STEP),
         ).pack(side="left", padx=3)
 
-        # -- Indication discrète "rééquilibrage en attente de la grosse
-        # blinde" (PHASE 3 de l'architecture validée le 2026-09-10, voir
+        # -- Indication discrète "rééquilibrage en attente du joueur à
+        # déplacer" (PHASE 3 de l'architecture validée le 2026-09-10, voir
         # database.py: pending_rebalance) : SEUL affichage Mac de cette
         # attente (aucune fenêtre intrusive, voir _check_pending_
         # rebalance) — un simple libellé + un bouton "Continuer sans
-        # indiquer la BB" équivalent au choix déjà disponible sur les
+        # désigner le joueur" équivalent au choix déjà disponible sur les
         # téléphones (remote_control.py: _REBALANCE_WIDGET), pour que le
         # responsable puisse trancher CE mouvement précis depuis le Mac
         # sans devoir décocher la préférence globale d'équilibrage guidé
@@ -10096,18 +10308,18 @@ class App(tk.Tk):
         )
         self._pending_rebalance_label.pack(side="left", padx=(0, 6))
         pending_rebalance_continue_btn = ttk.Button(
-            self._pending_rebalance_frame, text="Continuer sans indiquer la BB",
+            self._pending_rebalance_frame, text="Continuer sans désigner le joueur",
             command=self._continue_pending_rebalance_without_bb,
         )
         pending_rebalance_continue_btn.pack(side="left")
         Tooltip(
             pending_rebalance_continue_btn,
             "Résout ce rééquilibrage précis sans attendre de réponse d'un\n"
-            "téléphone, exactement comme si \"Continuer sans indiquer la\n"
-            "BB\" avait été répondu sur un téléphone du contrôle à\n"
-            "distance. La préférence \"Équilibrage guidé par la grosse\n"
-            "blinde\" n'est pas modifiée : le prochain rééquilibrage posera\n"
-            "de nouveau la question normalement.",
+            "téléphone, exactement comme si \"Continuer sans désigner le\n"
+            "joueur\" avait été répondu sur un téléphone du contrôle à\n"
+            "distance. La préférence \"Équilibrage guidé par UTG\" n'est\n"
+            "pas modifiée : le prochain rééquilibrage posera de nouveau\n"
+            "la question normalement.",
         )
         self._pending_rebalance_frame.pack_forget()
 
@@ -11680,6 +11892,7 @@ class App(tk.Tk):
         top_btns.pack(fill="x", padx=15, pady=(0, 10))
         ttk.Button(top_btns, text="➕ Ajouter un round", command=lambda: self._add_blind_round()).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Structure standard", command=self._reset_blind_structure_from_tab).pack(side="left", padx=3)
+        ttk.Button(top_btns, text="Appliquer", command=self._apply_blinds_from_tab).pack(side="left", padx=3)
 
         # Largeur (en caractères) des champs Durée/Petite Blind/Grosse
         # Blind/Ante/Durée Pause du tableau ci-dessous — réglable par
@@ -12411,6 +12624,59 @@ class App(tk.Tk):
             self._refresh_blinds_tab()
             if hasattr(self, "blinds_tree"):
                 self._go_to_level(1)
+
+    def _apply_blinds_from_tab(self):
+        """Bouton "Appliquer" (juste à droite de "Structure standard",
+        demande du 2026-09-24) : applique à ce tournoi les valeurs
+        ACTUELLEMENT visibles dans le tableau, sans les enregistrer comme
+        modèle réutilisable (voir _save_blinds_as_template pour ça) et
+        SANS confirmation (décision explicite : ce bouton ne fait que
+        committer ce que l'utilisateur voit déjà à l'écran, contrairement
+        à "Structure standard" ci-dessus, qui remplace tout par une
+        structure par défaut invisible du tableau).
+
+        Réutilise EXACTEMENT la même chaîne de validation/conversion que
+        _add_blind_round/_delete_blind_round/_save_blinds_as_template :
+        _collect_blinds_from_widgets() gère déjà la validation (montre
+        son propre message d'erreur précis et renvoie None SANS toucher
+        self.db en cas de valeur invalide, voir sa docstring) — rien à
+        dupliquer ici, la structure précédente et le niveau courant
+        restent alors intégralement intacts.
+
+        Tournoi en cours (demande explicite du 2026-09-24) : ne
+        réinitialise JAMAIS current_level_order à 1 (contrairement à
+        "Structure standard" ci-dessus, qui appelle _go_to_level(1)) — ni
+        level_start_epoch, ni paused_accum_seconds, ni l'état pause/
+        démarrage du chrono, tous laissés intacts. Seule exception,
+        reprise TELLE QUELLE de la règle déjà validée et déjà en
+        production dans _generate_custom_blind_structure (bouton
+        "Régénérer la structure de blindes..." de Paramètres, qui
+        fonctionne lui aussi en plein milieu d'un tournoi) : si la
+        nouvelle structure compte désormais MOINS de lignes que le
+        niveau courant, ce dernier est ramené au dernier niveau valide —
+        jamais au niveau 1. Si l'utilisateur raccourcit la durée du
+        niveau EN COURS sous le temps déjà écoulé, le mécanisme normal
+        du Chronomètre (_remaining_seconds) peut faire passer
+        automatiquement au niveau suivant dès le prochain tick — c'est le
+        comportement déjà existant pour tout changement de durée du
+        niveau courant, jamais un cas spécial ajouté ici.
+
+        _refresh_clock_tab() (si l'onglet/écran existe déjà, comme pour
+        _save_blinds_as_template) recharge le Chronomètre ET l'écran
+        projecteur d'un seul coup (voir sa fin, self.clock_window.
+        refresh(...)) — aucun appel séparé nécessaire pour le Chrono
+        Projo."""
+        rounds = self._collect_blinds_from_widgets()
+        if rounds is None:
+            return
+        flat = self._rounds_to_flat_structure(rounds)
+        self.db.set_blind_structure(flat)
+        current_order = self.db.get_setting_int("current_level_order", 1)
+        if current_order > len(flat):
+            self.db.set_settings({"current_level_order": len(flat)})
+        self._refresh_blinds_tab()
+        if hasattr(self, "blinds_tree"):
+            self._refresh_clock_tab()
 
     # ---------------------------------------------------------------
     # Onglet Gains
@@ -13177,20 +13443,15 @@ class App(tk.Tk):
             ("start_big_blind", "Big blind (niveau 1)"),
             ("ante_start_level", "Niveau à partir duquel l'ante commence"),
             ("start_ante", "Valeur de l'ante de départ (à ce niveau)"),
-            ("round_duration_minutes", "Durée d'un Round en min"),
-            ("break_duration_minutes", "Durée de la Pause (minutes)"),
         ]
         blind_field_tips = {
             "ante_start_level": "Compte uniquement les niveaux de blindes\n(les pauses ne sont pas comptées comme un niveau).",
             "start_ante": "Ante au niveau de départ choisi ci-dessus ; elle grandit\nensuite proportionnellement au big blind sur les niveaux suivants.",
-            "round_duration_minutes": "Durée (en minutes) de chaque niveau de blindes lors\nde la régénération ci-dessous — pas les pauses (réglage séparé).",
         }
         for j, (key, label) in enumerate(blind_fields, start=1):
             default = {
                 "start_small_blind": 25, "start_big_blind": 50,
                 "ante_start_level": 4, "start_ante": 25,
-                "round_duration_minutes": 15,
-                "break_duration_minutes": 15,
             }[key]
             lbl = ttk.Label(right, text=label + " :")
             lbl.grid(row=j, column=0, sticky="w", pady=4)
@@ -13200,7 +13461,87 @@ class App(tk.Tk):
             ttk.Entry(right, textvariable=var, width=25).grid(row=j, column=1, pady=4, padx=10)
             self.settings_vars[key] = var
 
-        blind_next_row = len(blind_fields) + 1
+        # -- Durées de round + pauses programmables (chantier "Paramètres
+        # > Structure des blindes — durées variables + 2 pauses
+        # programmables", 2026-09-24) : 2 lignes "Durée / Nb Rounds" puis
+        # 2 lignes "Durée de la pause / Après Round", chacune une sous-
+        # frame packée en columnspan=2 (même technique que primes_header
+        # plus bas dans cette méthode) — jamais un partage de la grille à
+        # 2 colonnes partagée avec les champs simples ci-dessus, qui
+        # imposerait une largeur de colonne 1 incohérente avec ces
+        # champs plus étroits.
+        #
+        # round_duration_minutes (ligne 1) : clé HISTORIQUE conservée
+        # telle quelle (compatibilité totale : un ancien tournoi qui n'a
+        # que cette clé se comporte exactement comme avant — round_
+        # count_1 vide = "s'applique à tous les rounds", voir structures.
+        # generate_blind_structure/_duration_for_round). round_count_1/
+        # round_duration_minutes_2/round_count_2 : nouvelles clés,
+        # absentes de DEFAULT_SETTINGS (comme les 4 champs simples
+        # ci-dessus) — Database.get_setting renvoie alors simplement le
+        # repli "" fourni ici, jamais une exception, pour tout fichier
+        # .tournoi antérieur à ce chantier.
+        def _build_dual_field_row(row, label1, key1, default1, label2, key2, default2, width1=8, width2=6):
+            line = ttk.Frame(right)
+            line.grid(row=row, column=0, columnspan=2, sticky="w", pady=4)
+            ttk.Label(line, text=label1 + " :").pack(side="left")
+            var1 = tk.StringVar(value=self.db.get_setting(key1, default1))
+            ttk.Entry(line, textvariable=var1, width=width1).pack(side="left", padx=(6, 16))
+            self.settings_vars[key1] = var1
+            ttk.Label(line, text=label2 + " :").pack(side="left")
+            var2 = tk.StringVar(value=self.db.get_setting(key2, default2))
+            ttk.Entry(line, textvariable=var2, width=width2).pack(side="left", padx=(6, 0))
+            self.settings_vars[key2] = var2
+            return line
+
+        duration_row1 = _build_dual_field_row(
+            len(blind_fields) + 1, "Durée d'un Round en min", "round_duration_minutes", "15",
+            "Nb Rounds", "round_count_1", "",
+        )
+        Tooltip(
+            duration_row1,
+            "Durée (en minutes) des premiers rounds de jeu lors de la\n"
+            "régénération ci-dessous — pas les pauses (réglages séparés\n"
+            "ci-dessous). \"Nb Rounds\" vide : cette durée s'applique à\n"
+            "TOUS les rounds du tournoi, la ligne suivante n'intervient\n"
+            "alors jamais.",
+        )
+        duration_row2 = _build_dual_field_row(
+            len(blind_fields) + 2, "Durée d'un Round en min", "round_duration_minutes_2", "",
+            "Nb Rounds", "round_count_2", "",
+        )
+        Tooltip(
+            duration_row2,
+            "Durée des rounds suivants, une fois les \"Nb Rounds\" de la\n"
+            "ligne du dessus écoulés. \"Nb Rounds\" vide ici : s'applique à\n"
+            "tous les rounds restants jusqu'à la fin du tournoi. Si cette\n"
+            "ligne est entièrement vide, la durée de la première ligne se\n"
+            "prolonge pour le reste du tournoi.",
+        )
+        break_row1 = _build_dual_field_row(
+            len(blind_fields) + 3, "Durée de la pause (m)", "break_minutes_1", "15",
+            "Après Round", "break_after_round_1", "4",
+        )
+        Tooltip(
+            break_row1,
+            "Insère une pause de cette durée juste après le round de jeu\n"
+            "numéro \"Après Round\" (jamais compté parmi les rounds : voir\n"
+            "\"Nb Rounds\" ci-dessus). Laisser les deux champs vides pour\n"
+            "ne définir aucune pause automatique ici.",
+        )
+        break_row2 = _build_dual_field_row(
+            len(blind_fields) + 4, "Durée de la pause (m)", "break_minutes_2", "",
+            "Après Round", "break_after_round_2", "",
+        )
+        Tooltip(
+            break_row2,
+            "Deuxième pause automatique, optionnelle — mêmes règles que\n"
+            "la ligne au-dessus. Toujours après la première (round plus\n"
+            "grand). Pour une 3e pause exceptionnelle, ajoutez-la\n"
+            "directement dans l'onglet Blindes après régénération.",
+        )
+
+        blind_next_row = len(blind_fields) + 5
         regen_btn = ttk.Button(
             right, text="🎲  Régénérer la structure de blindes avec ces valeurs",
             command=self._generate_custom_blind_structure,
@@ -13209,10 +13550,12 @@ class App(tk.Tk):
         Tooltip(
             regen_btn,
             "Remplace toute la structure de blindes par une nouvelle,\n"
-            "calculée à partir des 6 valeurs ci-dessus (fonctionne aussi\n"
-            "en plein milieu d'un tournoi). Enregistre aussi TOUS les\n"
-            "paramètres en même temps, comme le bouton \"Enregistrer les\n"
-            "paramètres\" — pas besoin de cliquer les deux.",
+            "calculée à partir des valeurs ci-dessus (fonctionne aussi en\n"
+            "plein milieu d'un tournoi, sans jamais revenir au niveau 1 :\n"
+            "voir le bouton \"Appliquer\" de l'onglet Blindes pour la même\n"
+            "garantie). Enregistre aussi TOUS les paramètres en même\n"
+            "temps, comme le bouton \"Enregistrer les paramètres\" — pas\n"
+            "besoin de cliquer les deux.",
         )
 
         bounty_start_row = blind_next_row + 1
@@ -13456,50 +13799,52 @@ class App(tk.Tk):
 
         # -- Contrôle à distance depuis un téléphone : déplacé dans son
         # propre onglet "CA/LOG" (demande du 2026-09-22, "réorganisation
-        # visuelle du contrôle à distance") — voir _build_ca_log_tab.
-        # Emplacement UNIQUE désormais : plus aucun widget de ce bloc
-        # (activation, code, Téléphones autorisés, Permissions DIRTO)
-        # n'est construit ici, pour ne jamais créer de doublon ni un
-        # second état indépendant.
+        # visuelle du contrôle à distance"), puis dans l'onglet "CA" seul
+        # le 2026-09-24 (séparation CA/LOG en CA + LOG) — voir
+        # _build_ca_tab. Emplacement UNIQUE désormais : plus aucun widget
+        # de ce bloc (activation, code, Téléphones autorisés, Permissions
+        # DIRTO) n'est construit ici, pour ne jamais créer de doublon ni
+        # un second état indépendant.
 
-        # -- Rééquilibrage simple guidé par la grosse blinde (version TEST,
-        # voir database.py: rebalance_tables/_bb_rebalance_prompt_enabled) :
-        # préférence GLOBALE (comme le bloc contrôle à distance, déplacé
-        # dans l'onglet CA/LOG ci-dessus). Fait partie du CONTENU
-        # DÉFILANT de l'onglet, comme le reste des réglages de "right"
-        # (grid, même colonne 0, même sticky="w").
+        # -- Rééquilibrage simple guidé par UTG (voir database.py:
+        # rebalance_tables/_bb_rebalance_prompt_enabled) : préférence
+        # GLOBALE (comme le bloc contrôle à distance, déplacé dans
+        # l'onglet CA ci-dessus). Fait partie du CONTENU DÉFILANT de
+        # l'onglet, comme le reste des réglages de "right" (grid, même
+        # colonne 0, même sticky="w").
         #
         # Libellé/tooltip mis à jour (clé de stockage BB_REBALANCE_PROMPT_
         # PREF_KEY et comportement INCHANGÉS, pour rester compatible avec
         # une préférence déjà enregistrée par une version antérieure) :
         # cette case ne pilote plus l'affichage d'une fenêtre Mac (retirée,
         # voir _check_pending_rebalance) mais reste le seul interrupteur
-        # entre le mode "guidé" (demande quel siège est BB, affichée sur
+        # entre le mode "guidé" (demande quel joueur est UTG, affichée sur
         # les téléphones) et le mode automatique historique
         # (_legacy_pick_mover, voir database.py: rebalance_tables) — elle
         # a donc toujours une utilité propre, indépendante de tout
         # affichage Mac.
         # Reprend directement la ligne libérée par le bloc contrôle à
-        # distance (déplacé dans CA/LOG, demande du 2026-09-22) — plus
-        # aucun décalage +4/+5/+6/+7 à ajouter ici.
+        # distance (déplacé dans l'onglet CA) — plus aucun décalage
+        # +4/+5/+6/+7 à ajouter ici.
         bb_prompt_row = voice_start_row + 3
         self.bb_rebalance_prompt_var = tk.BooleanVar(
             value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
         )
         bb_prompt_check = ttk.Checkbutton(
-            right, text="Équilibrage guidé par la grosse blinde (demande sur le téléphone)",
+            right, text="Équilibrage guidé par UTG (demande sur le téléphone)",
             variable=self.bb_rebalance_prompt_var, command=self._on_bb_rebalance_prompt_toggle,
         )
         bb_prompt_check.grid(row=bb_prompt_row, column=0, columnspan=2, sticky="w", pady=(0, 6))
         Tooltip(
             bb_prompt_check,
             "Activée (par défaut) : lors d'un simple rééquilibrage entre\n"
-            "tables (pas un cassage de table), demande quel siège est\n"
-            "actuellement grosse blinde — sur tous les téléphones du\n"
-            "contrôle à distance — pour choisir qui se déplace. Rien ne\n"
-            "s'affiche sur ce Mac, seul le calcul/résultat y est appliqué.\n"
+            "tables (pas un cassage de table), demande directement quel\n"
+            "joueur est UTG — sur tous les téléphones du contrôle à\n"
+            "distance — ce joueur est alors déplacé. Rien ne s'affiche sur\n"
+            "ce Mac, seul le calcul/résultat y est appliqué.\n"
             "Désactivée : aucune demande, l'ancien mécanisme historique\n"
-            "choisit directement, comme \"Continuer sans indiquer la BB\".",
+            "choisit directement, comme \"Continuer sans désigner le\n"
+            "joueur\".",
         )
 
         # -- "Un seul tournoi à la fois" : préférence GLOBALE (comme la
@@ -13647,13 +13992,14 @@ class App(tk.Tk):
         )
 
     # -----------------------------------------------------------------
-    # Onglet "CA/LOG" (demande du 2026-09-22, "réorganisation visuelle du
-    # contrôle à distance") : emplacement UNIQUE du bloc Contrôle à
-    # distance/Téléphones autorisés/Permissions DIRTO — retiré de
-    # Paramètres (voir _build_settings_tab, qui ne construit plus rien de
-    # ce bloc) pour ne jamais créer de doublon ni un second état
-    # indépendant. Fonctionnement STRICTEMENT préservé (aucune logique
-    # réécrite, seulement son ancrage/sa position) : mêmes noms
+    # Onglet "CA" (demande du 2026-09-22, "réorganisation visuelle du
+    # contrôle à distance", séparée en CA + LOG le 2026-09-24 — voir
+    # _build_log_tab pour le nouvel onglet "LOG") : emplacement UNIQUE du
+    # bloc Contrôle à distance/Téléphones autorisés/Permissions DIRTO —
+    # retiré de Paramètres (voir _build_settings_tab, qui ne construit
+    # plus rien de ce bloc) pour ne jamais créer de doublon ni un second
+    # état indépendant. Fonctionnement STRICTEMENT préservé (aucune
+    # logique réécrite, seulement son ancrage/sa position) : mêmes noms
     # d'attributs qu'avant (remote_control_enabled_var, remote_control_
     # code_lbl, remote_control_status_lbl, remote_devices_container,
     # remote_dirto_container...), lus/écrits par les mêmes méthodes
@@ -13661,20 +14007,21 @@ class App(tk.Tk):
     # control_status, _refresh_remote_devices_panel, _refresh_remote_
     # control_code_label, _build_remote_dirto_permissions_widgets...).
     # -----------------------------------------------------------------
-    def _build_ca_log_tab(self):
+    def _build_ca_tab(self):
         """Deux zones CÔTE À CÔTE occupant toute la largeur disponible
         (gauche : Contrôle à distance/Téléphones ; droite : Permissions
-        DIRTO), au même niveau vertical. La partie basse de cet onglet
-        reste délibérément VIDE pour l'instant — réservée au futur
-        Journal des actions (Phase 5 : filtres + tableau + Export, PAS
-        commencée ici, ni sa base SQLite).
+        DIRTO), au même niveau vertical. Les critères de recherche du
+        Journal des actions vivent désormais dans leur propre onglet
+        (voir _build_log_tab, chantier "séparation CA/LOG en CA + LOG",
+        2026-09-24) — cet onglet-ci ne s'occupe plus que du contrôle à
+        distance.
 
         La fenêtre flottante d'autorisation (RemoteDeviceRequestWindow)
-        n'est plus visible que sur CET onglet (voir _is_ca_log_tab_active,
+        n'est plus visible que sur CET onglet (voir _is_ca_tab_active,
         _refresh_remote_device_popup) et se positionne par défaut SOUS
         remote_devices_container (voir _remote_device_popup_position) —
         jamais recréée/réécrite, seulement son ancrage adapté."""
-        top = ttk.Frame(self.ca_log_tab)
+        top = ttk.Frame(self.ca_tab)
         top.pack(padx=20, pady=20, anchor="nw", fill="x")
         left = ttk.Frame(top)
         left.pack(side="left", anchor="n", padx=(0, 50))
@@ -13725,7 +14072,7 @@ class App(tk.Tk):
         # est un jour régénéré (incident du 2026-09-19) pendant que ce
         # tournoi reste ouvert, ce libellé est tenu à jour par
         # _refresh_remote_control_code_label, appelée depuis _tick tant
-        # que cet onglet est affiché (voir _is_ca_log_tab_active) —
+        # que cet onglet est affiché (voir _is_ca_tab_active) —
         # jamais à chaque tick de chaque fenêtre, pour rester négligeable.
         code = open_windows.remote_session_code()
         self.remote_control_code_lbl = ttk.Label(
@@ -13769,22 +14116,6 @@ class App(tk.Tk):
         self.remote_devices_container.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self._refresh_remote_devices_panel()
 
-        # -- Journal des actions : ZONE VISUELLE UNIQUEMENT pour l'instant
-        # (demande du 2026-09-24, "préparation visuelle de la partie LOG")
-        # — critères de recherche PRÉPARATOIRES, sous "Téléphones
-        # autorisés" (jamais sous Permissions DIRTO, colonne de droite,
-        # volontairement intacte). AUCUNE recherche réelle câblée ici,
-        # AUCUN accès à une base de données de LOG (qui n'existe pas
-        # encore), AUCUN tableau de résultats (emplacement/colonnes
-        # décidés après validation visuelle de ce premier bloc) — voir
-        # la demande explicite de ne pas commencer l'implémentation
-        # fonctionnelle. Un trait horizontal sépare clairement cette
-        # future zone de la gestion des téléphones juste au-dessus.
-        ttk.Separator(left, orient="horizontal").grid(
-            row=5, column=0, columnspan=2, sticky="ew", pady=(14, 12)
-        )
-        self._build_log_search_criteria_placeholder(left, row=6)
-
         # ================================================================
         # ZONE DROITE — Permissions DIRTO (pour ce tournoi)
         # ================================================================
@@ -13806,24 +14137,99 @@ class App(tk.Tk):
         self.remote_dirto_container.grid(row=1, column=0, sticky="new")
         self._build_remote_dirto_permissions_widgets(self.remote_dirto_container)
 
-        # ================================================================
-        # Partie basse — réservée au futur TABLEAU de résultats du
-        # Journal des actions (les critères de recherche, eux, sont déjà
-        # posés plus haut à gauche — voir _build_log_search_criteria_
-        # placeholder). Emplacement/colonnes du tableau, Export, et la
-        # base SQLite du LOG : PAS commencés ici. Volontairement vide.
-        # ================================================================
-        ttk.Frame(self.ca_log_tab).pack(fill="both", expand=True)
+    # -----------------------------------------------------------------
+    # Onglet "LOG" (créé lors du chantier "séparation CA/LOG en CA +
+    # LOG", 2026-09-24 ; rendu FONCTIONNEL lors du chantier "LOG, Phase
+    # 2", même jour) : filtres de recherche du Journal des actions
+    # (_build_log_search_criteria_placeholder, RÉUTILISÉE telle quelle —
+    # mêmes variables log_date_from_var/log_date_to_var/log_tournament_
+    # var/log_user_var/log_function_var/log_player_var/log_reset_btn/
+    # log_search_btn/log_export_btn qu'avant la Phase 2, désormais
+    # RÉELLEMENT câblées) en haut, grand tableau de résultats
+    # (self.log_tree) en dessous. Toute la lecture SQL passe par
+    # action_log.py (search_actions/list_tournaments/list_users/
+    # list_players/list_categories) — jamais de SQL direct ici.
+    # -----------------------------------------------------------------
+    def _build_log_tab(self):
+        """Filtres de recherche du Journal des actions en haut (voir
+        _build_log_search_criteria_placeholder), tableau de résultats
+        (self.log_tree, 9 colonnes) sur toute la largeur restante en
+        dessous. Chargement initial des opérations récentes (aucun
+        filtre) effectué ICI, à la construction — voir _refresh_log_tab.
+
+        self.log_count_lbl (renommé le 2026-09-25 — s'appelait log_
+        truncated_lbl tant qu'il ne servait qu'à signaler un dépassement
+        du plafond de 500 lignes, désormais supprimé) : affiche en
+        permanence "N opération(s) affichée(s)", voir _log_count_label_
+        text/_refresh_log_tab."""
+        top = ttk.Frame(self.log_tab)
+        top.pack(padx=20, pady=(20, 8), anchor="nw", fill="x")
+        self._build_log_search_criteria_placeholder(top, row=0)
+
+        self.log_count_lbl = ttk.Label(self.log_tab, foreground=MUTED)
+        self.log_count_lbl.pack(padx=20, anchor="w")
+
+        results = ttk.Frame(self.log_tab)
+        results.pack(fill="both", expand=True, padx=20, pady=(6, 20))
+
+        cols = ("ts", "tournament", "user", "role", "category", "action", "player", "result", "message")
+        headers = [
+            "Date/Heure", "Tournoi", "Utilisateur", "Rôle", "Fonction",
+            "Action", "Joueur", "Résultat", "Message",
+        ]
+        self.log_tree = ttk.Treeview(results, columns=cols, show="headings")
+        widths = {
+            "ts": 140, "tournament": 150, "user": 110, "role": 70,
+            "category": 110, "action": 150, "player": 130, "result": 90,
+        }
+        left_aligned = {"tournament", "user", "action", "player", "message"}
+        for c, h in zip(cols, headers):
+            self.log_tree.heading(c, text=h)
+            anchor = "w" if c in left_aligned else "center"
+            if c == "message":
+                self.log_tree.column(c, width=220, anchor=anchor, stretch=True)
+            else:
+                self.log_tree.column(c, width=widths[c], anchor=anchor, stretch=False)
+        log_scrollbar = ttk.Scrollbar(results, orient="vertical", command=self.log_tree.yview)
+        self.log_tree.configure(yscrollcommand=log_scrollbar.set)
+        self.log_tree.pack(side="left", fill="both", expand=True)
+        log_scrollbar.pack(side="right", fill="y")
+        # Détail complet d'une ligne (§14, chantier "LOG", Phase 2) : le
+        # tableau reste compact (Message peut être tronqué visuellement),
+        # un double-clic ouvre une fenêtre non modale avec tout le
+        # contenu — voir _on_log_row_double_click/_show_log_detail_window.
+        self.log_tree.bind("<Double-1>", self._on_log_row_double_click)
+
+        self._log_rows_by_item = {}
+        self._log_tournament_label_to_path = {}
+        self._log_category_label_to_key = {}
+
+        # Chargement initial (§11 de l'analyse validée) : opérations
+        # récentes affichées dès la construction de l'onglet, sans
+        # attendre un clic sur Rechercher — une seule requête indexée
+        # (ts DESC LIMIT 501), négligeable même sur un journal de
+        # plusieurs années.
+        self._refresh_log_tab()
 
     def _build_log_search_criteria_placeholder(self, parent, row):
-        """Critères de recherche du futur Journal des actions — ZONE
-        VISUELLE UNIQUEMENT (demande du 2026-09-24, "préparation
-        visuelle de la partie LOG") : aucune recherche réelle câblée
-        (aucun `command`/`trace_add` vers une quelconque logique), aucun
-        accès à une base de données de LOG (qui n'existe pas encore),
-        aucun tableau de résultats (emplacement/colonnes décidés après
-        validation visuelle de ce premier bloc — voir la demande
-        explicite de ne pas commencer l'implémentation fonctionnelle).
+        """Critères de recherche du Journal des actions — RÉELLEMENT
+        câblés depuis le chantier "LOG", Phase 2 (2026-09-24) : Du/Au/
+        Tournoi/Utilisateur/Fonction/Joueur alimentent action_log.
+        search_actions (voir _refresh_log_tab). 4 boutons : Réinitialiser/
+        Rechercher/Exporter (_on_log_reset/_on_log_search/_on_log_export)
+        et, ajouté par la correction du même jour, Purger (_on_log_purge)
+        — Du/Au portent aussi un petit bouton calendrier 📅 (voir
+        _show_log_date_picker), sans dépendance externe.
+
+        Purger réutilise désormais EXACTEMENT les mêmes 6 filtres que
+        Rechercher, avec EXACTEMENT la même interprétation (revu le
+        2026-09-25, "Purgeons ce qui est dans les filtres en cours,
+        comme ça on voit bien ce qui va être effacé", puis à nouveau le
+        même jour pour Du/Au — voir _current_log_filter_values/
+        _on_log_purge) : les 6 champs sont TOUS facultatifs — Du vide =
+        depuis le tout premier enregistrement, Au vide = jusqu'au tout
+        dernier, Tournoi/Utilisateur/Fonction/Joueur sur "Tous"/"Toutes"
+        = aucune restriction sur ce critère.
 
         Une seule grille PARTAGÉE par les 4 lignes (jamais une grille
         par ligne) : "Du"/"Utilisateur"/"Joueur" tombent tous en
@@ -13834,36 +14240,56 @@ class App(tk.Tk):
         criteria.grid(row=row, column=0, columnspan=2, sticky="w")
 
         # Ligne 1 : Du / Au / Tournoi
+        # Du/Au (+ bouton calendrier 📅, chantier "LOG", Phase 2 —
+        # correction "Purger" du 2026-09-24) : Entry + bouton empaquetés
+        # dans une petite sous-frame (jamais posés directement dans la
+        # grille partagée) pour ne pas perturber les colonnes 0-5
+        # existantes — chaque sous-frame occupe exactement la même
+        # cellule de grille que l'Entry seul occupait avant.
         ttk.Label(criteria, text="Du :").grid(row=0, column=0, sticky="w", padx=(0, 4), pady=(0, 6))
+        date_from_row = ttk.Frame(criteria)
+        date_from_row.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=(0, 6))
         self.log_date_from_var = tk.StringVar(value="")
-        ttk.Entry(criteria, textvariable=self.log_date_from_var, width=12).grid(
-            row=0, column=1, sticky="w", padx=(0, 16), pady=(0, 6)
+        ttk.Entry(date_from_row, textvariable=self.log_date_from_var, width=12).pack(side="left")
+        date_from_cal_btn = ttk.Button(date_from_row, text="📅", width=3)
+        date_from_cal_btn.pack(side="left", padx=(2, 0))
+        date_from_cal_btn.config(
+            command=lambda: self._show_log_date_picker(self.log_date_from_var, date_from_cal_btn)
         )
+
         ttk.Label(criteria, text="Au :").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=(0, 6))
+        date_to_row = ttk.Frame(criteria)
+        date_to_row.grid(row=0, column=3, sticky="w", padx=(0, 16), pady=(0, 6))
         self.log_date_to_var = tk.StringVar(value="")
-        ttk.Entry(criteria, textvariable=self.log_date_to_var, width=12).grid(
-            row=0, column=3, sticky="w", padx=(0, 16), pady=(0, 6)
+        ttk.Entry(date_to_row, textvariable=self.log_date_to_var, width=12).pack(side="left")
+        date_to_cal_btn = ttk.Button(date_to_row, text="📅", width=3)
+        date_to_cal_btn.pack(side="left", padx=(2, 0))
+        date_to_cal_btn.config(
+            command=lambda: self._show_log_date_picker(self.log_date_to_var, date_to_cal_btn)
         )
         ttk.Label(criteria, text="Tournoi :").grid(row=0, column=4, sticky="w", padx=(0, 4), pady=(0, 6))
         self.log_tournament_var = tk.StringVar(value="Tous")
-        ttk.Combobox(
+        self.log_tournament_combo = ttk.Combobox(
             criteria, textvariable=self.log_tournament_var, state="readonly", width=14,
             values=("Tous",),
-        ).grid(row=0, column=5, sticky="w", pady=(0, 6))
+        )
+        self.log_tournament_combo.grid(row=0, column=5, sticky="w", pady=(0, 6))
 
         # Ligne 2 : Utilisateur / Fonction
         ttk.Label(criteria, text="Utilisateur :").grid(row=1, column=0, sticky="w", padx=(0, 4), pady=(0, 6))
         self.log_user_var = tk.StringVar(value="Tous")
-        ttk.Combobox(
+        self.log_user_combo = ttk.Combobox(
             criteria, textvariable=self.log_user_var, state="readonly", width=14,
             values=("Tous",),
-        ).grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(0, 6))
+        )
+        self.log_user_combo.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(0, 6))
         ttk.Label(criteria, text="Fonction :").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(0, 6))
         self.log_function_var = tk.StringVar(value="Toutes")
-        ttk.Combobox(
+        self.log_function_combo = ttk.Combobox(
             criteria, textvariable=self.log_function_var, state="readonly", width=14,
             values=("Toutes",),
-        ).grid(row=1, column=3, sticky="w", pady=(0, 6))
+        )
+        self.log_function_combo.grid(row=1, column=3, sticky="w", pady=(0, 6))
 
         # Ligne 3 : Joueur, puis Réinitialiser / Rechercher / Exporter
         # SUR LA MÊME LIGNE (demande du 2026-09-24, précision apportée
@@ -13872,24 +14298,652 @@ class App(tk.Tk):
         # 3 colonnes de grille supplémentaires.
         ttk.Label(criteria, text="Joueur :").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(0, 10))
         self.log_player_var = tk.StringVar(value="Tous")
-        ttk.Combobox(
+        self.log_player_combo = ttk.Combobox(
             criteria, textvariable=self.log_player_var, state="readonly", width=14,
             values=("Tous",),
-        ).grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(0, 10))
+        )
+        self.log_player_combo.grid(row=2, column=1, sticky="w", padx=(0, 16), pady=(0, 10))
 
         log_actions_row = ttk.Frame(criteria)
         log_actions_row.grid(row=2, column=2, columnspan=4, sticky="w", pady=(0, 10))
-        # Aucun des 3 boutons n'a de `command` pour l'instant —
-        # strictement préparatoires, comme demandé : ni recherche réelle
-        # (Rechercher/Réinitialiser), ni export de fichier quel qu'il
-        # soit — CSV/Excel/PDF — (Exporter, ajouté à droite de
-        # Rechercher, lui aussi totalement inerte).
-        self.log_reset_btn = ttk.Button(log_actions_row, text="Réinitialiser")
+        # Réellement câblés depuis le chantier "LOG", Phase 2
+        # (2026-09-24) — voir _on_log_reset/_on_log_search/_on_log_export.
+        # "Purger" (revu le 2026-09-25) : utilise désormais les 6 mêmes
+        # filtres que Rechercher — voir _on_log_purge. Placé à droite
+        # d'un petit séparateur vertical pour le distinguer visuellement
+        # des 3 actions non destructives qui précèdent.
+        self.log_reset_btn = ttk.Button(log_actions_row, text="Réinitialiser", command=self._on_log_reset)
         self.log_reset_btn.pack(side="left")
-        self.log_search_btn = ttk.Button(log_actions_row, text="🔍 Rechercher")
+        self.log_search_btn = ttk.Button(log_actions_row, text="🔍 Rechercher", command=self._on_log_search)
         self.log_search_btn.pack(side="left", padx=(8, 0))
-        self.log_export_btn = ttk.Button(log_actions_row, text="Exporter")
+        self.log_export_btn = ttk.Button(log_actions_row, text="Exporter", command=self._on_log_export)
         self.log_export_btn.pack(side="left", padx=(8, 0))
+        ttk.Separator(log_actions_row, orient="vertical").pack(side="left", fill="y", padx=(12, 12))
+        self.log_purge_btn = ttk.Button(log_actions_row, text="🗑 Purger", command=self._on_log_purge)
+        self.log_purge_btn.pack(side="left")
+
+    # -----------------------------------------------------------------
+    # Onglet LOG — logique fonctionnelle (chantier "LOG", Phase 2,
+    # 2026-09-24). Tout le SQL passe par action_log.py (search_actions/
+    # list_tournaments/list_users/list_players/list_categories) — ces
+    # méthodes-ci ne font jamais de requête directe.
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _build_log_tournament_label_maps(entries):
+        """(path_to_label, label_to_path) à partir de action_log.
+        list_tournaments() (déjà triée par nom puis chemin, donc un
+        ordre stable ici). Désambiguïsation UNIQUEMENT lorsqu'au moins
+        deux tournament_path différents partagent le même
+        tournament_name (décision explicite du 2026-09-24) : le libellé
+        reste alors le nom simple pour tout tournoi non ambigu, et
+        gagne le nom du dossier parent pour les tournois en doublon — un
+        numéro (" #2", " #3"...) est ajouté en tout dernier recours, si
+        jamais deux tournois partagent EXACTEMENT le même nom et le même
+        dossier parent. tournament_path lui-même n'est JAMAIS affiché."""
+        by_name_count = {}
+        for e in entries:
+            by_name_count[e["tournament_name"]] = by_name_count.get(e["tournament_name"], 0) + 1
+
+        raw_labels = []
+        for e in entries:
+            name, path = e["tournament_name"], e["tournament_path"]
+            if by_name_count[name] == 1:
+                label = name
+            else:
+                parent = os.path.basename(os.path.dirname(path)) or name
+                label = f"{name} ({parent})"
+            raw_labels.append((path, label))
+
+        seen = {}
+        path_to_label = {}
+        label_to_path = {}
+        for path, label in raw_labels:
+            seen[label] = seen.get(label, 0) + 1
+            final_label = label if seen[label] == 1 else f"{label} #{seen[label]}"
+            path_to_label[path] = final_label
+            label_to_path[final_label] = path
+        return path_to_label, label_to_path
+
+    def _refresh_log_filter_choices(self):
+        """Repeuple les 4 combobox (Tournoi/Utilisateur/Fonction/Joueur)
+        depuis les données RÉELLEMENT présentes dans le journal — ne
+        touche PAS la sélection courante de l'utilisateur tant qu'elle
+        reste valide (seule la liste `values` change, jamais `.set()`
+        dans ce cas), pour ne jamais lui faire perdre un filtre déjà
+        choisi en cours de saisie.
+
+        Repli sur "Tous"/"Toutes" UNIQUEMENT si la sélection courante a
+        cessé d'exister dans les données réelles (ajouté par la
+        correction "Purger" du 2026-09-24) : en usage normal (Rechercher/
+        Réinitialiser/retour sur l'onglet), les valeurs ne font que
+        s'ACCUMULER, la sélection courante reste donc toujours présente
+        et ce repli est un pur no-op — il ne joue un rôle réel qu'après
+        une purge ayant fait disparaître la dernière trace d'un
+        tournoi/utilisateur/catégorie/joueur donné."""
+        tournaments = action_log.list_tournaments()
+        path_to_label, label_to_path = self._build_log_tournament_label_maps(tournaments)
+        self._log_tournament_label_to_path = label_to_path
+        tournament_values = ("Tous",) + tuple(
+            path_to_label[e["tournament_path"]] for e in tournaments
+        )
+        self.log_tournament_combo["values"] = tournament_values
+        if self.log_tournament_var.get() not in tournament_values:
+            self.log_tournament_var.set("Tous")
+
+        user_values = ("Tous",) + tuple(action_log.list_users())
+        self.log_user_combo["values"] = user_values
+        if self.log_user_var.get() not in user_values:
+            self.log_user_var.set("Tous")
+
+        categories = action_log.list_categories()
+        self._log_category_label_to_key = {
+            action_log.category_label(c): c for c in categories
+        }
+        function_values = ("Toutes",) + tuple(action_log.category_label(c) for c in categories)
+        self.log_function_combo["values"] = function_values
+        if self.log_function_var.get() not in function_values:
+            self.log_function_var.set("Toutes")
+
+        player_values = ("Tous",) + tuple(action_log.list_players())
+        self.log_player_combo["values"] = player_values
+        if self.log_player_var.get() not in player_values:
+            self.log_player_var.set("Tous")
+
+    def _parse_log_date_field(self, raw_value, field_label):
+        """Valide/parse un champ Du/Au (JJ/MM/AAAA) — renvoie (date,
+        True) si vide (aucune borne) ou valide, (None, False) si invalide
+        (un message d'erreur a alors déjà été affiché à l'utilisateur,
+        rien d'autre à faire côté appelant qu'annuler la recherche)."""
+        raw = (raw_value or "").strip()
+        if not raw:
+            return None, True
+        if not _LOG_DATE_RE.match(raw):
+            messagebox.showerror(
+                "Date invalide",
+                f"« {field_label} » doit être au format JJ/MM/AAAA (ex. 24/09/2026).",
+                parent=self,
+            )
+            return None, False
+        try:
+            parsed = datetime.strptime(raw, "%d/%m/%Y")
+        except ValueError:
+            messagebox.showerror("Date invalide", f"« {field_label} » n'est pas une date valide.", parent=self)
+            return None, False
+        return parsed, True
+
+    def _current_log_filter_values(self):
+        """Lit et valide les 6 filtres ACTUELLEMENT affichés dans l'onglet
+        LOG, sans rien interroger — source UNIQUE partagée par
+        _refresh_log_tab (Rechercher) ET _on_log_purge (revu le
+        2026-09-25, "Purgeons ce qui est dans les filtres en cours" :
+        les deux doivent toujours lire les filtres EXACTEMENT de la même
+        façon, jamais une conversion dupliquée qui pourrait diverger).
+
+        Renvoie (date_from, date_to, ok, tournament_path, category,
+        user_name, player_name). `ok=False` si une date saisie est
+        invalide ou si Du > Au (message d'erreur déjà affiché à
+        l'utilisateur) — l'appelant doit alors arrêter immédiatement,
+        les 6 autres valeurs valant None dans ce cas.
+
+        `date_from`/`date_to` valent None si le champ correspondant est
+        VIDE — ce n'est PAS une erreur en soi ici (Rechercher l'autorise
+        pour une recherche non bornée) : c'est à CHAQUE appelant de
+        décider s'il exige ou non des dates renseignées (Purger les
+        exige, voir _on_log_purge)."""
+        date_from, ok_from = self._parse_log_date_field(self.log_date_from_var.get(), "Du")
+        if not ok_from:
+            return None, None, False, None, None, None, None
+        date_to, ok_to = self._parse_log_date_field(self.log_date_to_var.get(), "Au")
+        if not ok_to:
+            return None, None, False, None, None, None, None
+        if date_from is not None and date_to is not None and date_from > date_to:
+            messagebox.showerror(
+                "Dates invalides", "« Du » doit être antérieur ou égal à « Au ».", parent=self,
+            )
+            return None, None, False, None, None, None, None
+
+        tournament_label = self.log_tournament_var.get()
+        tournament_path = self._log_tournament_label_to_path.get(tournament_label) if tournament_label != "Tous" else None
+
+        category_label = self.log_function_var.get()
+        category = self._log_category_label_to_key.get(category_label) if category_label != "Toutes" else None
+
+        user_name = self.log_user_var.get()
+        user_name = None if user_name in ("", "Tous") else user_name
+
+        player_name = self.log_player_var.get()
+        player_name = None if player_name in ("", "Tous") else player_name
+
+        return date_from, date_to, True, tournament_path, category, user_name, player_name
+
+    @staticmethod
+    def _log_count_label_text(n):
+        """"N opération(s) affichée(s)" — accord EXACTEMENT comme
+        demandé (0 et 1 au singulier, 2 et plus au pluriel) : "0
+        opération affichée", "1 opération affichée", "4 opérations
+        affichées", "750 opérations affichées". Utilisée par
+        _refresh_log_tab (source unique de l'affichage du tableau LOG),
+        donc aussi bien après Rechercher/Réinitialiser/un retour sur
+        l'onglet qu'après une Purge (qui rappelle _refresh_log_tab)."""
+        mot = "opération" if n <= 1 else "opérations"
+        accord = "affichée" if n <= 1 else "affichées"
+        return f"{n} {mot} {accord}"
+
+    def _refresh_log_tab(self):
+        """Coeur de l'onglet LOG : relit les filtres ACTUELLEMENT
+        affichés (jamais réinitialisés ici — voir _on_log_reset pour la
+        remise à zéro explicite) via _current_log_filter_values, interroge
+        action_log.search_actions et repeuple self.log_tree. Appelée à la
+        construction de l'onglet, par Rechercher, par Réinitialiser
+        (après remise à zéro des variables), et à chaque retour de
+        l'utilisateur sur l'onglet LOG (voir _refresh_all) — dans ce
+        dernier cas, les filtres en cours sont CONSERVÉS et réutilisés
+        tels quels (demande explicite du 2026-09-24 : ne jamais les
+        effacer silencieusement).
+
+        Revu le 2026-09-25 ("CE QUI CORRESPOND AUX FILTRES = CE QUI EST
+        AFFICHÉ = CE QUI EST EXPORTÉ = CE QUI PEUT ÊTRE PURGÉ") :
+        search_actions est appelée avec limit=None — plus aucun plafond
+        à 500 lignes, plus aucune troncature. self.log_count_lbl affiche
+        désormais en permanence le nombre EXACT de lignes du tableau
+        (voir _log_count_label_text), calculé sur `rows` lui-même —
+        jamais un compte séparé qui pourrait diverger de ce qui est
+        réellement affiché."""
+        self._refresh_log_filter_choices()
+
+        date_from, date_to, ok, tournament_path, category, user_name, player_name = (
+            self._current_log_filter_values()
+        )
+        if not ok:
+            return
+        ts_from = date_from.strftime("%Y-%m-%d 00:00:00") if date_from is not None else None
+        ts_to = date_to.strftime("%Y-%m-%d 23:59:59") if date_to is not None else None
+
+        rows, _truncated = action_log.search_actions(
+            ts_from=ts_from, ts_to=ts_to, tournament_path=tournament_path,
+            user_name=user_name, category=category, player_name=player_name,
+            limit=None,
+        )
+        self._populate_log_tree(rows)
+        self.log_count_lbl.config(text=self._log_count_label_text(len(rows)))
+
+    @staticmethod
+    def _format_log_ts(ts):
+        """"AAAA-MM-JJ HH:MM:SS" (stockage) -> "JJ/MM/AAAA HH:MM:SS"
+        (affichage) — présentation uniquement, ne modifie jamais le
+        format de stockage (voir action_log.log_action)."""
+        try:
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").strftime("%d/%m/%Y %H:%M:%S")
+        except (ValueError, TypeError):
+            return ts or ""
+
+    def _populate_log_tree(self, rows):
+        for item in self.log_tree.get_children():
+            self.log_tree.delete(item)
+        self._log_rows_by_item = {}
+        for row in rows:
+            values = (
+                self._format_log_ts(row["ts"]),
+                row["tournament_name"] or "",
+                row["user_name"] or "",
+                action_log.role_label(row["role"]),
+                action_log.category_label(row["category"]),
+                action_log.action_label(row["action"]),
+                row["player_name"] or "",
+                action_log.result_label(row["result"]),
+                row["message"] or "",
+            )
+            item_id = self.log_tree.insert("", "end", values=values)
+            self._log_rows_by_item[item_id] = row
+
+    def _on_log_search(self):
+        self._refresh_log_tab()
+
+    def _on_log_reset(self):
+        """Réinitialiser (option B validée le 2026-09-24) : vide Du/Au,
+        remet les 4 combobox sur "Tous"/"Toutes", PUIS relance
+        immédiatement une recherche sans filtre — jamais un tableau vidé
+        en attente d'un second clic sur Rechercher."""
+        self.log_date_from_var.set("")
+        self.log_date_to_var.set("")
+        self.log_tournament_var.set("Tous")
+        self.log_user_var.set("Tous")
+        self.log_function_var.set("Toutes")
+        self.log_player_var.set("Tous")
+        self._refresh_log_tab()
+
+    def _on_log_row_double_click(self, event):
+        item_id = self.log_tree.identify_row(event.y)
+        if not item_id:
+            return
+        row = self._log_rows_by_item.get(item_id)
+        if not row:
+            return
+        self._show_log_detail_window(row)
+
+    def _show_log_detail_window(self, row):
+        """Détail complet d'une ligne du LOG (§14, chantier "LOG", Phase
+        2) — fenêtre NON MODALE (aucun grab_set/wait_window : l'utilisateur
+        doit pouvoir continuer à consulter le tableau derrière). Affiche
+        device_label ("Appareil") mais JAMAIS device_id ni
+        tournament_path — voir la demande explicite de confidentialité."""
+        win = tk.Toplevel(self)
+        win.title("Détail de l'action")
+        win.transient(self)
+
+        frame = ttk.Frame(win)
+        frame.pack(padx=16, pady=16, fill="both", expand=True)
+        fields = [
+            ("Date/Heure", self._format_log_ts(row["ts"])),
+            ("Tournoi", row["tournament_name"] or ""),
+            ("Utilisateur", row["user_name"] or ""),
+            ("Rôle", action_log.role_label(row["role"])),
+            ("Appareil", row["device_label"] or ""),
+            ("Fonction", action_log.category_label(row["category"])),
+            ("Action", action_log.action_label(row["action"])),
+            ("Joueur", row["player_name"] or ""),
+            ("Résultat", action_log.result_label(row["result"])),
+        ]
+        for i, (label, value) in enumerate(fields):
+            ttk.Label(frame, text=f"{label} :", font=("Helvetica", 10, "bold")).grid(
+                row=i, column=0, sticky="ne", padx=(0, 8), pady=2,
+            )
+            ttk.Label(frame, text=value, wraplength=360, justify="left").grid(
+                row=i, column=1, sticky="nw", pady=2,
+            )
+
+        msg_row = len(fields)
+        ttk.Label(frame, text="Message :", font=("Helvetica", 10, "bold")).grid(
+            row=msg_row, column=0, sticky="ne", padx=(0, 8), pady=(8, 2),
+        )
+        # Texte lisible ENTIÈREMENT (demande explicite) : tk.Text plutôt
+        # qu'un Label, pour rester lisible même si le message dépasse
+        # largement la largeur des autres champs — lecture seule
+        # (disabled) : cette fenêtre affiche, elle ne modifie rien.
+        msg_text = tk.Text(frame, width=44, height=6, wrap="word")
+        msg_text.insert("1.0", row["message"] or "")
+        msg_text.config(state="disabled")
+        msg_text.grid(row=msg_row, column=1, sticky="nw", pady=(8, 2))
+
+        ttk.Button(frame, text="Fermer", command=win.destroy).grid(
+            row=msg_row + 1, column=0, columnspan=2, pady=(12, 0),
+        )
+
+    def _on_log_export(self):
+        """Ouvre "Exporter le LOG" (LogExportDialog — correction du
+        2026-09-24, remplace l'export CSV direct) — construit d'abord un
+        instantané FIGÉ des lignes actuellement affichées dans
+        self.log_tree (colonnes/ordre/libellés EXACTEMENT ceux de
+        _populate_log_tree), avant même d'ouvrir la fenêtre : "ce que je
+        vois dans le tableau LOG = ce qui peut être exporté", jamais une
+        nouvelle recherche relancée en coulisses. Aucun résultat affiché
+        -> refusé ici, la fenêtre ne s'ouvre même pas.
+
+        La ligne "Critères : ..." (ajoutée le 2026-09-24, uniquement
+        utilisée par l'export PDF — voir action_log.format_log_export_
+        criteria) est construite ICI, à partir des MÊMES widgets de
+        filtre actuellement affichés que ceux ayant produit `rows` —
+        jamais recalculée après coup, donc forcément cohérente avec le
+        tableau exporté."""
+        items = self.log_tree.get_children()
+        if not items:
+            messagebox.showinfo("Info", "Aucun résultat à exporter.", parent=self)
+            return
+        cols = ("ts", "tournament", "user", "role", "category", "action", "player", "result", "message")
+        rows = [dict(zip(cols, self.log_tree.item(item_id, "values"))) for item_id in items]
+        criteria_line = action_log.format_log_export_criteria(
+            date_from=self.log_date_from_var.get().strip() or None,
+            date_to=self.log_date_to_var.get().strip() or None,
+            tournament_label=self.log_tournament_var.get(),
+            user_label=self.log_user_var.get(),
+            function_label=self.log_function_var.get(),
+            player_label=self.log_player_var.get(),
+        )
+        LogExportDialog(self, rows, criteria_line)
+
+    # Noms de mois FRANÇAIS pour l'en-tête du calendrier — jamais les
+    # locale.setlocale() du système (source classique de plantages
+    # inter-plateforme quand la locale n'est pas installée) : une liste
+    # statique de 12 entrées, mêmes principe que MOVE_REASON_LABELS/
+    # REMOTE_PERMISSION_LABELS (database.py), toujours fiable Mac/
+    # Windows sans dépendance ni configuration système.
+    _LOG_CALENDAR_MONTH_NAMES_FR = [
+        "", "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
+        "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
+    ]
+
+    def _show_log_date_picker(self, target_var, anchor_widget):
+        """Petit calendrier POPUP (chantier "LOG", correction "Purger" du
+        2026-09-24) — pur Tkinter + module `calendar` de la bibliothèque
+        standard (déjà importé en tête de fichier), AUCUNE dépendance
+        externe, fonctionne identiquement Mac/Windows. Remplit
+        `target_var` au format JJ/MM/AAAA au clic sur un jour ; la saisie
+        manuelle reste par ailleurs toujours possible (ce popup ne
+        remplace rien, il complète). Ouvre sur la date déjà saisie si
+        elle est valide, sinon sur aujourd'hui — jamais sur une date par
+        défaut arbitraire."""
+        raw = (target_var.get() or "").strip()
+        try:
+            start = datetime.strptime(raw, "%d/%m/%Y") if raw else datetime.now()
+        except ValueError:
+            start = datetime.now()
+
+        picker = tk.Toplevel(self)
+        picker.title("Choisir une date")
+        picker.transient(self)
+        picker.resizable(False, False)
+        x = anchor_widget.winfo_rootx()
+        y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+        picker.geometry(f"+{x}+{y}")
+
+        state = {"year": start.year, "month": start.month}
+
+        header = ttk.Frame(picker)
+        header.pack(fill="x", padx=6, pady=(6, 2))
+        prev_btn = ttk.Button(header, text="◀", width=3)
+        prev_btn.pack(side="left")
+        month_lbl = ttk.Label(header, anchor="center", font=("Helvetica", 10, "bold"))
+        month_lbl.pack(side="left", expand=True, fill="x")
+        next_btn = ttk.Button(header, text="▶", width=3)
+        next_btn.pack(side="right")
+
+        grid_frame = ttk.Frame(picker)
+        grid_frame.pack(padx=6, pady=(0, 6))
+
+        def _select(day):
+            target_var.set(f"{day:02d}/{state['month']:02d}/{state['year']:04d}")
+            picker.destroy()
+
+        def _render():
+            for w in grid_frame.winfo_children():
+                w.destroy()
+            month_lbl.config(text=f"{self._LOG_CALENDAR_MONTH_NAMES_FR[state['month']]} {state['year']}")
+            for col, weekday_letter in enumerate(("L", "M", "M", "J", "V", "S", "D")):
+                ttk.Label(grid_frame, text=weekday_letter, width=3, anchor="center", foreground=MUTED).grid(
+                    row=0, column=col,
+                )
+            for row_idx, week in enumerate(calendar.Calendar(firstweekday=0).monthdayscalendar(
+                state["year"], state["month"],
+            ), start=1):
+                for col, day in enumerate(week):
+                    if day == 0:
+                        ttk.Label(grid_frame, text="", width=3).grid(row=row_idx, column=col)
+                    else:
+                        ttk.Button(
+                            grid_frame, text=str(day), width=3, command=lambda d=day: _select(d),
+                        ).grid(row=row_idx, column=col)
+
+        def _prev_month():
+            if state["month"] == 1:
+                state["month"] = 12
+                state["year"] -= 1
+            else:
+                state["month"] -= 1
+            _render()
+
+        def _next_month():
+            if state["month"] == 12:
+                state["month"] = 1
+                state["year"] += 1
+            else:
+                state["month"] += 1
+            _render()
+
+        prev_btn.config(command=_prev_month)
+        next_btn.config(command=_next_month)
+        _render()
+        picker.focus_set()
+
+    def _log_purge_filter_summary(self, tournament_path, category, user_name, player_name):
+        """Résumé lisible des filtres Tournoi/Utilisateur/Fonction/Joueur
+        ACTUELLEMENT actifs (revu le 2026-09-25, voir _on_log_purge) —
+        affiché dans la confirmation pour qu'on "voit bien ce qui va
+        être effacé" (demande explicite), en plus des deux dates déjà
+        affichées séparément. Reprend directement les LIBELLÉS déjà
+        sélectionnés dans les combobox (jamais recalculés depuis les
+        clés internes tournament_path/category) : c'est exactement ce
+        que l'utilisateur voit à l'écran. Une valeur à None (filtre resté
+        sur "Tous"/"Toutes") n'apparaît pas dans le résumé ; si les 4
+        sont à None, renvoie une phrase explicite plutôt qu'une chaîne
+        vide, pour ne jamais laisser croire par omission qu'un filtre
+        était actif."""
+        parts = []
+        if tournament_path:
+            parts.append(f"Tournoi = {self.log_tournament_var.get()}")
+        if category:
+            parts.append(f"Fonction = {self.log_function_var.get()}")
+        if user_name:
+            parts.append(f"Utilisateur = {user_name}")
+        if player_name:
+            parts.append(f"Joueur = {player_name}")
+        return " ; ".join(parts) if parts else "aucun (tous les tournois/utilisateurs/fonctions/joueurs)"
+
+    def _confirm_log_purge(self, date_from, date_to, count, filter_summary):
+        """Confirmation OBLIGATOIRE avant toute purge (demande explicite
+        du 2026-09-24) — Toplevel modal DÉDIÉ plutôt que messagebox.
+        askyesno : les libellés de boutons demandés ("Annuler"/"Purger")
+        ne sont pas ceux, fixes et dépendants de la langue système,
+        qu'impose askyesno ("Oui"/"Non") — même pattern Toplevel+grab_set
+        que les nombreuses autres fenêtres modales de ce fichier (ex. la
+        fenêtre "Modifier les achats").
+
+        `count` : nombre EXACT d'opérations que la purge va réellement
+        supprimer — calculé par App._on_log_purge via action_log.
+        count_actions AVANT d'ouvrir cette confirmation, avec EXACTEMENT
+        les mêmes arguments (dates + les 4 autres filtres) que la purge
+        elle-même. `filter_summary` (revu le 2026-09-25, "Purgeons ce
+        qui est dans les filtres en cours, comme ça on voit bien ce qui
+        va être effacé" — remplace l'ancien avertissement "les filtres
+        affichés ne sont pas pris en compte", qui décrivait le
+        comportement INVERSE) : résumé lisible de Tournoi/Utilisateur/
+        Fonction/Joueur actuellement actifs, voir _log_purge_filter_
+        summary — affiché explicitement pour qu'il n'y ait plus jamais
+        d'écart entre "ce qui est affiché à l'écran" et "ce qui va être
+        supprimé".
+
+        `date_from`/`date_to` peuvent désormais valoir None (revu le
+        2026-09-25, "je veux exactement la même interprétation que pour
+        l'affichage/recherche" : Du/Au ne sont plus obligatoires pour
+        purger) — le texte de période ci-dessous couvre les 4
+        combinaisons (aucune, une seule, ou les deux bornes renseignées),
+        avec une formulation française explicite pour chaque borne
+        ouverte ("depuis le début du journal"/"jusqu'à la fin du
+        journal") plutôt que de fabriquer une date artificielle.
+
+        Renvoie True SEULEMENT si l'utilisateur clique explicitement sur
+        "Purger" — Annuler ET la fermeture de la fenêtre (croix, Échap)
+        renvoient tous les deux False, sans AUCUNE suppression."""
+        result = {"confirmed": False}
+        win = tk.Toplevel(self)
+        win.title("Confirmer la purge")
+        win.transient(self)
+        win.grab_set()
+
+        if date_from is not None and date_to is not None:
+            period_text = (
+                f"entre le {date_from.strftime('%d/%m/%Y')} "
+                f"et le {date_to.strftime('%d/%m/%Y')} inclus"
+            )
+        elif date_from is not None:
+            period_text = f"à partir du {date_from.strftime('%d/%m/%Y')} (jusqu'à la fin du journal)"
+        elif date_to is not None:
+            period_text = f"jusqu'au {date_to.strftime('%d/%m/%Y')} inclus (depuis le début du journal)"
+        else:
+            period_text = "sur toute la période disponible dans le journal"
+
+        op_word = "opération" if count == 1 else "opérations"
+        message = (
+            f"Supprimer définitivement {count} {op_word} du LOG,\n"
+            f"{period_text},\n"
+            f"avec les filtres actuellement affichés :\n{filter_summary}\n\n"
+            "Cette opération est irréversible."
+        )
+        ttk.Label(win, text=message, justify="left", wraplength=360).grid(
+            row=0, column=0, columnspan=2, padx=16, pady=16,
+        )
+
+        def _cancel():
+            result["confirmed"] = False
+            win.destroy()
+
+        def _purge():
+            result["confirmed"] = True
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=1, column=0, columnspan=2, pady=(0, 16))
+        ttk.Button(btns, text="Annuler", command=_cancel).pack(side="left", padx=5)
+        ttk.Button(btns, text="Purger", command=_purge).pack(side="left", padx=5)
+
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        win.wait_window(win)
+        return result["confirmed"]
+
+    def _on_log_purge(self):
+        """Purger (revu le 2026-09-25, "Purgeons ce qui est dans les
+        filtres en cours, comme ça on voit bien ce qui va être effacé",
+        PUIS de nouveau le même jour pour Du/Au) : utilise désormais les
+        6 MÊMES filtres que Rechercher, avec EXACTEMENT la même
+        interprétation — voir _current_log_filter_values, source
+        PARTAGÉE avec _refresh_log_tab pour ne jamais lire/convertir les
+        combobox différemment selon l'appelant. Abandonne l'ancien
+        comportement ("Purger = suppression par période uniquement",
+        Tournoi/Utilisateur/Fonction/Joueur délibérément ignorés, ET Du/
+        Au obligatoires) : jugé après coup surprenant, un filtre affiché
+        à l'écran devant réellement délimiter ce qui est supprimé —
+        "ce qui correspond aux filtres et est affiché = ce qui sera
+        purgé", y compris quand Du et/ou Au sont vides.
+
+        LES 6 FILTRES SONT DÉSORMAIS TOUS FACULTATIFS : "Du" vide =
+        depuis le tout premier enregistrement du journal, "Au" vide =
+        jusqu'au tout dernier, les deux vides = toute la période
+        disponible — jamais de date artificielle fabriquée ici, une
+        borne absente n'ajoute simplement aucune clause SQL (voir
+        action_log._build_filters_clause). Une date RENSEIGNÉE reste
+        soumise aux mêmes validations que Rechercher (format JJ/MM/AAAA,
+        Du <= Au si les deux sont fournies) — voir _current_log_filter_
+        values, qui affiche déjà l'erreur le cas échéant.
+
+        ts_from/ts_to/tournament_path/category/user_name/player_name sont
+        calculés UNE SEULE FOIS ici et réutilisés SANS RECALCUL pour
+        action_log.count_actions PUIS action_log.purge_actions — garantit
+        structurellement que le nombre annoncé dans la confirmation et ce
+        qui est réellement supprimé portent sur EXACTEMENT les mêmes
+        critères. Aucune opération correspondante -> message dédié, ni
+        confirmation ni suppression. Sinon, confirmation OBLIGATOIRE (voir
+        _confirm_log_purge, reçoit ce compte exact, les dates — même
+        None — ET le résumé des filtres actifs) avant toute suppression
+        réelle ; en cas de succès, self._refresh_log_tab() est rappelée
+        pour tout rafraîchir (tableau + combobox) tout en CONSERVANT Du/
+        Au et les autres filtres encore valides (voir _refresh_log_
+        filter_choices)."""
+        date_from, date_to, ok, tournament_path, category, user_name, player_name = (
+            self._current_log_filter_values()
+        )
+        if not ok:
+            return
+
+        ts_from = date_from.strftime("%Y-%m-%d 00:00:00") if date_from is not None else None
+        ts_to = date_to.strftime("%Y-%m-%d 23:59:59") if date_to is not None else None
+
+        count = action_log.count_actions(
+            ts_from, ts_to, tournament_path=tournament_path, user_name=user_name,
+            category=category, player_name=player_name,
+        )
+        if count == 0:
+            messagebox.showinfo("Purge", "Aucune opération à purger pour ces critères.", parent=self)
+            return
+
+        filter_summary = self._log_purge_filter_summary(tournament_path, category, user_name, player_name)
+        if not self._confirm_log_purge(date_from, date_to, count, filter_summary):
+            return
+
+        try:
+            deleted = action_log.purge_actions(
+                ts_from, ts_to, tournament_path=tournament_path, user_name=user_name,
+                category=category, player_name=player_name,
+            )
+        except Exception as e:
+            messagebox.showerror("Erreur", f"La purge a échoué :\n{e}", parent=self)
+            return
+
+        if deleted > 0:
+            messagebox.showinfo(
+                "Purge effectuée", f"{deleted} opérations ont été supprimées du LOG.", parent=self,
+            )
+        else:
+            # Rarissime course avec un autre processus (voir action_log.
+            # purge_actions : cette même base est partagée entre
+            # plusieurs fenêtres/tournois) : le compte affiché à la
+            # confirmation était encore exact au moment du clic, mais
+            # ces lignes ont disparu entre-temps (déjà purgées ou
+            # rotées ailleurs) — jamais une erreur, juste un message
+            # cohérent avec l'issue réelle.
+            messagebox.showinfo(
+                "Purge effectuée", "Aucune opération à purger pour ces critères.", parent=self,
+            )
+        self._refresh_log_tab()
 
     def _on_single_tournament_toggle(self):
         export_prefs.save_value(SINGLE_TOURNAMENT_PREF_KEY, self.single_tournament_var.get())
@@ -14084,19 +15138,19 @@ class App(tk.Tk):
         self._update_primes_section_state(current, locked=locked)
 
     def _on_bb_rebalance_prompt_toggle(self):
-        """Case "Équilibrage guidé par la grosse blinde" (Paramètres) :
-        mémorise le choix (réglage global, comme _on_remote_control_
-        toggle) et prend effet immédiatement, sans redémarrer —
-        database.py relit cette préférence à chaque appel de
-        rebalance_tables() (voir _bb_rebalance_prompt_enabled), donc le
-        PROCHAIN rééquilibrage en tient déjà compte.
+        """Case "Équilibrage guidé par UTG" (Paramètres) : mémorise le
+        choix (réglage global, comme _on_remote_control_toggle) et prend
+        effet immédiatement, sans redémarrer — database.py relit cette
+        préférence à chaque appel de rebalance_tables() (voir _bb_
+        rebalance_prompt_enabled), donc le PROCHAIN rééquilibrage en
+        tient déjà compte.
 
         Cas particulier explicitement demandé : si la case est décochée
         alors qu'une question est actuellement en attente de réponse, on
         ne l'abandonne pas telle quelle (le mouvement resterait à
         décider indéfiniment) — on la résout tout de suite avec l'ancien
         mécanisme historique, exactement comme si "Continuer sans
-        indiquer la BB" avait été cliqué. Passe par
+        désigner le joueur" avait été cliqué. Passe par
         _resolve_pending_rebalance (pas un appel direct à la base) :
         cette demande est ainsi consommée de façon sûre, comme n'importe
         quelle autre réponse (voir sa docstring et celle de database.py:
@@ -14122,20 +15176,39 @@ class App(tk.Tk):
         if not sound_signal.play_tone(880, duration):
             self.bell()
 
+    def _parse_optional_positive_int(self, key):
+        """Lit self.settings_vars[key] : "" (vide, espaces compris) ->
+        (None, True) ; sinon tente un entier strictement positif -> (val,
+        True), ou (None, False) si ce n'est pas un entier strictement
+        positif. Utilisé par _generate_custom_blind_structure pour "Nb
+        Rounds"/"Après Round" (chantier "Paramètres > Structure des
+        blindes", 2026-09-24) — jamais pour un champ obligatoire comme la
+        durée de la ligne 1, qui garde sa propre validation stricte
+        héritée."""
+        raw = self.settings_vars[key].get().strip()
+        if not raw:
+            return None, True
+        try:
+            value = int(raw)
+        except ValueError:
+            return None, False
+        if value <= 0:
+            return None, False
+        return value, True
+
     def _generate_custom_blind_structure(self):
         try:
             sb = int(self.settings_vars["start_small_blind"].get())
             bb = int(self.settings_vars["start_big_blind"].get())
             ante_lvl = int(self.settings_vars["ante_start_level"].get())
             start_ante = int(self.settings_vars["start_ante"].get())
-            round_duration = int(self.settings_vars["round_duration_minutes"].get())
-            break_duration = int(self.settings_vars["break_duration_minutes"].get())
+            round_duration_1 = int(self.settings_vars["round_duration_minutes"].get())
         except (ValueError, KeyError):
             messagebox.showerror(
                 "Erreur",
                 "Veuillez saisir des nombres entiers valides pour le small blind, "
                 "le big blind, le niveau de début des antes, la valeur de l'ante "
-                "et les durées.",
+                "et la durée de la première ligne de rounds.",
             )
             return
         if sb <= 0 or bb <= sb:
@@ -14150,12 +15223,96 @@ class App(tk.Tk):
         if start_ante < 0:
             messagebox.showerror("Erreur", "L'ante de départ ne peut pas être négative.")
             return
-        if round_duration <= 0:
-            messagebox.showerror("Erreur", "La durée d'un round doit être supérieure à 0.")
+        if round_duration_1 <= 0:
+            messagebox.showerror("Erreur", "La durée de la première ligne de rounds doit être supérieure à 0.")
             return
-        if break_duration <= 0:
-            messagebox.showerror("Erreur", "La durée de la pause doit être supérieure à 0.")
+
+        # -- Durées de rounds : ligne 1 obligatoire, ligne 2 uniquement
+        # pertinente si "Nb Rounds" de la ligne 1 est renseigné (sinon la
+        # ligne 1 s'applique à tout le tournoi et la ligne 2 n'intervient
+        # jamais, quoi qu'elle contienne — demande explicite).
+        round_count_1, ok = self._parse_optional_positive_int("round_count_1")
+        if not ok:
+            messagebox.showerror("Erreur", "\"Nb Rounds\" (1re ligne) doit être un entier strictement positif, ou vide.")
             return
+
+        duration_schedule = [(round_duration_1, round_count_1)]
+        if round_count_1 is not None:
+            # La ligne 2 devient pertinente : sa durée est alors
+            # obligatoire (sans elle, aucune durée ne serait définie
+            # pour les rounds suivants).
+            raw_duration_2 = self.settings_vars["round_duration_minutes_2"].get().strip()
+            try:
+                round_duration_2 = int(raw_duration_2)
+            except ValueError:
+                messagebox.showerror(
+                    "Erreur",
+                    "La durée de la 2e ligne de rounds est obligatoire dès que "
+                    "\"Nb Rounds\" de la 1re ligne est renseigné.",
+                )
+                return
+            if round_duration_2 <= 0:
+                messagebox.showerror("Erreur", "La durée de la 2e ligne de rounds doit être supérieure à 0.")
+                return
+            round_count_2, ok = self._parse_optional_positive_int("round_count_2")
+            if not ok:
+                messagebox.showerror("Erreur", "\"Nb Rounds\" (2e ligne) doit être un entier strictement positif, ou vide.")
+                return
+            duration_schedule.append((round_duration_2, round_count_2))
+
+        # -- Pauses : chaque ligne doit être ENTIÈREMENT vide (pas de
+        # pause) ou ENTIÈREMENT remplie (durée ET round) — jamais à
+        # moitié, pour ne jamais deviner une intention incomplète.
+        break_schedule = []
+        break_rounds_seen = []
+        for idx, (minutes_key, round_key) in enumerate(
+            (("break_minutes_1", "break_after_round_1"), ("break_minutes_2", "break_after_round_2")), start=1
+        ):
+            raw_minutes = self.settings_vars[minutes_key].get().strip()
+            raw_round = self.settings_vars[round_key].get().strip()
+            if not raw_minutes and not raw_round:
+                continue  # pause non définie, ignorée proprement
+            if bool(raw_minutes) != bool(raw_round):
+                messagebox.showerror(
+                    "Erreur",
+                    f"La pause {idx} nécessite une durée ET un numéro de round — "
+                    "remplissez les deux champs, ou laissez-les tous les deux vides.",
+                )
+                return
+            try:
+                minutes = int(raw_minutes)
+                after_round = int(raw_round)
+            except ValueError:
+                messagebox.showerror("Erreur", f"La pause {idx} : durée et round doivent être des entiers.")
+                return
+            if minutes <= 0:
+                messagebox.showerror("Erreur", f"La durée de la pause {idx} doit être supérieure à 0.")
+                return
+            if after_round <= 0:
+                messagebox.showerror("Erreur", f"\"Après Round\" de la pause {idx} doit être 1 ou plus.")
+                return
+            if after_round > GENERATED_ROUNDS_COUNT:
+                messagebox.showerror(
+                    "Erreur",
+                    f"La pause {idx} est prévue après le round {after_round}, mais le "
+                    f"tournoi ne comptera que {GENERATED_ROUNDS_COUNT} rounds de jeu au maximum — "
+                    "elle ne serait jamais insérée.",
+                )
+                return
+            break_rounds_seen.append(after_round)
+            break_schedule.append((minutes, after_round))
+
+        if len(break_rounds_seen) == 2:
+            if break_rounds_seen[0] == break_rounds_seen[1]:
+                messagebox.showerror("Erreur", "Les deux pauses ne peuvent pas être placées après le même round.")
+                return
+            if break_rounds_seen[1] < break_rounds_seen[0]:
+                messagebox.showerror(
+                    "Erreur",
+                    "La 2e pause doit être après la 1re (round strictement supérieur).",
+                )
+                return
+
         if not messagebox.askyesno(
             "Confirmer",
             "Régénérer toute la structure de blindes avec ces valeurs ?\n"
@@ -14165,18 +15322,34 @@ class App(tk.Tk):
 
         new_structure = generate_blind_structure(
             start_small_blind=sb, start_big_blind=bb, ante_start_level=ante_lvl,
-            start_ante=start_ante, duration_minutes=round_duration,
-            break_duration_minutes=break_duration, break_every=4,
+            start_ante=start_ante, duration_minutes=round_duration_1,
+            duration_schedule=duration_schedule, break_schedule=break_schedule,
         )
         self.db.set_blind_structure(new_structure)
         # Enregistre TOUS les paramètres en même temps (pas seulement ceux
         # de la structure de blindes) : équivaut à cliquer aussi sur
         # "Enregistrer les paramètres", sans avoir à le faire séparément.
         self._collect_and_save_all_settings()
+        # Tournoi en cours (demande explicite du 2026-09-24) : JAMAIS de
+        # remise au niveau 1 — seule exception, reprise à l'identique de
+        # la règle déjà en production ici même depuis l'origine de ce
+        # bouton (voir aussi App._apply_blinds_from_tab, bouton
+        # "Appliquer" de l'onglet Blindes, qui applique la MÊME règle) :
+        # si la nouvelle structure est devenue plus courte que le niveau
+        # courant, on le ramène au dernier niveau encore valide.
         current_order = self.db.get_setting_int("current_level_order", 1)
         if current_order > len(new_structure):
             self.db.set_settings({"current_level_order": len(new_structure)})
         self._refresh_all()
+        # Rafraîchissement immédiat du Chronomètre ET du Chrono Projo
+        # (décision explicite du 2026-09-24, même garantie que le bouton
+        # "Appliquer") : _refresh_all() ci-dessus ne rafraîchit que
+        # l'onglet actuellement affiché (ici Paramètres, jamais
+        # Chronomètre) — sans cet appel explicite, l'affichage n'aurait
+        # attendu le prochain tick que si l'onglet Chronomètre ou l'écran
+        # projecteur étaient déjà visibles.
+        if hasattr(self, "blinds_tree"):
+            self._refresh_clock_tab()
         messagebox.showinfo(
             "Structure de blindes",
             "La structure de blindes a été régénérée et tous les paramètres "
@@ -14544,6 +15717,14 @@ class App(tk.Tk):
             # aussi au répertoire) — sans ce rafraîchissement, revenir
             # sur cet onglet pouvait afficher une liste périmée.
             self.roster_tab._refresh()
+        elif current == "LOG":
+            # Chantier "LOG", Phase 2 (2026-09-24) : relance la RECHERCHE
+            # EN COURS (filtres actuellement affichés CONSERVÉS, jamais
+            # réinitialisés ici — voir _refresh_log_tab) à chaque retour
+            # sur cet onglet, pour refléter des actions journalisées
+            # entre-temps — jamais de polling périodique (voir _tick,
+            # volontairement non modifié pour LOG).
+            self._refresh_log_tab()
 
     def _on_notebook_tab_changed(self, event):
         """<<NotebookTabChanged>> — événement virtuel émis par
@@ -14621,18 +15802,20 @@ class App(tk.Tk):
                 # une action qui rafraîchirait cet onglet pour une autre
                 # raison (voir _update_undo_elimination_button_state).
                 self._update_undo_elimination_button_state()
-            elif current.startswith("CA/LOG"):
+            elif current.startswith("CA"):
                 # Libellé "Code : XXXXXX" (demande du 2026-09-19, suite à
                 # un incident où ce code avait été régénéré — pollution de
                 # tests — pendant qu'un tournoi restait ouvert : le
                 # libellé, calculé une seule fois à la construction de
                 # l'onglet, restait alors périment affiché sans que le
                 # responsable ne puisse le savoir) : revérifié ici,
-                # UNIQUEMENT tant que l'onglet "CA/LOG" est affiché
-                # (déplacé depuis Paramètres le 2026-09-22 — jamais à
-                # chaque tick de CHAQUE fenêtre ouverte, pour ne pas
-                # relire ce fichier partagé inutilement) — voir
-                # _refresh_remote_control_code_label.
+                # UNIQUEMENT tant que l'onglet "CA" est affiché (déplacé
+                # depuis Paramètres le 2026-09-22, séparé de "LOG" le
+                # 2026-09-24 — jamais à chaque tick de CHAQUE fenêtre
+                # ouverte, pour ne pas relire ce fichier partagé
+                # inutilement ; "LOG" ne commence pas par "CA", il est
+                # donc naturellement exclu) — voir _refresh_remote_
+                # control_code_label.
                 self._refresh_remote_control_code_label()
             if self._remote_photo_uploaded:
                 # Une photo vient d'être envoyée depuis le téléphone (voir

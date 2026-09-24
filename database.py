@@ -371,7 +371,7 @@ REMOTE_PERMISSION_LABELS = {
     REMOTE_PERMISSION_CLOCK: "Chronomètre (pause / reprise)",
     REMOTE_PERMISSION_LEVELS: "Changer de niveau (blindes)",
     REMOTE_PERMISSION_PHOTOS: "Photos des joueurs",
-    REMOTE_PERMISSION_REBALANCE: "Répondre au rééquilibrage (grosse blinde)",
+    REMOTE_PERMISSION_REBALANCE: "Répondre au rééquilibrage (UTG)",
 }
 
 
@@ -547,8 +547,8 @@ MOVE_REASON_LABELS = {
     MOVE_REASON_STRUCTURAL: "Structurel (capacité)",
     MOVE_REASON_TABLE_CLOSURE: "Fusion/fermeture de table",
     MOVE_REASON_AUTO_BALANCE: "Équilibrage automatique",
-    MOVE_REASON_BB_GUIDED: "Grosse blinde (guidé)",
-    MOVE_REASON_BB_SKIPPED: "Continuer sans indiquer la BB",
+    MOVE_REASON_BB_GUIDED: "UTG (guidé)",
+    MOVE_REASON_BB_SKIPPED: "Continuer sans désigner le joueur",
     MOVE_REASON_ELIMINATION_UNDO: "Annulation d'élimination",
     "": "Équilibrage",
 }
@@ -2539,9 +2539,10 @@ class Database:
         rebalance_tables et pending_rebalance["before_state"]) ; un dict
         vide revient à toujours prendre le premier candidat trouvé (aucune
         préférence possible sans historique). Utilisé UNIQUEMENT par
-        "Continuer sans indiquer la BB" (voir resolve_pending_rebalance) —
-        la réponse "quel siège est BB" utilise une règle différente et
-        volontairement nouvelle (voir _next_active_seat_player).
+        "Continuer sans désigner le joueur" (voir resolve_pending_
+        rebalance) — une réponse UTG explicite (le téléphone désigne
+        directement le joueur à déplacer, voir _player_still_at_table)
+        n'a jamais besoin de cette préférence.
         Renvoie None si cette table n'a plus aucun joueur actif."""
         candidates = self.conn.execute(
             "SELECT id FROM players WHERE table_id=? AND status='active'",
@@ -2555,34 +2556,26 @@ class Database:
         )
         return mover["id"]
 
-    def _next_active_seat_player(self, table_id, bb_seat, occupied_seats=None):
-        """Joueur à déplacer selon la règle "grosse blinde" (voir
-        rebalance_tables / resolve_pending_rebalance) : le PROCHAIN joueur
-        actif dans l'ordre des sièges après `bb_seat`, sièges vides
-        sautés, avec retour circulaire au premier siège occupé après le
-        dernier (ex : sièges actifs 1,2,4,5,8 et bb_seat=8 -> siège 1).
-        Toujours recalculé à l'état COURANT de la table (occupied_seats
-        n'est accepté que pour éviter une requête redondante à l'appelant
-        qui l'a déjà sous la main ; jamais une liste mémorisée au moment
-        de la question, qui peut être obsolète — voir resolve_pending_
-        rebalance). Renvoie None si `bb_seat` ne correspond (plus) à un
-        siège occupé de cette table, ou si elle n'a plus qu'un seul joueur
-        actif (rien à "sauter") : l'appelant retombe alors sur l'ancien
-        mécanisme historique."""
-        if occupied_seats is None:
-            occupied_seats = sorted(
-                r["seat"] for r in self.conn.execute(
-                    "SELECT seat FROM players WHERE table_id=? AND status='active'",
-                    (table_id,),
-                )
-            )
-        if bb_seat not in occupied_seats or len(occupied_seats) < 2:
-            return None
-        idx = occupied_seats.index(bb_seat)
-        next_seat = occupied_seats[(idx + 1) % len(occupied_seats)]
+    def _player_still_at_table(self, table_id, player_id):
+        """`player_id` si ce joueur est ENCORE actif ET assis à `table_id`
+        MAINTENANT, sinon None (chantier "sélection directe du joueur
+        UTG", 2026-09-24 — remplace _next_active_seat_player, qui
+        dérivait le joueur à déplacer d'un siège "grosse blinde" indiqué :
+        le téléphone désigne désormais directement le joueur, cette
+        fonction se contente de revalider son identité EXACTE contre
+        l'état COURANT, jamais un instantané mémorisé au moment de la
+        question — même principe de fraîcheur que l'ancienne fonction,
+        appliqué à une identité de joueur plutôt qu'à un numéro de
+        siège). Couvre à la fois "joueur éliminé entre-temps" (status
+        n'est plus 'active') et "joueur déplacé vers une autre table
+        entre-temps" (table_id ne correspond plus) en une seule
+        requête — l'appelant (resolve_pending_rebalance) traite un
+        résultat None comme une réponse INVALIDE, exactement comme
+        l'ancien siège introuvable/obsolète : aucune substitution par un
+        autre joueur, jamais."""
         row = self.conn.execute(
-            "SELECT id FROM players WHERE table_id=? AND seat=? AND status='active'",
-            (table_id, next_seat),
+            "SELECT id FROM players WHERE id=? AND table_id=? AND status='active'",
+            (player_id, table_id),
         ).fetchone()
         return row["id"] if row else None
 
@@ -2626,28 +2619,33 @@ class Database:
         )
         self.conn.commit()
 
-    def resolve_pending_rebalance(self, request_id, seat):
-        """Traite une réponse à la question "quel siège est actuellement
-        grosse blinde ?" (voir rebalance_tables ci-dessus) — à appeler
-        UNIQUEMENT depuis le thread principal Tkinter (voir App._resolve_
-        pending_rebalance dans main.py) ; jamais directement depuis le
-        thread du serveur de contrôle à distance (remote_control.py ne
-        fait que déposer la réponse dans la file d'attente thread-safe
-        existante, voir on_rebalance_answer/voice_command_queue).
+    def resolve_pending_rebalance(self, request_id, player_id):
+        """Traite une réponse à la question "quel joueur est UTG ?" (voir
+        rebalance_tables ci-dessus) — à appeler UNIQUEMENT depuis le
+        thread principal Tkinter (voir App._resolve_pending_rebalance
+        dans main.py) ; jamais directement depuis le thread du serveur de
+        contrôle à distance (remote_control.py ne fait que déposer la
+        réponse dans la file d'attente thread-safe existante, voir
+        on_rebalance_answer/voice_command_queue).
 
-        `seat` : numéro de siège répondu, ou None ("Continuer sans
-        indiquer la BB").
+        `player_id` : identifiant du joueur désigné comme UTG (celui à
+        déplacer), ou None ("Continuer sans désigner le joueur"). Chantier
+        "sélection directe du joueur UTG" (2026-09-24) : REMPLACE l'ancien
+        paramètre `seat` (numéro de siège "grosse blinde", dont on
+        déduisait le joueur suivant via _next_active_seat_player,
+        supprimée — voir _player_still_at_table) — le téléphone désigne
+        désormais directement le joueur, jamais un siège à interpréter.
 
         RÈGLE DE CONSOMMATION — "première réponse VALIDE traitée gagne" :
         pending_rebalance n'est mis à None (consommant définitivement la
         demande) QUE lorsque cette réponse est jugée VALIDE ET qu'un
         mouvement est réellement décidé. Une réponse INVALIDE (mauvais/
-        vieux request_id, siège vide/invalide, siège dont l'occupant n'est
-        plus actif, ou état devenu obsolète) NE consomme RIEN : la demande
-        reste ouverte (avec le même request_id si elle concerne toujours
-        la même table) pour qu'une réponse valide arrivant ensuite —
-        d'un autre appareil ou du même — puisse encore déterminer le
-        mouvement. Étapes, dans l'ordre :
+        vieux request_id, player_id vide/invalide/inexistant, joueur qui
+        n'est plus actif ou plus à cette table, ou état devenu obsolète)
+        NE consomme RIEN : la demande reste ouverte (avec le même
+        request_id si elle concerne toujours la même table) pour qu'une
+        réponse valide arrivant ensuite — d'un autre appareil ou du même —
+        puisse encore déterminer le mouvement. Étapes, dans l'ordre :
 
         1. request_id ne correspond pas à la demande actuellement en
            attente (déjà traitée par une réponse VALIDE précédente, déjà
@@ -2669,19 +2667,20 @@ class Database:
            l'état courant (nouveau request_id ; l'ancien ne peut plus
            jamais gagner, y compris s'il semblait numériquement valide
            pour l'ancienne table).
-        4. Toujours la même table : si un siège est indiqué mais ne
-           correspond plus à un joueur actif de cette table (siège vide,
-           invalide, ou son occupant a été éliminé entre la question et la
-           réponse), la réponse est INVALIDE — voir règle de consommation
-           ci-dessus : la demande reste ouverte (sièges réaffichés à jour),
-           rien n'est déplacé, on ne choisit PAS de joueur à sa place.
-        5. "Continuer sans indiquer la BB" (seat=None) est toujours traité
-           comme une réponse VALIDE (choix explicite et délibéré), dès
-           lors que l'étape 2 confirme qu'un mouvement reste nécessaire :
-           utilise alors l'ancien mécanisme HISTORIQUE exact (voir
-           _legacy_pick_mover), y compris sa préférence pour un joueur
-           déjà déplacé pendant CE rééquilibrage (before_state mémorisé
-           dans la demande au moment de sa création, voir
+        4. Toujours la même table : si un joueur est désigné mais n'est
+           plus actif OU n'est plus assis à CETTE table (éliminé, ou
+           déplacé ailleurs entre la question et la réponse — voir
+           _player_still_at_table), la réponse est INVALIDE — voir règle
+           de consommation ci-dessus : la demande reste ouverte (sièges
+           réaffichés à jour), rien n'est déplacé, on ne choisit PAS un
+           autre joueur à sa place (aucune substitution, jamais).
+        5. "Continuer sans désigner le joueur" (player_id=None) est
+           toujours traité comme une réponse VALIDE (choix explicite et
+           délibéré), dès lors que l'étape 2 confirme qu'un mouvement
+           reste nécessaire : utilise alors l'ancien mécanisme HISTORIQUE
+           exact (voir _legacy_pick_mover), y compris sa préférence pour
+           un joueur déjà déplacé pendant CE rééquilibrage (before_state
+           mémorisé dans la demande au moment de sa création, voir
            rebalance_tables) — jamais une simplification approximative.
 
         Renvoie la liste des mouvements RÉELLEMENT effectués par cette
@@ -2725,17 +2724,18 @@ class Database:
             return []
 
         # Toujours la même table : détermine le joueur à déplacer.
-        if seat is not None:
-            mover_id = self._next_active_seat_player(source_table["id"], seat, occupied_seats)
+        if player_id is not None:
+            mover_id = self._player_still_at_table(source_table["id"], player_id)
             if mover_id is None:
                 # Étape 4 : réponse INVALIDE — ne consomme PAS la demande,
                 # qui reste ouverte (même request_id) pour une réponse
-                # valide ultérieure. Sièges réaffichés à jour uniquement.
+                # valide ultérieure. Sièges réaffichés à jour uniquement —
+                # AUCUNE substitution par un autre joueur.
                 self.pending_rebalance["seats"] = occupied_seats
                 return []
         else:
-            # Étape 5 : "Continuer sans indiquer la BB" — toujours valide
-            # ici (un mouvement est bien nécessaire, voir étape 2).
+            # Étape 5 : "Continuer sans désigner le joueur" — toujours
+            # valide ici (un mouvement est bien nécessaire, voir étape 2).
             mover_id = self._legacy_pick_mover(source_table["id"], pending.get("before_state", {}))
 
         # Réponse VALIDE : consommée SEULEMENT MAINTENANT (jamais avant ce
@@ -2759,14 +2759,18 @@ class Database:
                     "new_table_name": table_names.get(mover_after["table_id"]),
                     "new_seat": mover_after["seat"],
                     "moved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    # Raison (voir MOVE_REASON_*) : réponse effective d'un
-                    # siège -> équilibrage guidé par la grosse blinde ;
-                    # seat=None ("Continuer sans indiquer la BB") -> choix
-                    # explicite et délibéré du responsable, distingué
-                    # textuellement dans l'historique de l'équilibrage
-                    # automatique de la Phase 1/guidage désactivé, bien
-                    # que le même _legacy_pick_mover soit réutilisé.
-                    "reason": MOVE_REASON_BB_GUIDED if seat is not None else MOVE_REASON_BB_SKIPPED,
+                    # Raison (voir MOVE_REASON_*) : joueur UTG désigné
+                    # explicitement par le téléphone -> équilibrage guidé ;
+                    # player_id=None ("Continuer sans désigner le joueur")
+                    # -> choix explicite et délibéré du responsable,
+                    # distingué textuellement dans l'historique de
+                    # l'équilibrage automatique de la Phase 1/guidage
+                    # désactivé, bien que le même _legacy_pick_mover soit
+                    # réutilisé. Clés MOVE_REASON_BB_GUIDED/MOVE_REASON_BB_
+                    # SKIPPED volontairement INCHANGÉES (compatibilité des
+                    # mouvements déjà enregistrés dans d'anciens fichiers
+                    # .tournoi) — seul leur libellé affiché change.
+                    "reason": MOVE_REASON_BB_GUIDED if player_id is not None else MOVE_REASON_BB_SKIPPED,
                 }
 
         # Reprend le rééquilibrage sur l'état courant (peut fermer
@@ -4795,8 +4799,22 @@ SETTINGS_PRINT_FIELDS = [
     ("start_big_blind", "Big blind (niveau 1)"),
     ("ante_start_level", "Niveau à partir duquel l'ante commence"),
     ("start_ante", "Valeur de l'ante de départ"),
-    ("round_duration_minutes", "Durée d'un Round (minutes)"),
-    ("break_duration_minutes", "Durée de la Pause (minutes)"),
+    # round_duration_minutes/round_count_1/round_duration_minutes_2/
+    # round_count_2/break_minutes_1/break_after_round_1/break_minutes_2/
+    # break_after_round_2 (chantier "Paramètres > Structure des blindes",
+    # 2026-09-24) : remplacent les anciennes entrées "Durée d'un Round"/
+    # "Durée de la Pause" (1 seule valeur chacune) — break_duration_minutes
+    # reste une clé valide en base (voir DEFAULT_SETTINGS/App._edit_break_
+    # duration, onglet Chronomètre, chantier SANS RAPPORT) mais n'est plus
+    # un réglage de CET onglet, donc retirée de cette liste.
+    ("round_duration_minutes", "Durée d'un Round — ligne 1 (minutes)"),
+    ("round_count_1", "Nb Rounds — ligne 1"),
+    ("round_duration_minutes_2", "Durée d'un Round — ligne 2 (minutes)"),
+    ("round_count_2", "Nb Rounds — ligne 2"),
+    ("break_minutes_1", "Durée de la pause 1 (minutes)"),
+    ("break_after_round_1", "Pause 1 — après round"),
+    ("break_minutes_2", "Durée de la pause 2 (minutes)"),
+    ("break_after_round_2", "Pause 2 — après round"),
     ("attendance_bonus_points", "Prime de présence (points)"),
     ("assiduity_bonus_points", "Prime d'assiduité (points)"),
     ("assiduity_consecutive_days", "Nombre de jours consécutifs (assiduité)"),

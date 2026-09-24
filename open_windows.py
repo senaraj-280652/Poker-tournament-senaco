@@ -1650,6 +1650,25 @@ def get_remote_device_owner(browser_id):
     return entry.get("owner_name") if entry else None
 
 
+def get_remote_device_label(browser_id):
+    """Libellé lisible (voir list_approved_remote_devices) actuellement
+    affiché pour `browser_id`, ou None si inconnu du registre — même
+    principe que get_remote_device_owner (repli sur short_id si aucun
+    label explicite). Utilisé par action_log.py (chantier "LOG",
+    2026-09-24) pour FIGER le libellé de l'appareil dans chaque ligne du
+    journal AU MOMENT de l'action : un renommage ou une révocation
+    ultérieurs de cet appareil ne doivent jamais modifier rétroactivement
+    l'historique déjà écrit — cette fonction n'est donc appelée qu'UNE
+    FOIS, au moment de journaliser, jamais relue plus tard pour "mettre à
+    jour" une ligne existante."""
+    with _remote_control_lock():
+        devices = _read_json_or_empty(_remote_devices_path())
+    entry = devices.get(browser_id)
+    if not entry:
+        return None
+    return entry.get("label") or entry.get("short_id") or None
+
+
 def _fresh_remote_rate_limit_entry():
     return {"window_start": 0.0, "fail_count": 0, "level": 0, "block_until": 0.0}
 

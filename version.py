@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 APP_NAME = "Gestionnaire de Tournoi de Poker - Senaco"
-APP_VERSION = "1.2.42"
+APP_VERSION = "1.2.43"
 
 # Identification du code en cours d'exécution pendant le développement
 # (demande du 2026-09-09) : APP_VERSION ci-dessus reste un numéro figé,
