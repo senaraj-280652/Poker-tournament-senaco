@@ -772,6 +772,12 @@ class AppUndoLastEliminationTest(unittest.TestCase):
         def _refresh_all(self):
             self.refresh_all_calls += 1
 
+        def _refresh_remote_players_cache(self):
+            pass
+
+        def _refresh_remote_moves_cache(self):
+            pass
+
         def _check_pending_rebalance(self):
             self.check_pending_rebalance_calls += 1
 

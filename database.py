@@ -1799,17 +1799,17 @@ class Database:
                 "moved_at": now,
                 "reason": MOVE_REASON_ELIMINATION_UNDO,
             })
-        if moves:
-            self.conn.execute("DELETE FROM seat_moves")
-            for move in moves:
-                self.conn.execute(
-                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
-                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
-                    (move["player_name"], move["old_table_name"], move["old_seat"],
-                     move["new_table_name"], move["new_seat"], move["moved_at"],
-                     move["reason"]),
-                )
-            self.conn.commit()
+        # Revu le 2026-09-25 — voir _sync_seat_moves : annuler une
+        # élimination ne doit ni perdre les mouvements INDÉPENDANTS
+        # encore en attente (une autre table peut avoir un mouvement non
+        # confirmé sans aucun rapport avec cette élimination précise), ni
+        # laisser une instruction devenue fausse pour le joueur tout
+        # juste réactivé (voir l'étape "purge des joueurs inactifs" de
+        # _sync_seat_moves — inutile ici puisqu'il redevient actif, mais
+        # correcte par construction : le joueur réactivé, s'il apparaît
+        # dans `moves` ci-dessus, voit sa ligne remplacée par sa position
+        # d'avant l'élimination annulée, jamais dupliquée).
+        self._sync_seat_moves(moves)
 
         return moves
 
@@ -1963,6 +1963,146 @@ class Database:
                 )
                 return
             move_reasons[mover_id] = reason
+
+    def _sync_seat_moves(self, new_moves):
+        """Point d'écriture UNIQUE de `seat_moves` (onglet Mouvements),
+        partagé par rebalance_tables/resolve_pending_rebalance/
+        undo_last_elimination — factorisé le 2026-09-25 suite au
+        diagnostic "4 mouvements réels -> réponse UTG -> 1 seul mouvement
+        affiché" : chacune de ces 3 fonctions faisait auparavant son
+        propre `DELETE FROM seat_moves` inconditionnel avant de réinsérer
+        UNIQUEMENT ses propres mouvements, effaçant au passage tout
+        mouvement INDÉPENDANT décidé par un appel précédent et jamais
+        encore confirmé par le responsable — dangereux en situation
+        réelle (des mouvements réels, à faire physiquement, disparaissaient
+        de l'écran sans qu'aucun d'eux n'ait été fait).
+
+        `new_moves` : UNIQUEMENT les mouvements que L'APPELANT vient de
+        décider pour CET appel (même format que rebalance_tables() :
+        dicts player_name/old_table_name/old_seat/new_table_name/
+        new_seat/moved_at/reason) — jamais un instantané de l'existant.
+
+        Comportement, dans cet ordre :
+        1. Toute ligne DÉJÀ présente pour un joueur qui n'est PLUS actif
+           (éliminé depuis qu'elle a été inscrite) est retirée : un
+           mouvement devenu matériellement impossible ne doit jamais
+           rester affiché comme "à faire" (demande explicite du
+           2026-09-25) — recherché par player_name, seule clé dont
+           dispose ce schéma (pas d'id joueur dans seat_moves).
+        2. Toute ligne DÉJÀ présente pour un joueur que CET appel vient
+           justement de redéplacer est retirée AVANT réinsertion : un
+           même joueur redéplacé avant confirmation ne garde jamais
+           qu'UNE SEULE instruction, la plus récente — jamais deux lignes
+           empilées pour la même personne.
+        3. Les lignes de TOUS LES AUTRES joueurs (mouvements indépendants
+           encore non confirmés) restent intactes, quel que soit le
+           contenu de `new_moves`.
+        4. `new_moves` est ensuite inséré tel quel.
+
+        N'écrit rien du tout (pas même un commit) si `new_moves` est vide
+        ET qu'aucune ligne n'est à purger — le cas de très loin le plus
+        fréquent (aucun mouvement ce tour-ci), pour ne pas alourdir
+        chaque appel de rebalance_tables() d'un aller-retour SQL inutile.
+
+        ORIGINE PHYSIQUE PRÉSERVÉE À TRAVERS UNE CHAÎNE DE REDÉCISIONS
+        (correctif du 2026-09-25, diagnostic "question UTG posée avant
+        l'exécution physique des mouvements précédents" — voir aussi le
+        garde-fou sur count_seat_moves() dans rebalance_tables) : un
+        joueur peut être redéplacé LOGIQUEMENT (players.table_id) une
+        seconde fois par un appel séparé avant que son PREMIER
+        déplacement ait été confirmé/fait physiquement — auquel cas
+        `move["old_table_name"]`/`old_seat`, calculés par l'appelant à
+        partir de sa position ACTUELLE (déjà la cible du premier
+        mouvement), ne reflètent PLUS où il se trouve réellement.
+        Reproduit et vérifié par script direct : sans ce correctif, un
+        joueur physiquement toujours assis à la Table 1 pouvait se voir
+        attribuer l'instruction trompeuse "Table 2 -> Table 3". Cette
+        étape 2 (ci-dessus) réutilise donc TOUJOURS l'old_table_name/
+        old_seat de la ligne déjà en attente pour ce joueur (sa vraie
+        origine la plus ancienne encore non confirmée) au lieu de
+        l'instantané fourni par `new_moves` — y compris si ce même joueur
+        apparaît PLUSIEURS fois dans `new_moves` (chaîne au sein d'un
+        même appel, ex. resolve_pending_rebalance : my_move puis
+        further_moves) : une seule ligne finale par joueur, de sa VRAIE
+        origine vers sa toute dernière destination.
+
+        Corollaire (demande explicite du 2026-09-25) : si cette origine
+        réelle finit par coïncider avec la destination finale (le joueur
+        boucle et revient physiquement là où il était déjà), il n'y a
+        plus rien à déplacer — l'instruction est purement et simplement
+        supprimée plutôt que laissée affichée à tort (même convention que
+        rebalance_tables : seul un changement de TABLE compte comme un
+        mouvement réel).
+
+        Limite connue, préexistante au schéma (pas introduite ici) :
+        seat_moves identifie un joueur par son SEUL nom (player_name),
+        jamais par id — deux joueurs actifs strictement homonymes ne
+        seraient pas distingués par les étapes 1/2 ci-dessus, exactement
+        comme le reste de ce fichier (confirm_seat_move() identifie
+        heureusement chaque ligne par son id, jamais par nom, donc
+        jamais ambigu à la confirmation elle-même)."""
+        active_names = {
+            r["name"] for r in self.conn.execute(
+                "SELECT name FROM players WHERE status='active'"
+            )
+        }
+        existing = {
+            r["player_name"]: r for r in self.conn.execute(
+                "SELECT id, player_name, old_table_name, old_seat FROM seat_moves"
+            )
+        }
+        moved_names = {m["player_name"] for m in new_moves}
+
+        # Résout, pour chaque joueur présent dans new_moves, sa VRAIE
+        # origine encore non confirmée (voir docstring ci-dessus) — en
+        # tenant compte d'une éventuelle ligne déjà en attente ET d'une
+        # occurrence précédente de ce même joueur plus tôt dans new_moves
+        # lui-même — puis ne garde que sa toute DERNIÈRE destination.
+        resolved_by_name = {}
+        for move in new_moves:
+            name = move["player_name"]
+            if name in resolved_by_name:
+                true_old_table, true_old_seat = (
+                    resolved_by_name[name]["old_table_name"],
+                    resolved_by_name[name]["old_seat"],
+                )
+            elif name in existing:
+                true_old_table, true_old_seat = (
+                    existing[name]["old_table_name"], existing[name]["old_seat"],
+                )
+            else:
+                true_old_table, true_old_seat = move["old_table_name"], move["old_seat"]
+            resolved_by_name[name] = dict(
+                move, old_table_name=true_old_table, old_seat=true_old_seat
+            )
+
+        # Retour au point de départ réel : plus aucun déplacement physique
+        # à faire (voir docstring, corollaire) — l'instruction devient
+        # sans objet, jamais insérée/conservée.
+        final_moves = [
+            m for m in resolved_by_name.values()
+            if m["old_table_name"] != m["new_table_name"]
+        ]
+
+        stale_ids = [
+            r["id"] for name, r in existing.items()
+            if name not in active_names or name in moved_names
+        ]
+        if not final_moves and not stale_ids:
+            return
+        if stale_ids:
+            self.conn.executemany(
+                "DELETE FROM seat_moves WHERE id=?", [(i,) for i in stale_ids]
+            )
+        for move in final_moves:
+            self.conn.execute(
+                "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
+                "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
+                (move["player_name"], move["old_table_name"], move["old_seat"],
+                 move["new_table_name"], move["new_seat"], move["moved_at"],
+                 move["reason"]),
+            )
+        self.conn.commit()
 
     def rebalance_tables(self, record_moves=False):
         """Rééquilibre les tables actives : comble les sièges vides en déplaçant
@@ -2248,7 +2388,45 @@ class Database:
             # démarrage), donc aucun pending_rebalance ne peut avoir été
             # créé avant que cette condition ne devienne vraie.
             guided = self._bb_rebalance_prompt_enabled() and self.get_setting_int("clock_started", 0) == 1
-            if guided:
+
+            # GARDE-FOU (correctif du 2026-09-25, diagnostic "question UTG
+            # posée sur la Table 4 alors que 6 mouvements réels, issus
+            # d'une fermeture de Table 5, n'étaient pas encore
+            # physiquement faits") : une NOUVELLE question UTG ne doit
+            # jamais être posée tant qu'il reste, n'importe où, un
+            # mouvement déjà décidé mais pas encore confirmé par le
+            # responsable — sans quoi elle porterait sur une composition
+            # de table encore purement LOGIQUE (players.table_id déjà à
+            # jour) et pas forcément physique. Couvre deux origines,
+            # cumulables :
+            # 1. self.count_seat_moves() : mouvements laissés en attente
+            #    par un appel PRÉCÉDENT (question déjà résolue mais pas
+            #    confirmée, fermeture antérieure...).
+            # 2. la comparaison ci-dessous : mouvements bien RÉELS déjà
+            #    produits PENDANT CET APPEL-CI, plus haut (mise en
+            #    conformité de capacité ou fermeture de table, toujours
+            #    immédiates, jamais soumises à une question) — avant que
+            #    la question SUIVANTE ne soit créée. C'est exactement le
+            #    cas rapporté : la fermeture de Table 5 vient de déplacer
+            #    des joueurs vers Table 4 dans CET appel, avant même que
+            #    le besoin résiduel sur Table 4 ne soit évalué.
+            # Calculé INCONDITIONNELLEMENT (pas seulement si `guided`) :
+            # ne sert qu'à la branche guidée ci-dessous, mais reste bon
+            # marché (une requête COUNT() + une comparaison en mémoire) et
+            # évite tout risque de variable non définie selon la branche.
+            moves_still_unconfirmed = self.count_seat_moves() > 0 or any(
+                before_state.get(p["id"], (None, None))[0] != p["table_id"]
+                for p in self.list_players(status="active")
+            )
+            if guided and moves_still_unconfirmed:
+                # Différé : le besoin éventuel n'est même pas évalué ici,
+                # jamais résolu automatiquement à sa place (ce ne serait
+                # plus "guidé" du tout) — il sera ré-évalué dès que tout
+                # redevient confirmé (voir App._resume_rebalance_if_needed
+                # dans main.py, appelée après le dernier confirm_seat_
+                # move()/bouton "Terminé").
+                pass
+            elif guided:
                 need = self._detect_simple_rebalance_need()
                 if need is not None:
                     source_table, occupied_seats = need
@@ -2285,7 +2463,12 @@ class Database:
                 # qu'un écart persiste — repris ici du mécanisme d'origine
                 # (avant cette version TEST) pour résoudre tous les
                 # mouvements nécessaires en un seul appel, sans dépendre
-                # d'un enchaînement de réponses.
+                # d'un enchaînement de réponses. Volontairement PAS soumis
+                # au garde-fou ci-dessus (guidage désactivé : ce mécanisme
+                # résout déjà tout en un seul appel, avant/après cohérent
+                # de bout en bout — voir sa docstring et Q5 du diagnostic
+                # du 2026-09-25 ; seul le risque d'une chaîne de QUESTIONS
+                # posées avant exécution physique est visé ici).
                 for _ in range(200):  # garde-fou anti boucle infinie
                     need = self._detect_simple_rebalance_need()
                     if need is None:
@@ -2392,20 +2575,16 @@ class Database:
                 "reason": move_reasons.get(p["id"], MOVE_REASON_AUTO_BALANCE),
             }
             moves.append(move)
-        if moves and record_moves:
-            # On efface les mouvements précédents : l'onglet Mouvements
-            # n'affiche que le dernier lot de déplacements en date, pas un
-            # historique cumulatif.
-            self.conn.execute("DELETE FROM seat_moves")
-            for move in moves:
-                self.conn.execute(
-                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
-                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
-                    (move["player_name"], move["old_table_name"], move["old_seat"],
-                     move["new_table_name"], move["new_seat"], move["moved_at"],
-                     move["reason"]),
-                )
-            self.conn.commit()
+        if record_moves:
+            # Revu le 2026-09-25 (diagnostic "4 mouvements -> réponse UTG
+            # -> 1 seul mouvement affiché") : voir _sync_seat_moves —
+            # n'efface plus jamais un mouvement INDÉPENDANT encore non
+            # confirmé, contrairement à l'ancien DELETE FROM seat_moves
+            # inconditionnel qui vivait ici. `record_moves=False`
+            # (rappels internes, ex. resolve_pending_rebalance ligne plus
+            # bas) ne touche toujours PAS seat_moves ici — c'est alors à
+            # l'appelant de synchroniser lui-même le résultat combiné.
+            self._sync_seat_moves(moves)
         return moves
 
     def check_table_integrity(self):
@@ -2773,29 +2952,44 @@ class Database:
                     "reason": MOVE_REASON_BB_GUIDED if player_id is not None else MOVE_REASON_BB_SKIPPED,
                 }
 
+        # Persiste CE mouvement-ci IMMÉDIATEMENT (si l'appel d'origine
+        # l'archive), AVANT de relancer rebalance_tables() ci-dessous —
+        # correctif du 2026-09-25 (diagnostic "question UTG posée avant
+        # exécution physique des mouvements précédents") : sans ceci, le
+        # garde-fou de rebalance_tables() (voir moves_still_unconfirmed,
+        # basé sur count_seat_moves()) ne verrait pas encore my_move comme
+        # "en attente" — puisqu'il ne serait alors écrit qu'après coup,
+        # plus bas — et pourrait donc poser une SECONDE question portant
+        # sur une table qui vient tout juste de recevoir ce joueur,
+        # avant même qu'il ait physiquement bougé. _sync_seat_moves
+        # (idempotente, jamais destructive pour les autres joueurs) sera
+        # rappelée une seconde fois plus bas avec l'ensemble complet : sans
+        # effet différent pour my_move (déjà à jour), mais nécessaire pour
+        # que further_moves y soit archivé lui aussi.
+        if pending["record_moves"] and my_move is not None:
+            self._sync_seat_moves([my_move])
+
         # Reprend le rééquilibrage sur l'état courant (peut fermer
         # d'autres tables devenues inutiles, ou poser une NOUVELLE
-        # question si un écart persiste ailleurs). record_moves=False ici
-        # dans tous les cas : le mouvement décidé ci-dessus (my_move) a
-        # déjà eu lieu et ne serait de toute façon plus visible dans le
-        # diff avant/après de cet appel-là ; c'est ce résolveur-ci qui
-        # archive l'ensemble (my_move + further_moves) plus bas, une seule
-        # fois, selon le `record_moves` demandé par l'appel d'ORIGINE
-        # (celui qui a posé la question).
+        # question si un écart persiste ailleurs — mais jamais une
+        # portant sur my_move lui-même, voir ci-dessus). record_moves=
+        # False ici dans tous les cas : le mouvement décidé ci-dessus
+        # (my_move) a déjà eu lieu et ne serait de toute façon plus
+        # visible dans le diff avant/après de cet appel-là ; c'est ce
+        # résolveur-ci qui archive l'ensemble (my_move + further_moves)
+        # plus bas, une seule fois, selon le `record_moves` demandé par
+        # l'appel d'ORIGINE (celui qui a posé la question).
         further_moves = self.rebalance_tables(record_moves=False)
         moves = ([my_move] if my_move else []) + further_moves
 
-        if moves and pending["record_moves"]:
-            self.conn.execute("DELETE FROM seat_moves")
-            for move in moves:
-                self.conn.execute(
-                    "INSERT INTO seat_moves(player_name, old_table_name, old_seat, "
-                    "new_table_name, new_seat, moved_at, reason) VALUES (?,?,?,?,?,?,?)",
-                    (move["player_name"], move["old_table_name"], move["old_seat"],
-                     move["new_table_name"], move["new_seat"], move["moved_at"],
-                     move.get("reason", MOVE_REASON_AUTO_BALANCE)),
-                )
-            self.conn.commit()
+        if pending["record_moves"]:
+            # Revu le 2026-09-25 — voir _sync_seat_moves : n'efface plus
+            # les mouvements indépendants (ex. fermeture de table décidée
+            # par une élimination précédente) encore non confirmés au
+            # moment où CETTE question UTG est enfin résolue — c'est
+            # exactement le bug diagnostiqué ("4 mouvements -> réponse
+            # UTG -> 1 seul mouvement affiché").
+            self._sync_seat_moves(moves)
         return moves
 
     def get_seat_moves(self, limit=500):

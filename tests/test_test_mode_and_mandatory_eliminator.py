@@ -481,6 +481,12 @@ class _FakeAppForGroupElimination:
     def _refresh_all(self):
         pass
 
+    def _refresh_remote_players_cache(self):
+        pass
+
+    def _refresh_remote_moves_cache(self):
+        pass
+
     def _check_pending_rebalance(self):
         pass
 

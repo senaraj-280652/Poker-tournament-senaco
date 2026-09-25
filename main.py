@@ -7793,6 +7793,16 @@ class App(tk.Tk):
         elif moved_count:
             self._trigger_movement_alert()
         self._refresh_all()
+        # Correctif du 2026-09-25 (diagnostic "liste de candidats UTG du
+        # téléphone en retard sur une élimination locale") : une
+        # élimination faite ICI (Mode Test, onglet Joueurs) mettait à jour
+        # self._remote_players_cache/_remote_moves_cache uniquement via le
+        # prochain tick (~1s, voir _tick), contrairement à _remote_eliminate
+        # qui les rafraîchit déjà immédiatement — aligné ici sur le même
+        # comportement, plutôt que de laisser un téléphone afficher une
+        # liste momentanément périmée après des éliminations rapprochées.
+        self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
         self._check_pending_rebalance()
 
     def _ask_eliminator_position(self):
@@ -8048,6 +8058,11 @@ class App(tk.Tk):
             self._finish_movement_alert()
         self._clear_checked()
         self._refresh_all()
+        # Voir la même remarque dans _eliminate_selected (correctif du
+        # 2026-09-25) : "Annule Eliminer" change aussi le joueur actif/sa
+        # table, le téléphone ne doit pas en dépendre du prochain tick.
+        self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
         self._check_pending_rebalance()
 
     def _delete_selected(self):
@@ -8156,6 +8171,44 @@ class App(tk.Tk):
         self._refresh_clock_tab()
         if switch_to_clock and self.clock_window is not None and self.clock_window.winfo_exists():
             self.clock_window.bring_to_front()
+        # Correctif du 2026-09-25 (diagnostic "question UTG posée avant
+        # exécution physique des mouvements précédents") : maintenant que
+        # TOUS les mouvements en attente viennent d'être confirmés (ce
+        # clear_seat_moves() ci-dessus les vide entièrement), un besoin de
+        # rééquilibrage resté DIFFÉRÉ pendant qu'ils étaient encore en
+        # attente (voir Database.rebalance_tables : moves_still_
+        # unconfirmed) n'a plus aucune raison de le rester — sans cet
+        # appel, il resterait invisible jusqu'à la PROCHAINE élimination,
+        # potentiellement bien plus tard.
+        self._resume_rebalance_if_needed()
+
+    def _resume_rebalance_if_needed(self):
+        """Reprend le rééquilibrage sur l'état courant une fois que TOUS
+        les mouvements en attente ont été confirmés (dernier confirm_
+        seat_move individuel menant à count_seat_moves()==0, ou bouton
+        "Terminé"/"Mouvements terminés" — voir _finish_movement_alert,
+        seul appelant) : un besoin "simple" détecté PENDANT que d'autres
+        mouvements restaient non confirmés est volontairement différé
+        (voir Database.rebalance_tables, moves_still_unconfirmed) plutôt
+        que résolu ou proposé à ce moment-là — c'est ICI qu'il est
+        ré-évalué, avec archivage réel (record_moves=True) puisqu'un
+        déplacement décidé maintenant serait, comme après une élimination,
+        un véritable mouvement à faire physiquement.
+
+        Ne fait rien si des mouvements restent encore non confirmés (ne
+        devrait normalement pas arriver ici, puisque le seul appelant
+        vient justement de tout vider — garde-fou défensif) : ce n'est
+        JAMAIS à cette fonction de décider qu'un mouvement encore en
+        attente ne compte plus."""
+        if not self.db or self.db.count_seat_moves() > 0:
+            return
+        moves = self.db.rebalance_tables(record_moves=True)
+        if moves:
+            self._trigger_movement_alert()
+        self._refresh_all()
+        self._refresh_remote_players_cache()
+        self._refresh_remote_moves_cache()
+        self._check_pending_rebalance()
 
     # ---------------------------------------------------------------
     # Rééquilibrage simple : question "quel siège est grosse blinde ?"

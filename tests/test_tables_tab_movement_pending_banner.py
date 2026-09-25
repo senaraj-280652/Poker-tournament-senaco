@@ -114,6 +114,21 @@ class TablesTabMovementPendingTest(unittest.TestCase):
         self.win._on_tables_mousewheel = lambda event: None
         self.win._continue_pending_rebalance_without_bb = lambda: None
 
+        # Correctif du 2026-09-25 (diagnostic "question UTG posée avant
+        # exécution physique des mouvements précédents") : _finish_
+        # movement_alert appelle désormais _resume_rebalance_if_needed,
+        # elle-même liée ici pour de vrai (jamais réimplémentée) — ses
+        # scénarios (une seule table, ou déjà fusionnée) ne peuvent de
+        # toute façon jamais produire de nouveau besoin réel. Ses propres
+        # dépendances (rafraîchissements/caches téléphone) restent, elles,
+        # hors du périmètre testé ici — simples doublures, comme
+        # _refresh_clock_tab/_clock_resume ci-dessus.
+        self.win._refresh_all = lambda: None
+        self.win._trigger_movement_alert = lambda from_remote=False: None
+        self.win._check_pending_rebalance = lambda: None
+        self.win._refresh_remote_players_cache = lambda: None
+        self.win._refresh_remote_moves_cache = lambda: None
+
         self.win._build_tables_tab = types.MethodType(main.App._build_tables_tab, self.win)
         self.win._refresh_tables_tab = types.MethodType(main.App._refresh_tables_tab, self.win)
         self.win._pending_old_seat_by_name = types.MethodType(
@@ -121,6 +136,9 @@ class TablesTabMovementPendingTest(unittest.TestCase):
         )
         self.win._tables_blink_tick = types.MethodType(main.App._tables_blink_tick, self.win)
         self.win._cancel_tables_blink = types.MethodType(main.App._cancel_tables_blink, self.win)
+        self.win._resume_rebalance_if_needed = types.MethodType(
+            main.App._resume_rebalance_if_needed, self.win
+        )
         self.win._finish_movement_alert = types.MethodType(
             main.App._finish_movement_alert, self.win
         )

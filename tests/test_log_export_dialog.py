@@ -61,6 +61,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1465,17 +1466,25 @@ class OnLogExportBuildsCriteriaLineTest(unittest.TestCase):
         self.assertEqual(criteria_line, "Critères : Toutes les actions")
 
     def test_avec_dates_transmet_la_ligne_correspondante(self):
+        # Dates DYNAMIQUES (corrigé le 2026-09-25 — les bornes fixes
+        # "01/09/2026"/"24/09/2026" ne couvraient plus la ligne journalisée
+        # ci-dessous une fois cette date dépassée dans le calendrier réel,
+        # log_action horodatant toujours avec le vrai datetime.now(), non
+        # simulable) : "Du" largement avant maintenant, "Au" = aujourd'hui,
+        # pour rester valide quel que soit le jour d'exécution du test.
         self._log(player_name="Alice")
         self.win._build_log_tab()
-        self.win.log_date_from_var.set("01/09/2026")
-        self.win.log_date_to_var.set("24/09/2026")
+        date_from = (datetime.now() - timedelta(days=30)).strftime("%d/%m/%Y")
+        date_to = datetime.now().strftime("%d/%m/%Y")
+        self.win.log_date_from_var.set(date_from)
+        self.win.log_date_to_var.set(date_to)
         self.win._on_log_search()
         with patch("main.LogExportDialog") as mock_dialog:
             self.win._on_log_export()
         criteria_line = mock_dialog.call_args[0][2]
         self.assertEqual(
             criteria_line,
-            "Critères : Du 01/09/2026 au 24/09/2026 — Tournoi : Tous — "
+            f"Critères : Du {date_from} au {date_to} — Tournoi : Tous — "
             "Utilisateur : Tous — Fonction : Toutes — Joueur : Tous",
         )
 
