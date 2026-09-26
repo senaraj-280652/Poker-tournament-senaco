@@ -11,8 +11,8 @@ name: Build macOS .dmg (TEST, Apple Silicon)
 # Différences intentionnelles avec un éventuel futur build-dmg.yml de
 # production, TOUTES nécessaires à la sécurité de cette ligne TEST
 # (même principe que build-msi-test.yml pour Windows) :
-#   - déclenchement MANUEL UNIQUEMENT (workflow_dispatch) : aucun tag,
-#     aucun push, aucune branche ne déclenche jamais ce workflow ;
+#   - déclenchement manuel (workflow_dispatch) ; AUCUN tag ne déclenche
+#     jamais ce workflow ;
 #   - construit macos/poker_tournament-test.spec (PAS poker_tournament.
 #     spec) ;
 #   - AUCUNE étape d'injection de LICENSE_SECRET : la protection/licence
@@ -22,8 +22,22 @@ name: Build macOS .dmg (TEST, Apple Silicon)
 #     Release GitHub, jamais de tag créé ;
 #   - runner macOS choisi explicitement pour sa nature Apple Silicon
 #     native (voir ci-dessous) — jamais un runner Intel.
+#
+# Déclencheur `push` EXCEPTIONNEL ET TEMPORAIRE (accord explicite du
+# 2026-09-26) : limité au SEUL nom exact "feature/macos-arm64-standalone-
+# test" — aucune autre branche, jamais main. Nécessaire uniquement parce
+# que GitHub n'autorise le déclenchement MANUEL (workflow_dispatch, ci-
+# dessus) d'un workflow que s'il est déjà présent sur la branche par
+# défaut du dépôt (main) ; un déclenchement par push, lui, fonctionne dès
+# le premier push introduisant le fichier, sur n'importe quelle branche —
+# c'est le seul moyen de lancer ce tout premier essai sans toucher à
+# main. À RETIRER dès que ce premier essai est validé (voir la
+# discussion du 2026-09-26) : ne doit pas rester en place indéfiniment.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - feature/macos-arm64-standalone-test
 
 jobs:
   build-dmg-test:
