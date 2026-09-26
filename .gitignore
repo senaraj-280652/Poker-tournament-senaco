@@ -26,6 +26,15 @@ macos/venv/
 macos/build/
 macos/dist/
 
+# Ligne TEST macOS arm64 (chantier "Senaco autonome sur Mac Apple
+# Silicon", 2026-09-26, voir macos/build_dmg_test.sh) : même principe que
+# ci-dessus, plus le numéro de build TEST écrit localement le cas
+# échéant (généré normalement par le workflow GitHub Actions dédié sur
+# un runner éphémère, jamais commité — voir windows/assets/
+# TEST_BUILD_NUMBER pour le même mécanisme côté Windows).
+macos/venv_test/
+macos/assets/TEST_BUILD_NUMBER
+
 # Dossiers/archives de dépose ponctuelle (téléchargements, pas du code source)
 files/
 files [0-9]*/

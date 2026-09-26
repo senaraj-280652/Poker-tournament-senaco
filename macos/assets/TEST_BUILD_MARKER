@@ -1,0 +1,4 @@
+Ce fichier marque une build TEST macOS (voir main.py: _is_test_build et
+macos/poker_tournament-test.spec) : sa seule présence dans le bundle
+suffit à faire afficher "[TEST]" dans le titre de fenêtre et "À propos"
+de l'application. Absent de la ligne de production (poker_tournament.spec).

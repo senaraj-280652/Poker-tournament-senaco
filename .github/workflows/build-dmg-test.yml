@@ -1,0 +1,111 @@
+name: Build macOS .dmg (TEST, Apple Silicon)
+
+# Compile la version « TEST » macOS du Gestionnaire de Tournoi de Poker
+# — une build arm64 (M1/M2/M3/M4) séparée de toute ligne de production,
+# destinée à des tests à distance (licence désactivée, marqueur "[TEST]"
+# visible). Chantier "Senaco autonome sur Mac Apple Silicon" (2026-09-26).
+# Copie volontairement indépendante de build-msi.yml/build-msi-test.yml
+# (Windows) : PAS générée à partir d'eux, PAS maintenue en les modifiant
+# — aucun impact sur la fabrication Windows.
+#
+# Différences intentionnelles avec un éventuel futur build-dmg.yml de
+# production, TOUTES nécessaires à la sécurité de cette ligne TEST
+# (même principe que build-msi-test.yml pour Windows) :
+#   - déclenchement MANUEL UNIQUEMENT (workflow_dispatch) : aucun tag,
+#     aucun push, aucune branche ne déclenche jamais ce workflow ;
+#   - construit macos/poker_tournament-test.spec (PAS poker_tournament.
+#     spec) ;
+#   - AUCUNE étape d'injection de LICENSE_SECRET : la protection/licence
+#     reste inactive dans ce build, quel que soit l'état du secret de
+#     dépôt éventuel (il n'est même pas référencé ici) ;
+#   - publication en Artifact GitHub Actions UNIQUEMENT — jamais de
+#     Release GitHub, jamais de tag créé ;
+#   - runner macOS choisi explicitement pour sa nature Apple Silicon
+#     native (voir ci-dessous) — jamais un runner Intel.
+on:
+  workflow_dispatch:
+
+jobs:
+  build-dmg-test:
+    # macos-14 (et versions plus récentes) : runners hébergés GitHub
+    # NATIVEMENT Apple Silicon (arm64) depuis leur introduction fin 2023
+    # — contrairement à macos-13 et antérieurs (Intel). C'est ce choix,
+    # pas une option de compilation, qui garantit une vraie tranche arm64
+    # disponible pour target_arch="arm64" (voir macos/poker_tournament-
+    # test.spec) : PyInstaller ne peut pas "cross-compiler" arm64 depuis
+    # un Python purement x86_64.
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Récupération du dépôt
+        uses: actions/checkout@v4
+
+      - name: Installation de Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Vérification de l'architecture du runner et du Python
+        run: |
+          uname -m
+          file "$(command -v python3)"
+          python3 -c "import platform; print(platform.machine())"
+
+      - name: Installation des dépendances Python
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install -r macos/requirements.txt
+
+      # Volontairement AUCUNE étape d'injection de _license_secret.py ici
+      # (contrairement à un éventuel futur build de production) : ce
+      # build TEST ne doit jamais demander d'activation, et license.py
+      # ne doit subir aucun effet de ce workflow. Sans _license_secret.py,
+      # license.py: SECRET reste None et is_licensed() renvoie toujours
+      # Vrai (voir license.py) — comportement déjà celui par défaut de ce
+      # dépôt (fichier gitignoré, jamais commité).
+
+      # Identifie chaque build TEST par un numéro (ex. "[TEST 3]" dans
+      # "À propos", voir main.py: _test_build_number/_test_build_label),
+      # sans jamais coder un numéro en dur ni modifier version.py — même
+      # mécanisme que build-msi-test.yml (Windows) : ${{ github.run_number }}
+      # s'incrémente tout seul à chaque déclenchement de CE workflow.
+      - name: Marqueur de build TEST (numéro de run)
+        run: echo "${{ github.run_number }}" > macos/assets/TEST_BUILD_NUMBER
+
+      - name: Génération de PokerTournamentTest.app (PyInstaller, arm64)
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          pyinstaller macos/poker_tournament-test.spec --distpath macos/dist --workpath macos/build --noconfirm
+
+      - name: Vérification de l'architecture produite
+        run: |
+          ACTUAL_ARCH="$(lipo -archs "macos/dist/PokerTournamentTest.app/Contents/MacOS/PokerTournamentTest")"
+          echo "Architecture produite : $ACTUAL_ARCH"
+          if [ "$ACTUAL_ARCH" != "arm64" ]; then
+            echo "::error::L'exécutable produit n'est pas purement arm64 (obtenu : '$ACTUAL_ARCH')."
+            exit 1
+          fi
+
+      - name: Signature ad-hoc de l'app
+        run: codesign --force --deep --sign - "macos/dist/PokerTournamentTest.app"
+
+      - name: Génération du .dmg
+        run: |
+          STAGING="macos/dist/dmg_staging"
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          cp -R "macos/dist/PokerTournamentTest.app" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create -volname "Gestionnaire de Tournoi de Poker [TEST]" \
+              -srcfolder "$STAGING" \
+              -ov -format UDZO \
+              "macos/dist/PokerTournamentTest.dmg"
+
+      - name: Publication en Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokerTournamentTest-dmg
+          path: macos/dist/PokerTournamentTest.dmg
+          retention-days: 30
