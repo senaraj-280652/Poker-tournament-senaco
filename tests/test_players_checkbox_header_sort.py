@@ -63,9 +63,9 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         # cleanup_tk (voir tests/_tk_cleanup.py, chantier "crash Tcl/Tk"
-        # du 2026-09-19) : 9 méthodes greffées + 2 main.Tooltip (liés à
-        # delete_player_btn/eliminate_player_btn) forment chacun un
-        # cycle sur cls.root, réclamé ici par gc.collect().
+        # du 2026-09-19) : les méthodes greffées + les main.Tooltip (liés
+        # à delete_player_btn/eliminate_player_btn/abs_des_btn) forment
+        # chacun un cycle sur cls.root, réclamé ici par gc.collect().
         cleanup_tk(cls, "root")
 
     def setUp(self):
@@ -82,6 +82,11 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory(prefix="players_checkbox_sort_test_")
         self.addCleanup(self._tmp.cleanup)
         self.db = database.Database(os.path.join(self._tmp.name, "A.tournoi"))
+        # « Gestion de l'accueil » activée (modification du 2026-09-29) :
+        # ce test dépend de confirm_arrival pour peupler checked_player_
+        # ids (voir plus bas) — réglage propre au tournoi Open qui
+        # l'active, sans quoi confirm_arrival serait refusée par défaut.
+        self.db.set_settings({"accueil_management_enabled": 1})
         self.addCleanup(self.db.conn.close)
 
         # 4 joueurs, volontairement dans un ordre non alphabétique et
@@ -95,7 +100,17 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
 
         self.win = self.root
         self.win.db = self.db
-        self.win.checked_player_ids = {self.id_bob, self.id_alice}
+        # bob et Alice "cochés" (Lot 1, "Accueil des joueurs", précision
+        # du 2026-09-28) : depuis que la case reflète l'accueil tant que
+        # le tournoi n'a pas démarré, checked_player_ids est désormais
+        # DÉRIVÉ de arrived_at à chaque _refresh_players_tab (voir
+        # _players_checkbox_drives_accueil) — donc réellement confirmé
+        # ici via Database.confirm_arrival, plutôt qu'injecté directement
+        # dans l'ensemble, qui serait sinon écrasé dès le premier
+        # rafraîchissement.
+        self.db.confirm_arrival(self.id_bob)
+        self.db.confirm_arrival(self.id_alice)
+        self.win.checked_player_ids = set()
         self.win.players_sort = {"column": None, "ascending": True}
         self.win.test_mode_var = tk.BooleanVar(value=False)
         # CHECKBOX_CHECKED/UNCHECKED sont des attributs de CLASSE de App
@@ -110,6 +125,17 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
             "_update_tournament_started_buttons", "_pending_old_seat_by_name",
             "_test_mode_enabled", "_update_checked_count_label",
             "_update_undo_elimination_button_state",
+            "_players_checkbox_drives_accueil", "_update_players_stats_label",
+            # Lot 2 ("Gestion des absences et des retardataires",
+            # 2026-09-28) : _refresh_players_tab/_update_tournament_
+            # started_buttons ont désormais aussi besoin de ces deux-là
+            # (case Abs/Dés grisée avant démarrage, cycle de clignotement
+            # des joueurs signalés absents) — méthodes RÉELLES greffées
+            # ici, même principe que le reste de ce fichier.
+            "_cancel_players_absent_blink", "_players_absent_blink_tick",
+            # Complément du 2026-09-29 ("Pré-inscrit"/"Actif") :
+            # _refresh_players_tab en a désormais besoin.
+            "_accueil_status_label",
         ):
             setattr(self.win, meth, types.MethodType(getattr(main.App, meth), self.win))
 
@@ -131,6 +157,14 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
         # qui a besoin de ce bouton — même principe que delete_player_btn/
         # eliminate_player_btn ci-dessus.
         self.win.undo_elimination_btn = ttk.Button(parent)
+        # "Abs/Dés" (Lot 2, 2026-09-28) : même principe que eliminate_
+        # player_btn ci-dessus.
+        self.win.abs_des_btn = ttk.Button(parent)
+        self.win.abs_des_btn_tooltip = main.Tooltip(self.win.abs_des_btn, "")
+        self.win._abs_des_btn_tooltip_normal_text = ""
+        self.win.correct_arrival_btn = ttk.Button(parent)
+        self.win.correct_arrival_btn_tooltip = main.Tooltip(self.win.correct_arrival_btn, "")
+        self.win._correct_arrival_btn_tooltip_normal_text = ""
         self.win.player_photo_images = {}
 
     def _names_in_order(self):
@@ -143,8 +177,14 @@ class PlayersCheckboxHeaderSortTest(unittest.TestCase):
 
     def test_hors_mode_test_le_clic_ne_fait_rien(self):
         self.win.test_mode_var.set(False)
-        before = self._checked_ids_snapshot()
+        # Capturé APRÈS _refresh_players_tab (pas avant) : depuis le Lot 1
+        # ("Accueil des joueurs"), checked_player_ids est dérivé de
+        # arrived_at à chaque rafraîchissement tant que le tournoi n'a pas
+        # démarré (voir _players_checkbox_drives_accueil) — un
+        # "avant" capturé plus tôt refléterait l'ensemble vide initial,
+        # pas encore synchronisé avec bob/Alice confirmés dans setUp.
         self.win._refresh_players_tab()
+        before = self._checked_ids_snapshot()
         order_before = self._names_in_order()
 
         self.win._on_players_checkbox_header_click()

@@ -103,6 +103,7 @@ mêmes que celles déjà disponibles au clavier (Ctrl+Maj+J/C/T) ou dans
 l'onglet Joueurs — rien de destructeur, rien qui touche aux données du
 tournoi autrement que par une élimination normale.
 """
+import base64
 import json
 import logging
 import logging.handlers
@@ -210,7 +211,7 @@ _VALID_ACTIONS = {
 # Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à distance",
 # 2026-09-20) — application RÉELLE des autorisations accordées par
 # Phase 3 (voir database.py: REMOTE_PERMISSION_LABELS/remote_
-# authorizations). Les 7 chaînes ci-dessous sont dupliquées ici en
+# authorizations). Les chaînes ci-dessous sont dupliquées ici en
 # LITTÉRAUX plutôt qu'importées de database.py : remote_control.py reste
 # volontairement sans dépendance vers ce module (voir la docstring de
 # RemoteControlServer — chaque callback isole ce fichier de SQLite/
@@ -223,6 +224,11 @@ _PERM_CLOCK = "clock"
 _PERM_LEVELS = "levels"
 _PERM_PHOTOS = "photos"
 _PERM_REBALANCE = "rebalance"
+# "Permission spécifique" du Lot 1 ("Accueil des joueurs", cahier des
+# charges du 2026-09-27) : distincte des 7 permissions historiques
+# ci-dessus — confirmer une arrivée n'a rien à voir avec gérer les
+# éliminations, le plan de tables ou le rééquilibrage.
+_PERM_CHECKIN = "checkin"
 
 # Accès total (rôle ADMIN) : un objet distinct de "toutes les clés
 # valides actuellement" n'aurait aucun sens ici — un ADMIN n'est jamais
@@ -231,7 +237,7 @@ _PERM_REBALANCE = "rebalance"
 # sans dupliquer la logique de vérification par rôle.
 _ALL_PERMISSIONS = frozenset({
     _PERM_ELIMINATIONS, _PERM_TABLES, _PERM_MOVES, _PERM_CLOCK,
-    _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE,
+    _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE, _PERM_CHECKIN,
 })
 
 # "elimination" (bouton "⏸ Joueurs" de la page principale, PAS la page
@@ -286,14 +292,25 @@ _GET_ROUTE_PERMISSION = {
     "/moves": _PERM_MOVES, "/moves.html": _PERM_MOVES,
     "/moves_pending": _PERM_MOVES,
     "/rebalance_pending": _PERM_REBALANCE,
+    "/checkin": _PERM_CHECKIN, "/checkin.html": _PERM_CHECKIN,
+    "/checkin_players": _PERM_CHECKIN,
 }
 
 # "/clock_state" : cas particulier volontairement absent de _GET_ROUTE_
 # PERMISSION — alimente à la fois l'indicateur pause/lecture (clock) ET
 # le clignotement "Afficher Mouvements" (moves) sur TOUTES les pages ;
-# accessible dès que l'une des deux est accordée, jamais une 8e
-# permission séparée (le cahier des charges en exige exactement 7).
+# accessible dès que l'une des deux est accordée, jamais une permission
+# séparée pour ce seul indicateur.
 _CLOCK_STATE_PERMISSIONS = frozenset({_PERM_CLOCK, _PERM_MOVES})
+
+# "/absence_state" (Lot 2, "Gestion des absences et des retardataires",
+# 2026-09-28) : même principe que _CLOCK_STATE_PERMISSIONS ci-dessus —
+# accessible dès que l'une OU l'autre des deux pages qui en ont besoin
+# est autorisée (Éliminations pour le clignotement/l'alerte sonore/
+# l'éligibilité à la désactivation d'un absent ; Accueil pour savoir
+# quand se griser) — jamais une permission séparée rien que pour ce seul
+# indicateur, exactement comme has_pending_moves pour /clock_state.
+_ABSENCE_STATE_PERMISSIONS = frozenset({_PERM_ELIMINATIONS, _PERM_CHECKIN})
 
 # Mapping route POST -> permission requise. "/action/<mot>" est traité à
 # part (voir _ACTION_PERMISSION) ; "/authenticate" et "/end_tournament"
@@ -305,15 +322,30 @@ _POST_ROUTE_PERMISSION = {
     "/upload_photo": _PERM_PHOTOS,
     "/delete_photo": _PERM_PHOTOS,
     "/rebalance_answer": _PERM_REBALANCE,
+    "/confirm_arrival": _PERM_CHECKIN,
+    "/cancel_arrival": _PERM_CHECKIN,
+    # Lot 2 : mêmes routes réservées à _PERM_ELIMINATIONS que /eliminate —
+    # "Abs/Dés" vit sur la page "Gestion des éliminations" (cahier des
+    # charges, section 2), jamais une permission séparée.
+    "/declare_absence": _PERM_ELIMINATIONS,
+    "/cancel_absence": _PERM_ELIMINATIONS,
+    "/withdraw_absent_player": _PERM_ELIMINATIONS,
 }
 
 # Message affiché/renvoyé tel quel (page d'accueil ET réponses JSON de
 # refus) pour un appareil SANS propriétaire ou un DIRTO sans la moindre
 # autorisation pour CE tournoi (règle Phase 3 : "aucune autorisation
 # existante" = zéro permission, jamais distingué ici d'un DIRTO
-# explicitement autorisé mais dont les 7 cases ont été décochées — même
-# traitement, même message, décision explicite de simplicité/sûreté).
+# explicitement autorisé mais dont toutes les cases ont été décochées —
+# même traitement, même message, décision explicite de simplicité/sûreté).
 _NO_PERMISSION_MESSAGE = "Aucune fonction autorisée — contactez un ADMIN."
+
+# « Gestion de l'accueil » désactivée pour CE tournoi (modification du
+# 2026-09-29, réservée aux tournois Open) : message dédié, distinct de
+# _NO_PERMISSION_MESSAGE ci-dessus — ce n'est PAS un problème de
+# permission DIRTO (un ADMIN, qui a toutes les permissions, obtient
+# aussi ce message), mais un réglage de tournoi désactivé.
+_ACCUEIL_DISABLED_MESSAGE = "Gestion de l'accueil désactivée pour ce tournoi."
 
 
 def _strip_permission_sections(html, permissions):
@@ -330,7 +362,7 @@ def _strip_permission_sections(html, permissions):
     affiché."""
     for key in (
         _PERM_ELIMINATIONS, _PERM_TABLES, _PERM_MOVES, _PERM_CLOCK,
-        _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE,
+        _PERM_LEVELS, _PERM_PHOTOS, _PERM_REBALANCE, _PERM_CHECKIN,
     ):
         open_tag = f"<!--PERM:{key}-->"
         close_tag = f"<!--/PERM:{key}-->"
@@ -375,6 +407,203 @@ def _strip_admin_only_sections(html, is_admin):
     return html
 
 
+
+# Icône et manifest pour l'installation sur l'écran d'accueil iPhone
+# (demande du 2026-10-03, "SENACO SUR IPHONE : MODE WEB APP / PLEIN
+# ÉCRAN", test réel à valider manuellement) — UNIQUEMENT des éléments
+# statiques nouveaux : AUCUNE logique d'authentification, de cookie
+# (rc_bid/rc_auth/selected_pid), de SHORTID ou de permission ADMIN/
+# DIRTO n'est touchée. Les deux routes correspondantes (/apple-touch-
+# icon.png, /manifest.json, voir Handler.do_GET) sont exemptées
+# d'authentification (_AUTH_EXEMPT_PATHS) — exactement comme /login/
+# /authenticate/auth_status déjà exemptées pour une raison analogue :
+# une icône Écran d'accueil doit pouvoir se charger même avant toute
+# connexion (code à 6 chiffres pas encore saisi).
+#
+# Icône dérivée de windows/assets/app_icon.ico (déjà carrée, déjà
+# opaque — pas de nouvelle création graphique), redimensionnée à
+# 180x180 (taille standard "apple-touch-icon" pour les iPhone récents)
+# et ENCODÉE EN BASE64 ICI MÊME plutôt que chargée depuis un fichier :
+# ce module n'a aujourd'hui AUCUNE dépendance à un fichier externe
+# (toutes les pages sont des constantes Python autonomes) — un chemin
+# de fichier relatif serait en plus fragile une fois l'application
+# empaquetée (.app/.exe), jamais garanti résolu de la même façon selon
+# la plateforme. Décodée UNE SEULE FOIS à l'import, jamais à chaque
+# requête.
+_APPLE_TOUCH_ICON_PNG_BASE64 = (
+    "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"
+    "xx1jvGDi2afysxad85mvzjrh1JENj6350OWrr/xw97IT7r/misre3W+44dv3X/sngCGSqR3bSouX"
+    "xtVmqrN43Ls+cO9Vf5Tp6sl09xFzdXB41soTT7n86n99/5v8fKE0f3F9fKQ2uGfF7//pKVf8BZEh"
+    "B8eByeoIG/Pol69Z962bLviH7y38rTdVBrd/500rH/7iX8w++bV3fuzSoScef8tNa3qWLY+bzce+"
+    "et19f/VJk82suORP08WuVKmzVS4PP/Gw8VK10cF0dzbT2etnCqX5SyjwT7vyMwOveu3Wu2750eWX"
+    "bvjuV2edsHrXg/fMOW3lyZdfLWGY7elnP+hddsKKS//kyPPf/sydP7zro+9d/SfXzDr+1GfvuW32"
+    "8aeyb5a95dLTPvzpuFmtjw2NPvVk95HH5/vndx65/NzPfbNVmXzwb//s0S9dt+S8i3uXrVJryRgH"
+    "x8s8PpaNqezdseHmf1hy/vmLz75IRQqzFqy+8pqFZ71l90/XPHPHXWde89m+5atsHLMXHHfJB7ff"
+    "d8e6b395xbsvn9y6Ods7u/eYFbvX3l0d2tV3wknNydrkM1tUYxtHKhbEQbaw4LW/ne3ujhr10U0/"
+    "2/yD75953eckCsPGFJglDo3xjr7gXeynko1yGsd+vnjUBe8ae2YjgSe3bd58+7dtq1XevuXkD/w5"
+    "QQBhz/NSGS+VKcxeoIKZDfzOchwA74PQKo+1Jsu9R5+YTOkjY47/3SsAPHvn99nnwhHzVYQIcRQy"
+    "e50LFm+759/q4yPVvdsz3b2L3nDxT6/7yPCGx1Z/5DM7f3LvyJOP2LDJxoMVYgprk/d96gOVPWNL"
+    "zn/73scf9LNe99LjJAr9dC5pLFdFq1JOlbpUJdnapDaKGg2IeOnM0BNrqyO7m2MjcaN2wu99KJUv"
+    "eNnU4KP33vaH53leevDxB1e+/8quJctV5KANWw75mWAmSJNnqnu2kTEqAtW4WYcqGb/datEuKggR"
+    "i41t2LJhozo8mO4ozTvtbDI+wZu7+pxcd3djciisVYnIpMwvbvr8dy9+1d71j73uc19acMa5ex6/"
+    "36T8dEcJIBu1pjsYiD2zXxpIiZiMYd8La5VFr7vw4pvu/50f/Pw1V33BS2UAlsimu/qyfUdsvOX7"
+    "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"
+    "w8npRfT/AAKQS4dwaNHDAAAAAElFTkSuQmCC"
+)
+_APPLE_TOUCH_ICON_PNG = base64.b64decode(_APPLE_TOUCH_ICON_PNG_BASE64)
+
+# Manifest minimal (démarrage en mode standalone) — "start_url": "/"
+# pointe vers _PAGE_TEMPLATE (l'écran principal), relatif à l'origine
+# de CE serveur (IP locale:port du tournoi), jamais une URL en dur.
+# Volontairement minimal : nom, icône, mode d'affichage — rien d'autre
+# n'est nécessaire pour l'objectif demandé (voir diagnostic du
+# 2026-10-03). N'introduit aucune dépendance supplémentaire : un simple
+# document JSON statique, jamais lu ni modifié par le reste de ce
+# fichier.
+_MANIFEST_JSON = {
+    "name": "Senaco",
+    "short_name": "Senaco",
+    "display": "standalone",
+    "start_url": "/",
+    "icons": [
+        {"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"}
+    ],
+}
+
+
 # Petite page affichée à la place de l'accueil normal pour un appareil
 # SANS propriétaire ou un DIRTO à zéro permission pour ce tournoi — voir
 # _NO_PERMISSION_MESSAGE. Pas de bouton, pas de sondage périodique :
@@ -387,6 +616,11 @@ _NO_ACCESS_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Contrôle à distance</title>
 <style>
   body {{
@@ -428,6 +662,11 @@ _FORBIDDEN_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Contrôle à distance</title>
 <style>
   body {{
@@ -492,7 +731,17 @@ _AUTH_COOKIE_MAX_AGE = 24 * 3600
 # (pages ET actions) exige une session valide ET un appareil approuvé,
 # vérifiés ICI côté serveur (voir do_GET/do_POST), jamais seulement
 # côté page/JS.
-_AUTH_EXEMPT_PATHS = {"/login", "/authenticate", "/auth_status"}
+#
+# "/apple-touch-icon.png" et "/manifest.json" ajoutés le 2026-10-03
+# (mode Web App iPhone) pour la MÊME raison : une icône Écran d'accueil
+# doit pouvoir se charger avant même la saisie du code à 6 chiffres —
+# ce sont de simples ressources statiques (image/JSON), jamais une
+# action ni une donnée propre à un appareil/tournoi, donc sans aucun
+# risque à les exempter.
+_AUTH_EXEMPT_PATHS = {
+    "/login", "/authenticate", "/auth_status",
+    "/apple-touch-icon.png", "/manifest.json",
+}
 
 # Routes GET qui correspondent à une VRAIE navigation plein écran
 # (typiquement suivies d'un rendu HTML plein écran par le téléphone) :
@@ -505,6 +754,7 @@ _AUTH_EXEMPT_PATHS = {"/login", "/authenticate", "/auth_status"}
 _AUTH_PAGE_PATHS = {
     "/", "/index.html", "/eliminate", "/eliminate.html",
     "/photos", "/photos.html", "/moves", "/moves.html",
+    "/checkin", "/checkin.html",
     "/lobbylist", "/select_tournament",
 }
 
@@ -597,6 +847,11 @@ _LOGIN_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Code d'accès</title>
 <style>
   body {
@@ -721,6 +976,11 @@ _PAGE_TEMPLATE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Contrôle à distance</title>
 <style>
   body {{
@@ -764,6 +1024,7 @@ _PAGE_TEMPLATE = """<!doctype html>
   }}
   #btn-niveau-precedent, #btn-niveau-suivant {{ background: #2c6e8a; }}
   #btn-photos {{ background: #6e2c6e; }}
+  #btn-checkin {{ background: #1f8a5a; }}
   /* Ligne Chronomètre + petit bouton ON/OFF de pause à sa droite : les
      deux se partagent la largeur habituelle des boutons plutôt que
      chacun sa propre ligne pleine largeur. */
@@ -825,6 +1086,9 @@ _PAGE_TEMPLATE = """<!doctype html>
   <p class="version">v{app_version}</p>
 
   {lobby_button}
+  <!--PERM:checkin-->
+  <button id="btn-checkin" onclick="window.location.href='/checkin'">🙋 Accueil des joueurs</button>
+  <!--/PERM:checkin-->
   <!--PERM:eliminations-->
   <button id="btn-eliminations" onclick="window.location.href='/eliminate'">🎯 Gérer les éliminations</button>
   <!--/PERM:eliminations-->
@@ -1027,6 +1291,11 @@ _LOBBY_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Lobby</title>
 <style>
   body {{
@@ -1091,6 +1360,11 @@ _ELIMINATE_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Éliminations</title>
 <style>
   * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
@@ -1199,11 +1473,77 @@ _ELIMINATE_PAGE = """<!doctype html>
     font-weight: 700; font-size: 15px; box-shadow: 0 4px 14px rgba(0,0,0,.4);
     max-width: 70vw; text-align: center;
   }}
+  /* "Abs/Dés" (Lot 2, "Gestion des absences et des retardataires",
+     2026-09-28) : à côté de "Retour" (cahier des charges, section 2) —
+     regroupés dans .topbar-left pour que #topbar garde exactement 3
+     enfants directs (justify-content: space-between inchangé). Cible de
+     dépôt au même titre que la colonne "Éliminateur" (voir data-target
+     posé en JS) : même fond que #btn-mouvements (contrôle à distance),
+     jamais confondu avec le rouge d'une élimination. */
+  .topbar-left {{ display: flex; align-items: center; gap: 8px; }}
+  #btn-abs-des {{
+    border: none; border-radius: 8px; background: #8a6d1f; color: #f5efe0;
+    font-size: 14px; font-weight: 700; padding: 9px 12px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-abs-des:active {{ transform: scale(0.97); }}
+  #btn-abs-des.drop-hover {{ background: #e8c468; color: #10241a; }}
+  /* Clignotement rouge d'un joueur signalé absent (cahier des charges,
+     section 2 : "son nom clignote en rouge... sur les téléphones") —
+     jamais combiné avec .not-eligible (masqué) : un joueur absent reste
+     un candidat d'élimination normal par ailleurs.
+
+     Correctif du 2026-09-29 (clignotement pas systématique constaté aux
+     essais manuels) : PAS une animation CSS @keyframes — une telle
+     animation démarre son horloge au moment où l'ÉLÉMENT est créé, or
+     renderLists() reconstruit TOUTE la liste (tous les <div> recréés) à
+     CHAQUE sondage où quoi que ce soit a changé dans /players, même sans
+     rapport avec ce joueur — chaque reconstruction repartait donc d'une
+     phase neuve, et un sondage toutes les ~4s pouvait interrompre le
+     cycle bien avant qu'il ne soit visuellement perceptible. Remplacé
+     par une simple classe .absent-blink-on, basculée par un minuteur
+     JS INDÉPENDANT de tout cycle de rendu (voir tickAbsentBlink) — une
+     reconstruction de la liste ne fait donc plus JAMAIS repartir le
+     clignotement à zéro, au pire un décalage invisible d'un tick
+     (600ms) avant que la nouvelle ligne ne rattrape la phase commune. */
+  .player-item.absent {{ transition: background 0.3s ease-in-out; }}
+  .player-item.absent.absent-blink-on {{ background: #7a2020; }}
+  /* Confirmation avant la PREMIÈRE déclaration Abs/Dés (demande du
+     2026-10-03, "manque de sécurité" signalé sur le dépôt direct, sans
+     confirmation, vers declareAbsence) — overlay personnalisé, PAS
+     window.confirm() : un confirm() natif bloque indéfiniment sans
+     aucune notion de timeout, incompatible avec l'expiration automatique
+     demandée (voir showAbsDesConfirm, plus bas). Même palette visuelle
+     que _REBALANCE_WIDGET (fond #10241a, bordure or #e8c468), pour
+     rester cohérent avec l'overlay déjà existant sur cette même page. */
+  #abs-confirm-overlay {{
+    display: none; position: fixed; inset: 0; z-index: 950;
+    background: rgba(0,0,0,.72); align-items: center; justify-content: center;
+    padding: 20px;
+  }}
+  #abs-confirm-box {{
+    background: #10241a; border: 2px solid #e8c468; border-radius: 14px;
+    padding: 22px 20px; max-width: 340px; width: 100%; box-sizing: border-box;
+    text-align: center; box-shadow: 0 6px 24px rgba(0,0,0,.5);
+  }}
+  #abs-confirm-text {{
+    color: #f5efe0; font-size: 16px; font-weight: 700; margin: 0 0 18px;
+  }}
+  .abs-confirm-buttons {{ display: flex; gap: 10px; }}
+  .abs-confirm-buttons button {{
+    flex: 1; padding: 12px; border: none; border-radius: 10px;
+    font-size: 15px; font-weight: 700; -webkit-tap-highlight-color: transparent;
+  }}
+  #abs-confirm-cancel {{ background: #4a4a4a; color: #fff; }}
+  #abs-confirm-ok {{ background: #8a6d1f; color: #f5efe0; }}
 </style>
 </head>
 <body>
   <div id="topbar">
-    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
+    <div class="topbar-left">
+      <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
+      {abs_des_button}
+    </div>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
@@ -1219,6 +1559,15 @@ _ELIMINATE_PAGE = """<!doctype html>
     </div>
   </div>
   <div id="ghost"></div>
+  <div id="abs-confirm-overlay">
+    <div id="abs-confirm-box">
+      <p id="abs-confirm-text"></p>
+      <div class="abs-confirm-buttons">
+        <button type="button" id="abs-confirm-cancel">Annuler</button>
+        <button type="button" id="abs-confirm-ok">OK</button>
+      </div>
+    </div>
+  </div>
 
 <script>
 {auth_redirect_script}
@@ -1231,6 +1580,17 @@ var pollTimer = null;
 // (mouvement surtout vertical) et "c'est un glissement" (mouvement surtout
 // horizontal, colonne de gauche vers colonne de droite) — voir onTouchMove.
 var DRAG_THRESHOLD = 10;
+// Décalage vertical (px) entre le doigt RÉEL et le fantôme affiché
+// au-dessus (voir moveGhost) — pour que la main ne cache pas ce que
+// l'utilisateur tient. Constante PARTAGÉE avec la détection de cible de
+// dépôt sur "Abs/Dés" (voir onTouchMove, correctif du 2026-09-29) : ce
+// bouton vit tout en haut du bandeau, avec très peu de marge au-dessus,
+// et l'utilisateur vise naturellement avec le fantôme QU'IL VOIT, jamais
+// son doigt réel cachée sous sa main — sans cette constante partagée,
+// le point visé (fantôme) et le point testé (doigt réel) restent
+// décalés de 60px, obligeant à faire dépasser le doigt bien au-delà du
+// bord visible du bouton pour compenser cet écart.
+var GHOST_Y_OFFSET = 60;
 
 // ===================================================================
 // Fiabilité de la communication (demande du 2026-09-19, suite à un
@@ -1390,9 +1750,22 @@ function renderLists() {{
 
 function makeItem(p, isSource) {{
   var div = document.createElement('div');
-  div.className = 'player-item';
+  // "absentBlinkOn ? ' absent-blink-on' : ''" (correctif du 2026-09-29) :
+  // un élément recréé par un rafraîchissement démarre déjà dans la
+  // PHASE COURANTE du minuteur partagé (tickAbsentBlink), au lieu
+  // d'attendre jusqu'à 600ms en apparence "éteinte" — élimine même ce
+  // léger décalage visuel lors d'une reconstruction de liste.
+  div.className = 'player-item' + (p.absent ? ' absent' : '') + (p.absent && absentBlinkOn ? ' absent-blink-on' : '');
   div.dataset.id = p.id;
   div.dataset.table = p.table || '';
+  div.dataset.absent = p.absent ? 'true' : '';
+  // Correctif du 2026-09-29 (essais manuels du Lot 2) : "arrived" (voir
+  // App._refresh_remote_players_cache) permet à handleAbsDesDrop de
+  // router un joueur déjà accueilli vers une désactivation directe,
+  // jamais un signalement d'absence — la vraie interdiction reste
+  // appliquée côté base de données (Database.declare_absent), ceci
+  // n'est qu'une ergonomie qui évite un aller-retour réseau pour rien.
+  div.dataset.arrived = p.arrived ? 'true' : '';
   var sub = fmtSub(p);
   div.dataset.name = fmtLabel(p);
   div.dataset.sub = sub;
@@ -1448,8 +1821,13 @@ function clearTableFilter() {{
 function moveGhost(x, y) {{
   var ghost = document.getElementById('ghost');
   ghost.style.left = x + 'px';
-  ghost.style.top = (y - 60) + 'px';
+  ghost.style.top = (y - GHOST_Y_OFFSET) + 'px';
   ghost.style.transform = 'translate(-50%, -50%)';
+}}
+
+// (x, y) tombe-t-il dans ce rectangle (DOMRect, voir getBoundingClientRect) ?
+function pointInRect(x, y, rect) {{
+  return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
 }}
 
 // Glissement tactile pensé pour cohabiter avec le défilement natif de la
@@ -1467,7 +1845,8 @@ function onTouchStart(e) {{
   var t = e.touches[0];
   pending = {{
     id: el.dataset.id, label: el.dataset.name, sub: el.dataset.sub,
-    table: el.dataset.table, el: el,
+    table: el.dataset.table, absent: el.dataset.absent === 'true',
+    arrived: el.dataset.arrived === 'true', el: el,
     startX: t.clientX, startY: t.clientY, engaged: false,
   }};
   // Retour visuel tout de suite, avant même de savoir si ça deviendra
@@ -1488,9 +1867,26 @@ function onTouchMove(e) {{
     if (Math.abs(dx) < DRAG_THRESHOLD && Math.abs(dy) < DRAG_THRESHOLD) {{
       return;  // pas encore assez de mouvement pour trancher
     }}
-    if (Math.abs(dy) >= Math.abs(dx)) {{
-      // Mouvement surtout vertical : défilement, pas glissement. On se
-      // retire complètement et on laisse le navigateur défiler nativement.
+    // Correctif du 2026-09-29 (essais manuels du Lot 2) : "Abs/Dés" vit
+    // dans le bandeau, AU-DESSUS de la liste — y glisser un joueur est
+    // donc nécessairement un mouvement surtout VERTICAL, que
+    // l'heuristique ci-dessous (pensée pour distinguer un glissement
+    // horizontal Éliminé -> Éliminateur d'un simple défilement vertical
+    // de la liste) classait systématiquement comme "défilement" et
+    // abandonnait avant même d'avoir une chance d'atteindre le bouton —
+    // d'où le contournement "glisser à droite d'abord" constaté aux
+    // essais manuels. Un doigt qui a déjà QUITTÉ la liste PAR LE HAUT
+    // (donc entré dans le bandeau où vit le bouton) ne peut plus être un
+    // simple défilement DE LA LISTE : engage alors le glissement sans
+    // condition, quelle que soit l'orientation dx/dy. Tant que le doigt
+    // reste DANS la liste, l'heuristique existante s'applique à
+    // l'identique — glissement Éliminé/Éliminateur INCHANGÉ.
+    var columnsRect = document.getElementById('columns').getBoundingClientRect();
+    var aboveList = t.clientY < columnsRect.top;
+    if (!aboveList && Math.abs(dy) >= Math.abs(dx)) {{
+      // Mouvement surtout vertical DANS la liste : défilement, pas
+      // glissement. On se retire complètement et on laisse le
+      // navigateur défiler nativement.
       cancelPending();
       return;
     }}
@@ -1508,6 +1904,24 @@ function onTouchMove(e) {{
   autoScrollNearEdge(t.clientY);
   var el = document.elementFromPoint(t.clientX, t.clientY);
   var target = el ? el.closest('[data-target="true"]') : null;
+  // Correctif du 2026-09-29 (glisser-déposer imprécis sur "Abs/Dés") :
+  // le point ci-dessus est le doigt RÉEL, mais l'utilisateur vise
+  // naturellement avec le fantôme QU'IL VOIT (affiché GHOST_Y_OFFSET px
+  // plus haut, voir moveGhost — la main cacherait sinon ce qu'elle
+  // tient). Pour la plupart des cibles (colonne "Éliminateur", grande,
+  // au milieu de l'écran) cet écart passe inaperçu ; pour "Abs/Dés",
+  // petit bouton tout en haut du bandeau avec très peu de marge
+  // au-dessus, il obligeait à faire dépasser le doigt bien au-delà du
+  // bord visible du bouton pour compenser. Complète donc la détection
+  // du doigt réel par celle du fantôme, SPÉCIFIQUEMENT pour ce bouton —
+  // ne change rien pour la colonne "Éliminateur" (glissement Éliminé/
+  // Éliminateur intégralement inchangé, jamais concernée par cet écart).
+  if (!target) {{
+    var absDesBtn = document.getElementById('btn-abs-des');
+    if (absDesBtn && pointInRect(t.clientX, t.clientY - GHOST_Y_OFFSET, absDesBtn.getBoundingClientRect())) {{
+      target = absDesBtn;
+    }}
+  }}
   if (hoverTarget && hoverTarget !== target) {{
     hoverTarget.classList.remove('drop-hover');
   }}
@@ -1562,6 +1976,16 @@ function onTouchEnd(e) {{
   var target = hoverTarget;
   cancelPending();
 
+  // Lot 2 ("Gestion des absences et des retardataires", 2026-09-28) :
+  // déposer sur "Abs/Dés" (topbar) déclare l'absence du joueur glissé,
+  // ou propose sa désactivation s'il l'était déjà et que le délai est
+  // dépassé — voir handleAbsDesDrop, JAMAIS confondu avec une
+  // élimination même si ce bouton porte aussi data-target="true".
+  if (wasEngaged && target && target.id === 'btn-abs-des') {{
+    handleAbsDesDrop(drag);
+    return;
+  }}
+
   if (wasEngaged && target && target.dataset.id !== drag.id) {{
     // Colonne de gauche (glissée) = Éliminé, colonne de droite (déposée
     // dessus) = Éliminateur — voir confirmElimination pour l'ordre inverse
@@ -1571,7 +1995,160 @@ function onTouchEnd(e) {{
       target.dataset.id, target.dataset.name, target.dataset.sub,
       drag.id, drag.label, drag.sub
     );
+    return;
   }}
+
+  // Simple tap (jamais engagé en glissement) sur un joueur DÉJÀ signalé
+  // absent : propose "Annuler l'absence" (cahier des charges, section 3 —
+  // "lorsqu'on touche le joueur concerné"). Un tap sur un joueur PAS
+  // signalé absent reste sans effet, comme avant ce chantier.
+  if (!wasEngaged && drag && drag.absent) {{
+    promptCancelAbsence(drag.id, drag.label);
+  }}
+}}
+
+// -- Lot 2 : "Abs/Dés" (déclarer/désactiver) et "Annuler l'absence" -----
+
+function handleAbsDesDrop(drag) {{
+  // Correctif du 2026-09-29 (essais manuels du Lot 2) : un joueur déjà
+  // accueilli (voir App._refresh_remote_players_cache, "arrived") ne
+  // doit JAMAIS être signalé absent — /declare_absence le refuserait de
+  // toute façon (Database.declare_absent), mais on route directement
+  // vers la désactivation "selon les règles habituelles" plutôt que de
+  // laisser l'utilisateur découvrir un refus après coup. Même
+  // confirmation explicite obligatoire que pour une désactivation après
+  // délai (précaution du 2026-09-28) — jamais automatique.
+  if (drag.arrived) {{
+    confirmWithdrawAbsentPlayer(drag.id, drag.label, ' — déjà accueilli(e), désactiver définitivement ?');
+    return;
+  }}
+  if (!drag.absent) {{
+    // Confirmation AVANT la première déclaration Abs/Dés (demande du
+    // 2026-10-03, "manque de sécurité" — ce dépôt appelait declareAbsence
+    // directement, sans confirmation). showAbsDesConfirm (plus bas) :
+    // OK -> declareAbsence INCHANGÉE ; Annuler OU expiration du timeout
+    // (10s) -> aucun appel réseau, aucune modification. Libellé "absent"
+    // (demande du 2026-10-04) : rien n'est désinscrit dans cette branche,
+    // seul absent_declared_at est posé — jamais "désinscrit" ici.
+    showAbsDesConfirm('Déclarer ' + drag.label + ' absent ?', function() {{ declareAbsence(drag.id, drag.label); }});
+    return;
+  }}
+  if (!absenceDeadlinePassed) {{
+    // Délai pas encore dépassé : pas encore éligible à la désactivation
+    // (cahier des charges, section 4) — idempotent, sans effet, jamais
+    // une erreur bloquante pour un simple dépôt trop tôt.
+    return;
+  }}
+  // Branche D (demande du 2026-10-04) : migrée de confirmWithdrawAbsentPlayer
+  // (window.confirm, sans timeout) vers showAbsDesConfirm (AVEC timeout),
+  // même mécanisme que la branche B ci-dessus, jamais dupliqué. Libellé
+  // "désinscrit" : c'est ICI que la désinscription/désactivation définitive
+  // a réellement lieu (withdrawAbsentPlayer, plus bas) — OK inchangé,
+  // Annuler/timeout -> aucun appel réseau, exactement comme avant.
+  showAbsDesConfirm('Déclarer ' + drag.label + ' désinscrit ?', function() {{ withdrawAbsentPlayer(drag.id); }});
+}}
+
+// Confirmation personnalisée AVEC timeout (demande du 2026-10-03, étendue
+// à la branche D le 2026-10-04) — PAS window.confirm() : un confirm()
+// natif bloque indéfiniment, sans aucune notion d'expiration automatique,
+// incompatible avec l'exigence "si le timeout expire sans validation,
+// aucune action ne doit être effectuée". Utilisée par les branches B et D
+// de handleAbsDesDrop (ci-dessus) — la branche A (déjà accueilli),
+// l'élimination et "Fin de la partie" restent SUR window.confirm(),
+// volontairement inchangées.
+var ABS_CONFIRM_TIMEOUT_MS = 10000;
+var absConfirmTimer = null;
+
+function hideAbsConfirm() {{
+  document.getElementById('abs-confirm-overlay').style.display = 'none';
+  if (absConfirmTimer) {{ clearTimeout(absConfirmTimer); absConfirmTimer = null; }}
+  // Détache les gestionnaires posés par le dernier appel (voir
+  // showAbsDesConfirm) : un dépôt annulé/expiré puis un nouveau dépôt
+  // juste après ne doit jamais ré-exécuter l'ancien onConfirm.
+  document.getElementById('abs-confirm-ok').onclick = null;
+  document.getElementById('abs-confirm-cancel').onclick = null;
+}}
+
+function showAbsDesConfirm(message, onConfirm) {{
+  hideAbsConfirm();  // annule tout minuteur/overlay resté ouvert d'un dépôt précédent
+  // `message` déjà entièrement composé par l'appelant (demande du
+  // 2026-10-04) — branche B et branche D affichent désormais un texte
+  // différent ("absent" / "désinscrit"), jamais le même libellé générique.
+  document.getElementById('abs-confirm-text').textContent = message;
+  document.getElementById('abs-confirm-overlay').style.display = 'flex';
+  document.getElementById('abs-confirm-ok').onclick = function() {{
+    hideAbsConfirm();
+    onConfirm();
+  }};
+  document.getElementById('abs-confirm-cancel').onclick = function() {{
+    hideAbsConfirm();
+  }};
+  absConfirmTimer = setTimeout(function() {{
+    // Expiration (demande explicite) : strictement équivalente à
+    // Annuler — ferme l'overlay, AUCUN appel réseau, AUCUNE action.
+    hideAbsConfirm();
+  }}, ABS_CONFIRM_TIMEOUT_MS);
+}}
+
+// Appel réseau de la désactivation finale — extrait (demande du
+// 2026-10-04) de confirmWithdrawAbsentPlayer pour que la branche A
+// (window.confirm, ci-dessous) ET la branche D (showAbsDesConfirm,
+// ci-dessus) partagent le MÊME appel à /withdraw_absent_player, jamais
+// dupliqué. Comportement STRICTEMENT inchangé par rapport à avant cette
+// extraction (même requête, mêmes messages) — /withdraw_absent_player
+// revérifie de toute façon laquelle des deux éligibilités s'applique
+// côté serveur (voir App._remote_withdraw_absent_player), ce choix ne
+// change rien ici.
+function withdrawAbsentPlayer(playerId) {{
+  fetchWithTimeout('/withdraw_absent_player', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{player_id: playerId}}),
+  }}, 8000).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (!data.ok) {{ window.alert(data.message || 'Désactivation refusée.'); return; }}
+    loadPlayers();
+  }}).catch(function(e) {{
+    window.alert('Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.');
+  }});
+}}
+
+function confirmWithdrawAbsentPlayer(playerId, label, question) {{
+  // Branche A (déjà accueilli) UNIQUEMENT désormais (demande du
+  // 2026-10-04 : la branche D utilise maintenant showAbsDesConfirm,
+  // voir handleAbsDesDrop ci-dessus) — confirmation native
+  // window.confirm(), SANS timeout, strictement inchangée.
+  if (!window.confirm(label + question)) return;
+  withdrawAbsentPlayer(playerId);
+}}
+
+function declareAbsence(playerId, label) {{
+  fetchWithTimeout('/declare_absence', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{player_id: playerId}}),
+  }}, 8000).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (!data.ok) {{ window.alert(data.message || 'Signalement refusé.'); return; }}
+    loadPlayers();
+  }}).catch(function(e) {{
+    window.alert(
+      'Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.\\n'
+      + 'Vous pouvez retenter sans risque : signaler deux fois ne crée jamais de doublon.'
+    );
+  }});
+}}
+
+function promptCancelAbsence(playerId, label) {{
+  if (!window.confirm('Annuler le signalement d\\'absence de ' + label + ' ?')) return;
+  fetchWithTimeout('/cancel_absence', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{player_id: playerId}}),
+  }}, 8000).then(function(r) {{ return r.json(); }}).then(function(data) {{
+    if (!data.ok) {{ window.alert(data.message || 'Annulation refusée.'); return; }}
+    loadPlayers();
+  }}).catch(function(e) {{
+    window.alert('Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.');
+  }});
 }}
 
 // Identifiant de requête réutilisé pour un RETRY de la MÊME action
@@ -1668,6 +2245,66 @@ function confirmElimination(eliminatorId, eliminatorLabel, eliminatorSub, elimin
   }});
 }}
 
+// -- Lot 2 : alerte sonore unique à l'échéance du délai des retardataires --
+var absenceDeadlinePassed = false;
+var absenceAlertPlayed = false;  // propre à cette page/cet appareil, voir docstring Python de _ELIMINATE_PAGE
+
+function playAbsenceAlertBeep() {{
+  // Web Audio API générique (aucune dépendance, aucun fichier serveur) :
+  // AUCUN précédent de son côté téléphone dans cette application avant
+  // ce chantier (signalé dans l'audit du 2026-09-28) — contrairement à
+  // sound_signal.py (Mac uniquement, afplay/winsound/paplay). Silencieux
+  // en cas d'échec (API indisponible, contexte audio bloqué) : jamais une
+  // exception qui remonte à l'appelant.
+  try {{
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    var ctx = new Ctx();
+    var osc = ctx.createOscillator();
+    var gain = ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.value = 880;
+    gain.gain.value = 0.2;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    setTimeout(function() {{ osc.stop(); ctx.close(); }}, 700);
+  }} catch (e) {{ /* silence plutôt qu'une erreur bloquante */ }}
+}}
+
+function pollAbsenceState() {{
+  fetchWithTimeout('/absence_state', {{}}, 6000).then(function(r) {{
+    if (!r.ok) throw new Error('http_' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    var wasPassed = absenceDeadlinePassed;
+    absenceDeadlinePassed = !!data.deadline_passed;
+    if (absenceDeadlinePassed && !wasPassed && !absenceAlertPlayed) {{
+      absenceAlertPlayed = true;
+      playAbsenceAlertBeep();
+    }}
+  }}).catch(function() {{ /* réseau momentanément indisponible : retentera au prochain sondage */ }});
+}}
+pollAbsenceState();
+setInterval(pollAbsenceState, 3000);
+
+// -- Correctif du 2026-09-29 : clignotement piloté par un minuteur JS
+// persistant (voir la note CSS de .player-item.absent) plutôt que par
+// une animation CSS liée à la durée de vie de chaque élément — même
+// cadence (600ms) que App._players_absent_blink_tick côté Mac, pour un
+// rythme visuellement cohérent entre les deux écrans. querySelectorAll
+// relit le DOM à CHAQUE tick : une reconstruction de la liste entre deux
+// tics est donc automatiquement rattrapée au tick suivant, sans jamais
+// avoir besoin d'être prévenue de ce rafraîchissement.
+var absentBlinkOn = false;
+function tickAbsentBlink() {{
+  absentBlinkOn = !absentBlinkOn;
+  document.querySelectorAll('.player-item.absent').forEach(function(el) {{
+    el.classList.toggle('absent-blink-on', absentBlinkOn);
+  }});
+}}
+setInterval(tickAbsentBlink, 600);
+
 loadPlayers();
 {reload_script}
 </script>
@@ -1692,6 +2329,11 @@ _PHOTOS_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Photos</title>
 <style>
   * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
@@ -2091,6 +2733,11 @@ _MOVES_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
 <title>Mouvements</title>
 <style>
   * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
@@ -2363,6 +3010,396 @@ function confirmAllMoves() {{
 }}
 
 loadMoves();
+{reload_script}
+</script>
+{rebalance_widget}
+</body>
+</html>
+"""
+
+# Page "Accueil des joueurs" (Lot 1, "Accueil des joueurs et gestion des
+# absences", cahier des charges du 2026-09-27) : recherche des joueurs
+# pré-inscrits (déjà ajoutés au tournoi via Database.add_player, donc déjà
+# assis — voir sa docstring), confirmation de leur arrivée physique au
+# poste d'accueil, affichage table/siège, compteurs "arrivés / inscrits".
+# Même pattern de sondage/reconnexion que _MOVES_PAGE ci-dessus (fetch
+# avec timeout, backoff, indicateur de connexion) — nécessaire ici aussi :
+# plusieurs téléphones à l'accueil doivent voir les arrivées confirmées
+# par les autres sans recharger la page. Confirmer/annuler une arrivée
+# est idempotent par nature (simple horodatage NULL/non-NULL, voir
+# Database.confirm_arrival/cancel_arrival) : aucun request_id de
+# dédoublonnage nécessaire, comme /confirm_move.
+_CHECKIN_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Senaco">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.json">
+<title>Accueil des joueurs</title>
+<style>
+  * {{ box-sizing: border-box; -webkit-tap-highlight-color: transparent; }}
+  html, body {{
+    margin: 0; padding: 0; min-height: 100%;
+    background: #10241a; color: #f5efe0;
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  }}
+  #topbar {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px; background: #0b1c15; border-bottom: 1px solid #294235;
+    position: sticky; top: 0; z-index: 10;
+  }}
+  #topbar .tournoi {{ color: #e8c468; font-size: 15px; font-weight: 700; }}
+  #conn-indicator {{
+    display: flex; align-items: center; gap: 5px; font-size: 11px;
+    color: #9fb8a8; padding: 2px 14px;
+  }}
+  #conn-indicator .dot {{
+    width: 7px; height: 7px; border-radius: 50%; background: #4caf6d; flex: none;
+  }}
+  #conn-indicator.conn-reconnecting .dot {{ background: #e8c468; }}
+  #conn-indicator.conn-lost .dot {{ background: #d9534f; }}
+  #conn-indicator.conn-reconnecting {{ color: #e8c468; }}
+  #conn-indicator.conn-lost {{ color: #d9534f; }}
+  #btn-back {{
+    border: none; border-radius: 8px; background: #2c4a6e; color: #f5efe0;
+    font-size: 15px; font-weight: 700; padding: 9px 16px; line-height: 1.2;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #btn-back:active {{ transform: scale(0.97); }}
+  #btn-reload {{
+    width: 32px; height: 32px; border: none; border-radius: 50%;
+    background: #1c3d2c; color: #f5efe0; font-size: 15px; line-height: 32px;
+    padding: 0; -webkit-tap-highlight-color: transparent;
+  }}
+  #counters {{
+    text-align: center; padding: 10px 14px 0; color: #e8c468;
+    font-size: 15px; font-weight: 700;
+  }}
+  #search-row {{ padding: 10px 14px; }}
+  #search-input {{
+    display: block; width: 100%; max-width: 460px; margin: 0 auto;
+    padding: 10px 12px; font-size: 16px; border-radius: 10px; border: none;
+    background: #1c3d2c; color: #f5efe0;
+  }}
+  #search-input::placeholder {{ color: #7f9587; }}
+  #checkin-list {{ padding: 4px 14px 24px; overflow-y: auto; -webkit-overflow-scrolling: touch; }}
+  .checkin-row {{
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px; margin-bottom: 8px; border-radius: 10px;
+    background: #1c3d2c;
+  }}
+  .checkin-row.arrived {{ background: #16311f; }}
+  .checkin-row.absent {{ background: #3a1a1a; }}
+  .checkin-row .info {{ flex: 1; min-width: 0; text-align: left; }}
+  .checkin-row .info .name {{ font-size: 16px; font-weight: 700; }}
+  .checkin-row .info .sub {{ font-size: 12px; color: #9fb8a8; margin-top: 2px; }}
+  /* Harmonisation Mac/iPhone (modification du 2026-09-30) : statut
+     explicite ("Pré-inscrit"/"Actif"/"Absent"), même priorité qu'App.
+     _accueil_status_label côté Mac — absence déclarée d'abord, puis
+     arrivée confirmée, sinon Pré-inscrit. Toujours affiché (accueil
+     ouvert OU clôturé, voir renderList), jamais seulement déduit d'une
+     coche ou d'un tiret. */
+  .checkin-row .info .status {{ font-size: 12px; font-weight: 700; margin-top: 2px; }}
+  .status-preinscrit {{ color: #c9a96a; }}
+  .status-actif {{ color: #5fbf82; }}
+  .status-absent {{ color: #e0645c; }}
+  .checkin-row button {{
+    flex: none; border: none; border-radius: 10px; color: #fff;
+    font-size: 14px; font-weight: 700; padding: 10px 14px;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  .checkin-row button:active {{ transform: scale(0.95); }}
+  .checkin-row .btn-confirm {{ background: #1f6b3a; }}
+  #empty {{ text-align: center; color: #b9ad8f; padding: 40px 16px; font-size: 15px; }}
+  /* Lot 2 ("Gestion des absences et des retardataires", 2026-09-28) :
+     bandeau de clôture — la liste reste consultable (jamais masquée),
+     seuls Confirmer/Annuler disparaissent (voir renderList). */
+  #closed-banner {{
+    display: none; text-align: center; color: #e8c468; background: #2c2410;
+    font-size: 13px; padding: 8px 14px; border-bottom: 1px solid #4a3c10;
+  }}
+  .checkin-row .closed-label {{
+    flex: none; font-size: 12px; color: #9fb8a8; padding: 10px 4px;
+  }}
+  /* "Inscrit" (modification du 2026-10-01) : même emplacement que
+     l'ancien bouton "Confirmer", couleur alignée sur .status-actif. */
+  .checkin-row .inscrit-label {{
+    flex: none; font-size: 13px; font-weight: 700; color: #5fbf82; padding: 10px 4px;
+  }}
+</style>
+</head>
+<body>
+  <div id="topbar">
+    <button id="btn-back" onclick="window.location.href='/'">← Retour</button>
+    <span class="tournoi">{tournament_name}</span>
+    <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
+  </div>
+  <div id="conn-indicator" class="conn-ok"><span class="dot"></span><span id="conn-text">Connecté</span></div>
+  <div id="closed-banner">⏱ Accueil clôturé — délai des retardataires dépassé. Liste conservée en consultation.</div>
+  <div id="counters">— / —</div>
+  <div id="search-row">
+    <input id="search-input" type="text" placeholder="Rechercher un joueur..." autocomplete="off" autocorrect="off" autocapitalize="off">
+  </div>
+  <div id="checkin-list"></div>
+
+<script>
+{auth_redirect_script}
+var players = [];
+var lastSignature = null;
+var pollTimer = null;
+var pollDelayMs = 4000;
+var POLL_DELAY_MIN_MS = 4000;
+var POLL_DELAY_MAX_MS = 20000;
+var consecutiveFailures = 0;
+var connState = 'ok';
+var searchTerm = '';
+var accueilClosed = false;  // Lot 2 : voir pollAbsenceState
+
+function setConnState(state) {{
+  if (state === connState) return;
+  connState = state;
+  var el = document.getElementById('conn-indicator');
+  var txt = document.getElementById('conn-text');
+  if (!el || !txt) return;
+  el.className = state === 'ok' ? 'conn-ok' : (state === 'reconnecting' ? 'conn-reconnecting' : 'conn-lost');
+  txt.textContent = state === 'ok' ? 'Connecté' : (state === 'reconnecting' ? 'Reconnexion…' : 'Connexion perdue');
+}}
+
+function fetchWithTimeout(url, options, timeoutMs) {{
+  var opts = options || {{}};
+  var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  if (controller) opts.signal = controller.signal;
+  var timer = controller ? setTimeout(function() {{ controller.abort(); }}, timeoutMs) : null;
+  var clear = function() {{ if (timer) clearTimeout(timer); }};
+  return fetch(url, opts).then(function(r) {{ clear(); return r; }}, function(e) {{ clear(); throw e; }});
+}}
+
+function scheduleNextPoll(ok) {{
+  if (pollTimer) clearTimeout(pollTimer);
+  pollDelayMs = ok ? POLL_DELAY_MIN_MS : Math.min(pollDelayMs * 1.5, POLL_DELAY_MAX_MS);
+  pollTimer = setTimeout(loadPlayers, pollDelayMs);
+}}
+
+function tryRecoverViaLobby() {{
+  window.location.href = '/lobbylist';
+}}
+
+function loadPlayers() {{
+  fetchWithTimeout('/checkin_players', {{}}, 6000).then(function(r) {{
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ setConnState('reconnecting'); tryRecoverViaLobby(); }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    if (r.status === 502) {{
+      consecutiveFailures++;
+      setConnState('reconnecting');
+      if (consecutiveFailures >= 5) {{ tryRecoverViaLobby(); }}
+      throw new Error('proxy_unreachable');
+    }}
+    if (!r.ok) {{ throw new Error('http_' + r.status); }}
+    return r.json();
+  }}).then(function(data) {{
+    if (!Array.isArray(data)) {{ throw new Error('format_inattendu'); }}
+    consecutiveFailures = 0;
+    setConnState('ok');
+    var sig = JSON.stringify(data);
+    if (sig !== lastSignature) {{
+      lastSignature = sig;
+      players = data;
+      renderList();
+    }}
+    scheduleNextPoll(true);
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{ return; }}
+    consecutiveFailures++;
+    if (connState !== 'lost') {{
+      setConnState(consecutiveFailures >= 2 ? 'lost' : 'reconnecting');
+    }}
+    scheduleNextPoll(false);
+  }});
+}}
+
+function updateCounters() {{
+  var arrived = players.filter(function(p) {{ return !!p.arrived_at; }}).length;
+  document.getElementById('counters').textContent = arrived + ' arrivé' + (arrived > 1 ? 's' : '') + ' / ' + players.length + ' inscrit' + (players.length > 1 ? 's' : '');
+}}
+
+// Harmonisation Mac/iPhone (modification du 2026-09-30) : MÊME priorité
+// qu'App._accueil_status_label côté Mac — absence déclarée d'abord
+// ("Absent"), puis arrivée confirmée ("Actif"), sinon "Pré-inscrit".
+// `p.absent`/`p.arrived_at` proviennent tous deux de App._refresh_
+// remote_checkin_cache, jamais recalculés ici.
+function checkinStatusInfo(p) {{
+  if (p.absent) return {{ text: 'Absent', cls: 'status-absent' }};
+  if (p.arrived_at) return {{ text: 'Actif', cls: 'status-actif' }};
+  return {{ text: 'Pré-inscrit', cls: 'status-preinscrit' }};
+}}
+
+function renderList() {{
+  updateCounters();
+  var list = document.getElementById('checkin-list');
+  list.innerHTML = '';
+  var term = searchTerm.trim().toLowerCase();
+  var filtered = term
+    ? players.filter(function(p) {{ return p.name.toLowerCase().indexOf(term) !== -1; }})
+    : players;
+  if (filtered.length === 0) {{
+    list.innerHTML = '<div id="empty">' + (players.length === 0 ? 'Aucun joueur inscrit.' : 'Aucun résultat.') + '</div>';
+    return;
+  }}
+  var sorted = filtered.slice().sort(function(a, b) {{
+    return a.name.localeCompare(b.name, 'fr', {{sensitivity: 'base'}});
+  }});
+  sorted.forEach(function(p) {{
+    var row = document.createElement('div');
+    row.className = 'checkin-row' + (p.arrived_at ? ' arrived' : '') + (p.absent ? ' absent' : '');
+    var info = document.createElement('div');
+    info.className = 'info';
+    var nameEl = document.createElement('div');
+    nameEl.className = 'name';
+    nameEl.textContent = (p.arrived_at ? '✓ ' : '') + p.name;
+    info.appendChild(nameEl);
+    var sub = document.createElement('div');
+    sub.className = 'sub';
+    var place = p.table ? (p.table + ', siège ' + (p.seat || '—')) : 'Pas encore placé';
+    sub.textContent = p.club ? (p.club + ' — ' + place) : place;
+    info.appendChild(sub);
+    // Statut explicite (modification du 2026-09-30) : TOUJOURS affiché,
+    // que l'accueil soit ouvert ou clôturé (voir plus bas) — remplace
+    // l'ancien simple tiret affiché une fois clôturé, jamais réduit à un
+    // ✓ implicite dans le nom.
+    var statusInfo = checkinStatusInfo(p);
+    var statusEl = document.createElement('div');
+    statusEl.className = 'status ' + statusInfo.cls;
+    statusEl.textContent = statusInfo.text;
+    info.appendChild(statusEl);
+    row.appendChild(info);
+    // Lot 2 : accueil clôturé (délai des retardataires dépassé) — la
+    // ligne reste affichée (liste conservée EN CONSULTATION, cahier des
+    // charges section 6) mais Confirmer/Annuler disparaissent, remplacés
+    // par une simple icône de verrou (le statut lui-même est déjà
+    // affiché ci-dessus, dans TOUS les cas). Purement cosmétique : la
+    // vraie protection est déjà refaite côté serveur/base de données
+    // pour CHAQUE requête (voir Database.confirm_arrival/cancel_arrival),
+    // jamais seulement ici — un onglet déjà ouvert avant l'échéance ne
+    // peut donc rien contourner même s'il n'a pas encore vu accueilClosed
+    // passer à true.
+    // Modification du 2026-09-30 ("accueil : correction des erreurs
+    // réservée au Mac") : plus AUCUN bouton "Annuler" sur cette page —
+    // une fois "Actif" (p.arrived_at posé), le statut ci-dessus reste
+    // seul affiché, sans rien d'autre. Corriger une confirmation faite
+    // par erreur redevient un geste DIRTO, réservé au bouton "Corriger
+    // l'arrivée" de l'onglet Joueurs sur le Mac (voir App._correct_
+    // arrival_selected) — la vraie protection reste de toute façon
+    // refaite côté serveur pour CHAQUE requête (voir App._remote_
+    // cancel_arrival, qui refuse désormais INCONDITIONNELLEMENT
+    // l'annulation d'un joueur déjà "Actif"), jamais seulement ce
+    // masquage.
+    //
+    // Modification du 2026-10-01 ("accueil iPhone : remplacer Confirmer
+    // par Inscrit") : dès qu'un joueur est "Actif" (p.arrived_at posé),
+    // la mention "Inscrit" occupe désormais cet emplacement — qu'il
+    // vienne tout juste d'être confirmé (loadPlayers() après confirm
+    // Arrival rappelle renderList) ou qu'il soit déjà accueilli à
+    // l'ouverture/l'actualisation de la page (premier chargement via
+    // loadPlayers ci-dessus, même chemin). PRIORITAIRE sur accueilClosed :
+    // un joueur déjà arrivé n'a plus rien à faire, "Inscrit" est donc
+    // plus parlant que le verrou générique, qui reste réservé aux
+    // joueurs encore Pré-inscrit/Absent une fois le délai dépassé
+    // (mécanisme des retardataires INCHANGÉ, voir pollAbsenceState).
+    // Le statut "Actif" ci-dessus (checkinStatusInfo) n'est pas touché ;
+    // aucun bouton "Annuler" n'est réintroduit ici.
+    if (p.arrived_at) {{
+      var doneLabel = document.createElement('span');
+      doneLabel.className = 'inscrit-label';
+      doneLabel.textContent = 'Inscrit';
+      row.appendChild(doneLabel);
+    }} else if (accueilClosed) {{
+      var closedLabel = document.createElement('span');
+      closedLabel.className = 'closed-label';
+      closedLabel.textContent = '🔒';
+      row.appendChild(closedLabel);
+    }} else {{
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn-confirm';
+      btn.textContent = 'Confirmer';
+      btn.addEventListener('click', function() {{ confirmArrival(p.id); }});
+      row.appendChild(btn);
+    }}
+    list.appendChild(row);
+  }});
+}}
+
+function pollAbsenceState() {{
+  fetchWithTimeout('/absence_state', {{}}, 6000).then(function(r) {{
+    if (!r.ok) throw new Error('http_' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    var wasClosed = accueilClosed;
+    accueilClosed = !!data.deadline_passed;
+    document.getElementById('closed-banner').style.display = accueilClosed ? 'block' : 'none';
+    if (accueilClosed !== wasClosed) {{ renderList(); }}
+  }}).catch(function() {{ /* réseau momentanément indisponible : retentera au prochain sondage */ }});
+}}
+pollAbsenceState();
+setInterval(pollAbsenceState, 3000);
+
+function confirmArrival(playerId) {{
+  fetchWithTimeout('/confirm_arrival', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{player_id: playerId}}),
+  }}, 8000).then(function(r) {{
+    if (r.status === 409) {{
+      return r.json().then(function(data) {{
+        if (data && data.tournament_gone) {{ setConnState('reconnecting'); tryRecoverViaLobby(); }}
+        throw new Error('tournament_gone');
+      }});
+    }}
+    if (!r.ok) throw new Error('erreur ' + r.status);
+    return r.json();
+  }}).then(function(data) {{
+    if (!data.ok) {{
+      window.alert(data.message || 'Confirmation refusée.');
+      return;
+    }}
+    lastSignature = null;
+    loadPlayers();
+  }}).catch(function(e) {{
+    if (e && e.message === 'auth_required') {{ setConnState('lost'); return; }}
+    if (e && e.message === 'tournament_gone') {{ return; }}
+    window.alert(
+      'Échec : ' + (e && e.message ? e.message : 'réseau') + ' — vérifiez le wifi.\\n'
+      + 'Vous pouvez retenter sans risque : cette confirmation n\\'a aucun effet en double.'
+    );
+  }});
+}}
+
+// cancelArrival() a été retirée le 2026-09-30 ("accueil : correction
+// des erreurs réservée au Mac") : plus aucun bouton "Annuler" sur cette
+// page (voir renderList ci-dessus) — une confirmation faite par erreur
+// se corrige désormais exclusivement depuis le Mac ("Corriger
+// l'arrivée", onglet Joueurs, geste DIRTO). La route serveur /cancel_
+// arrival reste en place (utilisée par la case à cocher du Mac avant le
+// démarrage) mais refuse désormais INCONDITIONNELLEMENT toute requête
+// visant un joueur déjà "Actif" (voir App._remote_cancel_arrival) —
+// même si cette fonction JS avait subsisté ou qu'un appel direct était
+// tenté, le serveur refuserait de toute façon.
+
+document.getElementById('search-input').addEventListener('input', function(e) {{
+  searchTerm = e.target.value;
+  renderList();
+}});
+
+loadPlayers();
 {reload_script}
 </script>
 {rebalance_widget}
@@ -2792,6 +3829,19 @@ class RemoteControlServer:
       confirm_move a déjà déclenché le même mécanisme de fin que le
       bouton "Mouvements terminés" (_finish_movement_alert), jamais une
       fin réimplémentée à part.
+    - `get_checkin_players()` (Lot 1, "Accueil des joueurs", 2026-09-27) :
+      renvoie la liste de TOUS les joueurs actifs du tournoi (pré-inscrits,
+      pas seulement ceux déjà arrivés — voir page "Accueil des joueurs")
+      — liste de dicts {id, name, club, table, seat, arrived_at}, tenue à
+      jour depuis le thread principal (voir App._refresh_remote_checkin_
+      cache), jamais lue/écrite depuis ce thread-ci.
+    - `on_confirm_arrival(player_id)` / `on_cancel_arrival(player_id)` :
+      confirmation/annulation de l'arrivée d'un joueur pré-inscrit (page
+      "Accueil des joueurs") — même principe que on_confirm_move : ne
+      fait que déposer la demande dans la file d'attente thread-safe
+      (voir App._remote_confirm_arrival_request/_remote_cancel_arrival_
+      request), ce thread ne touche JAMAIS self.db ni Tkinter directement.
+      Renvoie {"ok": bool, "message": str}.
     - `get_dirto_permissions(dirto_name)` (Phase 4, "Sécurisation du
       Contrôle à distance", 2026-09-20) : renvoie l'ensemble (frozenset)
       des clés REMOTE_PERMISSION_* accordées à `dirto_name` POUR CE
@@ -2812,6 +3862,10 @@ class RemoteControlServer:
                  get_pending_rebalance=None, on_rebalance_answer=None,
                  on_end_tournament=None, get_has_pending_moves=None,
                  get_pending_moves=None, on_confirm_move=None,
+                 get_checkin_players=None, on_confirm_arrival=None, on_cancel_arrival=None,
+                 get_accueil_management_enabled=None,
+                 get_absence_deadline_passed=None, on_declare_absence=None,
+                 on_cancel_absence=None, on_withdraw_absent_player=None,
                  get_dirto_permissions=None, get_tournament_path=None,
                  port=DEFAULT_PORT):
         self.on_word = on_word
@@ -2854,6 +3908,38 @@ class RemoteControlServer:
         self.on_end_tournament = on_end_tournament or (lambda: None)
         self.get_pending_moves = get_pending_moves or (lambda: [])
         self.on_confirm_move = on_confirm_move or (lambda move_id: {"ok": True, "all_done": False})
+        # Lot 1, "Accueil des joueurs" (2026-09-27) : même principe que
+        # get_pending_moves/on_confirm_move ci-dessus.
+        self.get_checkin_players = get_checkin_players or (lambda: [])
+        self.on_confirm_arrival = on_confirm_arrival or (lambda player_id: {"ok": True, "message": ""})
+        self.on_cancel_arrival = on_cancel_arrival or (lambda player_id: {"ok": True, "message": ""})
+        # "Gestion de l'accueil" (modification du 2026-09-29, réservée
+        # aux tournois Open) : True/False propre à CE tournoi (voir
+        # Database.accueil_management_enabled, jamais recalculé ici).
+        # Gouverne, CÔTÉ SERVEUR (pas seulement l'affichage des boutons) :
+        # la visibilité du bouton "Accueil" sur la page d'accueil du
+        # contrôle à distance (pour TOUS les rôles, y compris ADMIN — voir
+        # do_GET, page "/"), la visibilité du bouton "Abs/Dés" sur la page
+        # Éliminations (voir _ELIMINATE_PAGE), et le refus explicite des
+        # routes /checkin, /checkin.html, /checkin_players, /confirm_
+        # arrival, /cancel_arrival, /declare_absence, /cancel_absence et
+        # /withdraw_absent_player lorsqu'elle est désactivée. Par défaut
+        # (paramètre non fourni, ex. anciens tests) : toujours False,
+        # jamais activée implicitement.
+        self.get_accueil_management_enabled = get_accueil_management_enabled or (lambda: False)
+        # Lot 2, "Gestion des absences et des retardataires" (2026-09-28) :
+        # get_absence_deadline_passed() renvoie l'état RÉEL (voir Database.
+        # absence_deadline_passed, jamais recalculé ici) — sondé par les
+        # pages Éliminations et Accueil (voir /absence_state). on_declare_
+        # absence/on_cancel_absence/on_withdraw_absent_player suivent
+        # exactement le même principe que on_confirm_arrival/on_cancel_
+        # arrival ci-dessus : ne font que déposer la demande dans la file
+        # d'attente thread-safe, ce thread ne touche JAMAIS self.db ni
+        # Tkinter directement.
+        self.get_absence_deadline_passed = get_absence_deadline_passed or (lambda: False)
+        self.on_declare_absence = on_declare_absence or (lambda player_id: {"ok": True, "message": ""})
+        self.on_cancel_absence = on_cancel_absence or (lambda player_id: {"ok": True, "message": ""})
+        self.on_withdraw_absent_player = on_withdraw_absent_player or (lambda player_id: {"ok": True, "message": ""})
         # Permissions DIRTO (Phase 4, "Sécurisation du Contrôle à
         # distance", 2026-09-20) : dirto_name -> frozenset de clés
         # REMOTE_PERMISSION_* accordées à CE DIRTO pour CE tournoi,
@@ -2887,6 +3973,14 @@ class RemoteControlServer:
         on_end_tournament = self.on_end_tournament
         get_pending_moves = self.get_pending_moves
         on_confirm_move = self.on_confirm_move
+        get_checkin_players = self.get_checkin_players
+        on_confirm_arrival = self.on_confirm_arrival
+        on_cancel_arrival = self.on_cancel_arrival
+        get_accueil_management_enabled = self.get_accueil_management_enabled
+        get_absence_deadline_passed = self.get_absence_deadline_passed
+        on_declare_absence = self.on_declare_absence
+        on_cancel_absence = self.on_cancel_absence
+        on_withdraw_absent_player = self.on_withdraw_absent_player
         get_dirto_permissions = self.get_dirto_permissions
         get_tournament_path = self.get_tournament_path
         own_pid = os.getpid()
@@ -3109,6 +4203,27 @@ class RemoteControlServer:
                 else:
                     self._send_json({"ok": False, "message": _NO_PERMISSION_MESSAGE}, status=403)
 
+            def _send_accueil_disabled(self, method, path, role, is_page=False):
+                """Refus explicite d'une route d'accueil/absence lorsque
+                « Gestion de l'accueil » est désactivée pour ce tournoi
+                (modification du 2026-09-29) — même mécanique que
+                _send_permission_denied ci-dessus (jamais un simple
+                masquage HTML, journalisé de la même façon), mais un
+                message dédié : ce n'est pas un problème de permission
+                DIRTO (voir _ACCUEIL_DISABLED_MESSAGE), un ADMIN obtient
+                ce même refus."""
+                log_remote_event(
+                    "permission_denied", method=method, path=path, role=role,
+                    port=self.server.server_port,
+                )
+                if is_page:
+                    self._send_html(
+                        _FORBIDDEN_PAGE.format(message=_ACCUEIL_DISABLED_MESSAGE),
+                        status=403,
+                    )
+                else:
+                    self._send_json({"ok": False, "message": _ACCUEIL_DISABLED_MESSAGE}, status=403)
+
             def _client_ip(self):
                 return self.client_address[0]
 
@@ -3139,6 +4254,45 @@ class RemoteControlServer:
                 browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
                 token = _parse_cookie(self.headers.get("Cookie", ""), _AUTH_COOKIE_NAME)
                 return open_windows.verify_device_session(browser_id, token)
+
+            def _own_phone_short_id(self):
+                """Identifiant permanent (short_id, 6 caractères hex) du
+                téléphone qui a émis CETTE requête précise — résolu à
+                partir du browser_id de SON cookie (jamais owner_name,
+                jamais un autre appareil), via open_windows.get_remote_
+                device_short_id, seul endroit qui sait lire le registre.
+                None si injoignable (cookie absent/forgé, appareil non
+                approuvé — ne devrait pas arriver sur une route déjà
+                protégée par _is_authenticated, mais jamais supposé).
+
+                Factorisé ici (demande du 2026-10-01, "affichage
+                permanent de l'identifiant iPhone") pour que TOUTE page
+                qui affiche le nom du tournoi (voir _tournament_display_
+                name ci-dessous) ET /lobbylist (voir _handle_lobbylist)
+                partagent le MÊME calcul — jamais deux implémentations
+                séparées du même "quel est mon identifiant"."""
+                browser_id = _parse_cookie(self.headers.get("Cookie", ""), _BROWSER_ID_COOKIE_NAME)
+                return open_windows.get_remote_device_short_id(browser_id)
+
+            def _tournament_display_name(self, name):
+                """Nom du tournoi tel qu'affiché dans la barre de titre de
+                CHAQUE page (demande du 2026-10-01, "affichage permanent
+                de l'identifiant iPhone") : le nom échappé, suivi de
+                " — IDENTIFIANT" si ce téléphone a un short_id résolvable
+                (voir _own_phone_short_id ci-dessus) — identique à ce qui
+                est déjà affiché dans /lobbylist (même source) ET dans
+                l'onglet CA du Mac (voir open_windows.get_remote_device_
+                short_id/main.py, _refresh_remote_devices_panel).
+
+                Remplace, dans le paramètre `tournament_name` de CHAQUE
+                page, l'ancien appel direct à _escape_html(get_name())
+                — jamais tournament_name_json
+                (comparaison de noms réels en JS, voir confirmEndTournament
+                dans _PAGE_TEMPLATE), qui doit rester le nom pur, sans
+                identifiant ajouté."""
+                short_id = self._own_phone_short_id()
+                suffix = f" — {short_id}" if short_id else ""
+                return _escape_html(name) + suffix
 
             def _handle_login(self):
                 browser_id, is_new = self._browser_id()
@@ -3235,6 +4389,31 @@ class RemoteControlServer:
                             f"SameSite=Lax; Max-Age={_AUTH_COOKIE_MAX_AGE}",
                         ))
                 self._send_json({"status": status}, extra_headers=extra_headers or None)
+
+            def _handle_apple_touch_icon(self):
+                """GET /apple-touch-icon.png — mode Web App iPhone
+                (2026-10-03) : sert l'icône statique _APPLE_TOUCH_ICON_PNG
+                (déjà décodée une seule fois à l'import, voir sa
+                définition). Aucune authentification, aucune permission,
+                aucun état propre à un appareil/tournoi — identique quel
+                que soit l'appelant, même principe que /photo_image pour
+                la réponse binaire (Content-Type/Content-Length, voir
+                do_GET)."""
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(_APPLE_TOUCH_ICON_PNG)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.end_headers()
+                self.wfile.write(_APPLE_TOUCH_ICON_PNG)
+
+            def _handle_manifest_json(self):
+                """GET /manifest.json — mode Web App iPhone (2026-10-03) :
+                sert le manifest statique _MANIFEST_JSON tel quel, sans
+                authentification (même raison que /apple-touch-icon.png
+                ci-dessus) — réutilise _send_json (même aide que toutes
+                les autres réponses JSON de ce fichier), jamais une
+                sérialisation dupliquée."""
+                self._send_json(_MANIFEST_JSON)
 
             def _proxy(self, target_port):
                 """Relaie telle quelle la requête en cours vers le VRAI
@@ -3351,11 +4530,25 @@ class RemoteControlServer:
                     current_pid = resolve_current_pid(
                         self.headers.get("Cookie", ""), own_pid, tournaments
                     )
+                    # Identifiant du téléphone (demande du 2026-10-01,
+                    # "afficher l'identifiant du téléphone sur l'iPhone",
+                    # puis "affichage permanent") : _tournament_display_
+                    # name réutilise _own_phone_short_id, lui-même basé
+                    # sur le browser_id du COOKIE DE CETTE REQUÊTE précise
+                    # (jamais owner_name, jamais un autre appareil) —
+                    # MÊME calcul que sur toutes les autres pages (/,
+                    # /eliminate, /photos, /moves, /checkin), jamais une
+                    # seconde implémentation ici. Même valeur pour CHAQUE
+                    # tournoi de la liste (un seul téléphone consulte ce
+                    # lobby), identique au short_id affiché en permanence
+                    # dans l'onglet CA du Mac — pur affichage, aucune
+                    # incidence sur les autorisations, jamais le code
+                    # secret de connexion.
                     parts = []
                     for t in sorted(tournaments, key=lambda x: x["name"].lower()):
                         is_self = t["pid"] == current_pid
                         css_class = " class=\"current\"" if is_self else ""
-                        label = _escape_html(t["name"]) + (" (celui-ci)" if is_self else "")
+                        label = self._tournament_display_name(t["name"]) + (" (celui-ci)" if is_self else "")
                         parts.append(
                             f'<button{css_class} '
                             f'onclick="window.location.href=\'/select_tournament?pid={t["pid"]}\'">{label}</button>'
@@ -3418,6 +4611,18 @@ class RemoteControlServer:
                 if path == "/auth_status":
                     self._handle_auth_status()
                     return
+                # Mode Web App iPhone (2026-10-03) : icône et manifest,
+                # ressources statiques pures (voir leur définition en
+                # tête de ce fichier) — jamais une action, jamais une
+                # donnée propre à un appareil/tournoi, donc traitées ici
+                # au même niveau que /login/auth_status, avant toute
+                # vérification d'authentification.
+                if path == "/apple-touch-icon.png":
+                    self._handle_apple_touch_icon()
+                    return
+                if path == "/manifest.json":
+                    self._handle_manifest_json()
+                    return
                 if path not in _AUTH_EXEMPT_PATHS and not self._is_authenticated():
                     if path in _AUTH_PAGE_PATHS:
                         self.send_response(302)
@@ -3463,7 +4668,7 @@ class RemoteControlServer:
                     # présentations différentes pour un même résultat.
                     if role == "NONE" or (role == "DIRTO" and not permissions):
                         self._send_html(_NO_ACCESS_PAGE.format(
-                            tournament_name=_escape_html(get_name()),
+                            tournament_name=self._tournament_display_name(get_name()),
                             message=_NO_PERMISSION_MESSAGE,
                             reload_script=_RELOAD_SCRIPT,
                             auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
@@ -3475,7 +4680,7 @@ class RemoteControlServer:
                         if len(tournaments) > 1 else ""
                     )
                     page_html = _PAGE_TEMPLATE.format(
-                        tournament_name=_escape_html(get_name()),
+                        tournament_name=self._tournament_display_name(get_name()),
                         # tournament_name_json : même nom que ci-dessus,
                         # mais échappé pour être injecté tel quel comme
                         # littéral JS (voir confirmEndTournament) — celui
@@ -3499,8 +4704,24 @@ class RemoteControlServer:
                     # sections) : /end_tournament refuse de toute façon
                     # tout appelant non-ADMIN, y compris un appel direct.
                     page_html = _strip_admin_only_sections(page_html, is_admin=(role == "ADMIN"))
+                    # « Gestion de l'accueil » (modification du
+                    # 2026-09-29) : le bouton "🙋 Accueil des joueurs" ne
+                    # doit apparaître pour PERSONNE — y compris ADMIN, qui
+                    # échappe normalement entièrement à _strip_permission_
+                    # sections ci-dessous — lorsqu'elle est désactivée
+                    # pour ce tournoi (réservée aux tournois Open). Retirer
+                    # _PERM_CHECKIN de l'ensemble de permissions utilisé
+                    # pour le nettoyage suffit : pour ADMIN, `permissions`
+                    # vaut _ALL_PERMISSIONS, donc `effective_permissions`
+                    # ne perd QUE cette section, aucune autre.
+                    effective_permissions = (
+                        permissions if get_accueil_management_enabled()
+                        else permissions - {_PERM_CHECKIN}
+                    )
                     if role == "DIRTO":
-                        page_html = _strip_permission_sections(page_html, permissions)
+                        page_html = _strip_permission_sections(page_html, effective_permissions)
+                    elif role == "ADMIN" and not get_accueil_management_enabled():
+                        page_html = _strip_permission_sections(page_html, effective_permissions)
                     self._send_html(page_html)
                     return
 
@@ -3514,31 +4735,72 @@ class RemoteControlServer:
                         return
                 elif path in _GET_ROUTE_PERMISSION:
                     if _GET_ROUTE_PERMISSION[path] not in permissions:
-                        is_page = path in ("/eliminate", "/eliminate.html", "/photos", "/photos.html", "/moves", "/moves.html")
+                        is_page = path in (
+                            "/eliminate", "/eliminate.html", "/photos", "/photos.html",
+                            "/moves", "/moves.html", "/checkin", "/checkin.html",
+                        )
                         self._send_permission_denied("GET", path, role, is_page=is_page)
+                        return
+                    if (
+                        path in ("/checkin", "/checkin.html", "/checkin_players")
+                        and not get_accueil_management_enabled()
+                    ):
+                        # Interdiction CÔTÉ SERVEUR (cahier des charges,
+                        # section 4 : "masquer les boutons ne suffit pas")
+                        # — jamais seulement le masquage du bouton
+                        # "Accueil" de la page d'accueil (voir do_GET,
+                        # page "/"), qui pourrait rester joignable par une
+                        # URL directe/un marque-page.
+                        self._send_accueil_disabled(
+                            "GET", path, role, is_page=path in ("/checkin", "/checkin.html")
+                        )
                         return
                 elif path == "/clock_state":
                     if not (permissions & _CLOCK_STATE_PERMISSIONS):
                         self._send_permission_denied("GET", path, role)
                         return
+                elif path == "/absence_state":
+                    if not (permissions & _ABSENCE_STATE_PERMISSIONS):
+                        self._send_permission_denied("GET", path, role)
+                        return
 
                 if path in ("/eliminate", "/eliminate.html"):
+                    # "🚩 Abs/Dés" (Lot 2) : présent uniquement si
+                    # « Gestion de l'accueil » est activée pour ce
+                    # tournoi (modification du 2026-09-29, réservée aux
+                    # tournois Open) — même principe que {lobby_button}
+                    # ci-dessus pour "🏛 Lobby" : un simple placeholder de
+                    # format calculé ICI, jamais un marqueur PERM à
+                    # nettoyer après coup (ce bouton ne dépend d'aucune
+                    # permission DIRTO, seulement de ce réglage).
+                    abs_des_button = (
+                        '<button id="btn-abs-des" data-target="true">🚩 Abs/Dés</button>'
+                        if get_accueil_management_enabled() else ""
+                    )
                     self._send_html(_ELIMINATE_PAGE.format(
-                        tournament_name=_escape_html(get_name()),
+                        tournament_name=self._tournament_display_name(get_name()),
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
                         auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
+                        abs_des_button=abs_des_button,
                     ))
                 elif path in ("/photos", "/photos.html"):
                     self._send_html(_PHOTOS_PAGE.format(
-                        tournament_name=_escape_html(get_name()),
+                        tournament_name=self._tournament_display_name(get_name()),
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
                         auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
                     ))
                 elif path in ("/moves", "/moves.html"):
                     self._send_html(_MOVES_PAGE.format(
-                        tournament_name=_escape_html(get_name()),
+                        tournament_name=self._tournament_display_name(get_name()),
+                        reload_script=_RELOAD_SCRIPT,
+                        rebalance_widget=_REBALANCE_WIDGET,
+                        auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
+                    ))
+                elif path in ("/checkin", "/checkin.html"):
+                    self._send_html(_CHECKIN_PAGE.format(
+                        tournament_name=self._tournament_display_name(get_name()),
                         reload_script=_RELOAD_SCRIPT,
                         rebalance_widget=_REBALANCE_WIDGET,
                         auth_redirect_script=_AUTH_REDIRECT_SCRIPT,
@@ -3552,6 +4814,13 @@ class RemoteControlServer:
                     # principal (voir get_pending_moves), jamais self.db
                     # touché depuis ce thread-ci.
                     self._send_json(get_pending_moves())
+                elif path == "/checkin_players":
+                    # Joueurs pré-inscrits pour l'accueil (Lot 1) — même
+                    # principe que /players/moves_pending : simple lecture
+                    # d'un cache tenu à jour par le thread principal (voir
+                    # get_checkin_players), jamais self.db touché depuis
+                    # ce thread-ci.
+                    self._send_json(get_checkin_players())
                 elif path == "/roster_players":
                     self._send_json(get_roster_players())
                 elif path == "/photo_image":
@@ -3592,6 +4861,20 @@ class RemoteControlServer:
                     self._send_json({
                         "paused": bool(get_clock_paused()),
                         "has_pending_moves": bool(get_has_pending_moves()),
+                    })
+                elif path == "/absence_state":
+                    # Lot 2, "Gestion des absences et des retardataires"
+                    # (2026-09-28) : sondé par la page "Gestion des
+                    # éliminations" (clignotement/alerte sonore/
+                    # éligibilité à la désactivation) ET par la page
+                    # "Accueil des joueurs" (griser confirmer/annuler une
+                    # fois clôturé) — un seul indicateur partagé, jamais
+                    # dupliqué (voir Database.absence_deadline_passed,
+                    # SEULE source de vérité, la même que celle qui refuse
+                    # réellement /confirm_arrival et /cancel_arrival côté
+                    # base de données).
+                    self._send_json({
+                        "deadline_passed": bool(get_absence_deadline_passed()),
                     })
                 elif path == "/permission_state":
                     # Sondage léger (Phase 4bis, "synchronisation
@@ -3798,6 +5081,191 @@ class RemoteControlServer:
                         self, role, _PERM_MOVES, "confirm_move",
                         action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
                         player_name=moved_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
+                    self._send_json(result)
+                elif path == "/confirm_arrival":
+                    # Confirmation de l'arrivée d'un joueur pré-inscrit
+                    # (Lot 1, page "Accueil des joueurs") — même principe
+                    # que /confirm_move ci-dessus : dépose la demande dans
+                    # la file d'attente thread-safe (voir on_confirm_
+                    # arrival/App._remote_confirm_arrival_request), ce
+                    # thread ne touche jamais self.db. Idempotent par
+                    # nature (simple horodatage, voir Database.confirm_
+                    # arrival) : jamais besoin d'un request_id de
+                    # dédoublonnage.
+                    if _PERM_CHECKIN not in permissions:
+                        log_action_event(self, role, _PERM_CHECKIN, "confirm_arrival", action_log.RESULT_DENIED)
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    if not get_accueil_management_enabled():
+                        # Interdiction CÔTÉ SERVEUR (modification du
+                        # 2026-09-29, cahier des charges section 4) — voir
+                        # aussi On_confirm_arrival/App._remote_confirm_
+                        # arrival, qui refuse de toute façon (défense en
+                        # profondeur), mais un refus immédiat ici évite
+                        # l'aller-retour vers le thread Tk pour un cas déjà
+                        # connu d'avance.
+                        log_action_event(self, role, _PERM_CHECKIN, "confirm_arrival", action_log.RESULT_DENIED)
+                        self._send_accueil_disabled("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        player_id = int(data["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    arriving_player_name = next(
+                        (p["name"] for p in get_checkin_players() if p["id"] == player_id), None
+                    )
+                    result = on_confirm_arrival(player_id)
+                    log_action_event(
+                        self, role, _PERM_CHECKIN, "confirm_arrival",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=arriving_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
+                    self._send_json(result)
+                elif path == "/cancel_arrival":
+                    # Annulation d'une confirmation d'arrivée faite par
+                    # erreur (Lot 1) — même principe que /confirm_arrival
+                    # ci-dessus.
+                    if _PERM_CHECKIN not in permissions:
+                        log_action_event(self, role, _PERM_CHECKIN, "cancel_arrival", action_log.RESULT_DENIED)
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    if not get_accueil_management_enabled():
+                        log_action_event(self, role, _PERM_CHECKIN, "cancel_arrival", action_log.RESULT_DENIED)
+                        self._send_accueil_disabled("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        player_id = int(data["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    cancelling_player_name = next(
+                        (p["name"] for p in get_checkin_players() if p["id"] == player_id), None
+                    )
+                    result = on_cancel_arrival(player_id)
+                    log_action_event(
+                        self, role, _PERM_CHECKIN, "cancel_arrival",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=cancelling_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
+                    self._send_json(result)
+                elif path == "/declare_absence":
+                    # Signale un joueur absent (Lot 2, bouton/glissement
+                    # "Abs/Dés" de la page "Gestion des éliminations") —
+                    # même principe que /confirm_arrival : dépose la
+                    # demande dans la file d'attente thread-safe, ce
+                    # thread ne touche jamais self.db. Idempotent par
+                    # nature (simple horodatage, voir Database.declare_
+                    # absent) : jamais besoin d'un request_id de
+                    # dédoublonnage, ni de confirmation préalable côté
+                    # client (signaler une absence est une action légère,
+                    # réversible via "Annuler l'absence" — seule la
+                    # DÉSACTIVATION finale, /withdraw_absent_player
+                    # ci-dessous, exige une confirmation explicite).
+                    if _PERM_ELIMINATIONS not in permissions:
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "declare_absence", action_log.RESULT_DENIED)
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    if not get_accueil_management_enabled():
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "declare_absence", action_log.RESULT_DENIED)
+                        self._send_accueil_disabled("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        player_id = int(data["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    absent_player_name = next(
+                        (p["name"] for p in get_players() if p["id"] == player_id), None
+                    )
+                    result = on_declare_absence(player_id)
+                    log_action_event(
+                        self, role, _PERM_ELIMINATIONS, "declare_absence",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=absent_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
+                    self._send_json(result)
+                elif path == "/cancel_absence":
+                    # "Annuler l'absence" (Lot 2, touche un joueur déjà
+                    # signalé absent sur la page "Gestion des
+                    # éliminations") — même principe que /cancel_arrival.
+                    if _PERM_ELIMINATIONS not in permissions:
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "cancel_absence", action_log.RESULT_DENIED)
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    if not get_accueil_management_enabled():
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "cancel_absence", action_log.RESULT_DENIED)
+                        self._send_accueil_disabled("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        player_id = int(data["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    cancelling_absence_player_name = next(
+                        (p["name"] for p in get_players() if p["id"] == player_id), None
+                    )
+                    result = on_cancel_absence(player_id)
+                    log_action_event(
+                        self, role, _PERM_ELIMINATIONS, "cancel_absence",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=cancelling_absence_player_name,
+                        message=None if result.get("ok") else result.get("message"),
+                    )
+                    self._send_json(result)
+                elif path == "/withdraw_absent_player":
+                    # Désactivation finale d'un joueur signalé absent, une
+                    # fois le délai dépassé (Lot 2, cahier des charges
+                    # section 5) — EXIGE une confirmation explicite côté
+                    # client (window.confirm, voir _ELIMINATE_PAGE) avant
+                    # même l'envoi de cette requête, précaution demandée
+                    # explicitement le 2026-09-28 ; le serveur ne la
+                    # redemande pas mais reste la SEULE autorité réelle
+                    # sur l'éligibilité (voir App._remote_withdraw_absent_
+                    # player, qui revérifie absence_deadline_passed()
+                    # avant d'agir — jamais une confiance aveugle envers
+                    # le client).
+                    if _PERM_ELIMINATIONS not in permissions:
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "withdraw_absent_player", action_log.RESULT_DENIED)
+                        self._send_permission_denied("POST", path, role)
+                        return
+                    if not get_accueil_management_enabled():
+                        log_action_event(self, role, _PERM_ELIMINATIONS, "withdraw_absent_player", action_log.RESULT_DENIED)
+                        self._send_accueil_disabled("POST", path, role)
+                        return
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                    raw = self.rfile.read(length) if length else b"{}"
+                    try:
+                        data = json.loads(raw.decode("utf-8"))
+                        player_id = int(data["player_id"])
+                    except (ValueError, KeyError, TypeError):
+                        self.send_error(400, "Requête invalide")
+                        return
+                    withdrawn_absent_player_name = next(
+                        (p["name"] for p in get_players() if p["id"] == player_id), None
+                    )
+                    result = on_withdraw_absent_player(player_id)
+                    log_action_event(
+                        self, role, _PERM_ELIMINATIONS, "withdraw_absent_player",
+                        action_log.RESULT_SUCCESS if result.get("ok") else action_log.RESULT_ERROR,
+                        player_name=withdrawn_absent_player_name,
                         message=None if result.get("ok") else result.get("message"),
                     )
                     self._send_json(result)

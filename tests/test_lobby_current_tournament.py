@@ -175,10 +175,20 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
             {"pid": self.own_pid + 2000, "port": 40002, "name": "tournoi18", "registered_at": 3},
         ]
 
+    # Modification du 2026-10-01 ("afficher l'identifiant du téléphone
+    # sur l'iPhone") : chaque libellé porte désormais aussi l'identifiant
+    # du téléphone connecté ("tournoi18 — 6CE1D5 (celui-ci)"), jamais
+    # prévisible à l'avance (6CE1D5 dépend de l'appareil approuvé par
+    # authenticated_jar, régénéré à chaque test) — ces assertions
+    # utilisent donc un motif plutôt qu'une sous-chaîne figée, mais
+    # vérifient toujours la même chose qu'avant ce chantier : QUEL
+    # tournoi porte "(celui-ci)".
+    _CURRENT_RE = r" — [0-9A-F]{6} \(celui-ci\)"
+
     def test_lobbylist_marque_le_plus_recent_pas_le_routeur(self):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
             html = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
-        self.assertIn("tournoi18 (celui-ci)", html)
+        self.assertRegex(html, "tournoi18" + self._CURRENT_RE)
         self.assertNotIn("tournoi20 (celui-ci)", html)
         self.assertNotIn("tournoi19 (celui-ci)", html)
 
@@ -190,7 +200,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
             html1 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
             html2 = _get_text(f"http://127.0.0.1:{self.test_port}/lobbylist", jar=self.jar)
         self.assertEqual(html1, html2)
-        self.assertIn("tournoi18 (celui-ci)", html2)
+        self.assertRegex(html2, "tournoi18" + self._CURRENT_RE)
 
     def test_selected_pid_mort_est_invalide_proprement(self):
         dead_pid = self.own_pid + 9999  # absent de self.live : "fermé"
@@ -199,7 +209,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
                 f"http://127.0.0.1:{self.test_port}/lobbylist",
                 jar=self.jar, extra_cookie=f"selected_pid={dead_pid}",
             )
-        self.assertIn("tournoi18 (celui-ci)", html)
+        self.assertRegex(html, "tournoi18" + self._CURRENT_RE)
 
     def test_selection_explicite_valide_est_respectee(self):
         with patch.object(remote_control.open_windows, "list_remote_tournaments", return_value=self.live):
@@ -207,7 +217,7 @@ class LobbyListMarksCorrectTournamentTest(unittest.TestCase):
                 f"http://127.0.0.1:{self.test_port}/lobbylist",
                 jar=self.jar, extra_cookie=f"selected_pid={self.own_pid + 1000}",  # tournoi19
             )
-        self.assertIn("tournoi19 (celui-ci)", html)
+        self.assertRegex(html, "tournoi19" + self._CURRENT_RE)
         self.assertNotIn("tournoi18 (celui-ci)", html)
 
 

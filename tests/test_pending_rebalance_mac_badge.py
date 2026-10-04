@@ -135,6 +135,7 @@ class PendingRebalanceMacBadgeTest(unittest.TestCase):
         self.win._refresh_all = MagicMock()
         self.win._refresh_remote_players_cache = MagicMock()
         self.win._refresh_remote_moves_cache = MagicMock()
+        self.win._refresh_remote_checkin_cache = MagicMock()
         self.win._trigger_movement_alert = MagicMock()
         self.win._finish_movement_alert = MagicMock()
 

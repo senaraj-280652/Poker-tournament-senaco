@@ -201,10 +201,10 @@ class RosterTreeColumnsTest(unittest.TestCase):
         prefs_patcher.start()
 
         self.roster_tree = ttk.Treeview(
-            self.root, columns=("name", "club", "group", "phone", "mail"), show="tree headings",
+            self.root, columns=("name", "club", "group", "phone", "mail", "pseudo"), show="tree headings",
         )
         for col, label in (("name", "Nom"), ("club", "Club"), ("group", "Groupe"),
-                           ("phone", "Téléphone"), ("mail", "Mail")):
+                           ("phone", "Téléphone"), ("mail", "Mail"), ("pseudo", "Pseudo")):
             self.roster_tree.heading(col, text=label)
 
         self.club_summary_tree = ttk.Treeview(self.root, columns=("club", "count"), show="headings")

@@ -211,7 +211,7 @@ def log_action(tournament_name, tournament_path, role, category, action, result,
 # ailleurs dans l'application (voir database.REMOTE_PERMISSION_LABELS),
 # pas l'ordre des chaînes techniques. list_categories() ci-dessous ne
 # retourne QUE celles réellement présentes en base, dans cet ordre.
-_CATEGORY_ORDER = ["eliminations", "moves", "clock", "levels", "photos", "rebalance", "admin_only"]
+_CATEGORY_ORDER = ["eliminations", "moves", "clock", "levels", "photos", "rebalance", "checkin", "admin_only"]
 
 CATEGORY_LABELS = {
     "eliminations": "Éliminations",
@@ -220,10 +220,11 @@ CATEGORY_LABELS = {
     "levels": "Niveaux",
     "photos": "Photos",
     "rebalance": "Rééquilibrage",
+    "checkin": "Accueil des joueurs",
     "admin_only": "Administration",
 }
 
-# Les 12 valeurs d'"action" réellement écrites par remote_control.py —
+# Les valeurs d'"action" réellement écrites par remote_control.py —
 # libellés français lisibles pour la colonne "Action" du tableau LOG
 # (jamais les clés techniques brutes, demande explicite du 2026-09-24).
 ACTION_LABELS = {
@@ -239,6 +240,11 @@ ACTION_LABELS = {
     "upload_photo": "Photo ajoutée",
     "delete_photo": "Photo supprimée",
     "rebalance_answer": "Réponse au rééquilibrage (UTG)",
+    "confirm_arrival": "Arrivée confirmée",
+    "cancel_arrival": "Arrivée annulée",
+    "declare_absence": "Absence signalée",
+    "cancel_absence": "Absence annulée",
+    "withdraw_absent_player": "Absent désactivé",
 }
 
 # "NONE" (appareil approuvé mais jamais lié à un propriétaire) affiché

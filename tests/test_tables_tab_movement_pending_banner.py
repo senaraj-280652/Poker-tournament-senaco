@@ -128,6 +128,7 @@ class TablesTabMovementPendingTest(unittest.TestCase):
         self.win._check_pending_rebalance = lambda: None
         self.win._refresh_remote_players_cache = lambda: None
         self.win._refresh_remote_moves_cache = lambda: None
+        self.win._refresh_remote_checkin_cache = lambda: None
 
         self.win._build_tables_tab = types.MethodType(main.App._build_tables_tab, self.win)
         self.win._refresh_tables_tab = types.MethodType(main.App._refresh_tables_tab, self.win)

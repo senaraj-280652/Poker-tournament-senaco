@@ -110,6 +110,12 @@ class TickNeverStopsSchedulingTest(unittest.TestCase):
         # no-op que les autres lignes de ce bloc.
         self.win._update_undo_elimination_button_state = lambda: None
         self.win._refresh_remote_players_cache = lambda: None
+        # Lot 2, "Gestion des absences et des retardataires" (2026-09-28) :
+        # _tick appelle désormais aussi ceci INCONDITIONNELLEMENT (voir sa
+        # docstring) — même principe de doublure no-op que les autres
+        # lignes de ce bloc, sans rapport avec ce que teste ce fichier
+        # (robustesse de la boucle _tick face à une exception).
+        self.win._maybe_play_absence_deadline_alert = lambda: None
         self.win._maybe_reclaim_default_remote_port = lambda: None
         self.win._check_pending_rebalance = lambda: None
         self.win._check_phone_selected_pid = lambda: None

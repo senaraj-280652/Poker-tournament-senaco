@@ -5,11 +5,19 @@ Stocké dans le dossier personnel de l'utilisateur (~/.poker_tournament/roster.j
 afin d'être disponible quel que soit l'endroit où l'application est lancée
 et quel que soit le fichier .tournoi ouvert.
 
-Chaque entrée est un dict {"name", "club", "group", "phone", "mail"} (tous
-les champs sauf "name" peuvent être des chaînes vides si inconnus/non
-renseignés). Les anciens fichiers roster.json (simple liste de chaînes,
-ou dicts {"name", "club"} d'avant le 2026-09-20) sont migrés
-automatiquement à la lecture, sans club/groupe/téléphone/mail.
+Chaque entrée est un dict {"name", "club", "group", "phone", "mail",
+"pseudo"} (tous les champs sauf "name" peuvent être des chaînes vides si
+inconnus/non renseignés). Les anciens fichiers roster.json (simple liste
+de chaînes, ou dicts {"name", "club"} d'avant le 2026-09-20) sont migrés
+automatiquement à la lecture, sans club/groupe/téléphone/mail/pseudo.
+
+"pseudo" (demande du 2026-10-03, "ajouter la colonne Pseudo au
+Répertoire") : surnom éventuel d'une personne du Répertoire, purement
+informatif — n'affecte ni les permissions ni aucune autre logique.
+Propagé une seule fois vers la table `players` d'un tournoi à l'ajout du
+joueur (voir Database.add_player), exactement comme "club" l'est déjà —
+jamais une seconde source de vérité, jamais relu en direct depuis le
+Répertoire une fois le joueur ajouté à un tournoi.
 
 "group" (demande du 2026-09-20, chantier "Sécurisation du Contrôle à
 distance") : identifie qui, parmi les personnes du Répertoire, peut être
@@ -54,9 +62,9 @@ def _normalize_group(value):
     return value if value in ROSTER_GROUPS else ""
 
 def load_roster_entries():
-    """Liste de dicts {"name", "club", "group", "phone", "mail"}, triée
-    par nom (insensible à la casse). Migre automatiquement l'ancien
-    format (liste de chaînes, ou dicts sans group/phone/mail)."""
+    """Liste de dicts {"name", "club", "group", "phone", "mail", "pseudo"},
+    triée par nom (insensible à la casse). Migre automatiquement l'ancien
+    format (liste de chaînes, ou dicts sans group/phone/mail/pseudo)."""
     path = _roster_path()
     if not os.path.exists(path):
         return []
@@ -71,13 +79,14 @@ def load_roster_entries():
     by_name = {}
     for item in data:
         if isinstance(item, str):
-            name, club, group, phone, mail = item.strip(), "", "", "", ""
+            name, club, group, phone, mail, pseudo = item.strip(), "", "", "", "", ""
         elif isinstance(item, dict):
             name = str(item.get("name", "")).strip()
             club = str(item.get("club", "") or "").strip()
             group = _normalize_group(item.get("group", ""))
             phone = str(item.get("phone", "") or "").strip()
             mail = str(item.get("mail", "") or "").strip()
+            pseudo = str(item.get("pseudo", "") or "").strip()
         else:
             continue
         if not name:
@@ -95,10 +104,12 @@ def load_roster_entries():
                 existing["phone"] = phone
             if not existing["mail"] and mail:
                 existing["mail"] = mail
+            if not existing["pseudo"] and pseudo:
+                existing["pseudo"] = pseudo
         else:
             by_name[name] = {
                 "name": name, "club": club, "group": group,
-                "phone": phone, "mail": mail,
+                "phone": phone, "mail": mail, "pseudo": pseudo,
             }
     return sorted(by_name.values(), key=lambda e: e["name"].lower())
 
@@ -115,6 +126,7 @@ def save_roster_entries(entries):
             "group": _normalize_group(e.get("group", "")),
             "phone": str(e.get("phone", "") or "").strip(),
             "mail": str(e.get("mail", "") or "").strip(),
+            "pseudo": str(e.get("pseudo", "") or "").strip(),
         }
     cleaned = sorted(by_name.values(), key=lambda e: e["name"].lower())
     with open(path, "w", encoding="utf-8") as f:
@@ -132,7 +144,7 @@ def save_roster(names):
     existing = {e["name"]: e for e in load_roster_entries()}
     cleaned = sorted({str(n).strip() for n in names if str(n).strip()}, key=str.lower)
     save_roster_entries([
-        existing.get(n, {"name": n, "club": "", "group": "", "phone": "", "mail": ""})
+        existing.get(n, {"name": n, "club": "", "group": "", "phone": "", "mail": "", "pseudo": ""})
         for n in cleaned
     ])
 
@@ -161,7 +173,7 @@ def set_club(name, club):
             e["club"] = club
             save_roster_entries(entries)
             return
-    entries.append({"name": name, "club": club, "group": "", "phone": "", "mail": ""})
+    entries.append({"name": name, "club": club, "group": "", "phone": "", "mail": "", "pseudo": ""})
     save_roster_entries(entries)
 
 def get_group(name):
@@ -188,7 +200,7 @@ def set_group(name, group):
             e["group"] = group
             save_roster_entries(entries)
             return
-    entries.append({"name": name, "club": "", "group": group, "phone": "", "mail": ""})
+    entries.append({"name": name, "club": "", "group": group, "phone": "", "mail": "", "pseudo": ""})
     save_roster_entries(entries)
 
 def get_phone(name):
@@ -211,7 +223,7 @@ def set_phone(name, phone):
             e["phone"] = phone
             save_roster_entries(entries)
             return
-    entries.append({"name": name, "club": "", "group": "", "phone": phone, "mail": ""})
+    entries.append({"name": name, "club": "", "group": "", "phone": phone, "mail": "", "pseudo": ""})
     save_roster_entries(entries)
 
 def get_mail(name):
@@ -234,11 +246,34 @@ def set_mail(name, mail):
             e["mail"] = mail
             save_roster_entries(entries)
             return
-    entries.append({"name": name, "club": "", "group": "", "phone": "", "mail": mail})
+    entries.append({"name": name, "club": "", "group": "", "phone": "", "mail": mail, "pseudo": ""})
+    save_roster_entries(entries)
+
+def get_pseudo(name):
+    name = name.strip()
+    for e in load_roster_entries():
+        if e["name"] == name:
+            return e["pseudo"]
+    return ""
+
+def set_pseudo(name, pseudo):
+    """Définit (ou efface, si pseudo vide) le pseudo d'une personne du
+    répertoire, en la créant si besoin."""
+    name = name.strip()
+    if not name:
+        return
+    pseudo = (pseudo or "").strip()
+    entries = load_roster_entries()
+    for e in entries:
+        if e["name"] == name:
+            e["pseudo"] = pseudo
+            save_roster_entries(entries)
+            return
+    entries.append({"name": name, "club": "", "group": "", "phone": "", "mail": "", "pseudo": pseudo})
     save_roster_entries(entries)
 
 def list_by_group(group):
-    """Entrées complètes ({"name", "club", "group", "phone", "mail"})
+    """Entrées complètes ({"name", "club", "group", "phone", "mail", "pseudo"})
     dont le groupe est exactement `group` ("ADMIN" ou "DIRTO"), triées
     par nom — pour peupler les futurs sélecteurs "AUTORISÉ PAR"/
     "UTILISATEUR AUTORISÉ" du Contrôle à distance (chantiers suivants).
@@ -253,9 +288,10 @@ def add_to_roster(name, club=None):
     """Ajoute `name` au répertoire s'il n'y est pas déjà. Si `club` est
     fourni (non None), le club est enregistré/mis à jour même si le
     joueur existait déjà ; sinon le club existant est conservé tel quel.
-    Ne touche jamais group/phone/mail (voir set_group/set_phone/
-    set_mail dédiés) — une personne nouvellement créée ici démarre donc
-    toujours "non classée", exactement comme une ancienne fiche."""
+    Ne touche jamais group/phone/mail/pseudo (voir set_group/set_phone/
+    set_mail/set_pseudo dédiés) — une personne nouvellement créée ici
+    démarre donc toujours "non classée", exactement comme une ancienne
+    fiche."""
     name = name.strip()
     if not name:
         return
@@ -266,7 +302,7 @@ def add_to_roster(name, club=None):
                 e["club"] = club.strip()
                 save_roster_entries(entries)
             return
-    entries.append({"name": name, "club": (club or "").strip(), "group": "", "phone": "", "mail": ""})
+    entries.append({"name": name, "club": (club or "").strip(), "group": "", "phone": "", "mail": "", "pseudo": ""})
     save_roster_entries(entries)
 
 def remove_from_roster(name):
@@ -276,26 +312,27 @@ def remove_from_roster(name):
         save_roster_entries(filtered)
 
 def rename_in_roster(old_name, new_name):
-    """Renomme une entrée en conservant son club/groupe/téléphone/mail.
-    Si `new_name` existe déjà, ses deux entrées fusionnent (pour chaque
-    champ, la valeur non vide de l'ancien nom l'emporte, sinon celle du
-    nom cible est conservée)."""
+    """Renomme une entrée en conservant son club/groupe/téléphone/mail/
+    pseudo. Si `new_name` existe déjà, ses deux entrées fusionnent (pour
+    chaque champ, la valeur non vide de l'ancien nom l'emporte, sinon
+    celle du nom cible est conservée)."""
     old_name = old_name.strip()
     new_name = new_name.strip()
     if not new_name:
         return
     entries = load_roster_entries()
     old_entry = next((e for e in entries if e["name"] == old_name), None)
-    old_entry = old_entry or {"club": "", "group": "", "phone": "", "mail": ""}
+    old_entry = old_entry or {"club": "", "group": "", "phone": "", "mail": "", "pseudo": ""}
     entries = [e for e in entries if e["name"] not in (old_name, new_name)]
     existing_new = next((e for e in load_roster_entries() if e["name"] == new_name), None)
-    existing_new = existing_new or {"club": "", "group": "", "phone": "", "mail": ""}
+    existing_new = existing_new or {"club": "", "group": "", "phone": "", "mail": "", "pseudo": ""}
     merged = {
         "name": new_name,
         "club": old_entry["club"] or existing_new["club"],
         "group": old_entry["group"] or existing_new["group"],
         "phone": old_entry["phone"] or existing_new["phone"],
         "mail": old_entry["mail"] or existing_new["mail"],
+        "pseudo": old_entry["pseudo"] or existing_new["pseudo"],
     }
     entries.append(merged)
     save_roster_entries(entries)

@@ -19,6 +19,11 @@ def _render(template):
         reload_script="",
         rebalance_widget="",
         auth_redirect_script="",
+        # Placeholder ajouté le 2026-09-29 pour le bouton "🚩 Abs/Dés"
+        # conditionnel (« Gestion de l'accueil ») — sans effet sur
+        # _PHOTOS_PAGE, qui ne le référence pas (str.format ignore les
+        # kwargs inutilisés).
+        abs_des_button="",
     )
 
 

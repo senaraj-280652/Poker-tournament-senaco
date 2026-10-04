@@ -152,6 +152,13 @@ class _StubWindow:
         # (verrou "Menu principal"), donc un simple no-op ici.
         pass
 
+    def _cancel_players_absent_blink(self):
+        # Même principe que _cancel_tables_blink ci-dessus (Lot 2,
+        # "Gestion des absences et des retardataires", 2026-09-28) :
+        # appelé inconditionnellement par _cleanup_for_close, sans rapport
+        # avec ce que teste ce fichier.
+        pass
+
 
 @unittest.skipUnless(hasattr(main.App, "_acquire_menu_principal_lock_if_needed"), "méthode absente")
 class AcquireMenuPrincipalLockTest(unittest.TestCase):

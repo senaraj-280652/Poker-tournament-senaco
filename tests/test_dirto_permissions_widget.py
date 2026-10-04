@@ -113,20 +113,25 @@ class DirtoPermissionsWidgetTest(unittest.TestCase):
 
 
 class ListeDesPermissionsTest(DirtoPermissionsWidgetTest):
-    def test_les_7_permissions_attendues_sont_presentes(self):
+    def test_les_8_permissions_attendues_sont_presentes(self):
+        """8 permissions depuis le Lot 1 ("Accueil des joueurs", cahier
+        des charges du 2026-09-27), qui ajoute "checkin" ("Permission
+        spécifique") aux 7 permissions historiques."""
         self.assertEqual(
             set(self.win.remote_dirto_permission_vars.keys()),
-            {"eliminations", "tables", "moves", "clock", "levels", "photos", "rebalance"},
+            {"eliminations", "tables", "moves", "clock", "levels", "photos", "rebalance", "checkin"},
         )
 
-    def test_les_7_cases_sont_reparties_sur_deux_sous_frames_alignees(self):
+    def test_les_8_cases_sont_reparties_sur_deux_sous_frames_alignees(self):
         """Demande du 2026-09-24 ("réorganisation Permissions DIRTO"),
         mise à jour le 2026-09-25 (alignement précis avec les Combobox
-        du dessus, voir _build_remote_dirto_permissions_widgets) : les 7
+        du dessus, voir _build_remote_dirto_permissions_widgets) : les
         cases passent de 1 à 2 colonnes, pour réduire la hauteur
         occupée — mais CHAQUE sous-colonne reste PARFAITEMENT alignée
         (héritage direct de la demande du 2026-09-22 : la longueur du
-        texte ne doit jamais déplacer une case).
+        texte ne doit jamais déplacer une case). Depuis le Lot 1
+        (2026-09-27, ajout de "checkin"), la répartition est 4/4 (elle
+        était 4/3 avec 7 permissions).
 
         Depuis le 2026-09-25, gauche et droite sont deux VRAIES
         sous-frames INDÉPENDANTES (plus une grille à 4 colonnes
@@ -136,10 +141,10 @@ class ListeDesPermissionsTest(DirtoPermissionsWidgetTest):
         colonne de grille qui ne distingue donc plus gauche/droite à
         elle seule. Vérifié ici via l'APPARTENANCE à la sous-frame
         (`.master`), jamais le numéro de colonne brut : 2 sous-frames
-        distinctes, 4 cases dans l'une, 3 dans l'autre — jamais le
-        texte dans le Checkbutton lui-même."""
+        distinctes, 4 cases dans chacune — jamais le texte dans le
+        Checkbutton lui-même."""
         checkbuttons = self._all_checkbuttons()
-        self.assertEqual(len(checkbuttons), 7)
+        self.assertEqual(len(checkbuttons), 8)
         for cb in checkbuttons:
             self.assertEqual(cb.cget("text"), "", "le Checkbutton ne doit plus porter son propre texte")
             self.assertEqual(int(cb.grid_info()["column"]), 0, "colonne LOCALE à sa propre sous-frame")
@@ -147,18 +152,18 @@ class ListeDesPermissionsTest(DirtoPermissionsWidgetTest):
         groups = {}
         for cb in checkbuttons:
             groups.setdefault(cb.master, []).append(cb)
-        self.assertEqual(len(groups), 2, "les 7 cases doivent se répartir sur exactement 2 sous-frames")
-        self.assertEqual(sorted(len(v) for v in groups.values()), [3, 4])
+        self.assertEqual(len(groups), 2, "les 8 cases doivent se répartir sur exactement 2 sous-frames")
+        self.assertEqual(sorted(len(v) for v in groups.values()), [4, 4])
 
-        # Les 7 libellés de permission précisément (pas les autres
+        # Les 8 libellés de permission précisément (pas les autres
         # Label du formulaire, ex. "Autorisé par (ADMIN) :") : identifiés
-        # par leur texte, qui doit correspondre exactement aux 7 valeurs
+        # par leur texte, qui doit correspondre exactement aux 8 valeurs
         # de REMOTE_PERMISSION_LABELS — chacun colonne 1 LOCALE à SA
         # sous-frame, et son .master doit être exactement celui de la
         # case juste à sa gauche sur la même ligne (row identique).
         permission_texts = set(database.REMOTE_PERMISSION_LABELS.values())
         permission_labels = [w for w in self._all_labels() if str(w.cget("text")) in permission_texts]
-        self.assertEqual(len(permission_labels), 7)
+        self.assertEqual(len(permission_labels), 8)
         for lbl in permission_labels:
             self.assertEqual(int(lbl.grid_info()["column"]), 1)
             self.assertIn(lbl.master, groups, "le libellé doit être dans l'une des 2 sous-frames des cases")
@@ -166,15 +171,17 @@ class ListeDesPermissionsTest(DirtoPermissionsWidgetTest):
     def test_changer_de_niveau_ouvre_la_sous_frame_de_droite(self):
         """Demande explicite : "Changer de niveau (blindes)" doit être
         placé À DROITE de "Gérer les éliminations", en tête (row=0) de
-        la sous-frame de DROITE — laquelle est la sous-frame la MOINS
-        peuplée (3 cases, contre 4 pour celle de "Gérer les
-        éliminations"/"Plan de tables"/"Afficher Mouvements"/
-        "Chronomètre")."""
+        la sous-frame de DROITE — identifiée ici par son GESTIONNAIRE de
+        géométrie (place, voir _build_remote_dirto_permissions_widgets :
+        right_checks.place(...) contre left_checks.grid(...)), jamais
+        par un nombre de cases qui devient égal (4/4) depuis le Lot 1
+        (2026-09-27, ajout de "checkin") et ne distingue donc plus les
+        deux sous-frames à lui seul."""
         checkbuttons = self._all_checkbuttons()
         groups = {}
         for cb in checkbuttons:
             groups.setdefault(cb.master, []).append(cb)
-        right_frame = next(master for master, cbs in groups.items() if len(cbs) == 3)
+        right_frame = next(master for master in groups if master.winfo_manager() == "place")
 
         levels_label = next(
             w for w in self._all_labels()
@@ -229,8 +236,9 @@ class ListeDesPermissionsTest(DirtoPermissionsWidgetTest):
         _walk(self.container)
         return result
 
-    def test_7_cases_a_cocher_exactement(self):
-        self.assertEqual(len(self._all_checkbuttons()), 7)
+    def test_8_cases_a_cocher_exactement(self):
+        """8 depuis le Lot 1 (2026-09-27, ajout de "checkin") — 7 avant."""
+        self.assertEqual(len(self._all_checkbuttons()), 8)
 
 
 class ComboboxAdminDirtoTest(DirtoPermissionsWidgetTest):

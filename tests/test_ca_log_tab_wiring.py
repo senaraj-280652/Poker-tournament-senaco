@@ -245,6 +245,9 @@ class CaTabRealBuildTest(unittest.TestCase):
             "_on_grant_remote_dirto_permissions",
             "_on_revoke_remote_dirto_permissions",
             "_on_remote_control_toggle",
+            "_refresh_personal_remote_code_status",
+            "_on_set_personal_remote_code",
+            "_on_clear_personal_remote_code",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
         # @staticmethod sur App : déjà des fonctions "nues" une fois

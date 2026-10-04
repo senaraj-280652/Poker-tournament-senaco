@@ -29,6 +29,7 @@ fichier).
 """
 import contextlib
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -1013,6 +1014,54 @@ def _bring_to_front_windows(pid):
 # ni journalisé nulle part.
 _REMOTE_TEST_CODE = "131261"
 
+# Code personnel permanent (demande du 2026-10-01, "onglet CA : code
+# personnel permanent") : TROISIÈME possibilité acceptée par verify_
+# remote_code, EN PLUS du code de session et du code de test ci-dessus
+# — jamais à la place. Contrairement à _REMOTE_TEST_CODE (non
+# confidentiel par construction), celui-ci est CHOISI par l'utilisateur
+# et doit rester confidentiel : jamais écrit en clair, y compris sur
+# disque — seul un sel + un hachage salé (PBKDF2-HMAC-SHA256,
+# bibliothèque standard) sont stockés, dans remote_control_personal_
+# code.json (voir set_personal_remote_code/_verify_personal_remote_
+# code ci-dessous). Fichier à PART des trois autres fichiers du module
+# (voir commentaire d'en-tête) : persistant comme remote_control_
+# devices.json (JAMAIS effacé par _clear_remote_control_session_files —
+# un code personnel doit survivre à la fin de toute session, c'est son
+# unique raison d'être), mais sans rapport avec l'approbation des
+# appareils (fichier 1) ni les jetons de session (fichier 2).
+_PERSONAL_CODE_PBKDF2_ITERATIONS = 200_000
+
+# Code personnel PAR DÉFAUT (demande du 2026-10-02, "sécurisation du
+# code personnel permanent", étendue le 2026-10-03, "code personnel par
+# défaut") — double rôle, UNIQUEMENT tant qu'aucun code personnalisé
+# n'est encore configuré (voir _personal_code_matches, seul endroit qui
+# le compare, réutilisé par verify_remote_code ET verify_personal_code_
+# change_authorization) :
+#   1. connecter un téléphone (comme s'il s'agissait du code personnel
+#      lui-même) ;
+#   2. autoriser la création du TOUT PREMIER code personnalisé.
+# POINT DE SÉCURITÉ explicitement demandé : ne doit JAMAIS réussir, pour
+# AUCUN de ces deux usages, une fois un code personnalisé configuré —
+# jamais une porte dérobée permanente capable de le remplacer ni de
+# connecter un téléphone à sa place. Contrairement à _REMOTE_TEST_CODE
+# (toujours accepté, par conception, quel que soit l'état du code
+# personnel), celui-ci cesse ENTIÈREMENT de fonctionner dès qu'un code
+# personnalisé existe.
+_PERSONAL_CODE_INITIAL = "280652"
+
+# Anti-bruteforce LOCAL (demande du 2026-10-02) : protège À LA FOIS la
+# vérification du code personnel courant (changement/suppression) ET
+# celle du code initial ci-dessus (première création) — un seul et même
+# compteur pour les deux, car ce sont les deux seuls secrets qui gardent
+# ce fichier. Une seule "clé" (pas de browser_id/IP comme pour le
+# contrôle à distance ci-dessous : ce contrôle est purement LOCAL,
+# jamais exposé au réseau) — mêmes seuil/escalade que l'anti-bruteforce
+# réseau, pour la cohérence, mais une implémentation séparée (fichier
+# différent, pas de notion d'IP).
+_PERSONAL_CODE_FAIL_THRESHOLD = 5
+_PERSONAL_CODE_RATE_LIMIT_WINDOW_SECONDS = 60
+_PERSONAL_CODE_RATE_LIMIT_DURATIONS = (60, 300, 900)
+
 # Anti-bruteforce (demande du 2026-09-09) : seuils validés par
 # l'utilisateur. Navigateur = clé la plus précise (un identifiant par
 # appareil, voir remote_control.py) ; IP = clé de secours plus large
@@ -1057,6 +1106,12 @@ def _remote_devices_path():
     # Registre PERSISTANT (voir le commentaire d'en-tête ci-dessus) —
     # jamais listé dans _clear_remote_control_session_files.
     return os.path.join(_remote_control_dir(), "remote_control_devices.json")
+
+
+def _personal_remote_code_path():
+    # PERSISTANT, comme _remote_devices_path ci-dessus — voir le
+    # commentaire près de _PERSONAL_CODE_PBKDF2_ITERATIONS.
+    return os.path.join(_remote_control_dir(), "remote_control_personal_code.json")
 
 
 def _acquire_lock(fd, timeout):
@@ -1262,20 +1317,240 @@ def remote_session_token():
 
 def verify_remote_code(entered_code):
     """True si `entered_code` (chaîne quelconque venant du téléphone)
-    correspond au code de la session actuelle OU au code de test
-    permanent (demande du 2026-09-09, point 5 : accepté EN PLUS, jamais
-    À LA PLACE du code aléatoire — qui continue d'être généré à chaque
-    session normalement) — validation stricte : exactement 6 chiffres,
-    rien d'autre accepté même par coïncidence de formatage.
-    Comparaison en temps constant (secrets.compare_digest) : évite
-    qu'une différence de timing ne laisse deviner combien de chiffres de
-    tête sont déjà corrects."""
+    correspond au code de la session actuelle, au code de test permanent
+    (demande du 2026-09-09, point 5 : accepté EN PLUS, jamais À LA PLACE
+    du code aléatoire — qui continue d'être généré à chaque session
+    normalement), OU au code personnel EFFECTIF (voir _personal_code_
+    matches : le code personnalisé s'il existe, sinon le code par défaut
+    _PERSONAL_CODE_INITIAL — demande du 2026-10-03, "code personnel par
+    défaut") — validation stricte : exactement 6 chiffres, rien d'autre
+    accepté même par coïncidence de formatage. Comparaison en temps
+    constant (secrets.compare_digest) : évite qu'une différence de
+    timing ne laisse deviner combien de chiffres de tête sont déjà
+    corrects."""
     if not isinstance(entered_code, str) or not re.fullmatch(r"\d{6}", entered_code):
         return False
     if secrets.compare_digest(entered_code, _REMOTE_TEST_CODE):
         return True
+    if _personal_code_matches(entered_code):
+        return True
     session_code = remote_session_code()
     return session_code is not None and secrets.compare_digest(entered_code, session_code)
+
+
+def set_personal_remote_code(code):
+    """Définit (ou remplace) le code personnel permanent (demande du
+    2026-10-01) — UNIQUEMENT un sel + un hachage salé (PBKDF2-HMAC-
+    SHA256, 200 000 itérations) sont écrits dans remote_control_
+    personal_code.json, JAMAIS le code en clair (voir le commentaire
+    près de _PERSONAL_CODE_PBKDF2_ITERATIONS). Un nouvel appel remplace
+    entièrement l'ancien (un seul code personnel actif à la fois,
+    jamais un historique).
+
+    Lève ValueError (message sûr, sans jamais inclure le code lui-même)
+    si `code` n'est pas une chaîne d'exactement 6 chiffres — même
+    validation stricte que verify_remote_code, pour qu'un code
+    personnel mal formé ne puisse jamais être enregistré puis rejeté en
+    silence à chaque tentative de connexion.
+
+    Fonction d'ÉCRITURE PURE — ne vérifie elle-même AUCUNE autorisation
+    (demande du 2026-10-02, "sécurisation du code personnel permanent") :
+    c'est à l'appelant (voir verify_personal_code_change_authorization
+    et main.py, App._on_set_personal_remote_code) de s'assurer que le
+    code actuel (ou le code initial, si aucun n'est encore configuré) a
+    déjà été vérifié AVANT cet appel. Préserve l'état anti-bruteforce
+    existant du fichier (clé "ratelimit", voir plus bas) — jamais
+    réinitialisé silencieusement par un simple remplacement de code."""
+    if not isinstance(code, str) or not re.fullmatch(r"\d{6}", code):
+        raise ValueError("Le code personnel doit comporter exactement 6 chiffres.")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), salt, _PERSONAL_CODE_PBKDF2_ITERATIONS)
+    with _remote_control_lock():
+        existing = _read_json_or_empty(_personal_remote_code_path())
+        data = {
+            "salt": salt.hex(),
+            "hash": digest.hex(),
+            "iterations": _PERSONAL_CODE_PBKDF2_ITERATIONS,
+            "ratelimit": existing.get("ratelimit") or _fresh_personal_code_rate_limit_entry(),
+        }
+        try:
+            _atomic_write_json(_personal_remote_code_path(), data)
+        except OSError:
+            pass
+
+
+def clear_personal_remote_code():
+    """Supprime le code personnel permanent, s'il existe — le téléphone
+    devra ensuite utiliser le code de session (ou le code de test).
+
+    Fonction d'ÉCRITURE PURE — mêmes précautions que set_personal_
+    remote_code ci-dessus : aucune autorisation vérifiée ici, c'est à
+    l'appelant de l'avoir déjà fait. Supprime tout le fichier, y
+    compris l'état anti-bruteforce : sans conséquence, puisque cette
+    fonction n'est JAMAIS atteinte sans avoir d'abord réussi la
+    vérification du code actuel (voir verify_personal_code_change_
+    authorization), ce qui réinitialise déjà ce compteur (succès =
+    pardon total, même principe que record_remote_auth_success)."""
+    try:
+        os.remove(_personal_remote_code_path())
+    except OSError:
+        pass
+
+
+def has_personal_remote_code():
+    """True si un code personnel permanent est RÉELLEMENT défini — teste
+    la présence effective du sel/hachage, PAS seulement l'existence du
+    fichier (depuis le 2026-10-02, ce même fichier peut exister rien que
+    pour porter l'état anti-bruteforce — voir _record_personal_code_
+    attempt — avant même qu'un code ait été créé ; une simple vérification
+    d'existence redeviendrait alors incorrecte dès le premier échec de
+    saisie du code initial). Pour AFFICHAGE (onglet CA, indicateur actif/
+    non défini) ET pour la logique d'autorisation (verify_personal_code_
+    change_authorization) : ne révèle jamais le code lui-même, qui n'est
+    de toute façon jamais stocké en clair (voir set_personal_remote_
+    code)."""
+    data = _read_json_or_empty(_personal_remote_code_path())
+    return bool(data.get("salt")) and bool(data.get("hash"))
+
+
+def _verify_personal_remote_code(entered_code):
+    """Compare `entered_code` (déjà validé 6 chiffres par l'appelant,
+    voir verify_remote_code) au hachage salé stocké, en temps constant.
+    False si aucun code personnel n'est défini ou si le fichier est
+    corrompu/incomplet (jamais d'exception propagée vers l'appelant —
+    un fichier illisible équivaut simplement à "pas de code personnel
+    défini")."""
+    data = _read_json_or_empty(_personal_remote_code_path())
+    salt_hex, hash_hex, iterations = data.get("salt"), data.get("hash"), data.get("iterations")
+    if not salt_hex or not hash_hex or not isinstance(iterations, int):
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(hash_hex)
+    except ValueError:
+        return False
+    computed = hashlib.pbkdf2_hmac("sha256", entered_code.encode("utf-8"), salt, iterations)
+    return secrets.compare_digest(computed, expected)
+
+
+def _personal_code_matches(entered_code):
+    """Code personnel EFFECTIF (demande du 2026-10-03, "code personnel
+    par défaut") — factorisé ici pour être réutilisé SANS duplication par
+    verify_remote_code (connexion téléphone) ET verify_personal_code_
+    change_authorization (autorisation Mac de création/changement/
+    suppression, voir plus bas) : le code personnalisé s'il existe
+    (`has_personal_remote_code()` True), SINON le code par défaut
+    _PERSONAL_CODE_INITIAL.
+
+    Le code par défaut permet ainsi, tant qu'aucun code personnalisé
+    n'existe, à la fois de connecter un téléphone ET d'autoriser la
+    toute première personnalisation — un seul et même mécanisme pour les
+    deux usages. POINT DE SÉCURITÉ INCHANGÉ (déjà posé le 2026-10-02) :
+    dès qu'un code personnalisé est enregistré, il REMPLACE ENTIÈREMENT
+    le code par défaut, pour les DEUX usages — plus aucun repli sur
+    _PERSONAL_CODE_INITIAL une fois `has_personal_remote_code()` True,
+    jamais une porte dérobée permanente.
+
+    `entered_code` doit déjà être un format valide (6 chiffres) — chaque
+    appelant le vérifie avant cet appel, jamais ici."""
+    if has_personal_remote_code():
+        return _verify_personal_remote_code(entered_code)
+    return secrets.compare_digest(entered_code, _PERSONAL_CODE_INITIAL)
+
+
+def _fresh_personal_code_rate_limit_entry():
+    return {"window_start": 0.0, "fail_count": 0, "level": 0, "block_until": 0.0}
+
+
+def personal_code_rate_limit_status():
+    """(bloqué: bool, secondes_restantes: float) — anti-bruteforce LOCAL
+    (demande du 2026-10-02, "sécurisation du code personnel permanent")
+    protégeant la vérification du code personnel courant ET celle du
+    code initial (_PERSONAL_CODE_INITIAL) — un seul compteur pour les
+    deux. Lecture seule (sous verrou, pour ne jamais lire un état à
+    moitié écrit par un appel concurrent) — à appeler AVANT toute
+    saisie/comparaison (voir App._prompt_personal_code_authorization),
+    jamais après : même discipline que remote_auth_rate_limit_status
+    côté contrôle à distance réseau."""
+    with _remote_control_lock():
+        data = _read_json_or_empty(_personal_remote_code_path())
+    entry = data.get("ratelimit") or _fresh_personal_code_rate_limit_entry()
+    remaining = entry.get("block_until", 0.0) - time.time()
+    return (remaining > 0), max(remaining, 0.0)
+
+
+def _record_personal_code_attempt(success):
+    """Sous verrou : met à jour le compteur anti-bruteforce LOCAL, même
+    principe que _record_remote_auth_attempt (une seule clé ici, jamais
+    browser_id/IP). `success=True` réinitialise entièrement (compteur ET
+    niveau d'escalade) ; `success=False` incrémente la fenêtre glissante
+    (60s) et déclenche le blocage dès que le seuil (5) est atteint, avec
+    la durée d'escalade correspondante (1/5/15 min, plafond)."""
+    now = time.time()
+    with _remote_control_lock():
+        data = _read_json_or_empty(_personal_remote_code_path())
+        entry = dict(data.get("ratelimit") or _fresh_personal_code_rate_limit_entry())
+        if success:
+            entry = _fresh_personal_code_rate_limit_entry()
+        elif entry.get("block_until", 0.0) > now:
+            # Déjà bloqué : ne prolonge/ne recompte pas par-dessus (filet
+            # de sécurité seulement — personal_code_rate_limit_status
+            # doit déjà avoir refusé la tentative AVANT cet appel).
+            pass
+        else:
+            if now - entry.get("window_start", 0.0) > _PERSONAL_CODE_RATE_LIMIT_WINDOW_SECONDS:
+                entry["window_start"] = now
+                entry["fail_count"] = 0
+            entry["fail_count"] = entry.get("fail_count", 0) + 1
+            if entry["fail_count"] >= _PERSONAL_CODE_FAIL_THRESHOLD:
+                level = entry.get("level", 0)
+                duration = _PERSONAL_CODE_RATE_LIMIT_DURATIONS[
+                    min(level, len(_PERSONAL_CODE_RATE_LIMIT_DURATIONS) - 1)
+                ]
+                entry["block_until"] = now + duration
+                entry["level"] = level + 1
+                entry["fail_count"] = 0
+                entry["window_start"] = now
+        data["ratelimit"] = entry
+        try:
+            _atomic_write_json(_personal_remote_code_path(), data)
+        except OSError:
+            pass
+
+
+def verify_personal_code_change_authorization(entered_code):
+    """LE seul gardien (demande du 2026-10-02, "sécurisation du code
+    personnel permanent") avant toute création/changement/suppression du
+    code personnel — jamais contournable par un rôle ADMIN (ce module ne
+    connaît même pas cette notion : c'est précisément pour ça que ce
+    contrôle est indispensable, voir le diagnostic présenté avant
+    programmation).
+
+    - Si un code personnel est DÉJÀ configuré (has_personal_remote_code
+      () True) : `entered_code` doit être CE code personnel actuel.
+    - Sinon (aucun code encore configuré) : `entered_code` doit être
+      EXACTEMENT _PERSONAL_CODE_INITIAL — seule façon d'autoriser la
+      toute première création. POINT DE SÉCURITÉ explicitement demandé :
+      ce code initial ne réussit JAMAIS une fois qu'un code personnel
+      existe (voir _personal_code_matches, réutilisée ici SANS
+      duplication — même fonction que verify_remote_code, demande du
+      2026-10-03 "code personnel par défaut") — il ne peut donc jamais
+      devenir une porte dérobée permanente capable de remplacer un code
+      déjà configuré.
+
+    Chaque appel est compté par le MÊME anti-bruteforce local que
+    personal_code_rate_limit_status (à vérifier par l'appelant AVANT
+    toute saisie, jamais après) — succès ou échec, cette fonction
+    enregistre toujours le résultat. Comparaison en temps constant dans
+    les deux branches (secrets.compare_digest), jamais une simple
+    égalité Python. `entered_code` n'est jamais journalisé ni renvoyé
+    dans aucun message d'erreur."""
+    if not isinstance(entered_code, str) or not re.fullmatch(r"\d{6}", entered_code):
+        _record_personal_code_attempt(success=False)
+        return False
+    ok = _personal_code_matches(entered_code)
+    _record_personal_code_attempt(success=ok)
+    return ok
 
 
 def _new_short_id(existing_short_ids):
@@ -1462,6 +1737,26 @@ def get_device_auth_status(browser_id):
     if status == "revoked":
         return "refused"
     return "pending"
+
+
+def get_remote_device_short_id(browser_id):
+    """`short_id` (6 caractères hex majuscules, voir _new_short_id) de
+    l'appareil `browser_id`, UNIQUEMENT s'il est "approved" — None sinon
+    (appareil inconnu, en attente, révoqué, ou `browser_id` vide).
+    Demande du 2026-10-01 ("afficher l'identifiant du téléphone sur
+    l'iPhone") : destinée à être appelée avec le browser_id du cookie
+    de LA requête en cours (jamais un autre), pour que l'identifiant
+    renvoyé corresponde toujours au téléphone réellement connecté —
+    jamais au propriétaire (owner_name, non concerné ici) ni à un autre
+    appareil. Lecture seule, aucune incidence sur les autorisations."""
+    if not browser_id:
+        return None
+    with _remote_control_lock():
+        devices = _read_json_or_empty(_remote_devices_path())
+    entry = devices.get(browser_id)
+    if not entry or entry.get("status") != "approved":
+        return None
+    return entry.get("short_id") or None
 
 
 def approve_remote_device(browser_id, label=None):

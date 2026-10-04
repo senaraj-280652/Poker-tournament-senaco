@@ -140,6 +140,9 @@ class _FakeAppForEliminateSelected:
     def _refresh_remote_moves_cache(self):
         pass
 
+    def _refresh_remote_checkin_cache(self):
+        pass
+
     def _check_pending_rebalance(self):
         pass
 

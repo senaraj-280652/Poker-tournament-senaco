@@ -82,7 +82,7 @@ class ExportFormatTest(RosterCsvTestCase):
         self._run_export(export_path)
         with open(export_path, "r", encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f, delimiter=";"))
-        self.assertEqual(rows[0], ["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL"])
+        self.assertEqual(rows[0], ["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL", "PSEUDO"])
 
     def test_ligne_exportee_contient_les_5_valeurs(self):
         roster.add_to_roster("Alice", club="CPC")
@@ -93,7 +93,7 @@ class ExportFormatTest(RosterCsvTestCase):
         self._run_export(export_path)
         with open(export_path, "r", encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f, delimiter=";"))
-        self.assertIn(["Alice", "CPC", "ADMIN", "0102030405", "alice@cpc.fr"], rows)
+        self.assertIn(["Alice", "CPC", "ADMIN", "0102030405", "alice@cpc.fr", ""], rows)
 
     def test_personne_non_classee_exporte_des_cellules_vides(self):
         roster.add_to_roster("Bob")
@@ -101,7 +101,7 @@ class ExportFormatTest(RosterCsvTestCase):
         self._run_export(export_path)
         with open(export_path, "r", encoding="utf-8-sig", newline="") as f:
             rows = list(csv.reader(f, delimiter=";"))
-        self.assertIn(["Bob", "", "", "", ""], rows)
+        self.assertIn(["Bob", "", "", "", "", ""], rows)
 
     def test_telephone_a_zero_initial_ecrit_tel_quel_dans_le_fichier(self):
         """Vérifie le contenu BRUT du fichier (pas juste relu par le
@@ -289,15 +289,91 @@ class RoundTripExportPuisReimportTest(RosterCsvTestCase):
         entries = {e["name"]: e for e in roster.load_roster_entries()}
         self.assertEqual(entries["Alice"], {
             "name": "Alice", "club": "CPC", "group": "ADMIN",
-            "phone": "0102030405", "mail": "alice@cpc.fr",
+            "phone": "0102030405", "mail": "alice@cpc.fr", "pseudo": "",
         })
         self.assertEqual(entries["Bob"], {
             "name": "Bob", "club": "Autre Club", "group": "DIRTO",
-            "phone": "0607080910", "mail": "",
+            "phone": "0607080910", "mail": "", "pseudo": "",
         })
         self.assertEqual(entries["Chris"], {
-            "name": "Chris", "club": "", "group": "", "phone": "", "mail": "",
+            "name": "Chris", "club": "", "group": "", "phone": "", "mail": "", "pseudo": "",
         })
+
+
+# =====================================================================
+# PSEUDO (demande du 2026-10-03, "ajouter la colonne Pseudo au
+# Répertoire") : 6e colonne CSV, ajoutée à la suite de MAIL — mêmes
+# règles déjà vérifiées ci-dessus pour group/phone/mail (ancien CSV à
+# 5 colonnes ou moins toujours importable, cellule absente/vide ne
+# détruit jamais un pseudo déjà connu, aller-retour export/import sans
+# perte)."""
+class PseudoCsvColumnTest(RosterCsvTestCase):
+    def test_entete_6_colonnes_avec_pseudo(self):
+        roster.add_to_roster("Alice")
+        export_path = os.path.join(self._tmp.name, "out.csv")
+        self._run_export(export_path)
+        with open(export_path, "r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f, delimiter=";"))
+        self.assertEqual(rows[0], ["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL", "PSEUDO"])
+
+    def test_pseudo_exporte(self):
+        roster.add_to_roster("Alice")
+        roster.set_pseudo("Alice", "Toto")
+        export_path = os.path.join(self._tmp.name, "out.csv")
+        self._run_export(export_path)
+        with open(export_path, "r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.reader(f, delimiter=";"))
+        self.assertIn(["Alice", "", "", "", "", "Toto"], rows)
+
+    def test_ancien_csv_5_colonnes_toujours_importable_pseudo_vide(self):
+        _write_bytes(
+            self.csv_path,
+            "NOM;CLUB;GROUPE;TELEPHONE;MAIL\r\nAlice;CPC;ADMIN;;\r\n".encode("utf-8"),
+        )
+        mock_error, _ = self._run_import()
+        mock_error.assert_not_called()
+        self.assertEqual(roster.get_pseudo("Alice"), "")
+
+    def test_nouveau_csv_6_colonnes_pseudo_importe(self):
+        _write_bytes(
+            self.csv_path,
+            "NOM;CLUB;GROUPE;TELEPHONE;MAIL;PSEUDO\r\nAlice;CPC;;;;Toto\r\n".encode("utf-8"),
+        )
+        self._run_import()
+        self.assertEqual(roster.get_pseudo("Alice"), "Toto")
+
+    def test_cellule_pseudo_vide_ne_detruit_pas_lexistant(self):
+        roster.set_pseudo("Alice", "Toto")
+        _write_bytes(
+            self.csv_path,
+            "NOM;CLUB;GROUPE;TELEPHONE;MAIL;PSEUDO\r\nAlice;CPC;;;;\r\n".encode("utf-8"),
+        )
+        self._run_import()
+        self.assertEqual(roster.get_pseudo("Alice"), "Toto")  # préservé
+
+    def test_nouvelle_valeur_remplace_lancienne(self):
+        roster.set_pseudo("Alice", "Toto")
+        _write_bytes(
+            self.csv_path,
+            "NOM;CLUB;GROUPE;TELEPHONE;MAIL;PSEUDO\r\nAlice;CPC;;;;Tata\r\n".encode("utf-8"),
+        )
+        self._run_import()
+        self.assertEqual(roster.get_pseudo("Alice"), "Tata")
+
+    def test_aller_retour_export_puis_reimport_sans_perte(self):
+        roster.set_pseudo("Alice", "Toto")
+        export_path = os.path.join(self._tmp.name, "out.csv")
+        self._run_export(export_path)
+        roster.save_roster_entries([])
+        self.assertEqual(roster.load_roster_entries(), [])
+
+        with patch.object(main.filedialog, "askopenfilename", return_value=export_path), \
+             patch.object(main.simpledialog, "askstring", return_value="CPC"), \
+             patch.object(main.messagebox, "showerror") as mock_error, \
+             patch.object(main.messagebox, "showinfo"):
+            main.RosterManagerDialog._import_csv(self.dlg)
+        mock_error.assert_not_called()
+        self.assertEqual(roster.get_pseudo("Alice"), "Toto")
 
 
 if __name__ == "__main__":

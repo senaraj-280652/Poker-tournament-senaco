@@ -331,19 +331,21 @@ class RosterSelectsNewMemberTest(unittest.TestCase):
         self.addCleanup(prefs_patcher.stop)
         prefs_patcher.start()
 
-        # 5 colonnes (pas seulement name/club) : reflète le VRAI Treeview
+        # 6 colonnes (pas seulement name/club) : reflète le VRAI Treeview
         # de RosterManagerDialog.__init__ depuis le 2026-09-20 (ajout
-        # group/phone/mail) — _update_roster_sort_headings() itère sur
-        # les 5, une racine à seulement 2 colonnes déclarées lèverait
-        # TclError: Invalid column index "group".
+        # group/phone/mail) puis le 2026-10-03 (ajout pseudo) —
+        # _update_roster_sort_headings() itère sur les 6, une racine à
+        # moins de colonnes déclarées lèverait TclError: Invalid column
+        # index "group" (ou "pseudo").
         self.roster_tree = ttk.Treeview(
-            self.root, columns=("name", "club", "group", "phone", "mail"), show="tree headings",
+            self.root, columns=("name", "club", "group", "phone", "mail", "pseudo"), show="tree headings",
         )
         self.roster_tree.heading("name", text="Nom")
         self.roster_tree.heading("club", text="Club")
         self.roster_tree.heading("group", text="Groupe")
         self.roster_tree.heading("phone", text="Téléphone")
         self.roster_tree.heading("mail", text="Mail")
+        self.roster_tree.heading("pseudo", text="Pseudo")
 
         self.club_summary_tree = ttk.Treeview(self.root, columns=("club", "count"), show="headings")
         self.club_summary_tree.heading("club", text="Club")

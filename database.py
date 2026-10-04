@@ -363,6 +363,7 @@ REMOTE_PERMISSION_CLOCK = "clock"
 REMOTE_PERMISSION_LEVELS = "levels"
 REMOTE_PERMISSION_PHOTOS = "photos"
 REMOTE_PERMISSION_REBALANCE = "rebalance"
+REMOTE_PERMISSION_CHECKIN = "checkin"
 
 REMOTE_PERMISSION_LABELS = {
     REMOTE_PERMISSION_ELIMINATIONS: "Gérer les éliminations",
@@ -372,6 +373,7 @@ REMOTE_PERMISSION_LABELS = {
     REMOTE_PERMISSION_LEVELS: "Changer de niveau (blindes)",
     REMOTE_PERMISSION_PHOTOS: "Photos des joueurs",
     REMOTE_PERMISSION_REBALANCE: "Répondre au rééquilibrage (UTG)",
+    REMOTE_PERMISSION_CHECKIN: "Accueil des joueurs (arrivées)",
 }
 
 
@@ -702,6 +704,37 @@ class Database:
         seat_moves_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(seat_moves)")}
         if "reason" not in seat_moves_cols:
             self.conn.execute("ALTER TABLE seat_moves ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+        # "arrived_at" (Lot 1, "Accueil des joueurs", 2026-09-27) : horodatage
+        # epoch de la confirmation d'arrivée physique au poste d'accueil,
+        # NULL tant qu'un joueur pré-inscrit n'a pas encore été confirmé —
+        # voir confirm_arrival, jamais touché par add_player/_seat_player/
+        # rebalance_tables (l'arrivée est un simple constat, sans aucun
+        # effet sur le placement).
+        if "arrived_at" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN arrived_at REAL")
+        # "absent_declared_at" (Lot 2, "Gestion des absences et des
+        # retardataires", 2026-09-28) : horodatage epoch de la déclaration
+        # d'absence en cours pour ce joueur (bouton/glissement "Abs/Dés"),
+        # NULL tant qu'aucune absence n'est signalée OU après annulation
+        # (voir cancel_absence — remis explicitement à NULL, jamais un
+        # simple drapeau en mémoire, pour que "plus de clignotement"
+        # survive un redémarrage de l'application). Jamais touché par
+        # withdraw_player (reste un historique une fois le joueur
+        # définitivement désactivé, même principe que arrived_at) ni par
+        # rebalance_tables/_seat_player (une déclaration/annulation
+        # d'absence ne déplace jamais personne).
+        if "absent_declared_at" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN absent_declared_at REAL")
+        # "pseudo" (demande du 2026-10-03, "ajouter la colonne Pseudo au
+        # Répertoire") : copié depuis roster.py à l'ajout du joueur (voir
+        # add_player), exactement comme "club" ci-dessus — un instantané
+        # PAR TOURNOI, jamais relu en direct depuis le Répertoire une
+        # fois le joueur ajouté (si le pseudo change au Répertoire après
+        # coup, ce tournoi garde celui qu'il avait à l'inscription,
+        # cohérent avec "club"). Purement informatif, ne touche jamais
+        # ni l'affichage du nom ni aucune logique de placement.
+        if "pseudo" not in cols:
+            self.conn.execute("ALTER TABLE players ADD COLUMN pseudo TEXT NOT NULL DEFAULT ''")
 
     # ---------- init ----------
     def _init_defaults(self):
@@ -1089,25 +1122,199 @@ class Database:
         directement à une méthode "privée"."""
         return self._primes_enabled()
 
-    def add_player(self, name, club=""):
-        """`club` : copié dans ce tournoi au moment de l'ajout (voir
-        roster.get_club côté appelant) — n'est ensuite plus synchronisé
-        avec le répertoire si celui-ci change, ce tournoi garde la photo
-        du club tel qu'il était à l'inscription."""
+    def add_player(self, name, club="", pseudo=""):
+        """`club`/`pseudo` : copiés dans ce tournoi au moment de l'ajout
+        (voir roster.get_club/roster.get_pseudo côté appelant) — ne sont
+        ensuite plus synchronisés avec le répertoire si celui-ci change,
+        ce tournoi garde la photo de ces champs telle qu'elle était à
+        l'inscription (demande du 2026-10-03, "ajouter la colonne Pseudo
+        au Répertoire" — `pseudo` suit exactement le même principe que
+        `club`, déjà en place)."""
         starting_chips = self.get_setting_int("starting_chips", 10000)
         # Primes désactivées (_primes_enabled) : jamais de bounty stampée
         # à l'inscription, quel que soit le réglage `bounty_amount`.
         bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
         cur = self.conn.execute(
             "INSERT INTO players(name, buyin_count, rebuy_count, addon_count, "
-            "chips, status, bounty, club) VALUES (?, 1, 0, 0, ?, 'active', ?, ?)",
-            (name, starting_chips, bounty_amount, (club or "").strip()),
+            "chips, status, bounty, club, pseudo) VALUES (?, 1, 0, 0, ?, 'active', ?, ?, ?)",
+            (name, starting_chips, bounty_amount, (club or "").strip(), (pseudo or "").strip()),
         )
         player_id = cur.lastrowid
         self.conn.commit()
         self._seat_player(player_id)
         self.rebalance_tables(record_moves=False)
         return player_id
+
+    def accueil_management_enabled(self):
+        """True si « Gestion de l'accueil » (réglage ajouté le 2026-09-29,
+        modification du Lot 2) est activée pour CE tournoi. Décochée par
+        défaut — y compris pour un tournoi déjà existant qui ne connaît
+        pas encore ce réglage : clé de la table settings, donc AUCUNE
+        migration de colonne requise, `get_setting_int` renvoie
+        naturellement 0 pour tout fichier antérieur à cette fonctionnalité
+        (même mécanisme que `absence_duration_minutes`).
+
+        Gouverne l'activation de TOUTE la fonctionnalité "Accueil des
+        joueurs" / "Gestion des absences et des retardataires" (Lots 1 et
+        2) : réservée aux tournois Open, jamais activée par défaut pour un
+        tournoi habituel du club."""
+        return self.get_setting_int("accueil_management_enabled", 0) == 1
+
+    def absence_deadline_epoch(self):
+        """Échéance (epoch, secondes) du délai des retardataires — Lot 2,
+        "Gestion des absences et des retardataires" (2026-09-28) :
+        `tournament_start_epoch + "Durée d'une absence en m" × 60`,
+        UNIQUEMENT si le tournoi a RÉELLEMENT démarré (clock_started == 1
+        ET tournament_start_epoch > 0) — sinon None.
+
+        Piège explicitement évité ici (signalé dans l'audit avant
+        développement) : `tournament_start_epoch` vaut 0 tant qu'aucun
+        "Démarrer" n'a jamais été cliqué ; un calcul naïf (0 + délai)
+        placerait alors l'échéance dans le passé, avant même le premier
+        démarrage, ce qui clôturerait l'accueil et rendrait les absences
+        éligibles à la désactivation dès l'ouverture d'un tournoi tout
+        neuf — jamais le comportement voulu (voir cahier des charges,
+        section 7 : "absence de tournoi démarré" explicitement listée
+        comme cas particulier à couvrir)."""
+        if self.get_setting_int("clock_started", 0) != 1:
+            return None
+        start_epoch = self.get_setting_int("tournament_start_epoch", 0)
+        if start_epoch <= 0:
+            return None
+        duration_minutes = self.get_setting_int("absence_duration_minutes", 60)
+        return start_epoch + duration_minutes * 60
+
+    def absence_deadline_passed(self):
+        """True si le délai des retardataires est réellement écoulé
+        (jamais avant que le tournoi n'ait démarré, voir absence_deadline_
+        epoch ci-dessus) — gouverne à la fois la clôture de l'accueil
+        (confirm_arrival/cancel_arrival ci-dessous) et l'éligibilité à la
+        désactivation manuelle d'un joueur signalé absent (voir cahier des
+        charges, section 6 : un seul et même délai pour les deux).
+
+        Renvoie toujours False si « Gestion de l'accueil » est désactivée
+        pour ce tournoi (modification du 2026-09-29) — l'accueil n'est
+        alors jamais clôturé puisqu'il n'est simplement pas utilisé, et
+        aucune éligibilité à la désactivation via le délai ne doit en
+        découler."""
+        if not self.accueil_management_enabled():
+            return False
+        deadline = self.absence_deadline_epoch()
+        return deadline is not None and time.time() >= deadline
+
+    def confirm_arrival(self, player_id):
+        """Constate l'arrivée physique d'un joueur pré-inscrit au poste
+        d'accueil (Lot 1, "Accueil des joueurs", 2026-09-27) — horodate
+        `arrived_at` ET efface `absent_declared_at` dans la MÊME requête
+        UPDATE (correctif du 2026-09-29, "retour d'un joueur absent") :
+        un joueur dont l'arrivée est confirmée n'est PLUS "signalé
+        absent", quel que soit l'appareil ayant déclenché cette
+        confirmation (téléphone OU Mac, voir App._reinstate_selected) —
+        sans cela, un joueur confirmé arrivé depuis le téléphone
+        continuait de clignoter en rouge sur le Mac malgré son statut
+        "Actif" affiché (Database.declare_absent refuse déjà l'inverse :
+        un joueur déjà accueilli ne peut jamais être signalé absent, voir
+        sa docstring — ce correctif complète l'invariant dans l'autre
+        sens). Les deux colonnes changent dans UNE SEULE requête UPDATE
+        (jamais deux écritures séparées) : aucun état intermédiaire où
+        l'un serait à jour et l'autre pas, ne serait-ce que l'instant
+        d'une lecture concurrente. Ne touche RIEN d'autre : jamais
+        `table_id`/`seat`/`chips`/`status`, et n'appelle JAMAIS
+        rebalance_tables (le siège d'un joueur pré-inscrit est déjà
+        attribué depuis son inscription, voir add_player ; confirmer son
+        arrivée ne doit provoquer aucun mouvement). Idempotent : reconfirmer
+        un joueur déjà arrivé se contente de rafraîchir l'horodatage (et
+        de confirmer que `absent_declared_at` reste bien NULL), sans
+        aucun autre effet — un double-tap ou un retry réseau depuis le
+        téléphone ne présente donc aucun risque.
+
+        Refuse (renvoie False, AUCUNE écriture — ni `arrived_at` ni
+        `absent_declared_at`) si l'accueil est clôturé (Lot 2, section 6
+        du cahier des charges du 2026-09-28 : "appliquer l'interdiction
+        côté serveur et base de données, pas uniquement dans
+        l'interface") — vérifié ICI, dans la méthode qui écrit
+        réellement, jamais seulement par l'appelant (Mac ou téléphone) :
+        une page déjà ouverte avant l'échéance ne peut donc jamais
+        contourner la clôture simplement parce qu'elle n'a pas encore vu
+        le nouvel état. C'est CE même refus qui garantit qu'un retour de
+        joueur absent (App._reinstate_selected) reste impossible une
+        fois le délai des retardataires dépassé — aucune interdiction
+        séparée à dupliquer. Renvoie True si l'écriture a bien eu lieu.
+
+        Refuse également (False) si « Gestion de l'accueil » est
+        désactivée pour ce tournoi (modification du 2026-09-29) : ce
+        garde-fou est vérifié ICI, côté serveur, pas seulement par le
+        masquage des boutons téléphone/iPad."""
+        if not self.accueil_management_enabled():
+            return False
+        if self.absence_deadline_passed():
+            return False
+        self.conn.execute(
+            "UPDATE players SET arrived_at=?, absent_declared_at=NULL WHERE id=?",
+            (time.time(), player_id),
+        )
+        self.conn.commit()
+        return True
+
+    def cancel_arrival(self, player_id):
+        """Annule une confirmation d'arrivée faite par erreur (Lot 1) —
+        remet `arrived_at` à NULL, sans aucun autre effet (mêmes garanties
+        que confirm_arrival ci-dessus, y compris le refus une fois
+        l'accueil clôturé — Lot 2 — et si « Gestion de l'accueil » est
+        désactivée pour ce tournoi — 2026-09-29)."""
+        if not self.accueil_management_enabled():
+            return False
+        if self.absence_deadline_passed():
+            return False
+        self.conn.execute(
+            "UPDATE players SET arrived_at=NULL WHERE id=?", (player_id,)
+        )
+        self.conn.commit()
+        return True
+
+    def correct_arrival_confirmation(self, player_id):
+        """Corrige une confirmation d'arrivée faite par erreur — réservé
+        au Mac, geste DIRTO (modification du 2026-09-30, "correction des
+        erreurs réservée au Mac") : remet `arrived_at` à NULL, RIEN
+        d'autre (mêmes garanties que confirm_arrival/cancel_arrival —
+        jamais chips/table_id/seat/status, jamais rebalance_tables), le
+        joueur redevient "Pré-inscrit" à l'affichage (voir App._accueil_
+        status_label).
+
+        DISTINCTE de cancel_arrival à dessein : celle-ci reste
+        RÉSERVÉE à la case à cocher de l'onglet Joueurs (avant le
+        démarrage) et refuse après l'expiration du délai des
+        retardataires — cette méthode-ci doit au contraire rester
+        possible MÊME après cette expiration (cahier des charges,
+        "corriger une arrivée confirmée par erreur... même après
+        l'expiration du délai d'accueil"), pour que le DIRTO puisse
+        toujours corriger une erreur de confirmation, quel que soit le
+        moment. AUCUNE vérification de délai ici, donc.
+
+        Point de sécurité (ne permet JAMAIS de réinscrire un retardataire
+        hors délai par la suite) : cette méthode n'écrit QUE dans le sens
+        de l'annulation, jamais `arrived_at` posé — la seule opération
+        qui accueille réellement un joueur reste confirm_arrival, déjà
+        et séparément bloquée après le délai (voir sa docstring) ; un
+        joueur ainsi corrigé après expiration reste donc "Pré-inscrit"
+        de façon DÉFINITIVE (ni "Inscrire" sur Mac, ni "Confirmer" sur
+        iPhone ne peuvent plus le faire redevenir "Actif" — seul
+        "Abs/Dés" reste disponible pour le désactiver formellement).
+
+        Refuse (renvoie False, aucune écriture) si « Gestion de
+        l'accueil » est désactivée pour ce tournoi, si le joueur n'est
+        pas actif, ou s'il n'a pas d'arrivée à corriger (rien à faire).
+        Renvoie True si l'écriture a bien eu lieu."""
+        if not self.accueil_management_enabled():
+            return False
+        player = self.get_player(player_id)
+        if player is None or player["status"] != "active" or not player["arrived_at"]:
+            return False
+        self.conn.execute(
+            "UPDATE players SET arrived_at=NULL WHERE id=?", (player_id,)
+        )
+        self.conn.commit()
+        return True
 
     def rebuy_player(self, player_id):
         chips = self.get_setting_int("rebuy_chips", 10000)
@@ -1812,6 +2019,114 @@ class Database:
         self._sync_seat_moves(moves)
 
         return moves
+
+    def declare_absent(self, player_id):
+        """Signale un joueur ENCORE ACTIF comme absent (Lot 2, "Gestion des
+        absences et des retardataires", bouton/glissement "Abs/Dés",
+        2026-09-28) — simple horodatage de `absent_declared_at`, RIEN
+        d'autre : jamais `table_id`/`seat`/`chips`/`status` touchés, jamais
+        d'appel à rebalance_tables (cahier des charges, section 2 : "ses
+        jetons, sa table et son siège restent inchangés"). Idempotent :
+        déclarer un joueur déjà signalé absent se contente de rafraîchir
+        l'horodatage — "les déclarations répétées ne créent aucun
+        doublon" (section 2), qu'elles viennent du Mac ou d'un ou
+        plusieurs téléphones.
+
+        Refuse (renvoie False, aucune écriture) si le joueur n'est pas
+        `status == 'active'` (rien à signaler pour un joueur déjà éliminé
+        ou désactivé), si le tournoi n'a pas encore démarré (l'absence
+        est par nature un concept POST-démarrage, voir absence_deadline_
+        epoch/section 1 : "le délai est calculé à partir du démarrage réel
+        du tournoi") — évite qu'une déclaration prématurée, avant même
+        `tournament_start_epoch` fixé, ne laisse un état incohérent une
+        fois le tournoi réellement démarré — OU si `arrived_at` est déjà
+        posé (correctif du 2026-09-29, essais manuels du Lot 2) : un
+        joueur dont l'arrivée a été confirmée à l'accueil (Lot 1) ne peut
+        JAMAIS être signalé absent, même une fois toutes les cases de
+        l'onglet Joueurs décochées au démarrage (voir _players_checkbox_
+        drives_accueil, main.py) — c'est `arrived_at`, la vérité en base,
+        qui fait foi ici, jamais l'état visuel d'une case à cocher. Un
+        joueur déjà accueilli qui doit être désactivé passe directement
+        par withdraw_player (voir App._on_abs_des_clicked/_remote_
+        withdraw_absent_player), sans jamais transiter par ce signalement.
+
+        Refuse également (False) si « Gestion de l'accueil » est
+        désactivée pour ce tournoi (modification du 2026-09-29) : pour un
+        tournoi habituel du club, le bouton "Abs/Dés" redevient un simple
+        "Désactiver (forfait)" et ne doit jamais passer par ce mécanisme
+        de signalement — la gestion des absences n'existe tout simplement
+        pas pour ce tournoi.
+
+        Renvoie True si l'écriture a eu lieu."""
+        if not self.accueil_management_enabled():
+            return False
+        player = self.get_player(player_id)
+        if player is None or player["status"] != "active":
+            return False
+        if player["arrived_at"]:
+            return False
+        if self.get_setting_int("clock_started", 0) != 1:
+            return False
+        self.conn.execute(
+            "UPDATE players SET absent_declared_at=? WHERE id=?", (time.time(), player_id)
+        )
+        self.conn.commit()
+        return True
+
+    def cancel_absence(self, player_id):
+        """Annule le signalement d'absence d'un joueur ENCORE ACTIF (Lot 2,
+        section 3 du cahier des charges : "annuler uniquement le
+        signalement d'absence et arrêter le clignotement") — remet
+        `absent_declared_at` à NULL, RIEN d'autre : ne touche jamais
+        chips/table_id/seat/status/bounty, et n'appelle NI _seat_player NI
+        rebalance_tables, contrairement à reinstate_player.
+
+        Explicitement DISTINCTE de reinstate_player (section 3 :
+        "ne jamais appeler la réinscription classique pour un joueur
+        encore actif") — reinstate_player réinitialiserait les jetons à
+        `starting_chips`, la prime, et réattribuerait un nouveau siège,
+        ce qui n'a strictement aucun sens pour un joueur qui n'a jamais
+        cessé d'être actif. reinstate_player reste réservée, INCHANGÉE, à
+        la réintégration d'un joueur réellement `status == 'withdrawn'`.
+
+        Remettre `absent_declared_at` à NULL (plutôt qu'un simple drapeau
+        gardé en mémoire) est ce qui garantit qu'un joueur dont l'absence
+        a été annulée NE clignote PLUS après un redémarrage de
+        l'application (précaution explicite du 2026-09-28) : cet état est
+        relu depuis la base à chaque reconstruction de l'onglet Joueurs et
+        de la page téléphone, jamais mis en cache ailleurs.
+
+        Idempotent et sans effet (jamais d'exception) si le joueur n'était
+        pas signalé absent, ou n'est plus actif — même garantie que
+        cancel_arrival (Lot 1).
+
+        Refuse (renvoie False, aucune écriture) une fois le délai des
+        retardataires dépassé (correctif du 2026-09-29, essais manuels du
+        Lot 2) : "le bouton Réinscrire permet actuellement d'annuler
+        l'absence après expiration du délai — cela doit être impossible."
+        Vérifié ICI, dans la méthode qui écrit réellement (même principe
+        que confirm_arrival/cancel_arrival, Lot 1×2, section 6) — jamais
+        seulement une case grisée côté Mac/téléphone. Ne concerne QUE
+        l'annulation d'une absence en cours : reinstate_player (joueurs
+        RÉELLEMENT désactivés) n'est ni appelée ni affectée par cette
+        règle.
+
+        Refuse également (False) si « Gestion de l'accueil » est
+        désactivée pour ce tournoi (modification du 2026-09-29) — aucune
+        opération d'absence n'est autorisée tant que la fonctionnalité
+        n'est pas activée pour ce tournoi.
+
+        Renvoie True si l'écriture a eu lieu."""
+        if not self.accueil_management_enabled():
+            return False
+        if self.absence_deadline_passed():
+            return False
+        self.conn.execute(
+            "UPDATE players SET absent_declared_at=NULL WHERE id=? AND status='active'",
+            (player_id,),
+        )
+        self.conn.commit()
+        return True
 
     def withdraw_player(self, player_id):
         """Retire un joueur de la liste active sans lui attribuer de place
@@ -3551,14 +3866,22 @@ class Database:
         Réglage/Valeur — pour en garder une trace papier ou la partager.
         Reflète les valeurs déjà enregistrées dans ce fichier .tournoi
         (l'appelant, App._print_settings_pdf, enregistre d'abord le
-        formulaire pour être sûr qu'elles soient à jour). Booléens
-        (pko_mode) affichés "Oui"/"Non" plutôt que "1"/"0". `club_name` :
-        à passer explicitement par l'appelant (ex : export_prefs.
-        load_value("club_name", "")) — ce réglage, commun à tous les
-        tournois/Sit & Go, n'est justement JAMAIS écrit dans ce fichier
-        .tournoi (voir App._collect_and_save_all_settings), donc
-        self.get_setting("club_name", ...) renverrait toujours vide ici.
-        Nécessite 'fpdf2'."""
+        formulaire pour être sûr qu'elles soient à jour). Booléens (voir
+        SETTINGS_PRINT_BOOLEAN_KEYS) affichés "Oui"/"Non" plutôt que
+        "1"/"0". `club_name` : à passer explicitement par l'appelant
+        (ex : export_prefs.load_value("club_name", "")) — ce réglage,
+        commun à tous les tournois/Sit & Go, n'est justement JAMAIS écrit
+        dans ce fichier .tournoi (voir App._collect_and_save_all_
+        settings), donc self.get_setting("club_name", ...) renverrait
+        toujours vide ici. Nécessite 'fpdf2'.
+
+        Repli d'une clé absente (ancien fichier .tournoi antérieur au
+        chantier qui l'a introduite) : voir SETTINGS_PRINT_DEFAULTS,
+        TOUJOURS la valeur réellement utilisée par le logiciel pour ce
+        tournoi dans ce cas précis (ex. 60 minutes pour la durée d'une
+        absence, voir App._build_settings_tab) — jamais une préférence
+        générale importée d'ailleurs (demande explicite du 2026-10-02,
+        "correction du PDF imprimé", point 4)."""
         name = self.get_setting("tournament_name", "Tournoi")
         rows = []
         for key, label in SETTINGS_PRINT_FIELDS:
@@ -3577,8 +3900,8 @@ class Database:
                 else:
                     value = RANKING_FORMULA_LABELS.get(formula, formula)
             else:
-                value = self.get_setting(key, "")
-                if key == "pko_mode":
+                value = self.get_setting(key, SETTINGS_PRINT_DEFAULTS.get(key, ""))
+                if key in SETTINGS_PRINT_BOOLEAN_KEYS:
                     value = "Oui" if value in ("1", 1, True) else "Non"
             rows.append((label, value))
         return _write_pdf_table(
@@ -3686,6 +4009,28 @@ class Database:
         self.conn.commit()
 
     def get_current_level(self):
+        """Niveau de blindes ACTUELLEMENT en cours — point de passage
+        UNIQUE pour tout affichage/usage "en direct" (Chronomètre Mac,
+        écran projecteur via App._remaining_seconds, fenêtre Lobby via
+        get_live_status) : CHAQUE écran passe par cette fonction, jamais
+        une lecture indépendante de `blind_levels`.
+
+        Heads-Up sans ante (demande du 2026-10-03) : si exactement 2
+        joueurs sont actifs et que ce niveau n'est pas une pause, l'ante
+        renvoyée est forcée à 0 — UNIQUEMENT dans la valeur renvoyée ICI,
+        jamais écrite en base (voir get_blind_structure, qui alimente la
+        grille d'édition de l'onglet Blindes et doit continuer d'afficher
+        la vraie valeur enregistrée pour modification). Le nombre de
+        joueurs actifs est toujours recalculé EN DIRECT (list_players),
+        jamais mis en cache : un retour exceptionnel à 3+ joueurs
+        (annulation d'une élimination, réinscription) restaure donc
+        l'ante normal tout seul, sans aucune plomberie supplémentaire —
+        une seule règle, fiable, qu'aucun écran ne peut afficher de
+        façon périmée par rapport à un autre.
+
+        Renvoie un dict (converti depuis le sqlite3.Row lu en base),
+        jamais le Row lui-même — l'accès `level["clé"]` déjà utilisé par
+        tout appelant existant reste identique."""
         order = self.get_setting_int("current_level_order", 1)
         row = self.conn.execute(
             "SELECT * FROM blind_levels WHERE level_order=?", (order,)
@@ -3694,7 +4039,12 @@ class Database:
             row = self.conn.execute(
                 "SELECT * FROM blind_levels ORDER BY level_order LIMIT 1"
             ).fetchone()
-        return row
+        if row is None:
+            return None
+        level = dict(row)
+        if not level.get("is_break") and len(self.list_players(status="active")) == 2:
+            level["ante"] = 0
+        return level
 
     def get_next_level(self):
         order = self.get_setting_int("current_level_order", 1)
@@ -4214,6 +4564,62 @@ class Database:
             subtitle_lines,
             [h for _, h, _ in cols],
             [[fn(r) for _, _, fn in cols] for r in rows],
+        )
+
+    def export_players_seating_pdf(self, path, sort_by="name"):
+        """Exporte en PDF la liste des joueurs ACTIFS avec leur table et
+        leur siège (demande du 2026-10-03, "onglet Joueurs — bouton
+        Imprimer") — pour communiquer À L'AVANCE à chaque joueur sa
+        place, avant un gros tournoi. RÉUTILISE _write_pdf_table (même
+        moteur que tous les autres exports PDF de ce fichier), jamais un
+        système parallèle.
+
+        Colonnes : Nom, Pseudo, Table, Siège — AUCUNE séparation Nom/
+        Prénom (décision explicite du 2026-10-03 : le nom reste un seul
+        champ texte libre partout dans Senaco, une scission aurait été
+        un chantier structurel bien plus lourd pour un bénéfice
+        incertain). "pseudo" vient de la colonne du même nom sur
+        `players`, copiée du Répertoire à l'inscription (voir
+        add_player) — jamais relue en direct depuis roster.py ici.
+
+        `sort_by` ("name" par défaut, ou "table") :
+        - "name" : Nom puis Pseudo, alphabétique (insensible à la casse)
+          — pour qu'un joueur retrouve facilement SA ligne dans une
+          liste affichée/envoyée à l'avance.
+        - "table" : Table puis Siège (table_id/seat bruts, PAS un tri
+          alphabétique du nom de table affiché, qui trierait "Table 10"
+          avant "Table 2" — même critère que list_players()) — pratique
+          pour le personnel qui installe la salle table par table.
+
+        Ne liste QUE les joueurs "active" (voir list_players) : un
+        joueur déjà éliminé ou forfait n'a plus de place à communiquer.
+        Nécessite le paquet 'fpdf2'."""
+        tables = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
+        players = [dict(p) for p in self.list_players(status="active")]
+        if sort_by == "table":
+            players.sort(key=lambda p: (
+                p["table_id"] is None, p["table_id"] or 0,
+                p["seat"] is None, p["seat"] or 0,
+            ))
+            subtitle = "Triés par table et siège"
+        else:
+            players.sort(key=lambda p: ((p["name"] or "").lower(), (p["pseudo"] or "").lower()))
+            subtitle = "Triés par nom"
+        name = self.get_setting("tournament_name", "Tournoi")
+        rows = [
+            (
+                p["name"],
+                p["pseudo"] or "",
+                tables.get(p["table_id"], "-") if p["table_id"] else "-",
+                p["seat"],
+            )
+            for p in players
+        ]
+        return _write_pdf_table(
+            path, f"Placement des joueurs — {name}",
+            [f"Imprimé le {time.strftime('%d/%m/%Y %H:%M')}", subtitle],
+            ["Nom", "Pseudo", "Table", "Siège"],
+            rows,
         )
 
     def close(self):
@@ -4989,6 +5395,14 @@ SETTINGS_PRINT_FIELDS = [
     ("rake_percent", "Rake / frais d'organisation (%)"),
     ("movement_signal_duration_ms", "Durée max. du signal de mouvement (ms)"),
     ("tournament_day_folder", "Chemin du dossier du tournoi du jour"),
+    # accueil_management_enabled/absence_duration_minutes (Lot 2,
+    # "Gestion des absences et des retardataires", 2026-09-28/29) —
+    # ajoutés le 2026-10-02 ("correction du PDF imprimé" : le PDF
+    # n'avait jamais été mis à jour depuis ce chantier). Même position
+    # relative que dans l'onglet Paramètres (juste avant la structure de
+    # blindes, colonne gauche).
+    ("accueil_management_enabled", "Gestion de l'accueil"),
+    ("absence_duration_minutes", "Durée d'une absence (minutes)"),
     ("start_small_blind", "Small blind (niveau 1)"),
     ("start_big_blind", "Big blind (niveau 1)"),
     ("ante_start_level", "Niveau à partir duquel l'ante commence"),
@@ -5009,6 +5423,11 @@ SETTINGS_PRINT_FIELDS = [
     ("break_after_round_1", "Pause 1 — après round"),
     ("break_minutes_2", "Durée de la pause 2 (minutes)"),
     ("break_after_round_2", "Pause 2 — après round"),
+    # primes_enabled (2026-09-09) : interrupteur général, gouverne TOUT
+    # le calcul primes/bounty/PKO ci-dessous — ajouté le 2026-10-02
+    # ("correction du PDF imprimé"), juste avant les montants qu'il
+    # gouverne, même ordre que dans l'onglet Paramètres.
+    ("primes_enabled", "Calculer les primes"),
     ("attendance_bonus_points", "Prime de présence (points)"),
     ("assiduity_bonus_points", "Prime d'assiduité (points)"),
     ("assiduity_consecutive_days", "Nombre de jours consécutifs (assiduité)"),
@@ -5016,7 +5435,34 @@ SETTINGS_PRINT_FIELDS = [
     ("bounty_amount", "Montant du bounty (points)"),
     ("pko_mode", "Mode PKO (prime progressive)"),
     ("pko_cash_percent", "Part en Perso immédiat en PKO (%)"),
+    # elimination_banner_seconds (2026-09-08) / undo_elimination_
+    # timeout_minutes (2026-09-17) — ajoutés le 2026-10-02 ("correction
+    # du PDF imprimé"), même position relative que dans l'onglet
+    # Paramètres (derniers réglages propres au tournoi, colonne droite).
+    ("elimination_banner_seconds", "Durée du bandeau d'élimination (secondes)"),
+    ("undo_elimination_timeout_minutes", "Timeout pour Annuler Éliminer (minutes)"),
 ]
+
+# Réglages booléens affichés "Oui"/"Non" (jamais "1"/"0") — généralise
+# depuis le 2026-10-02 ("correction du PDF imprimé") ce qui n'était
+# auparavant codé en dur que pour pko_mode, voir export_settings_pdf.
+SETTINGS_PRINT_BOOLEAN_KEYS = {"pko_mode", "accueil_management_enabled", "primes_enabled"}
+
+# Valeur de repli pour un ancien fichier .tournoi n'ayant jamais ces
+# clés (2026-10-02, "correction du PDF imprimé") — EXACTEMENT celle que
+# le logiciel utilise réellement pour CE tournoi dans ce cas (voir
+# Database.get_setting_int/accueil_management_enabled, App._build_
+# settings_tab), jamais une préférence générale importée d'ailleurs :
+# fidèle au comportement RÉEL de ce tournoi, jamais une invention de
+# cette fonction d'export. Toute clé absente d'ici garde le repli "" déjà
+# en vigueur (ex. round_duration_minutes_2, voir le commentaire plus
+# haut) — pas de changement pour les champs déjà existants.
+SETTINGS_PRINT_DEFAULTS = {
+    "primes_enabled": "1",
+    "absence_duration_minutes": "60",
+    "elimination_banner_seconds": "5",
+    "undo_elimination_timeout_minutes": "5",
+}
 
 # Colonnes disponibles pour l'export de la 2e table de l'onglet Primes,
 # l'historique du bounty progressif (mécanisme PKO interne, voir

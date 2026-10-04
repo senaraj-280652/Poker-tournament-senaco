@@ -439,6 +439,14 @@ WEEKDAY_NAMES_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi",
 # quel autre jour (ex. jeudi).
 DEFAULT_TOURNAMENT_DAYS = "4,6"
 
+# Libellés du statut TECHNIQUE d'un joueur (colonne "Statut", onglet
+# Joueurs) — voir App._accueil_status_label : constante de MODULE (pas
+# un attribut de classe App) pour rester accessible même lorsque cette
+# méthode est greffée isolément via types.MethodType sur un objet qui
+# n'est pas une véritable instance de App (nombreux tests unitaires de
+# cette suite).
+_PLAYER_STATUS_LABELS = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
+
 
 def tournament_day_folder_proposal(is_sng=False):
     """Renvoie (dossier_proposé, nom_de_fichier_proposé) pour "Nouveau
@@ -2034,6 +2042,7 @@ class RosterManagerDialog(ttk.Frame):
         ttk.Button(btns, text="Modifier le groupe...", command=self._edit_group).pack(side="left", padx=3)
         ttk.Button(btns, text="Modifier le téléphone...", command=self._edit_phone).pack(side="left", padx=3)
         ttk.Button(btns, text="Modifier le mail...", command=self._edit_mail).pack(side="left", padx=3)
+        ttk.Button(btns, text="Modifier le pseudo...", command=self._edit_pseudo).pack(side="left", padx=3)
         fill_missing_btn = ttk.Button(
             btns, text="Modifier clubs pour tous...", command=self._apply_default_club_to_missing,
         )
@@ -2089,7 +2098,7 @@ class RosterManagerDialog(ttk.Frame):
         # (roster.load_roster_entries les garantit toujours présents,
         # "" par défaut) s'affiche simplement avec ces 3 colonnes vides.
         self.roster_tree = ttk.Treeview(
-            list_frame, columns=("name", "club", "group", "phone", "mail"),
+            list_frame, columns=("name", "club", "group", "phone", "mail", "pseudo"),
             show="tree headings", selectmode="browse",
         )
         self.roster_tree.heading("#0", text="Photo")
@@ -2102,11 +2111,18 @@ class RosterManagerDialog(ttk.Frame):
         self.roster_tree.heading("group", text="Groupe", command=lambda: self._sort_roster_by("group"))
         self.roster_tree.heading("phone", text="Téléphone", command=lambda: self._sort_roster_by("phone"))
         self.roster_tree.heading("mail", text="Mail", command=lambda: self._sort_roster_by("mail"))
+        # "pseudo" (demande du 2026-10-03, "ajouter la colonne Pseudo au
+        # Répertoire") : ajoutée à la suite de "mail", même principe que
+        # group/phone/mail ci-dessus — une ancienne fiche sans ce champ
+        # (roster.load_roster_entries le garantit toujours présent, ""
+        # par défaut) s'affiche simplement avec cette colonne vide.
+        self.roster_tree.heading("pseudo", text="Pseudo", command=lambda: self._sort_roster_by("pseudo"))
         self.roster_tree.column("name", width=180, anchor="w")
         self.roster_tree.column("club", width=140, anchor="w")
         self.roster_tree.column("group", width=80, anchor="center")
         self.roster_tree.column("phone", width=120, anchor="w")
         self.roster_tree.column("mail", width=180, anchor="w")
+        self.roster_tree.column("pseudo", width=120, anchor="w")
         scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.roster_tree.yview)
         self.roster_tree.configure(yscrollcommand=scrollbar.set)
         self.roster_tree.pack(side="left", fill="both", expand=True)
@@ -2148,7 +2164,10 @@ class RosterManagerDialog(ttk.Frame):
         self._refresh()
 
     def _update_roster_sort_headings(self):
-        labels = {"name": "Nom", "club": "Club", "group": "Groupe", "phone": "Téléphone", "mail": "Mail"}
+        labels = {
+            "name": "Nom", "club": "Club", "group": "Groupe", "phone": "Téléphone",
+            "mail": "Mail", "pseudo": "Pseudo",
+        }
         for col, label in labels.items():
             if self.roster_sort["column"] == col:
                 arrow = " ▲" if self.roster_sort["ascending"] else " ▼"
@@ -2174,7 +2193,7 @@ class RosterManagerDialog(ttk.Frame):
                 self.roster_row_photo_images[e["name"]] = photo
             self.roster_tree.insert(
                 "", "end", iid=e["name"], image=photo if photo is not None else "",
-                values=(e["name"], e["club"], e["group"], e["phone"], e["mail"]),
+                values=(e["name"], e["club"], e["group"], e["phone"], e["mail"], e["pseudo"]),
             )
         if selected and self.roster_tree.exists(selected):
             self.roster_tree.selection_set(selected)
@@ -2328,6 +2347,21 @@ class RosterManagerDialog(ttk.Frame):
         )
         if mail is not None:
             roster.set_mail(name, mail.strip())
+            self._refresh()
+
+    def _edit_pseudo(self):
+        """Même principe que _edit_mail ci-dessus (demande du 2026-10-03,
+        "ajouter la colonne Pseudo au Répertoire") — un bouton dédié,
+        purement informatif, n'affecte aucune permission."""
+        name = self._selected_name()
+        if not name:
+            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
+            return
+        pseudo = simpledialog.askstring(
+            "Pseudo", f"Pseudo de {name} :", initialvalue=roster.get_pseudo(name),
+        )
+        if pseudo is not None:
+            roster.set_pseudo(name, pseudo.strip())
             self._refresh()
 
     def _apply_default_club_to_missing(self):
@@ -2677,6 +2711,13 @@ class RosterManagerDialog(ttk.Frame):
             mail_cell = cells[4] if len(cells) >= 5 else ""
             if mail_cell:
                 roster.set_mail(name, mail_cell)
+            # Pseudo (demande du 2026-10-03, "ajouter la colonne Pseudo
+            # au Répertoire") : ajouté à la suite de mail, même principe
+            # — une colonne absente (ancien CSV à 5 colonnes ou moins)
+            # ou une cellule vide ne touche jamais un pseudo déjà connu.
+            pseudo_cell = cells[5] if len(cells) >= 6 else ""
+            if pseudo_cell:
+                roster.set_pseudo(name, pseudo_cell)
             added += 1
 
         self._refresh()
@@ -2714,9 +2755,11 @@ class RosterManagerDialog(ttk.Frame):
         try:
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow(["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL"])
+                # PSEUDO (demande du 2026-10-03) : ajoutée à la suite de
+                # MAIL, même principe — jamais insérée au milieu.
+                writer.writerow(["NOM", "CLUB", "GROUPE", "TELEPHONE", "MAIL", "PSEUDO"])
                 for e in entries:
-                    writer.writerow([e["name"], e["club"], e["group"], e["phone"], e["mail"]])
+                    writer.writerow([e["name"], e["club"], e["group"], e["phone"], e["mail"], e["pseudo"]])
         except OSError as e:
             messagebox.showerror("Erreur", f"Impossible d'écrire ce fichier :\n{e}", parent=self)
             return
@@ -4644,6 +4687,44 @@ class ClassementExportDialog(tk.Toplevel):
         open_file_with_default_app(path)
 
 
+class PlayersSeatingPrintDialog(tk.Toplevel):
+    """Choix de l'ordre de tri avant d'imprimer la liste des joueurs avec
+    table/siège (demande du 2026-10-03, "onglet Joueurs — bouton
+    Imprimer") — "Par nom" (pour qu'un joueur retrouve facilement sa
+    ligne dans une liste affichée/envoyée à l'avance) ou "Par table"
+    (pour le personnel qui installe la salle table par table). `result`
+    reste None si la boîte est annulée (voir App._print_players_seating,
+    seul appelant)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Imprimer — Placement des joueurs")
+        self.configure(bg=FELT_DARK)
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+
+        self.sort_var = tk.StringVar(value="name")
+        ttk.Label(self, text="Trier la liste :").pack(anchor="w", padx=14, pady=(14, 4))
+        sort_frame = ttk.Frame(self)
+        sort_frame.pack(fill="x", padx=14, pady=(0, 10))
+        ttk.Radiobutton(
+            sort_frame, text="Par nom", variable=self.sort_var, value="name",
+        ).pack(side="left", padx=(0, 16))
+        ttk.Radiobutton(
+            sort_frame, text="Par table", variable=self.sort_var, value="table",
+        ).pack(side="left")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=14, pady=(0, 14))
+        ttk.Button(btns, text="Imprimer...", command=self._confirm).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+    def _confirm(self):
+        self.result = self.sort_var.get()
+        self.destroy()
+
+
 class PlayersExportDialog(tk.Toplevel):
     """Choix du format (CSV / Excel) et des colonnes à exporter pour le
     tableau de l'onglet Joueurs tel qu'affiché (nom, table, siège, chips,
@@ -5454,6 +5535,30 @@ class App(tk.Tk):
         # principal (voir _tick/_refresh_remote_dirto_permissions_cache),
         # jamais lue ni écrite depuis le thread du serveur web.
         self._remote_dirto_permissions_cache = {}
+        # Joueurs pré-inscrits pour la page "Accueil des joueurs" du
+        # contrôle à distance (Lot 1, "Accueil des joueurs", 2026-09-27) —
+        # liste de dicts {id, name, club, table, seat, arrived_at}, même
+        # principe que _remote_players_cache ci-dessus : tenue à jour
+        # depuis le thread principal (voir _tick/_refresh_remote_checkin_
+        # cache), jamais lue ni écrite depuis le thread du serveur web.
+        self._remote_checkin_cache = []
+        # « Gestion de l'accueil » et délai des retardataires dépassé
+        # (correctif du 2026-09-29) — même principe que _remote_clock_
+        # paused ci-dessus : tenus à jour EXCLUSIVEMENT depuis le thread
+        # principal (voir _tick/_start_remote_control_if_enabled/_on_
+        # accueil_management_toggle), jamais lus ni écrits depuis le
+        # thread du serveur web. AVANT ce correctif, get_accueil_
+        # management_enabled/get_absence_deadline_passed appelaient
+        # self.db directement depuis le thread HTTP — self.db.conn étant
+        # lié au thread qui l'a créé (sqlite3.connect, check_same_thread
+        # par défaut), cela levait sqlite3.ProgrammingError, avortait la
+        # connexion SANS réponse envoyée ("ERR_CONNECTION_CLOSED" côté
+        # client) — systématiquement pour "/" (page d'accueil), donc
+        # plus aucun accès possible au contrôle à distance depuis aucun
+        # appareil. Défauts par défaut (avant toute ouverture de
+        # tournoi) : décoché/faux, comme si l'accueil n'était pas géré.
+        self._remote_accueil_management_enabled = False
+        self._remote_absence_deadline_passed = False
         # Positionné (côté thread du serveur web, voir _remote_upload_photo)
         # dès qu'une photo vient d'être envoyée depuis le téléphone, pour
         # que _tick rafraîchisse la colonne Photo (Répertoire/Joueurs) sans
@@ -5509,6 +5614,26 @@ class App(tk.Tk):
         # rien), un double-tap ou un retry réseau ne présente donc aucun
         # risque de double effet métier.
         self._remote_move_confirm_results = {}
+        # Résultat de chaque confirmation/annulation d'arrivée demandée
+        # depuis le téléphone (Lot 1, "Accueil des joueurs", 2026-09-27) —
+        # même principe que _remote_move_confirm_results ci-dessus :
+        # {request_id: {"ok": bool, "message": str}}, écrit par _remote_
+        # confirm_arrival/_remote_cancel_arrival (thread Tk) et lu/consommé
+        # par _remote_confirm_arrival_request/_remote_cancel_arrival_
+        # request (thread HTTP). Pas de dédoublonnage par client_request_id
+        # (contrairement à _remote_action_dedup) : confirm_arrival/cancel_
+        # arrival sont idempotents par nature (simple horodatage NULL/non-
+        # NULL), un double-tap ou un retry réseau ne présente donc aucun
+        # risque de double effet métier.
+        self._remote_arrival_results = {}
+        # Résultat de chaque déclaration/annulation d'absence ou
+        # désactivation demandée depuis le téléphone (Lot 2, "Gestion des
+        # absences et des retardataires", 2026-09-28) — même principe que
+        # _remote_arrival_results ci-dessus : {request_id: {"ok": bool,
+        # "message": str}}, écrit par _remote_declare_absence/_remote_
+        # cancel_absence/_remote_withdraw_absent_player (thread Tk) et
+        # lu/consommé par leurs _request respectifs (thread HTTP).
+        self._remote_absence_results = {}
         # Synchronisation iPhone -> Mac SANS dépendre d'un Lobby ouvert
         # (voir _check_phone_selected_pid, appelé depuis _tick) : dernier
         # pid de tournoi déjà traité PAR CETTE fenêtre, même principe et
@@ -5628,6 +5753,7 @@ class App(tk.Tk):
         # d'interrompre l'ouverture avec une fenêtre d'erreur pour ça.
         self._start_remote_control_if_enabled(silent=True)
         self._bind_voice_command_shortcuts()
+        self._bind_personal_code_section_shortcut()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------------------------------------------------------
@@ -6426,7 +6552,7 @@ class App(tk.Tk):
         self._update_window_title()
         if result.get("is_new") and result.get("selected_players"):
             for name in self._filter_active_conflicts(result["selected_players"]):
-                self.db.add_player(name, roster.get_club(name))
+                self.db.add_player(name, roster.get_club(name), roster.get_pseudo(name))
         if result.get("is_sng"):
             self._apply_sng_defaults(n_players=len(result.get("selected_players") or []))
         return True
@@ -6482,6 +6608,7 @@ class App(tk.Tk):
         pendant qu'un tournoi est déjà affiché — voir App.__init__."""
         self._stop_remote_control()
         self._cancel_tables_blink()
+        self._cancel_players_absent_blink()
         if self.db:
             open_windows.unregister(self.db.path)
             self.db.close()
@@ -6795,6 +6922,16 @@ class App(tk.Tk):
         ttk.Button(
             check_bar, text="Exporter les joueurs (Excel/CSV)...", command=self._export_players,
         ).pack(side="left", padx=3)
+        print_seating_btn = ttk.Button(
+            check_bar, text="🖨️ Imprimer", command=self._print_players_seating,
+        )
+        print_seating_btn.pack(side="left", padx=3)
+        Tooltip(
+            print_seating_btn,
+            "Génère un PDF Nom/Pseudo/Table/Siège de tous les joueurs\n"
+            "actifs — pour communiquer à l'avance leur place, avant un\n"
+            "gros tournoi. Au choix, trié par nom ou par table.",
+        )
         columns_btn = ttk.Button(check_bar, text="Bou/Col...", command=self._manage_player_columns)
         columns_btn.pack(side="left", padx=3)
         Tooltip(
@@ -6837,20 +6974,75 @@ class App(tk.Tk):
         self._add_shrinkable_button(actions, "edit_chips", "Modifier chips...", self._edit_chips_selected)
         self._add_shrinkable_button(actions, "edit_purchases", "Modifier achats...", self._edit_purchases_selected)
 
-        withdraw_btn = ttk.Button(actions, text="Désactiver (forfait)", command=self._withdraw_selected)
+        # "Abs/Dés" (Lot 2, "Gestion des absences et des retardataires",
+        # 2026-09-28) : REMPLACE l'ancien bouton "Désactiver (forfait)" à
+        # sa place exacte (cahier des charges, section 2) — la
+        # désactivation directe (sans passer par un signalement d'absence
+        # préalable) reste possible pour un forfait/départ volontaire
+        # immédiat, voir _on_abs_des_clicked pour la machine à états
+        # complète (signaler/désactiver selon l'état de chaque joueur
+        # ciblé et le délai des retardataires).
+        self.abs_des_btn = ttk.Button(actions, text="🚩 Abs/Dés", command=self._on_abs_des_clicked)
         # Repère pour réinsérer un bouton réduit à sa bonne place (avant les
         # boutons suivants) quand "Bou/Col..." le réaffiche.
-        self._player_button_slots_anchor = withdraw_btn
-        withdraw_btn.pack(side="left", padx=3)
-        Tooltip(
-            withdraw_btn,
-            "Retire le joueur du tournoi sans lui attribuer de rang\n"
-            "(contrairement à Éliminer) : à utiliser pour un forfait/départ\n"
-            "volontaire plutôt qu'une élimination au jeu.",
+        self._player_button_slots_anchor = self.abs_des_btn
+        self.abs_des_btn.pack(side="left", padx=3)
+        # Texte basculé avec "Indisponible..." selon le démarrage du
+        # tournoi (voir _update_tournament_started_buttons), même
+        # principe que _eliminate_btn_tooltip_normal_text ci-dessus.
+        self._abs_des_btn_tooltip_normal_text = (
+            "Joueur pas encore signalé : signale son absence (jetons/table/\n"
+            "siège inchangés, aucun rééquilibrage). Joueur déjà signalé,\n"
+            "délai des retardataires dépassé : propose sa désactivation\n"
+            "définitive (confirmation demandée)."
         )
-        reinstate_btn = ttk.Button(actions, text="Réinscrire", command=self._reinstate_selected)
+        self.abs_des_btn_tooltip = Tooltip(self.abs_des_btn, self._abs_des_btn_tooltip_normal_text)
+        # "Inscrire" (renommé le 2026-09-29, anciennement "Réinscrire") :
+        # même bouton, mêmes trois fonctions selon l'état du joueur
+        # ciblé (voir _reinstate_selected, INCHANGÉE par ce
+        # renommage) — seul le libellé change, moins ambigu maintenant
+        # qu'il couvre aussi un joueur jamais encore inscrit/accueilli
+        # ("Réinscrire" ne convenait plus pour ce premier cas).
+        reinstate_btn = ttk.Button(actions, text="Inscrire", command=self._reinstate_selected)
         reinstate_btn.pack(side="left", padx=3)
-        Tooltip(reinstate_btn, "Remet en jeu un joueur désactivé (forfait) ou éliminé par erreur.")
+        Tooltip(
+            reinstate_btn,
+            "Trois cas, selon l'état du joueur sélectionné :\n"
+            "• Pré-inscrit (accueil activé, délai des retardataires non\n"
+            "  dépassé) : confirme son arrivée.\n"
+            "• Signalé absent (Abs/Dés) : confirme son retour — absence\n"
+            "  annulée, clignotement arrêté.\n"
+            "• Réellement désactivé (forfait/éliminé) : réinscription\n"
+            "  classique (mécanisme historique, jetons/siège réattribués).\n"
+            "Jetons/table/siège jamais touchés pour les deux premiers cas ;\n"
+            "impossible après expiration du délai des retardataires, ou si\n"
+            "l'accueil n'est pas activé.",
+        )
+        # "Corriger l'arrivée" (modification du 2026-09-30, "accueil :
+        # correction des erreurs réservée au Mac") : geste DIRTO,
+        # réservé au Mac (aucun équivalent iPhone, voir App._remote_
+        # cancel_arrival — l'annulation y est désormais refusée
+        # inconditionnellement une fois "Actif"). Grisé/dégrisé et
+        # info-bulle tenus à jour par _update_tournament_started_buttons,
+        # comme "Abs/Dés" — état et texte y sont FIXES ici (jamais de
+        # double texte selon l'accueil, contrairement à "Abs/Dés" :
+        # cette action n'a tout simplement aucun sens quand l'accueil
+        # est désactivé, elle reste alors grisée, jamais renommée).
+        self.correct_arrival_btn = ttk.Button(
+            actions, text="Corriger l'arrivée", command=self._correct_arrival_selected
+        )
+        self.correct_arrival_btn.pack(side="left", padx=3)
+        self._correct_arrival_btn_tooltip_normal_text = (
+            "Corrige une confirmation d'arrivée faite par erreur — le\n"
+            "joueur redevient « Pré-inscrit » (jetons/table/siège jamais\n"
+            "touchés, aucun rééquilibrage). Reste possible même après le\n"
+            "délai des retardataires — mais ne permet ensuite JAMAIS de le\n"
+            "réinscrire hors délai (ni « Inscrire », ni l'iPhone) : seul\n"
+            "« Abs/Dés » reste alors disponible pour le désactiver."
+        )
+        self.correct_arrival_btn_tooltip = Tooltip(
+            self.correct_arrival_btn, self._correct_arrival_btn_tooltip_normal_text
+        )
         self.delete_player_btn = ttk.Button(actions, text="Supprimer", command=self._delete_selected)
         self.delete_player_btn.pack(side="left", padx=3)
         # Grisé une fois le tournoi commencé (chronomètre déjà démarré au
@@ -6859,8 +7051,8 @@ class App(tk.Tk):
         # appelée à chaque rafraîchissement de cet onglet : supprimer un joueur en
         # cours de partie fausserait l'historique (mouvements, élimination
         # par...) sans qu'on puisse revenir en arrière, mieux vaut
-        # Désactiver (forfait), qui garde une trace. Se réactive de
-        # lui-même pour un nouveau tournoi (clock_started y repart à 0).
+        # Abs/Dés, qui garde une trace. Se réactive de lui-même pour un
+        # nouveau tournoi (clock_started y repart à 0).
         self.delete_player_btn_tooltip = Tooltip(self.delete_player_btn, "")
 
         # "Annule Eliminer" (demande du 2026-09-17) — sert à corriger
@@ -6938,6 +7130,10 @@ class App(tk.Tk):
         self.players_tree.column("name", width=180, anchor="w")
         self.players_tree.column("club", width=110, anchor="w")
         self.players_tree.column("elim_time", width=130, anchor="center")
+        # "Pré-inscrit" (complément du 2026-09-29) est plus long
+        # qu'"Actif"/"Forfait"/"Éliminé" : largeur par défaut (90px,
+        # voir la boucle ci-dessus) élargie pour ne jamais le tronquer.
+        self.players_tree.column("status", width=100, anchor="center")
         TreeHeadingTooltip(self.players_tree, {
             "sel": "Cocher pour inclure ce joueur dans les actions groupées\n(Éliminer, etc.).",
             "rang": "Place finale du joueur : 1 = vainqueur, un chiffre plus élevé\n= éliminé plus tôt. Vide tant que le joueur est encore en jeu.",
@@ -6980,6 +7176,29 @@ class App(tk.Tk):
         self.player_photo_images = {}  # {player_id: PhotoImage} — évite le garbage collect
 
     # -- Gestion des cases à cocher --------------------------------
+    def _players_checkbox_drives_accueil(self):
+        """True tant que le tournoi n'a pas démarré (Lot 1, "Accueil des
+        joueurs", précision du 2026-09-28) : pendant cette fenêtre, la
+        case à cocher de l'onglet Joueurs EST l'indicateur d'accueil,
+        synchronisé avec Database.confirm_arrival/cancel_arrival et donc
+        avec le téléphone (voir _on_players_tree_click/_check_all_players/
+        _uncheck_all_players/_sync_checkbox_for_arrival, tous gardés par
+        cette même méthode). Une fois le tournoi démarré (bouton
+        "Démarrer" du Chronomètre, voir _clock_resume qui décoche alors
+        tout), la case redevient une simple sélection pour les commandes
+        groupées (Éliminer/Désactiver/Réactiver/Supprimer/Rebuy/Add-on) —
+        PLUS JAMAIS pilotée par l'accueil, demande explicite.
+
+        Exige également « Gestion de l'accueil » activée pour ce tournoi
+        (modification du 2026-09-29) : pour un tournoi habituel du club
+        (réglage décoché par défaut), la case à cocher n'a jamais piloté
+        l'accueil — elle se comporte alors exactement comme avant le
+        Lot 1, une simple sélection pour les commandes groupées, dès le
+        premier instant."""
+        if not self.db.accueil_management_enabled():
+            return False
+        return self.db.get_setting_int("clock_started", 0) == 0
+
     def _on_players_tree_click(self, event):
         region = self.players_tree.identify("region", event.x, event.y)
         if region != "cell":
@@ -6989,12 +7208,23 @@ class App(tk.Tk):
         if not row_iid or col != "#1":  # "#1" = première colonne affichée ("sel")
             return
         pid = int(row_iid)
-        if pid in self.checked_player_ids:
-            self.checked_player_ids.discard(pid)
-        else:
+        checking = pid not in self.checked_player_ids
+        accueil_active = self._players_checkbox_drives_accueil()
+        if accueil_active:
+            if checking:
+                self.db.confirm_arrival(pid)
+            else:
+                self.db.cancel_arrival(pid)
+            self._refresh_remote_checkin_cache()
+            self._apply_accueil_status_display(pid)
+        if checking:
             self.checked_player_ids.add(pid)
+        else:
+            self.checked_player_ids.discard(pid)
         self._apply_checkbox_display(row_iid)
         self._update_checked_count_label()
+        if accueil_active:
+            self._update_players_stats_label()
         return "break"  # évite que le clic ne change aussi la sélection classique
 
     def _on_players_tree_right_click(self, event):
@@ -7043,6 +7273,18 @@ class App(tk.Tk):
         if player is None:
             return
         if player["status"] == "active":
+            # Correctif du 2026-09-30 ("menu contextuel des joueurs
+            # pré-inscrits") : un joueur "Pré-inscrit" (accueil activé
+            # pour ce tournoi, jamais accueilli) n'a pas encore été
+            # constaté présent — aucune action, exactement comme sur une
+            # zone vide. _eliminate_selected filtre déjà ce même cas
+            # pour le bouton rouge "Éliminer" (voir sa docstring), mais
+            # ce raccourci vise CE joueur précis directement : autant
+            # s'arrêter ICI, avant même d'ouvrir "Qui a éliminé ce
+            # joueur ?". Comportement historique inchangé quand
+            # « Gestion de l'accueil » est désactivée pour ce tournoi.
+            if self.db.accueil_management_enabled() and not player["arrived_at"]:
+                return
             self._eliminate_selected(skip_confirmation=True, ids=[pid], force_mandatory_eliminator=True)
             return
         if player["status"] == "eliminated":
@@ -7065,9 +7307,166 @@ class App(tk.Tk):
         mark = self.CHECKBOX_CHECKED if pid in self.checked_player_ids else self.CHECKBOX_UNCHECKED
         self.players_tree.set(row_iid, "sel", mark)
 
+    def _accueil_status_label(self, player):
+        """Statut affiché dans la colonne "Statut" de l'onglet Joueurs
+        (complément du 2026-09-29, "Pré-inscrit"/"Actif" ; distinction
+        "Inscrit"/"Actif" selon le démarrage ajoutée le 2026-10-03) —
+        UNIQUEMENT un libellé d'AFFICHAGE : ne crée jamais de nouvel état
+        technique (le statut réel du joueur, `player["status"]`, reste
+        "active"/"withdrawn"/"eliminated", INCHANGÉ, voir cahier des
+        charges section 4).
+
+        Tant que « Gestion de l'accueil » est désactivée pour ce tournoi
+        (comportement par défaut), ou que le joueur n'est pas `active`
+        (forfait/éliminé — jamais affichés "Pré-inscrit" simplement
+        parce qu'ils n'ont pas de confirmation d'arrivée), le libellé
+        habituel d'avant ce complément est conservé à l'identique.
+
+        Quand elle est activée, un joueur `active` affiche :
+        - "Pré-inscrit" tant que son arrivée n'a pas été confirmée
+          (`arrived_at` NULL) ;
+        - une fois confirmée (c'est `arrived_at`, la vérité en base, qui
+          fait foi ici, jamais l'état de la case à cocher — même principe
+          que Database.declare_absent, voir sa docstring), que ce soit
+          depuis la case d'accueil PC/Mac, le bouton "Inscrire" ou le
+          téléphone :
+            * "Inscrit" tant que le tournoi n'a pas démarré (demande du
+              2026-10-03, "vocabulaire plus parlant à ce stade, aligné
+              sur celui déjà affiché côté téléphone" — voir remote_
+              control.py, `.inscrit-label`) ;
+            * "Actif" une fois le tournoi démarré (vocabulaire historique
+              conservé pour cette phase, INCHANGÉ).
+          PUREMENT un changement de mot affiché au moment où `clock_
+          started` passe à 1 (App._clock_resume) : aucune nouvelle
+          écriture, aucun recalcul, `arrived_at` ne bouge pas — la
+          transition "Inscrit" -> "Actif" se fait donc SEULE, au
+          prochain rafraîchissement suivant le démarrage, sans aucune
+          action de confirmation supplémentaire.
+
+        Un joueur signalé absent (`absent_declared_at` posé) affiche
+        désormais "Absent" (harmonisation Mac/iPhone du 2026-09-30 —
+        avant cela, il restait affiché "Pré-inscrit", le clignotement de
+        sa ligne étant seul à signaler visuellement ce cas particulier).
+        PRIORITÉ explicite, pour un joueur `active` : absence déclarée
+        ("Absent") d'abord, puis arrivée confirmée ("Inscrit"/"Actif"
+        selon le démarrage), sinon "Pré-inscrit" — les deux premiers cas
+        restent mutuellement exclusifs par construction (Database.
+        confirm_arrival efface toujours `absent_declared_at` en posant
+        `arrived_at`, voir sa docstring), donc cet ordre ne change jamais
+        le résultat pour un joueur dans un état cohérent ; il ne fait que
+        rendre la règle explicite plutôt que de compter sur cette
+        exclusion mutuelle."""
+        if player["status"] != "active" or not self.db.accueil_management_enabled():
+            return _PLAYER_STATUS_LABELS.get(player["status"], player["status"])
+        if player["absent_declared_at"]:
+            return "Absent"
+        if not player["arrived_at"]:
+            return "Pré-inscrit"
+        return "Actif" if self.db.get_setting_int("clock_started", 0) == 1 else "Inscrit"
+
+    def _apply_accueil_status_display(self, player_id):
+        """Répercute IMMÉDIATEMENT, sur la ligne concernée de l'onglet
+        Joueurs, un changement de statut d'accueil ("Pré-inscrit" <->
+        "Actif") — sans reconstruire tout le tableau (voir
+        _apply_checkbox_display, même principe pour la case à cocher).
+        Relit le joueur EN BASE (jamais un état en mémoire) : c'est
+        `arrived_at`, la vérité en base, qui gouverne ce libellé."""
+        row_iid = str(player_id)
+        if not self.players_tree.exists(row_iid):
+            return
+        player = self.db.get_player(player_id)
+        if player is None:
+            return
+        self.players_tree.set(row_iid, "status", self._accueil_status_label(player))
+
+    def _clear_absent_blink_tag(self, player_id):
+        """Retire le tag "absent_blink" de CETTE seule ligne (correctif
+        du 2026-09-29, "retour d'un joueur absent") — sans reconstruire
+        tout le tableau, même principe que _apply_accueil_status_display
+        ci-dessus. Appelée dès qu'une confirmation d'arrivée efface
+        absent_declared_at (voir Database.confirm_arrival) : sans ce
+        correctif, la ligne continuait de clignoter en rouge malgré le
+        statut "Actif" affiché, jusqu'au prochain rafraîchissement
+        complet (_refresh_players_tab) — qui ne recalculait d'ailleurs
+        pas non plus ce cas avant ce correctif.
+
+        Arrête aussi le cycle de clignotement partagé (_cancel_players_
+        absent_blink) si plus AUCUNE ligne ne porte ce tag après ce
+        retrait — le tag est un style PARTAGÉ par tout le Treeview (voir
+        _players_absent_blink_tick), jamais la peine de le faire tourner
+        pour rien.
+
+        Restitue aussi le zébrage habituel (evenrow/oddrow) de cette
+        ligne (correctif du 2026-09-29, "clignotement rouge des
+        absents") : une ligne en cours de clignotement ne porte QUE le
+        tag "absent_blink", jamais combiné avec evenrow/oddrow (voir
+        _refresh_players_tab — un ttk::treeview donne priorité au
+        PREMIER tag de la liste pour une propriété de style en conflit,
+        ce qui empêchait sinon le fond rouge de s'afficher) — son
+        retrait doit donc explicitement reposer le bon tag de zébrage
+        (déterminé par la position ACTUELLE de la ligne dans le
+        tableau), jamais le laisser sans aucun tag jusqu'au prochain
+        rafraîchissement complet."""
+        row_iid = str(player_id)
+        if not self.players_tree.exists(row_iid):
+            return
+        current_tags = self.players_tree.item(row_iid, "tags")
+        if "absent_blink" not in current_tags:
+            return
+        children = self.players_tree.get_children()
+        row_tag = "evenrow" if children.index(row_iid) % 2 == 0 else "oddrow"
+        remaining = tuple(t for t in current_tags if t != "absent_blink")
+        self.players_tree.item(row_iid, tags=(row_tag,) + remaining)
+        still_blinking = any(
+            "absent_blink" in self.players_tree.item(iid, "tags")
+            for iid in children
+        )
+        if not still_blinking:
+            self._cancel_players_absent_blink()
+
     def _update_checked_count_label(self):
         n = len(self.checked_player_ids)
         self.checked_count_lbl.config(text=f"{n} joueur(s) coché(s)" if n else "")
+
+    def _sync_checkbox_for_arrival(self, player_id, arrived):
+        """Répercute IMMÉDIATEMENT, sur l'onglet Joueurs de CETTE fenêtre,
+        une confirmation/annulation d'arrivée décidée depuis le téléphone
+        (Lot 1, "Accueil des joueurs" — voir _remote_confirm_arrival/
+        _remote_cancel_arrival) — jamais besoin d'attendre le tick suivant
+        (~1s), même principe que _remote_confirm_move pour les
+        mouvements.
+
+        Précision du 2026-09-28 : le compteur "accueilli(s)" est TOUJOURS
+        mis à jour, y compris pour un retardataire accueilli APRÈS le
+        démarrage du tournoi. La case à cocher, elle, ne suit l'accueil
+        QUE tant que le tournoi n'a pas démarré (voir _players_checkbox_
+        drives_accueil) — après démarrage, elle reste telle que
+        l'utilisateur du Mac l'a laissée, jamais retouchée depuis le
+        téléphone."""
+        if self._players_checkbox_drives_accueil():
+            if arrived:
+                self.checked_player_ids.add(player_id)
+            else:
+                self.checked_player_ids.discard(player_id)
+            row_iid = str(player_id)
+            if self.players_tree.exists(row_iid):
+                self._apply_checkbox_display(row_iid)
+            self._update_checked_count_label()
+        # "Pré-inscrit" -> "Actif" (complément du 2026-09-29) : comme le
+        # compteur "accueilli(s)" ci-dessous, mis à jour ICI SANS
+        # condition — y compris pour un retardataire accueilli APRÈS le
+        # démarrage, alors que la case à cocher, elle, ne bouge plus
+        # (voir _players_checkbox_drives_accueil).
+        self._apply_accueil_status_display(player_id)
+        # Correctif du 2026-09-29 ("retour d'un joueur absent") :
+        # Database.confirm_arrival efface désormais aussi
+        # absent_declared_at (voir sa docstring) — répercute ICI l'arrêt
+        # du clignotement de CETTE ligne, sans attendre le prochain
+        # rafraîchissement complet (_refresh_players_tab), pour un
+        # retour confirmé depuis le téléphone.
+        if arrived:
+            self._clear_absent_blink_tag(player_id)
+        self._update_players_stats_label()
 
     def _sort_players_by(self, column):
         """Tri par clic sur un en-tête (Nom / Statut) : ré-appuyer sur le
@@ -7293,16 +7692,32 @@ class App(tk.Tk):
         ttk.Button(btns, text="Fermer", command=apply_and_close).pack()
 
     def _check_all_players(self):
+        accueil_active = self._players_checkbox_drives_accueil()
         for row_iid in self.players_tree.get_children():
-            self.checked_player_ids.add(int(row_iid))
+            pid = int(row_iid)
+            if accueil_active and pid not in self.checked_player_ids:
+                self.db.confirm_arrival(pid)
+                self._apply_accueil_status_display(pid)
+            self.checked_player_ids.add(pid)
             self._apply_checkbox_display(row_iid)
         self._update_checked_count_label()
+        if accueil_active:
+            self._refresh_remote_checkin_cache()
+            self._update_players_stats_label()
 
     def _uncheck_all_players(self):
+        accueil_active = self._players_checkbox_drives_accueil()
+        if accueil_active:
+            for pid in self.checked_player_ids:
+                self.db.cancel_arrival(pid)
+                self._apply_accueil_status_display(pid)
         self.checked_player_ids.clear()
         for row_iid in self.players_tree.get_children():
             self._apply_checkbox_display(row_iid)
         self._update_checked_count_label()
+        if accueil_active:
+            self._refresh_remote_checkin_cache()
+            self._update_players_stats_label()
 
     def _checked_or_selected_ids(self):
         """IDs à utiliser pour une action : les joueurs cochés en priorité,
@@ -7461,7 +7876,7 @@ class App(tk.Tk):
         if not self._warn_active_conflict(name):
             return
         club = self.new_player_club_var.get().strip()
-        self.db.add_player(name, club)
+        self.db.add_player(name, club, roster.get_pseudo(name))
         if not self.temp_player_var.get():
             roster.add_to_roster(name, club=club or None)
             # Rafraîchit la liste de clubs proposée dans le menu déroulant
@@ -7487,7 +7902,7 @@ class App(tk.Tk):
         self.wait_window(dialog)
         to_add = self._filter_active_conflicts(dialog.selected_names)
         for name in to_add:
-            self.db.add_player(name, roster.get_club(name))
+            self.db.add_player(name, roster.get_club(name), roster.get_pseudo(name))
         if to_add:
             self._refresh_all()
 
@@ -7650,6 +8065,31 @@ class App(tk.Tk):
             ids = self._checked_or_selected_ids()
         if not ids:
             return
+        # Correctif du 2026-09-30 ("menu contextuel des joueurs
+        # pré-inscrits") : un joueur "Pré-inscrit" (accueil activé pour
+        # ce tournoi, jamais accueilli — voir Database.confirm_arrival/
+        # App._accueil_status_label) ne peut pas être éliminé, quel que
+        # soit le point d'entrée — le raccourci clic droit (_on_players_
+        # tree_right_click) s'arrête déjà avant d'appeler cette méthode
+        # pour ce cas précis, mais le bouton rouge "Éliminer" (ids=None,
+        # sélection/cases cochées) passe TOUJOURS par ici : filtré donc
+        # à cet endroit unique, avant même le comptage du dernier actif
+        # ci-dessous, pour qu'un Pré-inscrit ne soit jamais compté comme
+        # cible valide — silencieusement exclu de la sélection, jamais
+        # de message bloquant (même principe que les autres statuts déjà
+        # implicitement écartés d'une sélection d'élimination). Quand
+        # « Gestion de l'accueil » est désactivée pour ce tournoi,
+        # accueil_management_enabled() vaut faux : comportement
+        # historique intégralement inchangé, aucun filtrage.
+        if self.db.accueil_management_enabled():
+            ids = [
+                pid for pid in ids
+                if (p := self.db.get_player(pid)) is None
+                or p["status"] != "active"
+                or p["arrived_at"]
+            ]
+            if not ids:
+                return
         # Un joueur doit toujours rester en jeu : c'est le vainqueur. On
         # bloque donc toute élimination qui viderait la table (élimination
         # du tout dernier actif, seul ou en groupe).
@@ -7803,6 +8243,7 @@ class App(tk.Tk):
         # liste momentanément périmée après des éliminations rapprochées.
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         self._check_pending_rebalance()
 
     def _ask_eliminator_position(self):
@@ -7962,10 +8403,20 @@ class App(tk.Tk):
         self.wait_window(win)
         return result["id"]
 
-    def _withdraw_selected(self):
+    def _withdraw_selected(self, ids=None):
         """Désactive un ou plusieurs joueurs sans leur attribuer de place
-        au classement (forfait / inscription annulée)."""
-        ids = self._checked_or_selected_ids()
+        au classement (forfait / inscription annulée) — RÉUTILISÉE
+        (jamais dupliquée) par _on_abs_des_clicked (Lot 2) pour la
+        désactivation finale d'un joueur signalé absent une fois le délai
+        des retardataires dépassé : `ids`, si fourni, cible PRÉCISÉMENT
+        ce sous-ensemble (déjà filtré par l'appelant) plutôt que de
+        relire `_checked_or_selected_ids()` — la sélection courante peut
+        en effet mélanger des joueurs à des stades différents (à
+        signaler / pas encore éligibles / déjà éligibles), voir la
+        docstring de _on_abs_des_clicked. `ids=None` (appel direct,
+        historique) retombe sur la sélection courante comme avant."""
+        if ids is None:
+            ids = self._checked_or_selected_ids()
         if not ids:
             return
         if len(ids) == 1:
@@ -7986,15 +8437,277 @@ class App(tk.Tk):
                 self.db.withdraw_player(pid)
             self._clear_checked()
             self._refresh_all()
+            self._refresh_remote_players_cache()
+            self._refresh_remote_checkin_cache()
 
-    def _reinstate_selected(self):
+    def _on_abs_des_clicked(self):
+        """"Abs/Dés" (Lot 2, "Gestion des absences et des retardataires",
+        2026-09-28, corrigé le 2026-09-29) — REMPLACE l'ancien bouton
+        "Désactiver (forfait)" à sa place exacte (cahier des charges,
+        section 2). Machine à états sur la sélection courante (case
+        cochée ou ligne sélectionnée, comme toutes les commandes groupées
+        de cet onglet — voir _checked_or_selected_ids, jamais pilotée par
+        l'accueil une fois le tournoi démarré, voir _players_checkbox_
+        drives_accueil) : chaque joueur ciblé est reclassé selon SON
+        PROPRE état, puisqu'une sélection peut mélanger des joueurs à des
+        stades différents.
+
+        - ACTIF, déjà accueilli (`arrived_at` posé, essais manuels du
+          2026-09-29 : "vérifie le statut d'accueil enregistré, pas
+          l'état visuel de la case") -> JAMAIS de signalement d'absence
+          (Database.declare_absent refuse de toute façon, voir sa
+          docstring) : désactivation directe, "selon les règles
+          habituelles" — RÉUTILISE _withdraw_selected, exactement comme
+          l'ancien bouton "Désactiver (forfait)", sans jamais transiter
+          par un signalement d'absence.
+        - ACTIF, PAS accueilli, pas encore signalé absent -> signale son
+          absence (Database.declare_absent : jetons/table/siège
+          inchangés, aucun rééquilibrage, aucune confirmation — geste
+          léger et réversible via "Réinscrire"). Rejoue sans jamais créer
+          de doublon.
+        - ACTIF, PAS accueilli, déjà signalé absent, délai des
+          retardataires dépassé -> désactivation définitive, RÉUTILISE
+          _withdraw_selected (même confirmation explicite obligatoire —
+          précaution demandée le 2026-09-28 — même mécanisme, même
+          rééquilibrage historique, jamais dupliqués ici).
+        - ACTIF, PAS accueilli, déjà signalé absent, délai PAS dépassé ->
+          ignoré (pas encore éligible, cahier des charges section 4) ;
+          message informatif si c'est la SEULE sélection, silencieux
+          sinon.
+        - non actif (déjà éliminé/désactivé) -> ignoré.
+
+        Lorsque « Gestion de l'accueil » est désactivée pour ce tournoi
+        (modification du 2026-09-29 : réservée aux tournois Open), toute
+        cette machine à états est court-circuitée — le bouton redevient
+        à tous égards l'ancien "Désactiver (forfait)" : désactivation
+        directe de la sélection, sans jamais passer par un signalement
+        d'absence (que Database.declare_absent refuserait de toute façon
+        dans ce cas, voir sa docstring)."""
+        if not self.db.accueil_management_enabled():
+            self._withdraw_selected()
+            return
         ids = self._checked_or_selected_ids()
         if not ids:
             return
+        deadline_passed = self.db.absence_deadline_passed()
+        to_declare, to_withdraw, not_yet_eligible = [], [], []
         for pid in ids:
-            self.db.reinstate_player(pid)
+            p = self.db.get_player(pid)
+            if p is None or p["status"] != "active":
+                continue
+            if p["arrived_at"]:
+                # Déjà accueilli : jamais un signalement d'absence, voir
+                # la docstring ci-dessus — désactivation directe comme
+                # l'ancien bouton "Désactiver (forfait)".
+                to_withdraw.append(pid)
+            elif not p["absent_declared_at"]:
+                to_declare.append(pid)
+            elif deadline_passed:
+                to_withdraw.append(pid)
+            else:
+                not_yet_eligible.append(pid)
+
+        if to_withdraw:
+            # Confirmation explicite déjà intégrée à _withdraw_selected —
+            # jamais sautée, même appelée depuis ce nouveau chemin.
+            self._withdraw_selected(ids=to_withdraw)
+        if to_declare:
+            for pid in to_declare:
+                self.db.declare_absent(pid)
+            self._clear_checked()
+            self._refresh_all()
+            self._refresh_remote_players_cache()
+        if not to_declare and not to_withdraw and not_yet_eligible:
+            if len(not_yet_eligible) == 1:
+                messagebox.showinfo(
+                    "Pas encore éligible",
+                    "Ce joueur est déjà signalé absent — le délai des "
+                    "retardataires n'est pas encore dépassé, sa "
+                    "désactivation n'est pas encore possible.\n\n"
+                    "Pour annuler ce signalement, utilisez « Inscrire ».",
+                )
+
+    def _reinstate_selected(self):
+        """Réinscrit les joueurs ciblés — DISTINGUE IMPÉRATIVEMENT (Lot 2,
+        cahier des charges section 3, étendu le 2026-09-29 "étendre le
+        bouton Réinscrire sur Mac") un joueur encore ACTIF (Pré-inscrit
+        OU signalé absent) d'un joueur RÉELLEMENT désactivé :
+
+        - actif ET PAS ENCORE ARRIVÉ (Pré-inscrit — jamais signalé
+          absent — OU signalé absent, les deux sont mutuellement
+          exclusifs par construction, voir Database.confirm_arrival) ->
+          traite son RETOUR/accueil : confirme son arrivée EXACTEMENT
+          comme le ferait le téléphone OU la case à cocher de l'onglet
+          Joueurs (Database.confirm_arrival, voir sa docstring) —
+          arrived_at horodaté ET absent_declared_at effacé s'il était
+          posé, dans la MÊME requête, jamais deux écritures séparées.
+          Jetons/table/siège/statut jamais touchés, aucun rééquilibrage
+          (confirm_arrival ne fait toujours qu'un horodatage) — même
+          résultat que l'iPhone OU la case : "Actif" affiché, compteur
+          "accueilli(s)" à jour (la case se recoche elle-même au
+          rafraîchissement suivant, voir _refresh_players_tab qui
+          reconstruit checked_player_ids depuis arrived_at tant que la
+          case pilote l'accueil), clignotement arrêté s'il y en avait un.
+          UNIQUEMENT si « Gestion de l'accueil » est activée pour ce
+          tournoi (vérifié ICI, explicitement, PAS seulement délégué à
+          confirm_arrival — voir ci-dessous pourquoi) :
+            * modification du 2026-10-03 ("bouton Inscrire pour un joueur
+              préinscrit") : fonctionne désormais AUSSI BIEN avant
+              qu'après le démarrage du tournoi — « Inscrire » devient un
+              SECOND moyen, strictement équivalent à la case à cocher,
+              de confirmer l'arrivée d'un Pré-inscrit avant le démarrage
+              (jusqu'ici réservée à la seule case, gate `clock_started`
+              retiré à dessein). confirm_arrival n'a d'ailleurs jamais
+              exigé le démarrage lui-même (seul le délai l'intéresse, et
+              absence_deadline_passed renvoie toujours False tant que le
+              tournoi n'a pas démarré, voir sa docstring) — les deux
+              mécanismes partagent donc exactement la même garantie,
+              avant comme après le démarrage ;
+            * « Gestion de l'accueil » désactivée -> aucun effet, JAMAIS
+              de tentative ni de message : comportement historique d'un
+              tournoi club classique STRICTEMENT préservé (confirm_
+              arrival refuserait de toute façon en interne, mais s'y fier
+              seule aurait affiché à tort "délai dépassé" à chaque
+              sélection d'un actif jamais accueilli — le cas normal d'un
+              tournoi qui n'utilise pas l'accueil) ;
+            * délai dépassé (nécessairement après démarrage, voir plus
+              haut) -> REFUSÉ (confirm_arrival renvoie False, accueil
+              étant alors garanti vrai par la garde ci-dessus, donc SEULE
+              cause possible de ce refus) : message informatif si c'est
+              la SEULE sélection concernée, silencieux sinon ;
+        - actif et DÉJÀ ARRIVÉ ("Actif" déjà confirmé) -> ignoré, sans
+          effet (rien à "faire revenir") ;
+        - réellement désactivé (forfait/éliminé) -> reinstate_player,
+          comportement historique STRICTEMENT INCHANGÉ par ce correctif
+          (cette gestion du retour ne concerne QUE l'accueil/l'absence
+          d'un joueur encore actif, jamais la réinscription classique).
+        Ne jamais appeler reinstate_player pour un joueur encore actif :
+        ça réinitialiserait ses jetons et lui attribuerait un nouveau
+        siège à tort (voir l'audit du 2026-09-28).
+
+        Résolution des ids ciblés (correctif du 2026-10-03, essai manuel
+        réel : "Alice déjà accueillie et cochée + Bob Pré-inscrit
+        sélectionné -> Inscrire confirmait Alice, jamais Bob") —
+        _checked_or_selected_ids() (voir sa docstring) donne la PRIORITÉ
+        aux joueurs cochés sur la sélection réelle du Treeview : un rôle
+        historique voulu et INCHANGÉ pour Éliminer/Désactiver/Supprimer/
+        Rebuy/Add-on/Corriger l'arrivée (jamais modifié ici). Mais AVANT
+        le démarrage, avec « Gestion de l'accueil » activée, la case
+        cochée EST l'indicateur d'accueil (_players_checkbox_drives_
+        accueil) : cocher confirme déjà IMMÉDIATEMENT l'arrivée (_on_
+        players_tree_click) — checked_player_ids ne représente alors QUE
+        "qui est déjà accueilli", jamais une présélection pour une action
+        groupée. Dès qu'un seul joueur avait déjà été accueilli (donc
+        coché), _checked_or_selected_ids() renvoyait SES ids à la place
+        de ceux du joueur réellement cliqué, et "Inscrire" agissait à
+        tort sur un joueur déjà "Actif" (ignoré, sans effet visible) au
+        lieu du Pré-inscrit visé. Correction LOCALE à cette seule
+        méthode : dans ce contexte précis, et UNIQUEMENT dans celui-ci,
+        on lit directement la sélection RÉELLE du Treeview (clic simple
+        OU Ctrl/Maj pour plusieurs) — jamais checked_player_ids. Dans
+        tous les autres cas (après démarrage, ou accueil désactivé),
+        _checked_or_selected_ids() reste utilisée EXACTEMENT comme avant.
+        Un joueur déjà accueilli qui se retrouverait malgré tout inclus
+        dans cette sélection réelle (sélectionné en même temps qu'un
+        Pré-inscrit) n'est de toute façon jamais reconfirmé : la
+        condition `not p["arrived_at"]` ci-dessous l'exclut déjà,
+        inchangée."""
+        if self._players_checkbox_drives_accueil():
+            ids = [int(s) for s in self.players_tree.selection()]
+        else:
+            ids = self._checked_or_selected_ids()
+        if not ids:
+            return
+        refused = []
+        for pid in ids:
+            p = self.db.get_player(pid)
+            if p is None:
+                continue
+            if p["status"] == "active":
+                if self.db.accueil_management_enabled() and not p["arrived_at"]:
+                    if not self.db.confirm_arrival(pid):
+                        refused.append(pid)
+                # sinon : aucun effet — accueil désactivé, ou joueur déjà
+                # "Actif" (comportement historique préservé).
+            else:
+                self.db.reinstate_player(pid)
         self._clear_checked()
         self._refresh_all()
+        self._refresh_remote_players_cache()
+        self._refresh_remote_checkin_cache()
+        if refused and len(ids) == 1:
+            messagebox.showinfo(
+                "Confirmation impossible",
+                "Le délai des retardataires est dépassé : la "
+                "confirmation d'arrivée n'est plus possible.\n\n"
+                "Utilisez « Abs/Dés » pour la désactivation définitive.",
+            )
+
+    def _correct_arrival_selected(self):
+        """"Corriger l'arrivée" (modification du 2026-09-30, "accueil :
+        correction des erreurs réservée au Mac") — geste DIRTO, RÉSERVÉ
+        au Mac : aucun équivalent iPhone (voir App._remote_cancel_
+        arrival, qui refuse désormais INCONDITIONNELLEMENT toute
+        annulation depuis le téléphone une fois un joueur "Actif").
+
+        Disponible uniquement une fois le tournoi démarré et « Gestion
+        de l'accueil » activée (revérifié ICI, comme _reinstate_selected
+        le fait déjà pour "Inscrire" — jamais seulement délégué à l'état
+        grisé/dégrisé du bouton, voir _update_tournament_started_buttons) :
+        avant le démarrage, la case à cocher de l'onglet Joueurs reste le
+        SEUL mécanisme pour corriger une arrivée, INCHANGÉE par ce
+        complément.
+
+        Ne s'applique QU'À un joueur actif déjà "Actif" (arrived_at
+        posé) — silencieusement ignoré pour tout autre état (Pré-inscrit,
+        signalé absent, réellement désactivé) : jamais confondu avec
+        "Inscrire", "Abs/Dés" ou la réinscription classique.
+
+        Database.correct_arrival_confirmation (voir sa docstring) reste
+        possible MÊME après expiration du délai des retardataires — mais
+        n'écrit JAMAIS `arrived_at`, seulement son effacement : POINT DE
+        SÉCURITÉ explicitement demandé, un joueur ainsi corrigé après le
+        délai reste "Pré-inscrit" de façon DÉFINITIVE, ni "Inscrire" ni
+        l'iPhone ne pouvant plus le faire redevenir "Actif" (confirm_
+        arrival refuse déjà, séparément, une fois le délai dépassé —
+        aucune logique supplémentaire nécessaire ici pour le garantir).
+
+        Confirmation explicite OBLIGATOIRE avant toute correction —
+        jamais automatique, même pour un seul joueur. Jetons/table/
+        siège jamais touchés, aucun rééquilibrage (correct_arrival_
+        confirmation ne fait jamais qu'un effacement d'horodatage)."""
+        ids = self._checked_or_selected_ids()
+        if not ids:
+            return
+        if not (
+            self.db.accueil_management_enabled()
+            and self.db.get_setting_int("clock_started", 0) == 1
+        ):
+            return
+        targets = [
+            pid for pid in ids
+            if (p := self.db.get_player(pid)) is not None
+            and p["status"] == "active"
+            and p["arrived_at"]
+        ]
+        if not targets:
+            return
+        if len(targets) == 1:
+            name = self.db.get_player(targets[0])["name"]
+            question = f"Corriger l'arrivée de {name} ?\n\nIl redeviendra « Pré-inscrit »."
+        else:
+            question = (
+                f"Corriger l'arrivée de ces {len(targets)} joueurs ?\n\n"
+                "Ils redeviendront « Pré-inscrit »."
+            )
+        if not messagebox.askyesno("Corriger l'arrivée", question):
+            return
+        for pid in targets:
+            self.db.correct_arrival_confirmation(pid)
+        self._clear_checked()
+        self._refresh_all()
+        self._refresh_remote_players_cache()
+        self._refresh_remote_checkin_cache()
 
     def _undo_last_elimination(self):
         """Fonction métier CENTRALE UNIQUE pour "Annule Eliminer" (demande
@@ -8063,6 +8776,7 @@ class App(tk.Tk):
         # table, le téléphone ne doit pas en dépendre du prochain tick.
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         self._check_pending_rebalance()
 
     def _delete_selected(self):
@@ -8208,6 +8922,7 @@ class App(tk.Tk):
         self._refresh_all()
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         self._check_pending_rebalance()
 
     # ---------------------------------------------------------------
@@ -8327,6 +9042,7 @@ class App(tk.Tk):
         self._refresh_all()
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         # Le rééquilibrage relancé par resolve_pending_rebalance a pu
         # poser une NOUVELLE question (écart encore présent ailleurs, ou
         # table suivante à son tour trop pleine) : l'affiche tout de suite
@@ -8513,9 +9229,16 @@ class App(tk.Tk):
         self._remote_control_tournament_path = self.db.path if self.db else None
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         self._refresh_remote_dirto_permissions_cache()
         self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1 if self.db else True
         self._remote_has_pending_moves = self.db.count_seat_moves() > 0 if self.db else False
+        # Correctif du 2026-09-29 (voir __init__) : initialisées ICI, sur
+        # le thread principal, exactement comme _remote_clock_paused/
+        # _remote_has_pending_moves ci-dessus — jamais lues depuis
+        # self.db par les lambdas get_* passées au serveur ci-dessous.
+        self._remote_accueil_management_enabled = self.db.accueil_management_enabled() if self.db else False
+        self._remote_absence_deadline_passed = self.db.absence_deadline_passed() if self.db else False
         server = remote_control.RemoteControlServer(
             on_word=lambda word: self.voice_command_queue.put(word),
             get_tournament_name=lambda: self._remote_control_tournament_name,
@@ -8525,6 +9248,14 @@ class App(tk.Tk):
             get_has_pending_moves=lambda: self._remote_has_pending_moves,
             get_pending_moves=lambda: self._remote_moves_cache,
             on_confirm_move=self._remote_confirm_move_request,
+            get_checkin_players=lambda: self._remote_checkin_cache,
+            get_accueil_management_enabled=lambda: self._remote_accueil_management_enabled,
+            on_confirm_arrival=self._remote_confirm_arrival_request,
+            on_cancel_arrival=self._remote_cancel_arrival_request,
+            get_absence_deadline_passed=lambda: self._remote_absence_deadline_passed,
+            on_declare_absence=self._remote_declare_absence_request,
+            on_cancel_absence=self._remote_cancel_absence_request,
+            on_withdraw_absent_player=self._remote_withdraw_absent_player_request,
             on_eliminate=self._remote_eliminate_request,
             on_upload_photo=self._remote_upload_photo,
             get_roster_players=self._remote_get_roster_players,
@@ -8577,6 +9308,147 @@ class App(tk.Tk):
             self.remote_control_server.stop()
             self.remote_control_server = None
         self._refresh_remote_control_status()
+
+    def _bind_personal_code_section_shortcut(self):
+        """Ctrl+Maj+P : affiche/masque la section "Code personnel"
+        (demande du 2026-10-03, "masquage de la section code personnel
+        et code par défaut") — même raccourci modificateur (Ctrl+Maj,
+        jamais Ctrl+Alt) et même précaution multiplateforme que _bind_
+        voice_command_shortcuts juste au-dessus (lié en MAJUSCULE et en
+        minuscule : <Control-Shift-P> ne se déclenche pas de façon fiable
+        sous Windows, <Control-Shift-p> si). Aucun conflit identifié avec
+        un raccourci existant de cette application (P n'est utilisé nulle
+        part ailleurs) ni avec un raccourci système courant sur macOS/
+        Windows (ni l'un ni l'autre ne réserve Ctrl+Maj+P globalement —
+        à distinguer de Ctrl+P/Cmd+P seul, "Imprimer", jamais lié ici et
+        donc sans interférence)."""
+        for key in ("P", "p"):
+            self.bind_all(f"<Control-Shift-{key}>", self._on_toggle_personal_code_section)
+
+    def _on_toggle_personal_code_section(self, event=None):
+        """Bascule la visibilité de la section "Code personnel" — SEULEMENT
+        si l'onglet "CA" est actuellement affiché (demande explicite :
+        "le raccourci fonctionne uniquement lorsque l'onglet CA est
+        ouvert"), sans effet depuis n'importe quel autre onglet malgré le
+        bind_all global (nécessaire pour capter le raccourci sans se
+        soucier du widget qui a le focus)."""
+        if not self._is_ca_tab_active():
+            return
+        self._set_personal_code_section_visible(not self._personal_code_section_visible)
+
+    def _set_personal_code_section_visible(self, visible):
+        """Affiche/masque le titre ET la ligne (indicateur + champ +
+        boutons Définir/Changer + Supprimer) de la section "Code
+        personnel" — grid_remove (jamais grid_forget) : conserve les
+        options de grille pour un grid() ultérieur sans rien recalculer,
+        et ne laisse aucun espace vide une fois masquée (une ligne de
+        grille Tk sans widget visible ne réserve aucune hauteur)."""
+        self._personal_code_section_visible = visible
+        if visible:
+            self.personal_code_title.grid()
+            self.personal_code_row.grid()
+        else:
+            self.personal_code_title.grid_remove()
+            self.personal_code_row.grid_remove()
+
+    def _refresh_personal_remote_code_status(self):
+        """Indicateur actif/non défini UNIQUEMENT (demande du 2026-10-01,
+        "onglet CA : code personnel permanent") — ne révèle JAMAIS le
+        code lui-même : open_windows.has_personal_remote_code se
+        contente de vérifier l'existence du fichier de hachage, jamais
+        son contenu."""
+        active = open_windows.has_personal_remote_code()
+        self.personal_code_status_lbl.configure(
+            text="Code personnel : actif" if active else "Code personnel : non défini"
+        )
+        self.personal_code_clear_btn.configure(state="normal" if active else "disabled")
+
+    def _prompt_personal_code_authorization(self):
+        """LE seul gardien avant toute création/changement/suppression du
+        code personnel (demande du 2026-10-02, "sécurisation du code
+        personnel permanent") — jamais contournable, y compris pour un
+        ADMIN (cette application n'a elle-même aucune notion de rôle
+        local distinct, c'est précisément pour ça que ce contrôle est
+        indispensable). Vérifie d'abord l'anti-bruteforce LOCAL (jamais
+        évaluer un code pendant un blocage actif, même principe que
+        /authenticate côté téléphone), puis demande — dans une boîte de
+        dialogue MASQUÉE (jamais affichée en clair) — le code personnel
+        actuel si un code est déjà configuré, sinon le code initial
+        (voir open_windows.verify_personal_code_change_authorization,
+        qui gate strictement ce second cas sur l'ABSENCE de code
+        existant : jamais une porte dérobée permanente). Renvoie True
+        seulement si le code saisi est correct ; False si annulé,
+        incorrect, ou bloqué — AUCUN code n'est jamais journalisé ni
+        réaffiché, ici ou ailleurs."""
+        blocked, remaining = open_windows.personal_code_rate_limit_status()
+        if blocked:
+            minutes = int(remaining // 60) + (1 if remaining % 60 else 0)
+            minutes = max(1, minutes)
+            messagebox.showerror(
+                "Code personnel",
+                f"Trop de tentatives incorrectes. Réessayez dans {minutes} min.",
+            )
+            return False
+        prompt = (
+            "Code personnel actuel :" if open_windows.has_personal_remote_code()
+            else "Code initial :"
+        )
+        entered = simpledialog.askstring("Code personnel", prompt, show="*")
+        if entered is None:
+            return False
+        if not open_windows.verify_personal_code_change_authorization(entered):
+            messagebox.showerror("Code personnel", "Code incorrect.")
+            return False
+        return True
+
+    def _on_set_personal_remote_code(self):
+        """Définit/remplace le code personnel permanent (onglet CA) —
+        validation stricte (exactement 6 chiffres) AVANT tout appel à
+        open_windows.set_personal_remote_code, PUIS autorisation
+        obligatoire (demande du 2026-10-02, "sécurisation du code
+        personnel permanent" — voir _prompt_personal_code_authorization) :
+        le code personnel ACTUEL s'il en existe déjà un, sinon le code
+        initial. Le champ de saisie du NOUVEAU code est vidé IMMÉDIATEMENT
+        après coup, succès ou échec : la valeur tapée ne reste jamais
+        affichée ni en mémoire plus longtemps que nécessaire (jamais
+        journalisée non plus, voir set_personal_remote_code, qui n'écrit
+        qu'un sel + un hachage salé)."""
+        code = self.personal_code_var.get().strip()
+        self.personal_code_var.set("")
+        if not re.fullmatch(r"\d{6}", code):
+            messagebox.showerror(
+                "Code personnel", "Le code personnel doit comporter exactement 6 chiffres.",
+            )
+            return
+        if not self._prompt_personal_code_authorization():
+            return
+        open_windows.set_personal_remote_code(code)
+        self._refresh_personal_remote_code_status()
+        messagebox.showinfo("Code personnel", "Code personnel enregistré.")
+
+    def _on_clear_personal_remote_code(self):
+        """Supprime le code personnel permanent — désormais gardée par la
+        MÊME autorisation obligatoire que le changement (demande du
+        2026-10-02, voir _prompt_personal_code_authorization : le code
+        personnel actuel doit être saisi et correct), PUIS confirmation
+        explicite classique (geste qui retire un moyen de connexion,
+        jamais automatique). Sans effet si aucun code n'est actuellement
+        défini (bouton d'ailleurs désactivé dans ce cas, voir _refresh_
+        personal_remote_code_status) — dans ce cas, _prompt_personal_
+        code_authorization demanderait de toute façon le code INITIAL,
+        jamais utile ici puisque rien n'existe à supprimer."""
+        if not open_windows.has_personal_remote_code():
+            return
+        if not self._prompt_personal_code_authorization():
+            return
+        if not messagebox.askyesno(
+            "Supprimer le code personnel",
+            "Supprimer le code personnel permanent ?\n\n"
+            "Seul le code de session (affiché ci-dessus) restera accepté.",
+        ):
+            return
+        open_windows.clear_personal_remote_code()
+        self._refresh_personal_remote_code_status()
 
     def _on_remote_control_toggle(self):
         """Case à cocher "Activer le contrôle à distance" (Paramètres) :
@@ -8719,6 +9591,28 @@ class App(tk.Tk):
             entry.bind(
                 "<Return>",
                 lambda e, bid=device["browser_id"], var=label_var: self._on_rename_remote_device(bid, var),
+            )
+            # Identifiant permanent (demande du 2026-10-01, "afficher
+            # l'identifiant du téléphone sur l'iPhone") : affiché EN PLUS
+            # du champ de renommage ci-dessus, pas seulement comme sa
+            # valeur par défaut — sans cela, renommer un appareil (ex.
+            # "iPhone de Marc") faisait disparaître tout moyen de le
+            # faire correspondre à l'identifiant que ce même téléphone
+            # affiche désormais dans son lobby (voir remote_control.py,
+            # _handle_lobbylist), rendant la correspondance promise
+            # impossible à vérifier pour tout appareil déjà renommé —
+            # exactement le cas où elle est le plus utile (plusieurs
+            # appareils, plusieurs noms).
+            short_id_lbl = ttk.Label(
+                row, text=f"[{device['short_id']}]", foreground=GOLD, font=("Helvetica", 9, "bold"),
+            )
+            short_id_lbl.pack(side="left", padx=(0, 6))
+            Tooltip(
+                short_id_lbl,
+                "Identifiant permanent de cet appareil — le même que celui\n"
+                "affiché sur le téléphone, dans son écran \"Choisir un\n"
+                "tournoi\" (lobby). Utile pour le retrouver ici avec\n"
+                "certitude avant de le révoquer, même s'il a été renommé.",
             )
             ttk.Label(row, text=f"({device['ip_last_seen']})", foreground=MUTED).pack(side="left")
             ttk.Button(
@@ -8865,11 +9759,14 @@ class App(tk.Tk):
         # photos/rebalance) descendent la colonne de DROITE — c'est bien
         # ce qui place "Changer de niveau (blindes)" en tête de la
         # colonne de droite, à côté de "Gérer les éliminations", comme
-        # demandé explicitement. self.remote_dirto_permission_vars
-        # reste un dict PLAT avec les 7 mêmes clés qu'avant (eliminations,
-        # tables, moves, clock, levels, photos, rebalance) — aucune
-        # variable ni clé renommée, seul leur PLACEMENT dans la grille
-        # change.
+        # demandé explicitement. self.remote_dirto_permission_vars reste
+        # un dict PLAT avec une clé par entrée de REMOTE_PERMISSION_LABELS
+        # (eliminations, tables, moves, clock, levels, photos, rebalance,
+        # checkin — Lot 1, 2026-09-27) — aucune variable ni clé renommée,
+        # seul leur PLACEMENT dans la grille change. `half` ci-dessous
+        # recalcule la coupure gauche/droite dynamiquement : ajouter une
+        # entrée ne demande jamais de toucher ce code (voir la boucle
+        # for group_frame, group_items juste plus bas).
         # Deux sous-frames INDÉPENDANTES (chacune sa propre grille à 2
         # colonnes case/libellé) plutôt qu'une seule grille à 4 colonnes
         # partagée (ajustement du 2026-09-24, "décaler la colonne de
@@ -9444,6 +10341,21 @@ class App(tk.Tk):
                 elif isinstance(item, tuple) and item and item[0] == "confirm_move":
                     _, move_id, request_id = item
                     self._remote_confirm_move(move_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "confirm_arrival":
+                    _, player_id, request_id = item
+                    self._remote_confirm_arrival(player_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "cancel_arrival":
+                    _, player_id, request_id = item
+                    self._remote_cancel_arrival(player_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "declare_absence":
+                    _, player_id, request_id = item
+                    self._remote_declare_absence(player_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "cancel_absence":
+                    _, player_id, request_id = item
+                    self._remote_cancel_absence(player_id, request_id=request_id)
+                elif isinstance(item, tuple) and item and item[0] == "withdraw_absent_player":
+                    _, player_id, request_id = item
+                    self._remote_withdraw_absent_player(player_id, request_id=request_id)
                 elif isinstance(item, tuple) and item and item[0] == "end_tournament":
                     self._remote_end_tournament()
                     # La fenêtre vient d'être détruite (ou l'a déjà été,
@@ -9647,6 +10559,303 @@ class App(tk.Tk):
         if request_id is not None:
             self._remote_move_confirm_results[request_id] = result
 
+    def _remote_confirm_arrival_request(self, player_id):
+        """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
+        contrôle à distance (voir remote_control.py: on_confirm_arrival,
+        Lot 1 "Accueil des joueurs", 2026-09-27) — PAS depuis le thread
+        Tk. Même principe que _remote_confirm_move_request : dépose la
+        demande dans voice_command_queue (traitée par _remote_confirm_
+        arrival, sur le thread Tk), puis ATTEND (sondage borné) le
+        résultat écrit dans self._remote_arrival_results, pour le renvoyer
+        tel quel au téléphone.
+
+        Aucun dédoublonnage par client_request_id (comme pour /confirm_
+        move) : Database.confirm_arrival est idempotent PAR NATURE (un
+        simple horodatage, réécrire la même valeur ne change rien) —
+        rejouer la même confirmation ne peut jamais produire un second
+        effet métier. Un dépassement du délai (Tk anormalement bloqué)
+        renvoie un résultat d'échec plutôt que de bloquer indéfiniment le
+        thread HTTP."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("confirm_arrival", player_id, request_id))
+        return self._await_remote_arrival_result(request_id)
+
+    def _remote_cancel_arrival_request(self, player_id):
+        """Équivalent de _remote_confirm_arrival_request pour l'annulation
+        d'une arrivée confirmée par erreur (Lot 1)."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("cancel_arrival", player_id, request_id))
+        return self._await_remote_arrival_result(request_id)
+
+    def _await_remote_arrival_result(self, request_id):
+        """Sondage borné (~150 ms de délai habituel de _poll_voice_queue,
+        voir _remote_confirm_move_request) de self._remote_arrival_results
+        pour CE request_id — factorisé ici car identique pour confirmation
+        et annulation d'arrivée."""
+        deadline = time.monotonic() + 3.0
+        result = None
+        while time.monotonic() < deadline:
+            result = self._remote_arrival_results.pop(request_id, None)
+            if result is not None:
+                break
+            time.sleep(0.03)
+        if result is None:
+            result = {"ok": False, "message": "Délai dépassé, réessayez."}
+        return result
+
+    def _remote_confirm_arrival(self, player_id, request_id=None):
+        """Traitement RÉEL d'une confirmation d'arrivée (Lot 1, "Accueil
+        des joueurs", 2026-09-27) — appelé UNIQUEMENT depuis _poll_voice_
+        queue (thread Tk), jamais directement depuis le thread HTTP.
+
+        Database.confirm_arrival n'horodate QUE `arrived_at` : ne touche
+        jamais table_id/seat/chips/status, et n'appelle JAMAIS rebalance_
+        tables (voir sa docstring) — le siège d'un joueur pré-inscrit est
+        déjà attribué depuis son inscription, confirmer son arrivée ne
+        provoque donc aucun mouvement ni aucun rafraîchissement du Plan
+        des tables/Mouvements, contrairement à _remote_confirm_move."""
+        player = self.db.get_player(player_id) if self.db else None
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert."}
+        elif not self.db.accueil_management_enabled():
+            # Modification du 2026-09-29 : « Gestion de l'accueil » est
+            # désactivée pour ce tournoi (réservée aux tournois Open) —
+            # message explicite distinct de la clôture par délai, vérifié
+            # ICI côté serveur, jamais seulement par le masquage du bouton
+            # « Accueil » sur la page d'accueil du téléphone.
+            result = {"ok": False, "message": "Gestion de l'accueil désactivée pour ce tournoi."}
+        elif not player or player["status"] != "active":
+            result = {"ok": False, "message": "Joueur introuvable ou inactif."}
+        elif not self.db.confirm_arrival(player_id):
+            # Accueil clôturé (Lot 2, section 6 : délai des retardataires
+            # dépassé) — confirm_arrival a REFUSÉ l'écriture elle-même
+            # (jamais seulement une case grisée côté téléphone) : un
+            # téléphone dont la page était déjà ouverte avant l'échéance
+            # reçoit donc ce refus explicite au lieu d'un succès silencieux.
+            result = {"ok": False, "message": "Accueil clôturé — délai des retardataires dépassé."}
+        else:
+            self._refresh_remote_checkin_cache()
+            self._sync_checkbox_for_arrival(player_id, True)
+            result = {"ok": True, "message": ""}
+        if request_id is not None:
+            self._remote_arrival_results[request_id] = result
+
+    def _remote_cancel_arrival(self, player_id, request_id=None):
+        """Annule une confirmation d'arrivée faite par erreur (Lot 1) —
+        même principe et mêmes garanties que _remote_confirm_arrival
+        ci-dessus, y compris le refus une fois l'accueil clôturé (Lot 2)
+        ou « Gestion de l'accueil » désactivée pour ce tournoi (2026-09-29).
+
+        REFUSÉE INCONDITIONNELLEMENT (modification du 2026-09-30,
+        "accueil : correction des erreurs réservée au Mac") si le joueur
+        est déjà "Actif" (`arrived_at` posé) — QUEL QUE SOIT le délai :
+        une fois confirmé, plus aucune annulation n'est possible depuis
+        l'iPhone (bouton "Annuler" d'ailleurs retiré de _CHECKIN_PAGE,
+        voir son template — mais ce refus-ci est la PROTECTION RÉELLE,
+        vérifiée ici côté serveur, jamais seulement l'absence du bouton :
+        une requête directe vers /cancel_arrival doit échouer tout
+        autant). Seule la case à cocher du Mac (avant le démarrage,
+        inchangée) ou le nouveau bouton "Corriger l'arrivée" (après le
+        démarrage, DIRTO uniquement, voir App._correct_arrival_selected)
+        peuvent encore défaire une confirmation."""
+        player = self.db.get_player(player_id) if self.db else None
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert."}
+        elif not self.db.accueil_management_enabled():
+            result = {"ok": False, "message": "Gestion de l'accueil désactivée pour ce tournoi."}
+        elif not player or player["status"] != "active":
+            result = {"ok": False, "message": "Joueur introuvable ou inactif."}
+        elif player["arrived_at"]:
+            result = {
+                "ok": False,
+                "message": "Ce joueur a déjà été confirmé — l'annulation n'est "
+                           "plus possible depuis l'iPhone.",
+            }
+        elif not self.db.cancel_arrival(player_id):
+            result = {"ok": False, "message": "Accueil clôturé — délai des retardataires dépassé."}
+        else:
+            self._refresh_remote_checkin_cache()
+            self._sync_checkbox_for_arrival(player_id, False)
+            result = {"ok": True, "message": ""}
+        if request_id is not None:
+            self._remote_arrival_results[request_id] = result
+
+    def _remote_declare_absence_request(self, player_id):
+        """Point d'entrée appelé DIRECTEMENT depuis le thread HTTP du
+        contrôle à distance (voir remote_control.py: on_declare_absence,
+        Lot 2 "Gestion des absences et des retardataires", 2026-09-28) —
+        PAS depuis le thread Tk. Même principe que _remote_confirm_
+        arrival_request : dépose la demande dans voice_command_queue,
+        attend (sondage borné) le résultat écrit dans self._remote_
+        absence_results. Aucun dédoublonnage par client_request_id :
+        Database.declare_absent est idempotent PAR NATURE (simple
+        horodatage, "aucun doublon" — cahier des charges section 2)."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("declare_absence", player_id, request_id))
+        return self._await_remote_absence_result(request_id)
+
+    def _remote_cancel_absence_request(self, player_id):
+        """Équivalent de _remote_declare_absence_request pour "Annuler
+        l'absence" (Lot 2, touche un joueur déjà signalé absent)."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("cancel_absence", player_id, request_id))
+        return self._await_remote_absence_result(request_id)
+
+    def _remote_withdraw_absent_player_request(self, player_id):
+        """Équivalent de _remote_declare_absence_request pour la
+        désactivation finale d'un joueur signalé absent (Lot 2, cahier
+        des charges section 5) — le téléphone a déjà demandé confirmation
+        (window.confirm, précaution explicite du 2026-09-28) AVANT
+        d'appeler cette route ; _remote_withdraw_absent_player (thread Tk)
+        revérifie quand même l'éligibilité réelle (statut actif, signalé
+        absent, délai dépassé) avant d'agir — jamais une confiance aveugle
+        envers le client."""
+        request_id = uuid.uuid4().hex
+        self.voice_command_queue.put(("withdraw_absent_player", player_id, request_id))
+        return self._await_remote_absence_result(request_id)
+
+    def _await_remote_absence_result(self, request_id):
+        """Sondage borné, même principe et même délai que _await_remote_
+        arrival_result (Lot 1) — factorisé ici pour les trois actions du
+        Lot 2 (déclarer/annuler/désactiver)."""
+        deadline = time.monotonic() + 3.0
+        result = None
+        while time.monotonic() < deadline:
+            result = self._remote_absence_results.pop(request_id, None)
+            if result is not None:
+                break
+            time.sleep(0.03)
+        if result is None:
+            result = {"ok": False, "message": "Délai dépassé, réessayez."}
+        return result
+
+    def _remote_declare_absence(self, player_id, request_id=None):
+        """Traitement RÉEL d'une déclaration d'absence (Lot 2, 2026-09-28)
+        — appelé UNIQUEMENT depuis _poll_voice_queue (thread Tk), jamais
+        directement depuis le thread HTTP. Database.declare_absent
+        n'horodate QUE `absent_declared_at` : ne touche jamais table_id/
+        seat/chips/status, et n'appelle JAMAIS rebalance_tables (cahier
+        des charges, section 2) — rafraîchit l'onglet Joueurs directement
+        (pas seulement _refresh_all, qui ne rafraîchit que l'onglet
+        ACTUELLEMENT affiché) pour que le clignotement démarre sans
+        attendre que l'utilisateur du Mac y revienne."""
+        player = self.db.get_player(player_id) if self.db else None
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert."}
+        elif not self.db.accueil_management_enabled():
+            # Modification du 2026-09-29 : idem _remote_confirm_arrival —
+            # vérifié ICI côté serveur, pas seulement par le masquage du
+            # bouton « Abs/Dés » sur la page Éliminations du téléphone.
+            result = {"ok": False, "message": "Gestion de l'accueil désactivée pour ce tournoi."}
+        elif not player or player["status"] != "active":
+            result = {"ok": False, "message": "Joueur introuvable ou inactif."}
+        elif player["arrived_at"]:
+            # Correctif du 2026-09-29 (essais manuels du Lot 2) : un
+            # joueur déjà accueilli ne doit JAMAIS être signalé absent —
+            # Database.declare_absent refuse de toute façon (voir sa
+            # docstring), message explicite ici plutôt qu'un refus
+            # générique. Normalement déjà écarté côté page (voir
+            # handleAbsDesDrop, JS), mais revérifié ici, jamais une
+            # confiance aveugle envers le client.
+            result = {"ok": False, "message": "Ce joueur a déjà été accueilli — utilisez la désactivation directe."}
+        elif not self.db.declare_absent(player_id):
+            # Database.declare_absent refuse avant le démarrage du tournoi
+            # (voir sa docstring) — cas normalement déjà écarté côté
+            # téléphone (bouton "Abs/Dés" disponible dès que la page
+            # Éliminations l'est), mais revérifié ici, jamais une
+            # confiance aveugle envers le client.
+            result = {"ok": False, "message": "Le tournoi n'a pas encore démarré."}
+        else:
+            self._refresh_remote_players_cache()
+            self._refresh_players_tab()
+            result = {"ok": True, "message": ""}
+        if request_id is not None:
+            self._remote_absence_results[request_id] = result
+
+    def _remote_cancel_absence(self, player_id, request_id=None):
+        """"Annuler l'absence" décidée depuis le téléphone (Lot 2) —
+        Database.cancel_absence n'horodate QUE `absent_declared_at` (remis
+        à NULL) : ne touche jamais chips/table_id/seat/status, et
+        n'appelle NI _seat_player NI rebalance_tables, contrairement à
+        reinstate_player (jamais appelée ici, voir sa docstring pour le
+        diagnostic complet — précaution explicite du 2026-09-28).
+
+        Refuse désormais (correctif du 2026-09-29) une fois le délai des
+        retardataires dépassé — Database.cancel_absence renvoie False
+        dans ce cas (même principe que confirm_arrival/cancel_arrival,
+        Lot 1×2 section 6) : jamais seulement une case grisée côté page."""
+        player = self.db.get_player(player_id) if self.db else None
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert."}
+        elif not self.db.accueil_management_enabled():
+            result = {"ok": False, "message": "Gestion de l'accueil désactivée pour ce tournoi."}
+        elif not player or player["status"] != "active":
+            result = {"ok": False, "message": "Joueur introuvable ou inactif."}
+        elif not self.db.cancel_absence(player_id):
+            result = {"ok": False, "message": "Délai des retardataires dépassé — annulation impossible."}
+        else:
+            self._refresh_remote_players_cache()
+            self._refresh_players_tab()
+            result = {"ok": True, "message": ""}
+        if request_id is not None:
+            self._remote_absence_results[request_id] = result
+
+    def _remote_withdraw_absent_player(self, player_id, request_id=None):
+        """Désactivation finale d'un joueur signalé absent, décidée depuis
+        le téléphone (Lot 2, cahier des charges section 5) — le téléphone
+        a déjà demandé confirmation AVANT d'appeler cette route (précaution
+        explicite du 2026-09-28), mais l'éligibilité réelle (actif, signalé
+        absent, délai des retardataires dépassé) est revérifiée ICI, sur
+        le thread Tk, avant d'agir : jamais une confiance aveugle envers
+        le client, jamais une désactivation automatique (cahier des
+        charges section 4 : "ne jamais désactiver automatiquement un
+        joueur" — cette vérification est ce qui la distingue d'une
+        désactivation automatique, une action humaine explicite reste
+        TOUJOURS le déclencheur, ici comme sur PC/Mac).
+
+        Database.withdraw_player, RÉUTILISÉE telle quelle (jamais
+        dupliquée) : mécanisme et rééquilibrage historiques INCHANGÉS,
+        identiques au bouton "Abs/Dés"/"Désactiver" du Mac.
+
+        Éligibilité (corrigée le 2026-09-29, voir App._on_abs_des_clicked
+        pour la même règle côté Mac) : soit le joueur est déjà accueilli
+        (`arrived_at` posé — désactivation directe "selon les règles
+        habituelles", jamais passée par un signalement d'absence), soit
+        il est signalé absent ET le délai des retardataires est dépassé."""
+        player = self.db.get_player(player_id) if self.db else None
+        if not self.db:
+            result = {"ok": False, "message": "Aucun tournoi ouvert."}
+        elif not self.db.accueil_management_enabled():
+            # Modification du 2026-09-29 : contrairement aux autres
+            # actions Lot 1×2, Database.withdraw_player (appelée
+            # ci-dessous si éligible) n'est PAS elle-même gouvernée par
+            # « Gestion de l'accueil » — c'est le mécanisme historique de
+            # désactivation, toujours disponible par ailleurs (bouton
+            # Abs/Dés du Mac quand le réglage est désactivé). Vérifié ICI
+            # explicitement pour que CETTE route distante spécifique à
+            # l'absence reste bloquée quand la fonctionnalité est
+            # désactivée, même sur des données d'accueil/absence
+            # anciennes non effacées (cahier des charges, section 4).
+            result = {"ok": False, "message": "Gestion de l'accueil désactivée pour ce tournoi."}
+        elif not player or player["status"] != "active":
+            result = {"ok": False, "message": "Joueur introuvable ou inactif."}
+        elif not player["arrived_at"] and not player["absent_declared_at"]:
+            result = {"ok": False, "message": "Ce joueur n'est pas signalé absent."}
+        elif not player["arrived_at"] and not self.db.absence_deadline_passed():
+            result = {"ok": False, "message": "Délai des retardataires pas encore dépassé."}
+        else:
+            # Éligible : soit déjà accueilli (désactivation directe,
+            # aucune condition de délai), soit signalé absent ET le délai
+            # des retardataires est dépassé — voir la docstring ci-dessus.
+            self.db.withdraw_player(player_id)
+            self._refresh_remote_players_cache()
+            self._refresh_remote_checkin_cache()
+            self._refresh_players_tab()
+            self._refresh_tables_tab()
+            result = {"ok": True, "message": ""}
+        if request_id is not None:
+            self._remote_absence_results[request_id] = result
+
     def _remote_eliminate(self, eliminated_id, eliminator_id, request_id=None):
         """Élimination décidée depuis la page "Éliminations" du contrôle
         à distance (glisser un joueur éliminé sur son éliminateur, voir
@@ -9732,6 +10941,7 @@ class App(tk.Tk):
         self._refresh_all()
         self._refresh_remote_players_cache()
         self._refresh_remote_moves_cache()
+        self._refresh_remote_checkin_cache()
         if request_id is not None:
             self._remote_elimination_results[request_id] = {"ok": True, "message": ""}
         # Contrairement à une élimination faite directement dans l'onglet
@@ -10071,18 +11281,34 @@ class App(tk.Tk):
         self._open_clock_window(fullscreen=True)
 
     def _update_tournament_started_buttons(self):
-        """Ajuste 'Supprimer' et 'Éliminer' (onglet Joueurs) selon que le
-        tournoi a démarré ou non (chronomètre déjà lancé au moins une
-        fois, voir clock_started) — sens opposés :
+        """Ajuste 'Supprimer', 'Éliminer', 'Abs/Dés' et 'Corriger
+        l'arrivée' (onglet Joueurs) selon que le tournoi a démarré ou
+        non (chronomètre déjà lancé au moins une fois, voir
+        clock_started) :
 
         - 'Supprimer' se grise UNE FOIS le tournoi démarré : l'effacer en
           cours de partie fausserait l'historique (mouvements, 'éliminé
-          par'...) sans recours possible — 'Désactiver (forfait)' garde
-          une trace, à utiliser à la place.
+          par'...) sans recours possible — 'Abs/Dés' garde une trace, à
+          utiliser à la place.
         - 'Éliminer' se grise TANT QUE le tournoi n'a pas démarré : rien
           à éliminer avant que la partie ait commencé.
+        - 'Abs/Dés' (Lot 2, "Gestion des absences et des retardataires",
+          2026-09-28) se grise TANT QUE le tournoi n'a pas démarré,
+          MÊME RAISON qu'Éliminer : l'absence est par nature un concept
+          post-démarrage (le délai se calcule depuis tournament_start_
+          epoch, voir Database.absence_deadline_epoch) — Database.
+          declare_absent refuse de toute façon l'écriture avant le
+          démarrage (défense en profondeur), ce grisement n'est donc
+          qu'une ergonomie, jamais LA protection réelle. MAIS ce
+          grisement-par-démarrage, ainsi que le texte/comportement
+          "🚩 Abs/Dés", ne s'appliquent QUE si « Gestion de l'accueil »
+          est activée pour ce tournoi (modification du 2026-09-29) :
+          sinon, le bouton redevient à l'identique l'ancien "Désactiver
+          (forfait)" — toujours disponible, dès avant le démarrage,
+          exactement comme pour un tournoi habituel du club avant le
+          Lot 2.
 
-        Lu à chaque rafraîchissement (pas mis en cache) : les deux se
+        Lu à chaque rafraîchissement (pas mis en cache) : les trois se
         remettent d'eux-mêmes dans leur état initial pour un nouveau
         tournoi, où clock_started repart à 0."""
         started = self.db.get_setting_int("clock_started", 0) == 1
@@ -10090,8 +11316,8 @@ class App(tk.Tk):
         self.delete_player_btn.configure(state="disabled" if started else "normal")
         self.delete_player_btn_tooltip.text = (
             "Suppression désactivée : le tournoi a déjà démarré. Utilisez\n"
-            "plutôt « Désactiver (forfait) », qui garde une trace du\n"
-            "joueur au lieu de l'effacer."
+            "plutôt « Abs/Dés », qui garde une trace du joueur au lieu de\n"
+            "l'effacer."
         ) if started else ""
 
         self.eliminate_player_btn.configure(state="normal" if started else "disabled")
@@ -10100,6 +11326,48 @@ class App(tk.Tk):
             "Élimination désactivée : le tournoi n'a pas encore démarré\n"
             "(cliquez « Démarrer » dans l'onglet Chronomètre)."
         )
+
+        if self.db.accueil_management_enabled():
+            self.abs_des_btn.configure(text="🚩 Abs/Dés", state="normal" if started else "disabled")
+            self.abs_des_btn_tooltip.text = (
+                self._abs_des_btn_tooltip_normal_text if started else
+                "Indisponible : le tournoi n'a pas encore démarré (l'absence\n"
+                "se calcule depuis le démarrage réel, cliquez « Démarrer »\n"
+                "dans l'onglet Chronomètre)."
+            )
+        else:
+            self.abs_des_btn.configure(text="Désactiver (forfait)", state="normal")
+            self.abs_des_btn_tooltip.text = (
+                "Désactive définitivement le(s) joueur(s) sélectionné(s)\n"
+                "(forfait) — confirmation demandée. « Gestion de l'accueil »\n"
+                "est désactivée pour ce tournoi (réglage réservé aux\n"
+                "tournois Open, onglet Paramètres) : ni accueil, ni\n"
+                "signalement d'absence, jetons/table/siège inchangés."
+            )
+
+        # "Corriger l'arrivée" (modification du 2026-09-30, "accueil :
+        # correction des erreurs réservée au Mac") : disponible
+        # UNIQUEMENT une fois le tournoi démarré ET « Gestion de
+        # l'accueil » activée — avant le démarrage, la case à cocher de
+        # l'onglet Joueurs reste seule maîtresse d'une correction (Lot
+        # 1, inchangée) ; quand l'accueil est désactivé, cette action
+        # n'a simplement aucun sens (jamais renommée, contrairement à
+        # "Abs/Dés" — elle reste juste grisée).
+        if self.db.accueil_management_enabled():
+            self.correct_arrival_btn.configure(state="normal" if started else "disabled")
+            self.correct_arrival_btn_tooltip.text = (
+                self._correct_arrival_btn_tooltip_normal_text if started else
+                "Indisponible : le tournoi n'a pas encore démarré — avant le\n"
+                "démarrage, utilisez la case à cocher de l'onglet Joueurs\n"
+                "pour corriger une arrivée."
+            )
+        else:
+            self.correct_arrival_btn.configure(state="disabled")
+            self.correct_arrival_btn_tooltip.text = (
+                "Indisponible : « Gestion de l'accueil » n'est pas activée\n"
+                "pour ce tournoi (réglage réservé aux tournois Open, onglet\n"
+                "Paramètres)."
+            )
 
     def _update_undo_elimination_button_state(self):
         """Grise "Annule Eliminer" (demande du 2026-09-16, timeout ajouté
@@ -10159,11 +11427,10 @@ class App(tk.Tk):
 
         pending_old_by_name = self._pending_old_seat_by_name()
 
-        status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
         players = [dict(p) for p in self.db.list_players()]
         n_active = sum(1 for p in players if p["status"] == "active")
         for p in players:
-            p["status_label"] = status_labels.get(p["status"], p["status"])
+            p["status_label"] = self._accueil_status_label(p)
             p["table_name"] = tables.get(p["table_id"], "-") if p["table_id"] else "-"
             if p["name"] in pending_old_by_name:
                 old_table_name, old_seat = pending_old_by_name[p["name"]]
@@ -10177,6 +11444,18 @@ class App(tk.Tk):
                 p["rang"] = 1 if n_active == 1 else None
             else:
                 p["rang"] = p["place"]
+
+        if self._players_checkbox_drives_accueil():
+            # Lot 1 : tant que le tournoi n'a pas démarré, la case à
+            # cocher EST l'indicateur d'accueil — resynchronisée ici
+            # depuis la vérité base de données (arrived_at) à CHAQUE
+            # rafraîchissement, pour refléter sans délai une confirmation
+            # faite depuis un AUTRE poste ou processus (_sync_checkbox_
+            # for_arrival, plus bas, met déjà à jour CETTE fenêtre-ci
+            # immédiatement ; ceci couvre les autres). Remplace entièrement
+            # l'ensemble : pré-démarrage, il n'a plus d'autre usage que
+            # l'accueil (voir _players_checkbox_drives_accueil).
+            self.checked_player_ids = {p["id"] for p in players if p["arrived_at"]}
 
         sort_col = self.players_sort["column"]
         if sort_col == "name":
@@ -10224,6 +11503,12 @@ class App(tk.Tk):
         self._update_sort_headings()
 
         self.player_photo_images = {}
+        # Lot 2 ("Gestion des absences et des retardataires", 2026-09-28) :
+        # True dès qu'AU MOINS un joueur ACTIF est signalé absent parmi
+        # ceux affichés ci-dessous — pilote le (re)démarrage du cycle de
+        # clignotement juste après la boucle (voir _players_absent_blink_
+        # tick/_cancel_players_absent_blink).
+        any_absent_active = False
         for idx, p in enumerate(players):
             present_ids.add(p["id"])
             table_name = p["table_name"]
@@ -10231,7 +11516,27 @@ class App(tk.Tk):
             mark = self.CHECKBOX_CHECKED if p["id"] in self.checked_player_ids else self.CHECKBOX_UNCHECKED
             row_tag = "evenrow" if idx % 2 == 0 else "oddrow"
             if p["status"] == "active":
-                tags = (row_tag,)
+                if p["absent_declared_at"]:
+                    # Correctif du 2026-09-29 ("clignotement rouge des
+                    # absents") : SEUL "absent_blink" est posé, jamais
+                    # combiné avec row_tag — un ttk::treeview donne
+                    # priorité au PREMIER tag de la liste pour une
+                    # propriété de style en conflit (ici `background`) ;
+                    # row_tag (evenrow/oddrow) ne définissant QUE
+                    # `background`, le poser en même temps qu'absent_
+                    # blink écrasait systématiquement son fond rouge,
+                    # ne laissant plus visible que l'alternance de
+                    # `foreground` (crème/noir, jamais disputée) — d'où
+                    # un clignotement perçu sans jamais de rouge. Le
+                    # zébrage n'a de toute façon aucun sens pendant
+                    # qu'une ligne alterne déjà sa propre couleur ; il
+                    # réapparaît normalement dès que le joueur revient
+                    # (tags repasse à (row_tag,) au rafraîchissement
+                    # suivant, voir App._reinstate_selected/_refresh_all).
+                    tags = ("absent_blink",)
+                    any_absent_active = True
+                else:
+                    tags = (row_tag,)
             elif p["status"] == "withdrawn":
                 tags = (row_tag, "withdrawn")
             else:
@@ -10257,9 +11562,47 @@ class App(tk.Tk):
         self.players_tree.tag_configure("oddrow", background=CREAM_ALT)
         self.players_tree.tag_configure("eliminated", foreground="#8a7d63")
         self.players_tree.tag_configure("withdrawn", foreground="#b05c2e")
+        # (Re)démarre le clignotement des joueurs signalés absents, le cas
+        # échéant — toujours EN DERNIER, une fois les lignes construites
+        # ET taguées ci-dessus. Correctif du 2026-09-29 (essais manuels
+        # du Lot 2, "les rafraîchissements périodiques ne doivent pas
+        # interrompre ou réinitialiser constamment l'animation") : NE
+        # touche au cycle en cours QUE si l'état a réellement changé
+        # (apparition/disparition du DERNIER absent) — le tag "absent_
+        # blink" vit sur le Treeview lui-même (tag_configure), pas sur
+        # les lignes : un after() déjà programmé continue de colorer
+        # correctement les lignes fraîchement retaguées ci-dessus sans
+        # avoir besoin d'être annulé/reprogrammé à chaque reconstruction
+        # (contrairement au clignotement des tables, _tables_blink_tick,
+        # qui vise des cadres Tk directement et doit, lui, repartir d'un
+        # cycle neuf — voir _refresh_tables_tab, non modifiée ici).
+        was_blinking = getattr(self, "_players_absent_blink_active", False)
+        self._players_absent_blink_active = any_absent_active
+        if any_absent_active and not was_blinking:
+            self._players_absent_blink_tick()
+        elif not any_absent_active and was_blinking:
+            self._cancel_players_absent_blink()
         # on oublie les joueurs cochés qui n'existent plus (ex : supprimés)
         self.checked_player_ids &= present_ids
         self._update_checked_count_label()
+        self._update_players_stats_label()
+
+    def _update_players_stats_label(self):
+        """Actualise la ligne "Actifs : X  |  Entrées : Y  |  Z
+        accueilli(s)" de l'onglet Joueurs — factorisé (Lot 1, "Accueil des
+        joueurs", précision du 2026-09-28) pour être appelé aussi bien
+        depuis un rafraîchissement complet (_refresh_players_tab) que
+        depuis une confirmation/annulation d'arrivée ponctuelle (case
+        cochée manuellement, ou depuis le téléphone via _sync_checkbox_
+        for_arrival), sans reconstruire tout le tableau.
+
+        Le compteur "accueilli(s)" continue d'être recalculé ICI, sans
+        aucune condition sur clock_started : avant le démarrage il suit
+        les cases cochées, après le démarrage il continue d'augmenter
+        pour les retardataires accueillis depuis le téléphone (demande
+        explicite du 2026-09-28), même si la case, elle, ne bouge plus
+        (voir _players_checkbox_drives_accueil)."""
+        players = self.db.list_players()
         stats = self.db.get_stats()
         # Entrées affichées ici = buy-ins des joueurs encore réellement
         # dans le tournoi (actifs + éliminés), désistements exclus — pas
@@ -10270,9 +11613,20 @@ class App(tk.Tk):
         # "combien de joueurs sont dans ce tournoi en ce moment" : un
         # joueur désactivé (forfait) n'en fait plus partie.
         entries_current = sum(p["buyin_count"] for p in players if p["status"] != "withdrawn")
-        self.stats_lbl.config(
-            text=f"Actifs : {stats['active_count']}  |  Entrées : {entries_current}"
-        )
+        base_text = f"Actifs : {stats['active_count']}  |  Entrées : {entries_current}"
+        # "Z accueilli(s)" masqué quand « Gestion de l'accueil » est
+        # désactivée (modification du 2026-09-29) : pour un tournoi
+        # habituel du club, l'accueil n'existe simplement pas — afficher
+        # "0 accueilli(s)" en permanence serait trompeur, et ce segment
+        # n'existait pas avant le Lot 1. accueil_management_enabled()
+        # garantit de toute façon `accueillis == 0` ici (arrived_at n'est
+        # jamais posé tant que le réglage est désactivé, voir
+        # Database.confirm_arrival) : ce masquage n'est donc qu'une
+        # question de présentation, jamais de cohérence des données.
+        if self.db.accueil_management_enabled():
+            accueillis = sum(1 for p in players if p["status"] == "active" and p["arrived_at"])
+            base_text += f"  |  {accueillis} accueilli(s)"
+        self.stats_lbl.config(text=base_text)
 
     # ---------------------------------------------------------------
     # Onglet Tables
@@ -10721,6 +12075,62 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
         self._tables_blink_after_id = self.after(600, self._tables_blink_tick)
+
+    def _cancel_players_absent_blink(self):
+        """Annule proprement le cycle de clignotement des joueurs signalés
+        absents (onglet Joueurs, Lot 2 — voir _players_absent_blink_tick),
+        s'il y en a un en cours — même principe que _cancel_tables_blink
+        (appelé avant toute reconstruction de l'onglet et à la fermeture
+        du tournoi, _cleanup_for_close), pour ne jamais laisser un
+        callback after() orphelin viser un Treeview déjà détruit.
+
+        Remet aussi `_players_absent_blink_active` à False (correctif du
+        2026-09-29) : "annuler" doit laisser l'état COMPLÈTEMENT éteint,
+        jamais seulement l'identifiant after() effacé pendant que le
+        drapeau "actif" resterait vrai — une telle incohérence ferait
+        croire à tort à _refresh_players_tab qu'un cycle tourne déjà
+        (voir son "was_blinking"), et ne jamais le relancer."""
+        after_id = getattr(self, "_players_absent_blink_after_id", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            self._players_absent_blink_after_id = None
+        self._players_absent_blink_active = False
+
+    def _players_absent_blink_tick(self):
+        """Fait alterner l'apparence du tag "absent_blink" (voir
+        _refresh_players_tab, posé sur chaque ligne ACTIVE signalée
+        absente) entre la couleur d'alerte (DANGER_RED) et une apparence
+        neutre (CREAM), toutes les 600 ms — même principe/cadence que
+        _tables_blink_tick, jamais dupliqué autrement qu'en l'adaptant à
+        un tag de ttk.Treeview plutôt qu'à des cadres Tk bruts (un SEUL
+        appel à tag_configure change l'apparence de TOUTES les lignes
+        taguées d'un coup, pas besoin de les reparcourir individuellement
+        comme pour les cadres de l'onglet Tables).
+
+        UN SEUL cycle actif à la fois (voir _players_absent_blink_after_
+        id/_cancel_players_absent_blink, systématiquement annulé avant
+        d'en programmer un nouveau). S'arrête de lui-même (sans se
+        reprogrammer) dès que la fenêtre/le tableau n'existent plus, ou
+        qu'il n'y a plus personne à signaler (annulation, désactivation,
+        joueur supprimé) — jamais d'erreur Tkinter après destruction,
+        jamais une boucle qui persiste inutilement."""
+        self._players_absent_blink_after_id = None
+        if not self.winfo_exists() or not self.players_tree.winfo_exists():
+            return
+        if not getattr(self, "_players_absent_blink_active", False):
+            return
+        self._players_absent_blink_phase = not getattr(self, "_players_absent_blink_phase", False)
+        try:
+            if self._players_absent_blink_phase:
+                self.players_tree.tag_configure("absent_blink", background=DANGER_RED, foreground=CREAM)
+            else:
+                self.players_tree.tag_configure("absent_blink", background=CREAM, foreground="black")
+        except tk.TclError:
+            return
+        self._players_absent_blink_after_id = self.after(600, self._players_absent_blink_tick)
 
     def _finish_movement_alert_from_tables(self):
         """Bouton "Terminé" de l'onglet Tables (voir _build_tables_tab) :
@@ -11384,6 +12794,19 @@ class App(tk.Tk):
             # session après ce verrouillage, voir _align_primes_enabled_
             # on_open.
             open_windows.mark_primes_session_started(self.db.get_setting_int("primes_enabled", 1) == 1)
+            # Lot 1 ("Accueil des joueurs", précision du 2026-09-28) : dès
+            # cet instant, la case à cocher de l'onglet Joueurs cesse
+            # DÉFINITIVEMENT d'être pilotée par l'accueil (voir
+            # _players_checkbox_drives_accueil, qui lit clock_started —
+            # déjà passé à 1 juste au-dessus) — décochée ici pour repartir
+            # d'un état neutre de pure sélection, jamais un résidu de qui
+            # était arrivé ou non. _uncheck_all_players, appelée à ce
+            # stade, ne touche donc plus arrived_at (accueil_active déjà
+            # faux) : les confirmations d'arrivée restent intactes en
+            # base, et le compteur "accueilli(s)" (_update_players_stats_
+            # label) continue de les refléter normalement, y compris pour
+            # les retardataires accueillis après ce point.
+            self._uncheck_all_players()
         elif self.db.get_setting_int("is_paused", 1) == 1:
             # reprise : on décale level_start_epoch du temps passé en pause
             self.db.set_settings({"is_paused": 0, "level_start_epoch": int(time.time()) - self._elapsed_before_pause()})
@@ -13432,7 +14855,7 @@ class App(tk.Tk):
             ),
         )
         multi_table_check.grid(
-            row=test_mode_row + 1, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            row=test_mode_row + 2, column=0, columnspan=2, sticky="w", pady=(10, 0)
         )
         Tooltip(
             multi_table_check,
@@ -13441,6 +14864,77 @@ class App(tk.Tk):
             "l'ajouter ici — en pratique, ce cas reste rare.",
         )
 
+        # -- "Gestion de l'accueil" + "Durée d'une absence" (Lot 2,
+        # "Gestion des absences et des retardataires", 2026-09-28 ; case
+        # à cocher "Gestion de l'accueil" ajoutée le 2026-09-29 pour
+        # réserver toute la fonctionnalité Accueil/Absences aux tournois
+        # Open — décochée par défaut, jamais activée pour un tournoi
+        # habituel du club). Une seule ligne : case à cocher, puis libellé
+        # + spinbox de la durée, cote à cote (☐ Gestion de l'accueil
+        # Durée d'une absence : [60] min). Délai calculé à partir du
+        # démarrage RÉEL du tournoi (jamais de la déclaration d'une
+        # absence, voir Database.absence_deadline_epoch) — gouverne à la
+        # fois la clôture de l'accueil (Lot 1) et l'éligibilité d'un
+        # joueur signalé absent à la désactivation manuelle (Lot 2).
+        # Valeur initiale proposée : 60 minutes, jamais mémorisée dans
+        # tournament_prefs (comme le Timeout plus bas, dont c'est le plus
+        # proche précédent) : chaque nouveau tournoi reparaît sur 60,
+        # jamais sur le dernier réglage d'un tournoi précédent. Le
+        # réglage "Gestion de l'accueil" lui, EST propre à ce tournoi
+        # (clé de la table settings, voir Database.accueil_management_
+        # enabled) — décoché par défaut pour tout tournoi, y compris un
+        # ancien fichier antérieur à cette fonctionnalité.
+        absence_duration_row = test_mode_row + 1
+        accueil_row_frame = ttk.Frame(left)
+        accueil_row_frame.grid(
+            row=absence_duration_row, column=0, columnspan=2, sticky="w", pady=(6, 0)
+        )
+        self.accueil_management_var = tk.BooleanVar(
+            value=self.db.accueil_management_enabled()
+        )
+        accueil_management_check = ttk.Checkbutton(
+            accueil_row_frame, text="Gestion de l'accueil",
+            variable=self.accueil_management_var,
+            command=self._on_accueil_management_toggle,
+        )
+        accueil_management_check.pack(side="left")
+        Tooltip(
+            accueil_management_check,
+            "Réservé aux tournois Open : active l'accueil des joueurs\n"
+            "(téléphone/iPad) et la gestion des absences/retardataires\n"
+            "(bouton « Abs/Dés »). Décoché par défaut — les tournois\n"
+            "habituels du club n'en ont pas besoin et ne sont pas\n"
+            "affectés.",
+        )
+        absence_duration_lbl = ttk.Label(accueil_row_frame, text="   Durée d'une absence :")
+        absence_duration_lbl.pack(side="left")
+        Tooltip(
+            absence_duration_lbl,
+            "Délai, en minutes, accordé aux retardataires après le\n"
+            "démarrage RÉEL du tournoi (décompté depuis ce moment précis,\n"
+            "jamais depuis une déclaration d'absence individuelle) —\n"
+            "60 minutes par défaut. Passé ce délai : l'accueil se clôture\n"
+            "automatiquement (plus aucune confirmation/annulation\n"
+            "d'arrivée) et les joueurs signalés absents deviennent\n"
+            "éligibles à une désactivation manuelle (bouton « Abs/Dés »).",
+        )
+        absence_duration_var = tk.IntVar(
+            value=max(0, self.db.get_setting_int("absence_duration_minutes", 60))
+        )
+        self.absence_duration_spin = ttk.Spinbox(
+            accueil_row_frame, from_=0, to=360, width=5, textvariable=absence_duration_var,
+            command=lambda: self._save_absence_duration_minutes(absence_duration_var),
+        )
+        self.absence_duration_spin.pack(side="left", padx=6)
+        self.absence_duration_spin.bind(
+            "<Return>", lambda e: self._save_absence_duration_minutes(absence_duration_var)
+        )
+        self.absence_duration_spin.bind(
+            "<FocusOut>", lambda e: self._save_absence_duration_minutes(absence_duration_var)
+        )
+        ttk.Label(accueil_row_frame, text="min").pack(side="left")
+        self._update_accueil_management_widgets()
+
         # -- Jours de tournoi / Sit & Go : purement une référence pour le
         # club (utile si un autre club joue un autre jour, ex. le jeudi),
         # sans effet sur la création des dossiers — le sous-dossier
@@ -13448,7 +14942,7 @@ class App(tk.Tk):
         # façon le nom du jour en cours, quel qu'il soit (voir
         # tournament_day_folder_proposal / WEEKDAY_NAMES_FR). Mémorisé
         # globalement (tournament_prefs), comme "Dossier par défaut".
-        days_row = test_mode_row + 2
+        days_row = test_mode_row + 3
         days_lbl = ttk.Label(
             left, text="Jours de tournoi / Sit & Go",
             font=("Helvetica", 11, "bold"), foreground=GOLD,
@@ -14168,6 +15662,70 @@ class App(tk.Tk):
         self.remote_devices_container = ttk.Frame(left)
         self.remote_devices_container.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(0, 10))
         self._refresh_remote_devices_panel()
+
+        # -- Code personnel permanent (demande du 2026-10-01, "onglet CA :
+        # code personnel permanent") : accepté par verify_remote_code en
+        # PLUS du code de session ci-dessus, jamais à la place — permet
+        # de connecter son téléphone sans relire ce code à chaque
+        # nouvelle session. Jamais affiché une fois enregistré (champ
+        # masqué, vidé immédiatement après écriture, succès ou échec) :
+        # seul un indicateur actif/non défini est visible (voir
+        # _refresh_personal_remote_code_status). Aucune incidence sur
+        # ADMIN/DIRTO (résolus uniquement via owner_name, zone de droite
+        # ci-dessous) ni sur le fonctionnement multi-tournois (vérifié
+        # indépendamment de toute session active, comme le code de test
+        # — voir open_windows.verify_remote_code/_verify_personal_
+        # remote_code).
+        self.personal_code_title = ttk.Label(
+            left, text="Code personnel (facultatif)", font=("Helvetica", 10, "bold"), foreground=GOLD,
+        )
+        self.personal_code_title.grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        Tooltip(
+            self.personal_code_title,
+            "Code à 6 chiffres de VOTRE choix, accepté EN PLUS du code de\n"
+            "session ci-dessus (jamais à la place) — pratique pour\n"
+            "connecter votre téléphone sans relire ce code à chaque\n"
+            "nouvelle session. Reste confidentiel : jamais réaffiché une\n"
+            "fois enregistré, jamais journalisé. N'accorde aucun droit\n"
+            "par lui-même — l'appareil doit de toute façon être approuvé\n"
+            "ci-dessus comme n'importe quel autre.\n\n"
+            "Protégé contre toute modification par un autre ADMIN : "
+            "changer\nou supprimer un code déjà défini exige de ressaisir "
+            "CE code\nactuel (jamais contournable). Pour en définir un "
+            "pour la\npremière fois, un code initial distinct est "
+            "demandé.",
+        )
+        self.personal_code_row = ttk.Frame(left)
+        self.personal_code_row.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        self.personal_code_status_lbl = ttk.Label(self.personal_code_row, foreground=MUTED)
+        self.personal_code_status_lbl.pack(side="left", padx=(0, 10))
+        self.personal_code_var = tk.StringVar(value="")
+        personal_code_entry = ttk.Entry(
+            self.personal_code_row, textvariable=self.personal_code_var, width=8, show="•",
+        )
+        personal_code_entry.pack(side="left", padx=(0, 6))
+        ttk.Button(
+            self.personal_code_row, text="Définir/Changer", command=self._on_set_personal_remote_code,
+        ).pack(side="left", padx=(0, 6))
+        self.personal_code_clear_btn = ttk.Button(
+            self.personal_code_row, text="Supprimer", command=self._on_clear_personal_remote_code,
+        )
+        self.personal_code_clear_btn.pack(side="left")
+        self._refresh_personal_remote_code_status()
+        # Masquée par défaut (demande du 2026-10-03, "masquage de la
+        # section code personnel") : titre + indicateur + champ + les
+        # deux boutons, basculés par Ctrl+Maj+P UNIQUEMENT quand l'onglet
+        # CA est affiché (voir _on_toggle_personal_code_section) — repart
+        # TOUJOURS masquée à chaque lancement (_build_ca_tab s'exécute
+        # une fois par ouverture de fenêtre, cet état n'est jamais
+        # persisté sur disque). grid_remove (pas grid_forget) : conserve
+        # les options de grille pour un grid() ultérieur sans rien
+        # recalculer, et une ligne sans widget visible ne réserve aucun
+        # espace dans un grid Tk — rien à occuper "en vide" une fois
+        # masquée.
+        self._personal_code_section_visible = False
+        self.personal_code_title.grid_remove()
+        self.personal_code_row.grid_remove()
 
         # ================================================================
         # ZONE DROITE — Permissions DIRTO (pour ce tournoi)
@@ -15586,6 +17144,68 @@ class App(tk.Tk):
         if hasattr(self, "undo_elimination_btn"):
             self._update_undo_elimination_button_state()
 
+    def _save_absence_duration_minutes(self, var):
+        """Enregistre "Durée d'une absence en m" (Lot 2, "Gestion des
+        absences et des retardataires", 2026-09-28) — CE tournoi
+        uniquement, jamais mémorisé dans tournament_prefs (comme le
+        Timeout ci-dessus, son précédent le plus proche) : un nouveau
+        tournoi reproposera toujours 60 minutes, jamais le dernier réglage
+        d'un tournoi précédent. Une valeur invalide/vide est ignorée sans
+        planter. 0 est une valeur valide (délai immédiatement écoulé dès
+        le démarrage — jamais utile en pratique, mais jamais bloqué non
+        plus, cohérent avec le principe déjà établi pour le Timeout
+        "Annuler Eliminer" : aucune valeur numérique n'est un cas
+        interdit)."""
+        try:
+            minutes = max(0, min(360, int(var.get())))
+        except (tk.TclError, ValueError):
+            return
+        self.db.set_settings({"absence_duration_minutes": minutes})
+
+    def _on_accueil_management_toggle(self):
+        """Bascule "Gestion de l'accueil" (modification du 2026-09-29) —
+        réglage propre à CE tournoi, enregistré immédiatement en base
+        (table settings), jamais dans tournament_prefs : un tournoi Open
+        peut l'activer sans affecter les autres tournois, et un ancien
+        fichier sans ce réglage reste désactivé par défaut (voir
+        Database.accueil_management_enabled). Répercute le changement
+        immédiatement dans l'interface, sans attendre un redémarrage :
+        grise/dégrise "Durée d'une absence", recalcule le texte/l'état du
+        bouton "Abs/Dés", et rafraîchit les caches distants pour que les
+        boutons "Accueil" (page d'accueil du téléphone) et "Abs/Dés"
+        (page Éliminer) apparaissent/disparaissent sans recharger la
+        page. Ne touche JAMAIS aux données d'accueil/d'absence déjà
+        enregistrées : désactiver ce réglage ne les efface pas (cahier
+        des charges, section 4)."""
+        enabled = self.accueil_management_var.get()
+        self.db.set_settings({"accueil_management_enabled": 1 if enabled else 0})
+        self._update_accueil_management_widgets()
+        if hasattr(self, "abs_des_btn"):
+            self._update_tournament_started_buttons()
+        if hasattr(self, "_refresh_remote_players_cache"):
+            self._refresh_remote_players_cache()
+        if hasattr(self, "_refresh_remote_checkin_cache"):
+            self._refresh_remote_checkin_cache()
+        # Correctif du 2026-09-29 (voir __init__) : mise à jour IMMÉDIATE
+        # du cache lu par le thread du serveur web (get_accueil_
+        # management_enabled), sans attendre le prochain tick (~1s) —
+        # déjà sur le thread principal ici, donc self.db.absence_
+        # deadline_passed() peut être relu directement sans risque
+        # (celui-ci redevient de toute façon toujours False dès que ce
+        # réglage est désactivé, voir Database.absence_deadline_passed).
+        self._remote_accueil_management_enabled = enabled
+        self._remote_absence_deadline_passed = self.db.absence_deadline_passed()
+
+    def _update_accueil_management_widgets(self):
+        """Grise "Durée d'une absence" lorsque "Gestion de l'accueil" est
+        décochée (cahier des charges, section 2) — le réglage reste
+        visible et sa valeur enregistrée n'est jamais perdue, seule sa
+        modification est bloquée tant que la case n'est pas cochée."""
+        if not hasattr(self, "absence_duration_spin"):
+            return
+        enabled = self.accueil_management_var.get()
+        self.absence_duration_spin.configure(state="normal" if enabled else "disabled")
+
     def _save_club_name(self):
         """Enregistre en continu le "Nom du Club" (préférence partagée,
         commune à tous les tournois/Sit & Go — voir _build_settings_tab)
@@ -15664,6 +17284,36 @@ class App(tk.Tk):
 
     def _open_settings_templates(self):
         SettingsTemplatesDialog(self)
+
+    def _print_players_seating(self):
+        """Bouton "🖨️ Imprimer" de l'onglet Joueurs (demande du 2026-10-03,
+        "onglet Joueurs — bouton Imprimer et PDF des places") — demande
+        l'ordre de tri (PlayersSeatingPrintDialog), puis suit exactement
+        le même patron que _print_settings_pdf/_print_movement_slips
+        ci-dessous : asksaveasfilename -> export -> ouverture
+        automatique. Génère Database.export_players_seating_pdf (Nom/
+        Pseudo/Table/Siège, joueurs actifs uniquement)."""
+        dialog = PlayersSeatingPrintDialog(self)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        sort_by = dialog.result
+        name = self.db.get_setting("tournament_name", "placement") or "placement"
+        safe_name = "".join(c if c.isalnum() or c in " _-" else "_" for c in name).strip() or "placement"
+        path = filedialog.asksaveasfilename(
+            title="Imprimer le placement des joueurs",
+            defaultextension=".pdf",
+            filetypes=[("Fichier PDF", "*.pdf")],
+            initialfile=f"placement_{safe_name}.pdf",
+        )
+        if not path:
+            return
+        try:
+            self.db.export_players_seating_pdf(path, sort_by=sort_by)
+        except ImportError:
+            show_missing_export_module("pdf")
+            return
+        open_file_with_default_app(path)
 
     def _print_settings_pdf(self):
         """Enregistre tous les réglages du formulaire (comme "Enregistrer
@@ -15801,6 +17451,24 @@ class App(tk.Tk):
         self._refresh_all()
         self._check_remote_device_requests()
 
+    def _maybe_play_absence_deadline_alert(self):
+        """Alerte sonore UNIQUE (Lot 2, cahier des charges section 4) à
+        l'échéance du délai des retardataires — jouée UNE SEULE FOIS pour
+        toute la vie de CE tournoi, grâce à un réglage persistant en base
+        (survit à un redémarrage de l'application, cas explicitement
+        listé section 7) : contrairement au téléphone (voir _ELIMINATE_
+        PAGE, alerte propre à chaque page/appareil, sans registre
+        partagé), une fenêtre Mac par tournoi en usage normal suffit à
+        ce qu'un simple réglage en base garantisse l'unicité ici.
+        Jamais rejouée tant que ce tournoi reste ouvert, même si l'onglet
+        change ou que la fenêtre perd/reprend le focus."""
+        if not self.db.absence_deadline_passed():
+            return
+        if self.db.get_setting_int("absence_deadline_alert_sounded", 0) == 1:
+            return
+        self.db.set_setting("absence_deadline_alert_sounded", "1")
+        sound_signal.play_tone(600, 700)
+
     def _tick(self):
         if not self.winfo_exists():
             return
@@ -15887,10 +17555,24 @@ class App(tk.Tk):
                 self._remote_control_tournament_name = self.db.get_setting("tournament_name", "Tournoi")
                 self._refresh_remote_players_cache()
                 self._refresh_remote_moves_cache()
+                self._refresh_remote_checkin_cache()
                 self._refresh_remote_dirto_permissions_cache()
                 self._remote_clock_paused = self.db.get_setting_int("is_paused", 1) == 1
                 self._remote_has_pending_moves = self.db.count_seat_moves() > 0
+                # Correctif du 2026-09-29 (voir __init__) : même principe
+                # que les deux lignes ci-dessus, rafraîchies ici à chaque
+                # tick (thread principal) plutôt que lues depuis self.db
+                # par le thread du serveur web.
+                self._remote_accueil_management_enabled = self.db.accueil_management_enabled()
+                self._remote_absence_deadline_passed = self.db.absence_deadline_passed()
                 self._maybe_reclaim_default_remote_port()
+            # Alerte sonore unique à l'échéance du délai des retardataires
+            # (Lot 2, "Gestion des absences et des retardataires",
+            # cahier des charges section 4) — INCONDITIONNEL (contrairement
+            # au bloc ci-dessus) : doit se déclencher même si le contrôle
+            # à distance n'est pas activé pour cette fenêtre.
+            if self.db is not None:
+                self._maybe_play_absence_deadline_alert()
             # Approbation des téléphones (demande du 2026-09-09) : toutes
             # les ~2s seulement (pas à chaque tick, voir _check_remote_
             # device_requests) — un compteur simple plutôt qu'un after()
@@ -16042,6 +17724,51 @@ class App(tk.Tk):
                 # d'un coup d'œil qui a déjà une photo au répertoire,
                 # sans endpoint séparé (voir player_photos.get_photo_path).
                 "has_photo": player_photos.get_photo_path(p["name"]) is not None,
+                # Lot 2, "Gestion des absences et des retardataires"
+                # (2026-09-28) : fait clignoter ce joueur en rouge sur la
+                # page "Gestion des éliminations" (voir _ELIMINATE_PAGE) —
+                # même source (absent_declared_at NON NULL) que le
+                # clignotement de l'onglet Joueurs sur le Mac, aucune
+                # logique séparée.
+                "absent": bool(p["absent_declared_at"]),
+                # Correctif du 2026-09-29 (essais manuels du Lot 2) : la
+                # page Éliminations doit savoir, PAR JOUEUR, s'il a déjà
+                # été accueilli (Lot 1) pour router "Abs/Dés" vers une
+                # désactivation directe plutôt qu'un signalement d'absence
+                # (voir handleAbsDesDrop, JS) — même source (arrived_at
+                # NON NULL) que la vérité base de données qui fait
+                # réellement foi côté serveur (Database.declare_absent).
+                "arrived": bool(p["arrived_at"]),
+            }
+            for p in self.db.list_players(status="active")
+        ]
+
+    def _refresh_remote_checkin_cache(self):
+        """Reconstruit self._remote_checkin_cache (Lot 1, "Accueil des
+        joueurs", 2026-09-27) — TOUS les joueurs actifs (pré-inscrits,
+        déjà assis via Database.add_player) pour la page "Accueil des
+        joueurs" du contrôle à distance, avec leur état d'arrivée — depuis
+        le thread principal, jamais depuis le thread du serveur web (même
+        principe que _refresh_remote_players_cache ci-dessus).
+
+        "absent" (modification du 2026-09-30, "harmonisation des statuts
+        Mac et iPhone") : ajouté pour que cette page affiche elle aussi
+        un statut "Absent" explicite — même donnée (`absent_declared_at`)
+        et même priorité que App._accueil_status_label côté Mac, jamais
+        recalculée différemment d'un appareil à l'autre."""
+        if not self.db:
+            self._remote_checkin_cache = []
+            return
+        tables = {t["id"]: t["name"] for t in self.db.list_tables(active_only=False)}
+        self._remote_checkin_cache = [
+            {
+                "id": p["id"],
+                "name": p["name"],
+                "club": p["club"],
+                "table": tables.get(p["table_id"]),
+                "seat": p["seat"],
+                "arrived_at": p["arrived_at"],
+                "absent": bool(p["absent_declared_at"]),
             }
             for p in self.db.list_players(status="active")
         ]
