@@ -488,6 +488,153 @@ class CopyTreeExclusionUnitTest(unittest.TestCase):
         )
         self.assertNotIn("license.json", backup_restore.RESTORE_EXCLUDED_DATA_FILENAMES)
 
+    # ------------------------------------------------------------------
+    # exclude_dir_names (correctif du 2026-10-09 — pre_restore_backups
+    # recopié dans lui-même)
+    # ------------------------------------------------------------------
+
+    def test_exclude_dir_names_elague_bien_le_sous_dossier_a_toute_profondeur(self):
+        _write(os.path.join(self.src, "pre_restore_backups", "ancien", "x.json"), "X")
+        _write(os.path.join(self.src, "sous_dossier", "pre_restore_backups", "y.json"), "Y")
+        count = backup_restore._copy_tree_file_by_file(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+        self.assertEqual(count, 3)
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "pre_restore_backups")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "sous_dossier", "pre_restore_backups")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dst, "sous_dossier", "c.json")))
+
+    def test_verify_copied_tree_avec_exclude_dir_names_ne_signale_jamais_lexclu_comme_manquant(self):
+        _write(os.path.join(self.src, "pre_restore_backups", "ancien", "x.json"), "X")
+        backup_restore._copy_tree_file_by_file(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+        backup_restore._verify_copied_tree(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+
+    def test_verify_copied_tree_sans_exclude_dir_names_detecte_bien_un_vrai_manquant(self):
+        backup_restore._copy_tree_file_by_file(self.src, self.dst)
+        os.remove(os.path.join(self.dst, "b.json"))
+        with self.assertRaises(backup_restore.BackupError):
+            backup_restore._verify_copied_tree(self.src, self.dst)
+
+
+class PreRestoreBackupsRecursionTest(unittest.TestCase):
+    """Correctif du 2026-10-09 : restore_backup() avec pre_restore_root=
+    None (le vrai défaut, jamais utilisé ailleurs dans ce fichier) calcule
+    pre_restore_root À L'INTÉRIEUR de poker_data_dir — la sauvegarde de
+    sécurité se recopiait alors indéfiniment dans elle-même ("WinError
+    206 : nom de fichier... trop long" sur un poste réel). Ces tests
+    patchent default_poker_data_dir pour reproduire EXACTEMENT ce calcul
+    par défaut, sur un dossier synthétique — jamais le vrai
+    ~/.poker_tournament."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_pre_restore_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+
+        self._patchers = [
+            patch.object(backup_restore, "default_poker_data_dir", return_value=self.env.poker_data_dir),
+            patch.object(backup_restore, "default_tournament_folder", return_value=self.env.tournament_folder),
+        ]
+        for p in self._patchers:
+            self.addCleanup(p.stop)
+            p.start()
+
+        self.backup_dir = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="POSTE-TEST",
+        )["backup_dir"]
+
+    def _restore(self, **overrides):
+        kwargs = dict(
+            tournament_folder=self.env.tournament_folder,
+            poker_data_dir=None,
+            pre_restore_root=None,
+            open_tournament_paths=[],
+        )
+        kwargs.update(overrides)
+        return backup_restore.restore_backup(self.backup_dir, **kwargs)
+
+    def test_restauration_avec_le_vrai_defaut_pre_restore_root_ne_plante_pas(self):
+        result = self._restore()
+        self.assertTrue(result["restored_data"])
+        pre_restore_root = os.path.join(self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)
+        self.assertEqual(len(os.listdir(pre_restore_root)), 1)
+
+    def test_la_sauvegarde_de_securite_nest_jamais_imbriquee_dans_elle_meme(self):
+        result = self._restore()
+        safety_data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertFalse(
+            os.path.exists(os.path.join(safety_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)),
+        )
+
+    def test_fichiers_reels_restent_inclus_dans_la_sauvegarde_de_securite(self):
+        result = self._restore()
+        data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "export_prefs.json")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "roster.json")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "photos", "jean.jpg")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "license.json")))
+
+    def test_trois_restaurations_successives_ne_font_pas_grossir_chaque_sauvegarde(self):
+        file_counts = []
+        safety_dirs = []
+        for _ in range(3):
+            result = self._restore()
+            safety_dirs.append(result["safety_backup_dir"])
+            data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+            file_counts.append(sum(len(files) for _, _, files in os.walk(data_dir)))
+        self.assertEqual(len(set(safety_dirs)), 3)
+        self.assertEqual(len(set(file_counts)), 1, f"décomptes attendus identiques, obtenus {file_counts}")
+
+    def test_sauvegarde_de_securite_precedente_reste_intacte_sur_le_disque(self):
+        result1 = self._restore()
+        first_safety_dir = result1["safety_backup_dir"]
+        before_path = os.path.join(first_safety_dir, backup_restore.POKER_DATA_SUBDIR, "export_prefs.json")
+        with open(before_path) as f:
+            before = f.read()
+
+        result2 = self._restore()
+        self.assertNotEqual(first_safety_dir, result2["safety_backup_dir"])
+        self.assertTrue(os.path.isdir(first_safety_dir))
+        with open(before_path) as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+    def test_sauvegarde_manuelle_classique_exclut_aussi_pre_restore_backups(self):
+        _write(
+            os.path.join(
+                self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "ancien", "x.json",
+            ),
+            "ancien contenu",
+        )
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder, poker_data_dir=self.env.poker_data_dir,
+        )
+        data_dir = os.path.join(result["backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertFalse(os.path.exists(os.path.join(data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "export_prefs.json")))
+
+    def test_restauration_depuis_une_ancienne_sauvegarde_contenant_deja_pre_restore_backups_ne_le_reinjecte_pas(self):
+        _write(
+            os.path.join(
+                self.backup_dir, backup_restore.POKER_DATA_SUBDIR,
+                backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "vieux", "y.json",
+            ),
+            "vieux contenu",
+        )
+        self._restore()
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "vieux"),
+            ),
+        )
+
 
 class NoOpOnCancellationTest(unittest.TestCase):
     """"Vérifie que l'annulation par l'utilisateur ne modifie rien" —

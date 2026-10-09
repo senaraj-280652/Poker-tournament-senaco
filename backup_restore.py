@@ -30,17 +30,20 @@ Principes de sécurité (demande explicite du 2026-09-07) :
   seules default_tournament_folder()/default_poker_data_dir() lisent
   la config réelle ; le reste est testable avec des dossiers
   synthétiques sans toucher aux vraies données.
-- La SAUVEGARDE copie toujours l'intégralité de ~/.poker_tournament,
-  sans aucune exception (demande explicite du 2026-09-07). La
-  RESTAURATION, elle, n'y réinjecte jamais open_windows.json ni
-  phone_selected_pid.json (voir RESTORE_EXCLUDED_DATA_FILENAMES) : ce
-  sont des états de session temporaires liés aux processus en cours
-  sur LA machine d'origine au moment de la sauvegarde, sans rapport
-  avec la machine/le moment de la restauration — les réinjecter
-  pourrait laisser croire à tort qu'un tournoi est ouvert (ou par qui).
-  license.json n'est PAS concerné par cette exclusion : il reste
-  sauvegardé et restauré normalement, sans aucune modification du
-  système de licence lui-même (voir license.py, inchangé)."""
+- La SAUVEGARDE copie l'intégralité de ~/.poker_tournament, à une seule
+  exception près : PRE_RESTORE_BACKUPS_DIRNAME ("pre_restore_backups",
+  voir ce commentaire — correctif du 2026-10-09, recopie infinie d'une
+  sauvegarde de sécurité dans elle-même) n'est jamais inclus dans
+  AUCUNE sauvegarde, manuelle ou automatique. La RESTAURATION, elle,
+  n'y réinjecte jamais open_windows.json ni phone_selected_pid.json
+  (voir RESTORE_EXCLUDED_DATA_FILENAMES) : ce sont des états de session
+  temporaires liés aux processus en cours sur LA machine d'origine au
+  moment de la sauvegarde, sans rapport avec la machine/le moment de la
+  restauration — les réinjecter pourrait laisser croire à tort qu'un
+  tournoi est ouvert (ou par qui). license.json n'est PAS concerné par
+  cette exclusion : il reste sauvegardé et restauré normalement, sans
+  aucune modification du système de licence lui-même (voir license.py,
+  inchangé)."""
 import json
 import os
 import platform
@@ -56,6 +59,25 @@ BACKUP_FOLDER_PREFIX = "PokerTournament_Backup_"
 MANIFEST_FILENAME = "backup_manifest.json"
 TOURNAMENTS_SUBDIR = "tournois"
 POKER_DATA_SUBDIR = "poker_tournament_data"
+
+# Sous-dossier des sauvegardes de sécurité PRÉ-RESTAURATION, créé par
+# restore_backup À L'INTÉRIEUR MÊME de poker_data_dir (voir
+# restore_backup, pre_restore_root). Correctif du 2026-10-09 ("WinError
+# 206 : nom de fichier... trop long" sur un poste réel) : une sauvegarde
+# de poker_data_dir qui ne l'exclut pas se recopie indéfiniment dans
+# elle-même (sa propre destination vit À L'INTÉRIEUR de sa propre
+# source), et ferait grossir chaque sauvegarde suivante de TOUTES les
+# précédentes déjà présentes dans ce dossier. EXCLU de TOUTE sauvegarde
+# de poker_data_dir, sans exception — manuelle (Menu principal) ou
+# interne (sécurité pré-restauration elle-même) — voir create_backup/
+# restore_backup, qui passent tous deux EXCLUDED_POKER_DATA_DIR_NAMES
+# ci-dessous à _copy_tree_file_by_file/_verify_copied_tree. Les
+# sauvegardes de sécurité déjà présentes sur le disque ne sont jamais
+# ni supprimées ni modifiées par cette exclusion : elle ne change que
+# ce qui est COPIÉ dans les FUTURES sauvegardes, jamais ce qui existe
+# déjà.
+PRE_RESTORE_BACKUPS_DIRNAME = "pre_restore_backups"
+EXCLUDED_POKER_DATA_DIR_NAMES = frozenset({PRE_RESTORE_BACKUPS_DIRNAME})
 
 # Fichiers d'état de session temporaires (voir open_windows.py) : jamais
 # réinjectés lors d'une RESTAURATION (demande du 2026-09-07) — ils restent
@@ -120,7 +142,7 @@ def find_tournament_files(base_dir):
     return found
 
 
-def _copy_tree_file_by_file(src_dir, dst_dir, exclude_relpaths=None):
+def _copy_tree_file_by_file(src_dir, dst_dir, exclude_relpaths=None, exclude_dir_names=None):
     """Copie récursive fichier par fichier de `src_dir` vers `dst_dir` —
     jamais un rmtree/DELETE préalable sur `dst_dir` (qui peut déjà
     contenir des données, voir restore_backup) : chaque fichier existant
@@ -131,11 +153,22 @@ def _copy_tree_file_by_file(src_dir, dst_dir, exclude_relpaths=None):
 
     `exclude_relpaths` : ensemble de chemins relatifs (séparateur "/",
     ex. {"open_windows.json"}) à ne JAMAIS copier — utilisé uniquement
-    par restore_backup (voir RESTORE_EXCLUDED_DATA_FILENAMES) ;
-    create_backup n'exclut jamais rien."""
+    par restore_backup (voir RESTORE_EXCLUDED_DATA_FILENAMES).
+
+    `exclude_dir_names` (correctif du 2026-10-09, "WinError 206 : nom
+    de fichier... trop long" — pre_restore_backups, À L'INTÉRIEUR de
+    poker_data_dir, se recopiait indéfiniment dans lui-même) : ensemble
+    de NOMS de sous-dossiers (pas des chemins, juste le nom — ex.
+    {"pre_restore_backups"}) à ne JAMAIS descendre, à QUELQUE
+    PROFONDEUR QUE CE SOIT sous `src_dir`. Élagué EN PLACE sur `dirs`
+    (`dirs[:] = ...`), seule façon reconnue par os.walk pour l'empêcher
+    de descendre dans un sous-dossier — jamais un simple filtre sur
+    `files`, qui laisserait `os.walk` y descendre quand même."""
     exclude_relpaths = exclude_relpaths or frozenset()
+    exclude_dir_names = exclude_dir_names or frozenset()
     count = 0
-    for root, _dirs, files in os.walk(src_dir):
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d not in exclude_dir_names]
         rel = os.path.relpath(root, src_dir)
         target_root = dst_dir if rel == "." else os.path.join(dst_dir, rel)
         os.makedirs(target_root, exist_ok=True)
@@ -148,11 +181,18 @@ def _copy_tree_file_by_file(src_dir, dst_dir, exclude_relpaths=None):
     return count
 
 
-def _verify_copied_tree(src_dir, dst_dir):
+def _verify_copied_tree(src_dir, dst_dir, exclude_dir_names=None):
     """Vérifie que chaque fichier de `src_dir` a bien son pendant dans
     `dst_dir`, de même taille. Lève BackupError (message prêt pour
-    l'utilisateur) au premier écart trouvé."""
-    for root, _dirs, files in os.walk(src_dir):
+    l'utilisateur) au premier écart trouvé.
+
+    `exclude_dir_names` : MÊME ensemble que celui passé à
+    _copy_tree_file_by_file pour CETTE copie — indispensable pour
+    rester symétrique : un sous-dossier délibérément jamais copié (voir
+    ci-dessus) ne doit jamais être signalé comme "manquant" ici."""
+    exclude_dir_names = exclude_dir_names or frozenset()
+    for root, dirs, files in os.walk(src_dir):
+        dirs[:] = [d for d in dirs if d not in exclude_dir_names]
         rel = os.path.relpath(root, src_dir)
         target_root = dst_dir if rel == "." else os.path.join(dst_dir, rel)
         for name in files:
@@ -218,7 +258,10 @@ def create_backup(destination_parent_dir, tournament_folder=None, poker_data_dir
 
         poker_data_included = bool(poker_data_dir and os.path.isdir(poker_data_dir))
         if poker_data_included:
-            _copy_tree_file_by_file(poker_data_dir, os.path.join(backup_dir, POKER_DATA_SUBDIR))
+            _copy_tree_file_by_file(
+                poker_data_dir, os.path.join(backup_dir, POKER_DATA_SUBDIR),
+                exclude_dir_names=EXCLUDED_POKER_DATA_DIR_NAMES,
+            )
 
         manifest = {
             "created_at": timestamp.isoformat(timespec="seconds"),
@@ -237,7 +280,10 @@ def create_backup(destination_parent_dir, tournament_folder=None, poker_data_dir
         if tournament_files:
             _verify_copied_tree(tournament_folder, os.path.join(backup_dir, TOURNAMENTS_SUBDIR))
         if poker_data_included:
-            _verify_copied_tree(poker_data_dir, os.path.join(backup_dir, POKER_DATA_SUBDIR))
+            _verify_copied_tree(
+                poker_data_dir, os.path.join(backup_dir, POKER_DATA_SUBDIR),
+                exclude_dir_names=EXCLUDED_POKER_DATA_DIR_NAMES,
+            )
     except Exception as e:
         try:
             shutil.rmtree(backup_dir, ignore_errors=True)
@@ -332,7 +378,7 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
     tournament_folder = default_tournament_folder() if tournament_folder is None else tournament_folder
     poker_data_dir = default_poker_data_dir() if poker_data_dir is None else poker_data_dir
     if pre_restore_root is None:
-        pre_restore_root = os.path.join(default_poker_data_dir(), "pre_restore_backups")
+        pre_restore_root = os.path.join(default_poker_data_dir(), PRE_RESTORE_BACKUPS_DIRNAME)
 
     # 1) Sauvegarde de sécurité de l'état ACTUEL, avant tout écrasement.
     os.makedirs(pre_restore_root, exist_ok=True)
@@ -376,8 +422,13 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
             # réinjectés (états de session temporaires d'une autre
             # machine/d'un autre moment, voir RESTORE_EXCLUDED_DATA_FILENAMES
             # et le docstring du module). license.json n'est PAS exclu.
+            # pre_restore_backups (EXCLUDED_POKER_DATA_DIR_NAMES) : défense
+            # en profondeur contre une ANCIENNE sauvegarde créée avant ce
+            # correctif, qui pourrait déjà contenir une version gonflée de
+            # ce dossier — jamais réinjectée ici non plus.
             _copy_tree_file_by_file(
                 data_src, poker_data_dir, exclude_relpaths=RESTORE_EXCLUDED_DATA_FILENAMES,
+                exclude_dir_names=EXCLUDED_POKER_DATA_DIR_NAMES,
             )
             restored_data = True
     except Exception as e:
