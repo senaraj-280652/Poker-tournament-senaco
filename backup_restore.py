@@ -247,6 +247,14 @@ def create_backup(destination_parent_dir, tournament_folder=None, poker_data_dir
 
         tournament_files = find_tournament_files(tournament_folder)
         relative_tournament_files = []
+        # Paires (src, dst) réellement copiées — revérifiées explicitement
+        # plus bas, PAIRE PAR PAIRE (correctif du 2026-10-09, incident réel
+        # "Fichier manquant après la copie : primes_To170926.pdf") : jamais
+        # un parcours libre de tournament_folder (_verify_copied_tree),
+        # qui peut contenir des fichiers ANNEXES (PDF d'export, CSV,
+        # fichiers techniques OS) jamais copiés — un tel parcours les
+        # signalerait à tort comme "manquants".
+        tournament_copy_pairs = []
         if tournament_files:
             tournaments_dst = os.path.join(backup_dir, TOURNAMENTS_SUBDIR)
             for src_path in tournament_files:
@@ -255,6 +263,7 @@ def create_backup(destination_parent_dir, tournament_folder=None, poker_data_dir
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 relative_tournament_files.append(rel.replace(os.sep, "/"))
+                tournament_copy_pairs.append((src_path, dst_path))
 
         poker_data_included = bool(poker_data_dir and os.path.isdir(poker_data_dir))
         if poker_data_included:
@@ -276,9 +285,14 @@ def create_backup(destination_parent_dir, tournament_folder=None, poker_data_dir
             json.dump(manifest, f, ensure_ascii=False, indent=2)
 
         # Vérification post-copie (demande explicite) : compare chaque
-        # fichier annoncé dans le manifeste à sa copie.
-        if tournament_files:
-            _verify_copied_tree(tournament_folder, os.path.join(backup_dir, TOURNAMENTS_SUBDIR))
+        # fichier RÉELLEMENT copié (tournament_copy_pairs) à sa copie —
+        # jamais un parcours libre du dossier source (voir le
+        # commentaire sur tournament_copy_pairs plus haut).
+        for src_path, dst_path in tournament_copy_pairs:
+            if not os.path.isfile(dst_path):
+                raise BackupError(f"Fichier manquant après la copie : {os.path.basename(src_path)}")
+            if os.path.getsize(dst_path) != os.path.getsize(src_path):
+                raise BackupError(f"Taille différente après la copie : {os.path.basename(src_path)}")
         if poker_data_included:
             _verify_copied_tree(
                 poker_data_dir, os.path.join(backup_dir, POKER_DATA_SUBDIR),

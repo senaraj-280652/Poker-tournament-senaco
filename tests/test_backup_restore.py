@@ -197,6 +197,98 @@ class CreateBackupTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(r2["backup_dir"]))
 
 
+class TournamentFolderExtraneousFilesTest(unittest.TestCase):
+    """Incident RÉEL du 2026-10-09 (HP, PokerTournament-TEST-12) :
+    "Fichier manquant après la copie : primes_To170926.pdf" — asymétrie
+    copie/vérification des .tournoi, corrigée en vérifiant uniquement
+    les paires réellement copiées (tournament_copy_pairs)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_extraneous_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        _write(os.path.join(self.env.tournament_folder, "dimanche", "primes_To170926.pdf"), "PDF PRIMES")
+        _write(os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv"), "nom;club\nJean;CPC")
+        _write(os.path.join(self.env.tournament_folder, "Vendredi", "placement_sitngo.pdf"), "PDF PLACEMENT")
+        _write(os.path.join(self.env.tournament_folder, ".DS_Store"), "FAUX FICHIER TECHNIQUE MAC")
+
+    def test_fichiers_annexes_ne_bloquent_plus_la_sauvegarde(self):
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="POSTE-TEST",
+        )
+        self.assertEqual(result["tournament_file_count"], 2)
+
+    def test_les_tournois_restent_bien_copies_et_corrects(self):
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        backed_up = os.path.join(result["backup_dir"], backup_restore.TOURNAMENTS_SUBDIR, "dimanche", "tournoi14.tournoi")
+        with open(backed_up) as f:
+            self.assertEqual(f.read(), "DB tournoi 14")
+
+    def test_fichiers_annexes_ne_sont_jamais_copies_dans_la_sauvegarde(self):
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        tournois_dst = os.path.join(result["backup_dir"], backup_restore.TOURNAMENTS_SUBDIR)
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, "dimanche", "primes_To170926.pdf")))
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, "repertoire_joueurs.csv")))
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, ".DS_Store")))
+
+    def test_fichiers_annexes_restent_intacts_sur_le_disque_dorigine(self):
+        pdf_path = os.path.join(self.env.tournament_folder, "dimanche", "primes_To170926.pdf")
+        csv_path = os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv")
+        backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        with open(pdf_path) as f:
+            self.assertEqual(f.read(), "PDF PRIMES")
+        with open(csv_path) as f:
+            self.assertEqual(f.read(), "nom;club\nJean;CPC")
+
+    def test_un_vrai_tournoi_manquant_reste_bien_detecte(self):
+        orig_copy2 = backup_restore.shutil.copy2
+
+        def _copy2_puis_supprime_un_tournoi(src, dst):
+            orig_copy2(src, dst)
+            if os.path.basename(dst) == "tournoi14.tournoi":
+                os.remove(dst)
+
+        with patch.object(backup_restore.shutil, "copy2", side_effect=_copy2_puis_supprime_un_tournoi):
+            with self.assertRaises(backup_restore.BackupError) as ctx:
+                backup_restore.create_backup(
+                    self.usb, tournament_folder=self.env.tournament_folder,
+                    poker_data_dir=self.env.poker_data_dir,
+                )
+        self.assertIn("tournoi14.tournoi", str(ctx.exception))
+
+    def test_plusieurs_sauvegardes_et_restaurations_successives_avec_fichiers_annexes(self):
+        restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        for i in range(3):
+            result = backup_restore.create_backup(
+                self.usb, tournament_folder=self.env.tournament_folder,
+                poker_data_dir=self.env.poker_data_dir,
+            )
+            self.assertEqual(result["tournament_file_count"], 2)
+            restore_result = backup_restore.restore_backup(
+                result["backup_dir"],
+                tournament_folder=restore_tournament_folder,
+                poker_data_dir=restore_poker_data_dir,
+                pre_restore_root=os.path.join(self._tmp.name, f"pre_restore_{i}"),
+                open_tournament_paths=[],
+            )
+            self.assertEqual(restore_result["restored_tournament_files"], 2)
+        with open(os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv")) as f:
+            self.assertEqual(f.read(), "nom;club\nJean;CPC")
+
+
 class ValidateBackupFolderTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
