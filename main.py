@@ -6200,6 +6200,19 @@ class App(tk.Tk):
                 return
             count = len(manifest.get("tournament_files", []))
             has_data = manifest.get("poker_tournament_data_included", False)
+            # Avertissement explicite sur le remplacement (demande du
+            # 2026-10-10) : restore_backup() écrase bien un .tournoi de
+            # même nom relatif déjà présent à destination (comportement
+            # voulu, protégé par la sauvegarde de sécurité ci-dessous) —
+            # mais rien ne le disait jusqu'ici avant confirmation.
+            # Seulement si cette sauvegarde contient effectivement des
+            # .tournoi (count > 0) : sinon aucun fichier de tournoi
+            # n'est concerné par cette restauration.
+            overwrite_note = (
+                "\n\nLes fichiers de tournoi (.tournoi) de même nom déjà "
+                "présents dans le dossier de tournoi actuel seront "
+                "REMPLACÉS par ceux de la sauvegarde."
+            ) if count else ""
             if not messagebox.askyesno(
                 "Confirmer la restauration",
                 f"Sauvegarde du {manifest.get('created_at', '?')}\n"
@@ -6207,7 +6220,8 @@ class App(tk.Tk):
                 f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
                 f"Tournois : {count}\n"
                 "Données de l'application (réglages, joueurs, photos...) : "
-                f"{'oui' if has_data else 'non'}\n\n"
+                f"{'oui' if has_data else 'non'}"
+                f"{overwrite_note}\n\n"
                 "Une sauvegarde de sécurité des données actuelles sera créée "
                 "automatiquement avant toute modification.\n\n"
                 "Confirmer la restauration ?",

@@ -341,6 +341,77 @@ def validate_backup_folder(backup_dir):
     return manifest
 
 
+# Clé "tournament_day_folder" de last_settings.json (seule clé
+# machine-spécifique de ce fichier — voir tournament_prefs.
+# PERSISTED_KEYS, qui ne l'exporte pas comme constante publique) —
+# voir _read_tournament_day_folder/_restore_tournament_day_folder
+# ci-dessous : ces deux fonctions opèrent TOUJOURS sur un
+# `poker_data_dir` fourni en paramètre, jamais via tournament_prefs.
+# load_last_settings()/save_last_settings(), qui résolvent TOUJOURS le
+# vrai ~/.poker_tournament — sans rapport avec le dossier (réel ou
+# synthétique, pour les tests) réellement manipulé ici.
+_LAST_SETTINGS_FILENAME = "last_settings.json"
+
+
+def _read_tournament_day_folder(last_settings_path):
+    """Lit UNIQUEMENT la clé "tournament_day_folder" du fichier
+    `last_settings_path` — jamais via tournament_prefs (voir le
+    commentaire ci-dessus). None si le fichier est absent, illisible,
+    ou sans cette clé — jamais une exception."""
+    if not os.path.isfile(last_settings_path):
+        return None
+    try:
+        with open(last_settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data.get("tournament_day_folder")
+
+
+def _restore_tournament_day_folder(last_settings_path, value):
+    """Réécrit UNIQUEMENT la clé "tournament_day_folder" dans
+    `last_settings_path` (déjà restauré par la copie intégrale de
+    poker_data_dir au moment où cette fonction est appelée) — fusionne
+    avec le contenu déjà présent (ne touche à aucune autre préférence),
+    ou retire la clé si `value` est None (aucune valeur locale avant la
+    restauration — jamais en introduire une venue de la machine
+    source). Jamais une exception : si le fichier restauré est
+    illisible, abandonne silencieusement plutôt que de faire échouer
+    toute la restauration pour ce seul détail — le reste a déjà été
+    restauré avec succès à ce stade.
+
+    N'écrit RIEN si l'état souhaité est déjà celui présent (y compris
+    quand `last_settings_path` n'existe pas encore et qu'il n'y a rien
+    à y retirer) — sans cette garde, un restore vers un poker_data_dir
+    qui n'avait jamais eu de last_settings.json créerait un fichier
+    vide pour rien, perturbant tout calcul qui compte les fichiers de
+    ce dossier (ex. la non-croissance des sauvegardes de sécurité
+    successives)."""
+    try:
+        with open(last_settings_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    had_key = "tournament_day_folder" in data
+    if value is None:
+        if not had_key:
+            return
+        data.pop("tournament_day_folder", None)
+    else:
+        if had_key and data.get("tournament_day_folder") == value:
+            return
+        data["tournament_day_folder"] = value
+    try:
+        with open(last_settings_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
 def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
                     pre_restore_root=None, computer_name=None, open_tournament_paths=None):
     """Restaure la sauvegarde `backup_dir`. `tournament_folder`/
@@ -356,6 +427,17 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
        Aucune copie ni sauvegarde de sécurité n'est tentée dans ce cas.
     1) Valide le manifeste (voir validate_backup_folder) — rien n'est
        encore touché à ce stade.
+    1bis) Si cette sauvegarde contient des .tournoi à restaurer, valide
+       le DOSSIER DE TOURNOI DE DESTINATION (demande explicite du
+       2026-10-10) : doit être le "Dossier par défaut" RÉELLEMENT
+       configuré sur CETTE machine (tournament_prefs, jamais le repli
+       "C:\\poker\\senaco" de default_tournament_folder(), jamais le
+       chemin de la machine SOURCE), existant, et accessible en
+       écriture (os.access, SANS créer ni modifier aucun fichier —
+       limite documentée dans le code : pas une garantie absolue sur
+       tous les systèmes). Refuse avec un message explicite sinon —
+       TOUJOURS avant la moindre écriture, y compris la sauvegarde de
+       sécurité de l'étape 2.
     2) Crée une sauvegarde de sécurité de l'état ACTUEL (via
        create_backup, même mécanisme, vers `pre_restore_root` —
        ~/.poker_tournament/pre_restore_backups par défaut) — toujours
@@ -367,11 +449,20 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
        _copy_tree_file_by_file) — un échec en cours de route laisse un
        mélange d'anciens/nouveaux fichiers, jamais un dossier vidé, et
        la sauvegarde de sécurité de l'étape 2 reste disponible pour une
-       récupération manuelle. open_windows.json et
-       phone_selected_pid.json ne sont volontairement JAMAIS restaurés
-       (voir RESTORE_EXCLUDED_DATA_FILENAMES) ; license.json, lui, est
-       restauré normalement, sans toucher au système de licence
-       lui-même.
+       récupération manuelle. Un .tournoi de même nom déjà présent à
+       destination est ÉCRASÉ (restauration voulue, comportement
+       inchangé), protégé par cette même sauvegarde de sécurité.
+       open_windows.json et phone_selected_pid.json ne sont
+       volontairement JAMAIS restaurés (voir RESTORE_EXCLUDED_DATA_
+       FILENAMES) ; license.json, lui, est restauré normalement, sans
+       toucher au système de licence lui-même. tournament_day_folder
+       (dans last_settings.json) fait exception au sein même de la
+       copie de poker_data_dir : la valeur LOCALE est préservée (ou
+       effacée si elle était absente), jamais remplacée par celle de
+       la machine source — voir _read_tournament_day_folder/_restore_
+       tournament_day_folder, qui opèrent sur poker_data_dir lui-même,
+       jamais via tournament_prefs (qui résoudrait toujours le vrai
+       ~/.poker_tournament).
 
     Renvoie {"restored_tournament_files", "restored_data",
     "safety_backup_dir"}. Lève BackupError (message prêt pour
@@ -389,7 +480,54 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
 
     manifest = validate_backup_folder(backup_dir)
 
-    tournament_folder = default_tournament_folder() if tournament_folder is None else tournament_folder
+    # Validation du DOSSIER DE TOURNOI DE DESTINATION — demande
+    # explicite du 2026-10-10, AVANT toute écriture (y compris la
+    # sauvegarde de sécurité ci-dessous) : la restauration doit
+    # utiliser EXCLUSIVEMENT le "Dossier par défaut" RÉELLEMENT
+    # configuré sur CETTE machine — jamais le repli "C:\poker\senaco"
+    # de default_tournament_folder() (qui conviendrait pour un usage
+    # normal, mais choisirait ici SILENCIEUSEMENT un autre dossier),
+    # jamais une création automatique d'un dossier manquant, et jamais
+    # le chemin de la machine SOURCE (manifest["source_tournament_
+    # folder"], jamais lu ici). Seulement si cette sauvegarde contient
+    # effectivement des .tournoi à restaurer — sinon aucune exigence
+    # sur ce réglage.
+    if tournament_folder is None and manifest["tournament_files"]:
+        raw = (tournament_prefs.load_last_settings().get("tournament_day_folder", "") or "").strip()
+        if not raw:
+            raise BackupError(
+                "Aucun « Dossier par défaut » n'est configuré sur cet "
+                "ordinateur. Renseignez-le dans Paramètres avant de "
+                "restaurer — la restauration n'utilise jamais un autre "
+                "emplacement."
+            )
+        tournament_folder = raw
+    if manifest["tournament_files"]:
+        if not os.path.isdir(tournament_folder):
+            raise BackupError(
+                "Le « Dossier par défaut » configuré n'existe pas ou n'est "
+                f"plus accessible :\n{tournament_folder}\n\nVérifiez ce "
+                "réglage dans Paramètres avant de restaurer."
+            )
+        # Accessibilité en ÉCRITURE — demande explicite : vérifiée SANS
+        # créer ni modifier aucun fichier (os.access, jamais un fichier-
+        # sonde créé puis supprimé). Limite connue, documentée plutôt
+        # que cachée : os.access n'est pas une garantie absolue sur
+        # tous les systèmes (certains partages réseau/configurations
+        # Windows particulières peuvent la tromper dans un sens ou
+        # l'autre — limite de l'OS/de Python, pas de cette application).
+        # Toute écriture qui échouerait malgré tout PLUS TARD reste de
+        # toute façon interceptée par la gestion d'erreur déjà en place
+        # (voir le except plus bas) — jamais une donnée corrompue ni une
+        # restauration silencieusement incomplète.
+        if not os.access(tournament_folder, os.W_OK):
+            raise BackupError(
+                "Le « Dossier par défaut » configuré n'est pas accessible "
+                f"en écriture sur cette machine :\n{tournament_folder}\n\n"
+                "Vérifiez les permissions de ce dossier (ou reconnectez le "
+                "support concerné) avant de restaurer."
+            )
+
     poker_data_dir = default_poker_data_dir() if poker_data_dir is None else poker_data_dir
     if pre_restore_root is None:
         pre_restore_root = os.path.join(default_poker_data_dir(), PRE_RESTORE_BACKUPS_DIRNAME)
@@ -406,16 +544,18 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
     try:
         # 2) Restauration des .tournoi — copie fichier par fichier dans
         # le dossier de tournoi ACTUEL (jamais l'ancien chemin absolu du
-        # manifeste, qui peut venir d'une autre machine).
+        # manifeste, qui peut venir d'une autre machine). tournament_
+        # folder est déjà validé (existant, accessible en écriture)
+        # ci-dessus — jamais recréé ici (os.makedirs retiré : un
+        # dossier manquant doit être REFUSÉ, jamais créé silencieusement).
+        # Un fichier .tournoi de même nom déjà présent à destination est
+        # ÉCRASÉ (shutil.copy2) — comportement de restauration voulu et
+        # inchangé, protégé par la sauvegarde de sécurité de l'étape 1
+        # (récupération manuelle possible) et par la gestion d'erreur
+        # ci-dessous (jamais un rollback automatique des fichiers déjà
+        # copiés, voir le docstring).
         restored_tournament_files = 0
         if manifest["tournament_files"]:
-            if not tournament_folder:
-                raise BackupError(
-                    "Impossible de restaurer les fichiers de tournoi : aucun "
-                    "dossier de tournoi par défaut n'est configuré sur cette "
-                    "machine (voir Paramètres > Dossier par défaut)."
-                )
-            os.makedirs(tournament_folder, exist_ok=True)
             tournaments_src = os.path.join(backup_dir, TOURNAMENTS_SUBDIR)
             for rel in manifest["tournament_files"]:
                 src_path = os.path.join(tournaments_src, rel)
@@ -432,6 +572,18 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
         if manifest["poker_tournament_data_included"]:
             data_src = os.path.join(backup_dir, POKER_DATA_SUBDIR)
             os.makedirs(poker_data_dir, exist_ok=True)
+            # Préserve le "Dossier par défaut" LOCAL (demande explicite
+            # du 2026-10-10) : capturé AVANT la copie, car last_
+            # settings.json fait partie de la copie intégrale ci-dessous
+            # et contient aussi tournament_day_folder — SPÉCIFIQUE à
+            # CETTE machine, jamais à remplacer par celui de la machine
+            # SOURCE. Lu/écrit ICI directement dans poker_data_dir (le
+            # PARAMÈTRE de cette fonction) — JAMAIS via tournament_prefs.
+            # load_last_settings()/save_last_settings(), qui résolvent
+            # TOUJOURS le VRAI ~/.poker_tournament, indépendamment de
+            # poker_data_dir.
+            local_settings_path = os.path.join(poker_data_dir, "last_settings.json")
+            local_day_folder = _read_tournament_day_folder(local_settings_path)
             # open_windows.json / phone_selected_pid.json : jamais
             # réinjectés (états de session temporaires d'une autre
             # machine/d'un autre moment, voir RESTORE_EXCLUDED_DATA_FILENAMES
@@ -444,6 +596,7 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
                 data_src, poker_data_dir, exclude_relpaths=RESTORE_EXCLUDED_DATA_FILENAMES,
                 exclude_dir_names=EXCLUDED_POKER_DATA_DIR_NAMES,
             )
+            _restore_tournament_day_folder(local_settings_path, local_day_folder)
             restored_data = True
     except Exception as e:
         raise BackupError(

@@ -17,8 +17,10 @@ AVANT ce correctif : trois clamps distincts forçaient silencieusement 0
 max(1, ...)) — 0 s ne pouvait donc jamais être réellement enregistré ni
 appliqué ; le bandeau s'affichait quand même, juste 1 seconde. Corrigé
 en changeant les trois planchers de 1 à 0."""
+import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -26,6 +28,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main  # noqa: E402
+import tournament_prefs  # noqa: E402
 
 
 class _FakeDb:
@@ -125,25 +128,70 @@ class BannerNormalAboveZeroSecondsTest(unittest.TestCase):
 
 
 class SaveAndReloadSettingTest(unittest.TestCase):
+    """Incident réel du 2026-10-10 : _save_elimination_banner_seconds
+    appelle RÉELLEMENT tournament_prefs.save_last_settings (voir sa
+    propre docstring dans main.py, "CE tournoi + préférences
+    globales") — jamais mocké ici avant ce correctif, alors que seul
+    self.db (_FakeDb) l'était. Chaque test de cette classe écrivait
+    donc réellement dans le vrai ~/.poker_tournament/last_settings.json
+    de la machine qui exécute les tests (constaté concrètement :
+    elimination_banner_seconds s'est retrouvé à 30 dans le vrai fichier
+    après une exécution de la suite complète). tournament_prefs.
+    _prefs_path est désormais patché vers un fichier temporaire pour
+    CHAQUE test ci-dessous, et chaque test qui écrit vérifie
+    explicitement que le vrai fichier n'a pas bougé."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="elim_banner_prefs_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self._fake_prefs_path = os.path.join(self._tmp.name, "last_settings.json")
+        patcher = patch.object(tournament_prefs, "_prefs_path", return_value=self._fake_prefs_path)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        # Capturé AVANT chaque test pour pouvoir vérifier après coup
+        # qu'il n'a stricement rien changé au vrai fichier (contenu ET
+        # date de modification) — non-régression directe de l'incident
+        # décrit ci-dessus.
+        self._real_path = os.path.join(os.path.expanduser("~"), ".poker_tournament", "last_settings.json")
+        if os.path.isfile(self._real_path):
+            with open(self._real_path, "r", encoding="utf-8") as f:
+                self._real_content_before = f.read()
+            self._real_mtime_before = os.path.getmtime(self._real_path)
+        else:
+            self._real_content_before = None
+            self._real_mtime_before = None
+
+    def _assert_vrai_fichier_intact(self):
+        if self._real_content_before is None:
+            self.assertFalse(os.path.exists(self._real_path))
+            return
+        with open(self._real_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), self._real_content_before)
+        self.assertEqual(os.path.getmtime(self._real_path), self._real_mtime_before)
+
     def test_enregistre_bien_0_sans_le_remonter_a_1(self):
         fake = _FakeApp()
         main.App._save_elimination_banner_seconds(fake, _FakeVar(0))
         self.assertEqual(fake.db.set_settings_calls, [{"elimination_banner_seconds": 0}])
+        self._assert_vrai_fichier_intact()
 
     def test_enregistre_une_valeur_normale_inchangee(self):
         fake = _FakeApp()
         main.App._save_elimination_banner_seconds(fake, _FakeVar(10))
         self.assertEqual(fake.db.set_settings_calls, [{"elimination_banner_seconds": 10}])
+        self._assert_vrai_fichier_intact()
 
     def test_valeur_negative_plafonnee_a_0_pas_a_1(self):
         fake = _FakeApp()
         main.App._save_elimination_banner_seconds(fake, _FakeVar(-3))
         self.assertEqual(fake.db.set_settings_calls, [{"elimination_banner_seconds": 0}])
+        self._assert_vrai_fichier_intact()
 
     def test_valeur_trop_grande_plafonnee_a_30(self):
         fake = _FakeApp()
         main.App._save_elimination_banner_seconds(fake, _FakeVar(999))
         self.assertEqual(fake.db.set_settings_calls, [{"elimination_banner_seconds": 30}])
+        self._assert_vrai_fichier_intact()
 
     def test_lecture_0_enregistre_est_bien_relue_a_0(self):
         """Persistance : une fois 0 enregistré (voir get_setting_int
@@ -153,6 +201,17 @@ class SaveAndReloadSettingTest(unittest.TestCase):
         fake = _FakeApp(elimination_banner_seconds=0, queue=[_job()])
         main.App._advance_elimination_banner(fake)
         self.assertIsNone(fake._elimination_banner_current)
+        self._assert_vrai_fichier_intact()
+
+    def test_la_valeur_est_bien_persistee_dans_le_fichier_isole_jamais_dans_le_vrai(self):
+        """Confirmation positive que l'isolation ne rend pas non plus
+        le test aveugle : la valeur est bien écrite dans le fichier
+        TEMPORAIRE patché — jamais dans le vrai."""
+        main.App._save_elimination_banner_seconds(_FakeApp(), _FakeVar(7))
+        with open(self._fake_prefs_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["elimination_banner_seconds"], 7)
+        self._assert_vrai_fichier_intact()
 
 
 class TooltipTest(unittest.TestCase):
