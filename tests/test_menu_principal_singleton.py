@@ -181,6 +181,22 @@ class AcquireMenuPrincipalLockTest(unittest.TestCase):
         lock_patcher.start()
         self.addCleanup(lock_patcher.stop)
 
+        # Correctif du 2026-10-12 (course corrigée, voir tests/test_
+        # acquire_menu_principal_race.py) : _acquire_menu_principal_
+        # lock_if_needed appelle désormais open_windows.acquire_menu_
+        # principal, qui pose son PROPRE verrou de fichier OS (voir
+        # _menu_principal_registry_lock_path) — jamais ~/.poker_
+        # tournament pendant les tests, même précaution que pour le
+        # fichier JSON ci-dessus.
+        def _fake_registry_lock_path(key):
+            return os.path.join(self._tmp.name, f"menu_principal_{key}.lock")
+
+        registry_lock_patcher = patch.object(
+            open_windows, "_menu_principal_registry_lock_path", side_effect=_fake_registry_lock_path,
+        )
+        registry_lock_patcher.start()
+        self.addCleanup(registry_lock_patcher.stop)
+
         # POKER_TOURNAMENT_INTERNAL_LAUNCH ne doit jamais fuiter d'un test
         # à l'autre (ni depuis l'environnement réel de la machine).
         env_patcher = patch.dict(os.environ, {}, clear=False)

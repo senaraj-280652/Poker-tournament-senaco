@@ -2160,5 +2160,67 @@ class ConfirmPurgeModalSafetyTest(unittest.TestCase):
         self.assertEqual(str(dlg.grab_current()), str(dlg))
 
 
+@unittest.skipUnless(_TK_AVAILABLE, "Pas d'affichage Tk disponible dans cet environnement")
+class DataPurgeDialogParentWindowTest(unittest.TestCase):
+    """DataPurgeDialog.__init__(master, parent_window=None) — demande du
+    2026-10-12 ("🗑️ Purger les données" au Menu principal) : `master`
+    reste l'objet dont les méthodes (_show_log_date_picker, _run_backup_
+    flow) sont réutilisées via self.app, tandis que `parent_window`,
+    SÉPARÉ, devient la fenêtre Tk réelle (super().__init__/transient).
+
+    Historique (onglet LOG, DataPurgeDialog(self.root) SANS parent_
+    window) : `master` sert aux DEUX rôles, comme avant — vérifié ici
+    NON-RÉGRESSÉ. Nouveau (Menu principal) : `master` peut être une
+    fenêtre racine withdraw() (comme App.__init__ à ce stade du
+    démarrage) tant que parent_window désigne une fenêtre RÉELLEMENT
+    visible — vérifié ici que c'est bien CETTE fenêtre-là, jamais
+    `master`, qui devient la cible transient()."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="data_purge_parent_window_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self._patchers = [
+            patch.object(backup_restore, "default_tournament_folder", return_value=self._tmp.name),
+            patch.object(backup_restore, "default_poker_data_dir", return_value=self._tmp.name),
+            patch.object(export_prefs, "load_value", return_value=None),
+            patch.object(open_windows, "list_open_paths", return_value=[]),
+            patch.object(action_log, "list_tournaments", return_value=[]),
+        ]
+        for p in self._patchers:
+            self.addCleanup(p.stop)
+            p.start()
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        for name in ("_show_log_date_picker", "_parse_log_date_field", "_run_backup_flow"):
+            setattr(self.root, name, types.MethodType(getattr(main.App, name), self.root))
+        self.visible_win = tk.Toplevel(self.root)
+        self.addCleanup(lambda: cleanup_tk(self, "root", "visible_win"))
+
+    def test_sans_parent_window_transient_vers_master_comme_avant(self):
+        """Non-régression : appel historique (onglet LOG) INCHANGÉ."""
+        dlg = main.DataPurgeDialog(self.root)
+        self.addCleanup(dlg.destroy)
+        self.assertEqual(dlg.tk.call("wm", "transient", dlg._w), str(self.root))
+        self.assertIs(dlg.app, self.root)
+
+    def test_avec_parent_window_transient_vers_parent_window_pas_master(self):
+        """Nouveau chemin (Menu principal) : transient() cible bien
+        parent_window, jamais master — même si master est withdraw()."""
+        dlg = main.DataPurgeDialog(self.root, parent_window=self.visible_win)
+        self.addCleanup(dlg.destroy)
+        self.assertEqual(dlg.tk.call("wm", "transient", dlg._w), str(self.visible_win))
+        self.assertNotEqual(dlg.tk.call("wm", "transient", dlg._w), str(self.root))
+
+    def test_avec_parent_window_self_app_reste_master(self):
+        """self.app reste `master` (jamais parent_window) : les méthodes
+        déléguées (_show_log_date_picker/_run_backup_flow) continuent de
+        fonctionner à l'identique, quel que soit parent_window."""
+        dlg = main.DataPurgeDialog(self.root, parent_window=self.visible_win)
+        self.addCleanup(dlg.destroy)
+        self.assertIs(dlg.app, self.root)
+        self.assertIsNot(dlg.app, self.visible_win)
+
+
 if __name__ == "__main__":
     unittest.main()

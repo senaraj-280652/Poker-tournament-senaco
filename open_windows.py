@@ -877,6 +877,74 @@ def menu_principal_pid(key):
     return pid
 
 
+def _menu_principal_registry_lock_path(key):
+    return os.path.join(
+        os.path.expanduser("~"), ".poker_tournament", f"menu_principal_{key}.lock",
+    )
+
+
+@contextlib.contextmanager
+def _menu_principal_registry_lock(key, timeout=5.0):
+    """Verrou inter-processus COURT autour de la section lecture-
+    décision-écriture de acquire_menu_principal ci-dessous (correctif du
+    2026-10-12, essai réel sur un poste Windows : "deux lancements
+    successifs de Senaco ont ouvert deux fenêtres identiques").
+
+    Délègue à _file_lock (voir sa docstring) sur son PROPRE fichier,
+    jamais open_windows.lock (voir _registry_lock) ni remote_control.lock
+    (voir _remote_control_lock) : une section critique de plus,
+    INDÉPENDANTE des deux autres, inutile de les faire attendre l'une
+    l'autre — même raisonnement déjà appliqué pour séparer ces deux-là
+    (voir la docstring de _remote_control_lock). Une ligne par `key`
+    (ex. "prod"/"test", voir _menu_principal_lock_path) : un lancement
+    PROD et un lancement TEST ne se bloquent jamais l'un l'autre, pas
+    même le temps de ce verrou très court."""
+    with _file_lock(_menu_principal_registry_lock_path(key), timeout=timeout):
+        yield
+
+
+def acquire_menu_principal(pid, key):
+    """Tente d'acquérir ATOMIQUEMENT le verrou d'unicité du "Menu
+    principal" de la ligne `key`, pour le compte de `pid`.
+
+    Correctif du 2026-10-12 (essai réel, poste Windows HP : "deux
+    lancements successifs de Senaco ont ouvert deux fenêtres
+    identiques") : App._acquire_menu_principal_lock_if_needed appelait
+    jusqu'ici menu_principal_pid() (lecture) PUIS register_menu_
+    principal() (écriture) comme deux étapes SÉPARÉES, sans le moindre
+    verrou commun — une vraie course entre deux lancements survenus à
+    quelques millisecondes d'écart (double-clic accidentel sur le
+    raccourci, ou l'explorateur qui relance le programme deux fois) :
+    chacun des deux process pouvait lire "aucune instance" avant que
+    L'UN DES DEUX n'ait eu le temps d'écrire son propre verrou — les
+    deux continuaient alors vers _choose_tournament_file(), ouvrant
+    chacun son propre écran "Bienvenue" : exactement le bug observé.
+
+    Cette fonction regroupe désormais la lecture ET l'écriture dans UNE
+    SEULE section critique protégée par _menu_principal_registry_lock —
+    même idiome déjà éprouvé pour open_windows.json/primes_session_
+    started.json (voir _registry_lock) : aucune nouvelle architecture,
+    seulement la même discipline appliquée ici aussi. menu_principal_pid
+    et register_menu_principal, elles, restent INCHANGÉES (toujours
+    utilisées telles quelles À L'INTÉRIEUR de cette section critique) ;
+    unregister_menu_principal n'a pas besoin de la même atomicité (une
+    libération ne court jamais avec elle-même) et reste donc appelée
+    seule, sans ce verrou, comme avant.
+
+    Renvoie None si `pid` détient désormais le verrou (aucune autre
+    instance vivante de la ligne `key` trouvée pendant cette section
+    critique) — l'appelant doit alors continuer normalement. Renvoie le
+    PID de l'instance déjà détentrice sinon — l'appelant doit alors
+    ramener CE PID au premier plan et renoncer à afficher quoi que ce
+    soit, sans toucher au verrou (qui reste à cette autre instance)."""
+    with _menu_principal_registry_lock(key):
+        existing_pid = menu_principal_pid(key)
+        if existing_pid is not None:
+            return existing_pid
+        register_menu_principal(pid, key)
+        return None
+
+
 def bring_pid_to_front(pid):
     """Ramène au premier plan la fenêtre du processus `pid` (best-effort,
     silencieux en cas d'échec — ex : permission Accessibilité macOS non

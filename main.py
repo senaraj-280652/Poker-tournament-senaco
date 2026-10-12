@@ -6123,8 +6123,32 @@ class DataPurgeDialog(tk.Toplevel):
         data_purge.SCAN_REASON_CANCELLED: "recherche annulée",
     }
 
-    def __init__(self, master):
-        super().__init__(master)
+    def __init__(self, master, parent_window=None):
+        """`master` : objet App dont cette fenêtre réutilise les méthodes
+        (self.app ci-dessous) — _show_log_date_picker, appelée avec
+        self=CETTE instance (jamais self.app, voir sa propre docstring),
+        et _run_backup_flow, toujours appelée avec CETTE instance comme
+        `parent` explicite (voir plus bas) : `master` n'a donc besoin
+        d'exposer que ces méthodes, jamais d'être lui-même une fenêtre
+        VISIBLE.
+
+        `parent_window` (demande du 2026-10-12, "🗑️ Purger les données"
+        au Menu principal) : fenêtre Tk à utiliser pour super().__init__
+        et self.transient() ci-dessous — SÉPARÉE de `master` à dessein.
+        Depuis l'onglet LOG (appel historique, DataPurgeDialog(self)),
+        `master` EST déjà la fenêtre App visible : parent_window reste
+        None, et master sert alors aux deux rôles comme avant, aucun
+        changement de comportement. Depuis le Menu principal (nouveau),
+        `master` est l'App racine ENCORE self.withdraw() à ce stade du
+        démarrage (voir App.__init__/_choose_tournament_file) : s'en
+        servir comme parent Tk rendrait cette fenêtre transient() d'une
+        fenêtre jamais affichée — "testé : aucune erreur, mais rien à
+        l'écran, y compris sous le Dock" (même diagnostic déjà documenté
+        pour "Bienvenue" elle-même et pour ActivationDialog). parent_
+        window reçoit alors "win", l'écran "Bienvenue" RÉELLEMENT visible
+        — self.app reste `master` (l'App), pour que les méthodes
+        déléguées ci-dessus continuent de fonctionner à l'identique."""
+        super().__init__(parent_window or master)
         self.app = master
         # Sources AUTOMATIQUES de la découverte multi-dossiers — résolues
         # UNE SEULE FOIS à l'ouverture (jamais réévaluées en cours de
@@ -6189,7 +6213,7 @@ class DataPurgeDialog(tk.Toplevel):
 
         self.title("Purger Données")
         self.configure(bg=FELT_DARK)
-        self.transient(master)
+        self.transient(parent_window or master)
         self.grab_set()
         self.resizable(False, False)
         # Drapeau de fermeture (correctif du 2026-10-07, risque de
@@ -8644,7 +8668,14 @@ class App(tk.Tk):
         if open_path is not None or os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH):
             return True
         menu_key = _menu_principal_key()
-        existing_pid = open_windows.menu_principal_pid(menu_key)
+        # Correctif du 2026-10-12 (essai réel, poste Windows HP : "deux
+        # lancements successifs de Senaco ont ouvert deux fenêtres
+        # identiques") : lecture (menu_principal_pid) ET écriture
+        # (register_menu_principal) regroupées en UNE SEULE opération
+        # atomique (open_windows.acquire_menu_principal, voir sa
+        # docstring pour le diagnostic complet de la course qu'elle
+        # ferme) — jamais plus deux appels séparés sans verrou commun.
+        existing_pid = open_windows.acquire_menu_principal(os.getpid(), menu_key)
         if existing_pid is not None:
             # Une autre instance du Menu principal (de la MÊME ligne
             # prod/test) tourne déjà sur ce poste : on la ramène au
@@ -8658,7 +8689,6 @@ class App(tk.Tk):
             raise_process_when_ready(self, existing_pid)
             self.after(3500, self.destroy)
             return False
-        open_windows.register_menu_principal(os.getpid(), menu_key)
         self._holds_menu_principal_lock = True
         return True
 
@@ -8768,16 +8798,25 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        # 480x527 (480x460 avant l'ajout de la zone "Sauvegarde des
-        # données" ; 620 avec séparateur + texte explicatif sous le
-        # titre ; 570 avec seulement le titre, sans séparateur/texte ;
-        # le titre lui-même a été retiré le 2026-09-08 (plus que les 2
-        # boutons, qui remontent naturellement) — 43px de moins, mesuré
-        # via winfo_reqheight() sur les mêmes widgets/polices/paddings)
-        # : sans cet ajustement, ces éléments dépasseraient hors de la
-        # fenêtre (toujours non redimensionnable), ou inversement
-        # laisseraient un espace vide en bas.
-        win.geometry("480x527")
+        # 480x567 (480x527 avant l'ajout du bouton "🗑️ Purger les
+        # données" le 2026-10-12, qui dépassait sinon hors de la fenêtre,
+        # toujours non redimensionnable — signalé après essai manuel ;
+        # 480x460 avant l'ajout de la zone "Sauvegarde des données" ; 620
+        # avec séparateur + texte explicatif sous le titre ; 570 avec
+        # seulement le titre, sans séparateur/texte ; le titre lui-même a
+        # été retiré le 2026-09-08 — 43px de moins). +40px mesurés via
+        # winfo_reqheight() sur les mêmes widgets/police/largeur/pady
+        # qu'un bouton existant (icône + texte, ttk.Button width=28,
+        # pady=6) : largeur et dimensions des boutons INCHANGÉES, seule
+        # la hauteur de fenêtre grandit en conséquence, avec la même
+        # marge qu'avant en bas (jamais recalculée à l'aveugle). Aucun
+        # réglage de mise à l'échelle DPI Windows ici ni ailleurs dans ce
+        # fichier (voir par ex. self.geometry("480x560") plus haut,
+        # ligne ~4968, même motif) : cette fenêtre suit exactement le
+        # même modèle de géométrie fixe que toutes les autres, Tk gérant
+        # déjà seul la mise à l'échelle du système — rien de spécifique
+        # à régler pour ce bouton.
+        win.geometry("480x567")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -9041,6 +9080,49 @@ class App(tk.Tk):
                 parent=win,
             )
 
+        def purge_now():
+            """"🗑️ Purger les données" au Menu principal (demande du
+            2026-10-12) — ouvre DIRECTEMENT la fenêtre "Purger Données"
+            déjà existante (DataPurgeDialog, voir sa docstring), sans
+            ouvrir ni créer aucun tournoi : AUCUNE logique de purge
+            dupliquée ici, un second point d'entrée vers EXACTEMENT le
+            même mécanisme que l'onglet LOG — mêmes garde-fous (sélection
+            des périodes/types/dossiers, vérification de sauvegarde,
+            confirmations), inchangés.
+
+            Même garde-fou cross-process que restore_now ci-dessus
+            (open_windows.list_open_paths, "ici ou dans une autre
+            fenêtre") : la purge reste strictement interdite tant qu'un
+            tournoi est ouvert, quelle que soit l'instance Senaco qui le
+            détient. DataPurgeDialog revérifie de toute façon elle-même,
+            tournoi par tournoi, au moment de purger (défense en
+            profondeur, jamais une confiance aveugle envers ce seul
+            contrôle d'entrée) — ce garde-fou-ci est une couche
+            SUPPLÉMENTAIRE, plus stricte : interdit même d'OUVRIR la
+            fenêtre tant qu'un seul tournoi, n'importe lequel, reste
+            ouvert quelque part.
+
+            parent_window=win (PAS self, l'App racine encore self.
+            withdraw() à ce stade — voir DataPurgeDialog.__init__) : sans
+            quoi la fenêtre resterait invisible, même diagnostic déjà
+            rencontré pour "Bienvenue" et ActivationDialog. self.app
+            reste `self` (l'App) : _show_log_date_picker/_run_backup_flow
+            continuent de fonctionner à l'identique. Fermeture : gérée
+            entièrement par DataPurgeDialog elle-même (grab_set/
+            transient) — revient seule à "Bienvenue" (win), déjà affichée
+            et jamais masquée ni détruite entre-temps, sans code
+            supplémentaire ici."""
+            if open_windows.list_open_paths():
+                messagebox.showerror(
+                    "Tournoi(s) actuellement ouvert(s)",
+                    "Au moins un tournoi est actuellement ouvert (ici ou "
+                    "dans une autre fenêtre).\n\nFermez tous les tournois "
+                    "ouverts avant de purger des données.",
+                    parent=win,
+                )
+                return
+            DataPurgeDialog(self, parent_window=win)
+
         def open_basic_settings():
             """"⚙️ Paramètres de base" (demande explicite du 2026-10-12) :
             fenêtre MINIMALE, accessible SANS ouvrir ni créer aucun
@@ -9171,6 +9253,18 @@ class App(tk.Tk):
             restore_btn,
             "Permet de restaurer les tournois, joueurs, photos et\n"
             "réglages depuis une clé USB.",
+        )
+
+        purge_btn = ttk.Button(
+            btn_frame, text="🗑️  Purger les données", command=purge_now, width=28,
+        )
+        purge_btn.pack(pady=6)
+        Tooltip(
+            purge_btn,
+            "Supprime définitivement de vieux tournois, par période et\n"
+            "par type, après vérification qu'une sauvegarde accessible\n"
+            "les couvre déjà — mêmes garde-fous que depuis l'onglet LOG.\n"
+            "Indisponible tant qu'un tournoi est ouvert (ici ou ailleurs).",
         )
 
         settings_btn = ttk.Button(
