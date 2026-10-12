@@ -8,3 +8,7 @@ openpyxl>=3.1
 fpdf2>=2.7
 opencv-python>=4.8
 pillow>=10.0
+# Génère l'image du QR code "Envoi WhatsApp > Mon téléphone" (voir
+# main.py: WhatsAppQRShareDialog) — pur Python, pillow ci-dessus comme
+# moteur de rendu.
+qrcode>=7.4

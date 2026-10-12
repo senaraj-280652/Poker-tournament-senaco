@@ -115,6 +115,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1385,7 +1386,7 @@ _ELIMINATE_PAGE = """<!doctype html>
      périmée, sans qu'un message ne s'impose à chaque sondage raté. */
   #conn-indicator {{
     display: flex; align-items: center; gap: 5px; font-size: 11px;
-    color: #9fb8a8; padding: 2px 0;
+    color: #9fb8a8; padding: 2px 10px 2px 0; justify-content: space-between;
   }}
   #conn-indicator .dot {{
     width: 7px; height: 7px; border-radius: 50%; background: #4caf6d; flex: none;
@@ -1394,6 +1395,40 @@ _ELIMINATE_PAGE = """<!doctype html>
   #conn-indicator.conn-lost .dot {{ background: #d9534f; }}
   #conn-indicator.conn-reconnecting {{ color: #e8c468; }}
   #conn-indicator.conn-lost {{ color: #d9534f; }}
+  /* Recherche Nom/Table/Siège (demande du 2026-10-07, DIRTO retrouvant un
+     joueur par la place vide constatée, ou par son nom dans une liste de
+     ~100 joueurs) : volontairement compacte (placeholders plutôt que des
+     libellés texte séparés) — vérifié tenir sans débordement à 375px ET
+     320px (plus petit écran réaliste). min-width: 0 laisse les champs se
+     rétrécir plutôt que forcer un débordement de page sur un écran encore
+     plus étroit. */
+  #elim-search {{ display: flex; align-items: center; gap: 3px; flex: none; }}
+  #elim-search input {{
+    padding: 3px 5px; border-radius: 6px; border: 1px solid #294235;
+    background: #14301f; color: #f5efe0; font-size: 11px; min-width: 0;
+    -webkit-tap-highlight-color: transparent;
+  }}
+  #search-name {{ width: 72px; }}
+  #search-table, #search-seat {{ width: 36px; text-align: center; }}
+  #elim-search input::placeholder {{ color: #6f8578; }}
+  /* Bouton "×" (demande explicite) : plus ergonomique que d'effacer les 3
+     champs à la main — masqué par défaut (aucun critère renseigné), voir
+     updateSearchClearVisibility(). Ne touche JAMAIS absFirstSortActive.
+     Agrandi le 2026-10-07 (zone tactile trop petite constatée à
+     l'usage) : 28px (au lieu de 18px) + croix plus grosse, sans
+     toucher à la largeur des 3 champs ni au reste de l'interface —
+     vérifié tenir sans débordement à 375px ET 320px. align-items/
+     justify-content (au lieu de line-height) pour un centrage de la
+     croix fiable quelle que soit sa taille — actif seulement quand
+     affiché (voir updateSearchClearVisibility, qui bascule display
+     entre 'flex' et 'none', jamais '' : un display vide retomberait sur
+     ce display:none par défaut et laisserait le bouton invisible). */
+  #search-clear {{
+    border: none; border-radius: 50%; width: 28px; height: 28px;
+    align-items: center; justify-content: center;
+    background: #294235; color: #f5efe0; font-size: 18px; font-weight: 700;
+    padding: 0; flex: none; display: none; -webkit-tap-highlight-color: transparent;
+  }}
   /* "← Retour" : un vrai bouton tactile (fond plein, coins arrondis,
      zone de frappe confortable), pas un simple lien texte discret —
      pour qu'il soit immédiatement identifiable comme actionnable sur un
@@ -1488,6 +1523,17 @@ _ELIMINATE_PAGE = """<!doctype html>
   }}
   #btn-abs-des:active {{ transform: scale(0.97); }}
   #btn-abs-des.drop-hover {{ background: #e8c468; color: #10241a; }}
+  /* Indication DISCRÈTE du tri "absents en premier" (demande du
+     2026-10-06) : contour renforcé + léger effet "enfoncé", JAMAIS un
+     changement de couleur de fond (réservé à .drop-hover, pendant un
+     glissement réel — jamais combiné avec .sort-active dans la pratique,
+     un glissement engagé masque de toute façon ce bouton derrière le
+     fantôme tactile). Disparaît au second tap, quand absFirstSortActive
+     redevient false. */
+  #btn-abs-des.sort-active {{
+    box-shadow: inset 0 0 0 2px #f5efe0;
+    transform: scale(0.97);
+  }}
   /* Clignotement rouge d'un joueur signalé absent (cahier des charges,
      section 2 : "son nom clignote en rouge... sur les téléphones") —
      jamais combiné avec .not-eligible (masqué) : un joueur absent reste
@@ -1547,7 +1593,15 @@ _ELIMINATE_PAGE = """<!doctype html>
     <span class="tournoi">{tournament_name}</span>
     <button id="btn-reload" onclick="reloadApp()" title="Recharger la dernière version">🔄</button>
   </div>
-  <div id="conn-indicator" class="conn-ok"><span class="dot"></span><span id="conn-text">Connecté</span></div>
+  <div id="conn-indicator" class="conn-ok">
+    <span class="dot"></span><span id="conn-text">Connecté</span>
+    <div id="elim-search">
+      <input id="search-name" type="text" placeholder="Nom" autocomplete="off" autocorrect="off" autocapitalize="off">
+      <input id="search-table" type="text" inputmode="numeric" placeholder="Table" autocomplete="off">
+      <input id="search-seat" type="text" inputmode="numeric" placeholder="Siège" autocomplete="off">
+      <button id="search-clear" type="button" title="Effacer la recherche">×</button>
+    </div>
+  </div>
   <div id="columns">
     <div class="col col-left">
       <h2>Éliminé — glisser vers →</h2>
@@ -1576,6 +1630,24 @@ var lastSignature = null;
 var pending = null;    // candidat de glissement pas encore confirmé : {{id, label, sub, el, startX, startY, engaged}}
 var hoverTarget = null;
 var pollTimer = null;
+// Tri visuel "absents en premier" (demande du 2026-10-06) : bascule par un
+// simple tap sur "Abs/Dés" (voir son listener 'click' plus bas, JAMAIS
+// déclenché par un glissement réel — preventDefault() déjà appelé sur
+// tout touchmove engagé, voir onTouchMove, supprime nativement le click
+// synthétique de fin de geste). Purement local à cette page : aucune
+// écriture BDD, aucun appel serveur, jamais lu ailleurs que par
+// renderLists() ci-dessous — ne concerne QUE la colonne gauche
+// ("Éliminé", glissable), jamais la colonne droite ("Éliminateur").
+var absFirstSortActive = false;
+// Recherche Nom/Table/Siège (demande du 2026-10-07) : détermine QUELS
+// joueurs sont affichés dans la colonne gauche — absFirstSortActive,
+// lui, détermine ensuite dans quel ORDRE (voir renderLists : le tri
+// s'applique APRÈS le filtre, jamais l'inverse). Purement local à cette
+// page : aucune écriture BDD, aucun appel serveur, jamais lu ailleurs
+// que par renderLists() — jamais la colonne droite ("Éliminateur").
+var nameFilter = '';
+var tableFilter = '';
+var seatFilter = '';
 // Distance (px) à partir de laquelle on tranche entre "c'est un défilement"
 // (mouvement surtout vertical) et "c'est un glissement" (mouvement surtout
 // horizontal, colonne de gauche vers colonne de droite) — voir onTouchMove.
@@ -1742,10 +1814,72 @@ function renderLists() {{
   var sorted = players.slice().sort(function(a, b) {{
     return a.name.localeCompare(b.name, 'fr', {{sensitivity: 'base'}});
   }});
-  sorted.forEach(function(p) {{
-    left.appendChild(makeItem(p, true));   // gauche = Éliminé (glissable)
-    right.appendChild(makeItem(p, false)); // droite = Éliminateur (cible)
+
+  // Recherche Nom/Table/Siège (demande du 2026-10-07) : UNIQUEMENT la
+  // colonne gauche — la colonne droite ("Éliminateur") reste toujours
+  // construite depuis `sorted` en entier, jamais filtrée (chercher le
+  // joueur à ÉLIMINER n'a aucun rapport avec qui l'a éliminé). Chaque
+  // critère rempli doit être satisfait (ET logique) ; un critère vide
+  // est ignoré. `filtered` ne fait QUE choisir quels objets de `sorted`
+  // passer à makeItem ensuite — jamais une copie/transformation du
+  // joueur lui-même (voir makeItem, totalement inchangée : un joueur
+  // filtré reste l'exact même item glissable qu'avant ce chantier).
+  var nameTerm = nameFilter.trim().toLowerCase();
+  var tableTerm = tableFilter.trim();
+  var seatTerm = seatFilter.trim();
+  var filtered = sorted.filter(function(p) {{
+    if (nameTerm && p.name.toLowerCase().indexOf(nameTerm) === -1) return false;
+    if (tableTerm && !tableMatchesQuery(p.table, tableTerm)) return false;
+    // Comparaison EXACTE (jamais une sous-chaîne) : "4" ne doit jamais
+    // retrouver le siège 14, contrairement à Nom (sous-chaîne volontaire).
+    if (seatTerm && String(p.seat) !== seatTerm) return false;
+    return true;
   }});
+
+  // Tri visuel "absents en premier" (demande du 2026-10-06) : s'applique
+  // APRÈS le filtre, jamais avant — "le filtre détermine QUELS joueurs
+  // sont affichés, absFirstSortActive détermine ensuite L'ORDRE" (demande
+  // explicite du 2026-10-07). Array.prototype.sort est stable (ECMA-262) :
+  // une clé purement booléenne (absent d'abord) regroupe les deux groupes
+  // sans jamais changer l'ordre alphabétique déjà en place à l'intérieur
+  // de chacun d'eux.
+  var leftOrder = filtered;
+  if (absFirstSortActive) {{
+    leftOrder = filtered.slice().sort(function(a, b) {{
+      return (b.absent ? 1 : 0) - (a.absent ? 1 : 0);
+    }});
+  }}
+  if (leftOrder.length === 0) {{
+    // Jamais une zone vide qui pourrait laisser croire à un problème de
+    // chargement (demande explicite) — distingué de "Aucun joueur actif"
+    // (aucun joueur du tout dans le tournoi, cas déjà géré plus haut).
+    left.innerHTML = '<div id="empty">Aucun joueur</div>';
+  }} else {{
+    leftOrder.forEach(function(p) {{
+      left.appendChild(makeItem(p, true));   // gauche = Éliminé (glissable)
+    }});
+  }}
+  sorted.forEach(function(p) {{
+    right.appendChild(makeItem(p, false)); // droite = Éliminateur (cible), jamais filtrée
+  }});
+}}
+
+// Correspondance Table (demande du 2026-10-07) : les tables s'appellent
+// aujourd'hui "Table N" (voir Database.add_table) — une saisie purement
+// numérique doit retrouver EXACTEMENT ce numéro ("7" -> "Table 7", jamais
+// "Table 17/27/70"), donc comparée au nombre extrait du nom, jamais en
+// sous-chaîne. Repli en sous-chaîne insensible à la casse UNIQUEMENT si
+// la saisie n'est pas purement numérique — pour un éventuel futur nom de
+// table non numérique (aucun aujourd'hui, mais le schéma ne l'interdit
+// pas et inputmode="numeric" n'empêche aucune saisie, voir les champs
+// HTML ci-dessus).
+function tableMatchesQuery(tableName, query) {{
+  if (!tableName) return false;
+  if (/^\\d+$/.test(query)) {{
+    var m = tableName.match(/\\d+/);
+    return !!m && m[0] === query;
+  }}
+  return tableName.toLowerCase().indexOf(query.toLowerCase()) !== -1;
 }}
 
 function makeItem(p, isSource) {{
@@ -2304,6 +2438,60 @@ function tickAbsentBlink() {{
   }});
 }}
 setInterval(tickAbsentBlink, 600);
+
+// Tri visuel "absents en premier" (demande du 2026-10-06) : un tap SIMPLE
+// sur "Abs/Dés" bascule absFirstSortActive puis redessine — jamais
+// déclenché par un vrai glissement jusqu'à ce bouton (le navigateur
+// supprime lui-même le click synthétique de fin de geste dès que
+// touchmove a appelé preventDefault(), ce qui est déjà le cas pour tout
+// glissement engagé, voir onTouchMove). Purement local à cette page :
+// aucune écriture BDD, aucun appel serveur.
+document.getElementById('btn-abs-des').addEventListener('click', function() {{
+  absFirstSortActive = !absFirstSortActive;
+  document.getElementById('btn-abs-des').classList.toggle('sort-active', absFirstSortActive);
+  renderLists();
+}});
+
+// Recherche Nom/Table/Siège (demande du 2026-10-07) : dynamique, sans
+// bouton "Rechercher" — chaque frappe redessine directement la colonne
+// gauche (voir renderLists). Jamais d'appel réseau ni d'écriture BDD ;
+// n'affecte jamais absFirstSortActive.
+function updateSearchClearVisibility() {{
+  var active = !!(nameFilter.trim() || tableFilter.trim() || seatFilter.trim());
+  // 'flex' explicite (jamais '') : le CSS par défaut de #search-clear
+  // est display:none — remettre '' ne ferait que REVENIR à ce défaut et
+  // laisserait le bouton invisible même quand un critère est renseigné.
+  // 'flex' (pas 'inline-block') : nécessaire pour que align-items/
+  // justify-content centrent effectivement la croix agrandie.
+  document.getElementById('search-clear').style.display = active ? 'flex' : 'none';
+}}
+document.getElementById('search-name').addEventListener('input', function(e) {{
+  nameFilter = e.target.value;
+  updateSearchClearVisibility();
+  renderLists();
+}});
+document.getElementById('search-table').addEventListener('input', function(e) {{
+  tableFilter = e.target.value;
+  updateSearchClearVisibility();
+  renderLists();
+}});
+document.getElementById('search-seat').addEventListener('input', function(e) {{
+  seatFilter = e.target.value;
+  updateSearchClearVisibility();
+  renderLists();
+}});
+// "×" (demande explicite) : efface les 3 champs d'un coup et fait
+// réapparaître la liste complète — ne touche jamais à absFirstSortActive.
+document.getElementById('search-clear').addEventListener('click', function() {{
+  nameFilter = '';
+  tableFilter = '';
+  seatFilter = '';
+  document.getElementById('search-name').value = '';
+  document.getElementById('search-table').value = '';
+  document.getElementById('search-seat').value = '';
+  updateSearchClearVisibility();
+  renderLists();
+}});
 
 loadPlayers();
 {reload_script}
@@ -3615,6 +3803,360 @@ class _SelectionVanished:
 SELECTION_VANISHED = _SelectionVanished()
 
 
+# =====================================================================
+# Partage d'un PDF par QR code vers un téléphone (bouton "💬 Envoi
+# WhatsApp" > "📱 Mon téléphone", onglets Classement/Statistiques —
+# demande du 2026-10-11). INDÉPENDANT à 100% du contrôle à distance et
+# de son authentification (_is_authenticated(), cookie de session,
+# approbation d'appareil) : le jeton ci-dessous est la SEULE protection
+# de cette route, jamais consultée après un _is_authenticated(), jamais
+# dépendante de lui. handle_whatsapp_share_path() est appelée par
+# RemoteControlServer.start() (greffée sur le serveur déjà actif) ET par
+# WhatsAppShareServer (serveur minimal démarré quand le contrôle à
+# distance est désactivé pour ce tournoi, voir sa docstring) — un SEUL
+# point d'implémentation, jamais dupliqué entre les deux.
+# =====================================================================
+
+WHATSAPP_SHARE_TOKEN_TTL_SECONDS = 300  # 5 minutes (demande explicite)
+
+# Fenêtre de grâce après le PREMIER téléchargement réussi (demande
+# explicite du 2026-10-11, incident réel constaté sur iPhone) : Chrome
+# iOS affiche le PDF en ligne via un premier GET, puis — quand on
+# l'enregistre dans Fichiers ou qu'on le partage vers WhatsApp depuis
+# cet aperçu — refait une SECONDE requête HTTP séparée vers la même
+# URL, plutôt que de réutiliser les octets déjà affichés. Avec un jeton
+# à usage unique strict (version précédente), cette seconde requête
+# arrivait sur un jeton déjà consommé et recevait la page d'erreur HTML
+# à la place du PDF (433 octets, enregistrés tels quels par Chrome/iOS
+# comme si c'était le fichier demandé — symptôme réel observé et
+# diagnostiqué). Cette fenêtre tolère les quelques requêtes légitimes
+# rapprochées qu'un seul geste humain déclenche réellement côté mobile,
+# tout en resserrant l'exposition peu après la première utilisation
+# réelle — jamais au-delà de WHATSAPP_SHARE_TOKEN_TTL_SECONDS (point 3
+# explicite : le lien expire au plus tard 5 minutes après sa création,
+# même si cette fenêtre de grâce n'est pas terminée).
+WHATSAPP_SHARE_DOWNLOAD_GRACE_SECONDS = 60
+
+_whatsapp_share_tokens = {}  # jeton -> {"path", "label", "expires_at", "first_downloaded_at"}
+_whatsapp_share_lock = threading.Lock()
+
+
+def register_whatsapp_share(pdf_path, label):
+    """Enregistre un nouveau partage de `pdf_path` (déjà généré et
+    vérifié par l'appelant — jamais régénéré ici), valide pendant
+    WHATSAPP_SHARE_TOKEN_TTL_SECONDS. Le téléchargement réel (voir
+    _consume_whatsapp_share) tolère plusieurs requêtes rapprochées dans
+    la fenêtre de grâce suivant la PREMIÈRE réussite (voir WHATSAPP_
+    SHARE_DOWNLOAD_GRACE_SECONDS) — jamais pour la simple page de
+    confirmation (voir _get_valid_whatsapp_share), qui reste
+    consultable autant de fois que nécessaire tant que le délai
+    n'est pas écoulé : une prévisualisation automatique du navigateur/
+    de l'app Appareil photo (simple GET sur cette première page, jamais
+    sur l'URL de téléchargement elle-même, atteinte uniquement par un
+    appui réel sur son bouton) ne peut donc jamais déclencher la fenêtre
+    de grâce à la place de l'utilisateur. `label` : texte affiché sur la
+    page de confirmation (ex. "Classement — CPC Poker"). Renvoie le
+    jeton (chaîne aléatoire à haute entropie, secrets.token_urlsafe)."""
+    token = secrets.token_urlsafe(24)
+    with _whatsapp_share_lock:
+        _whatsapp_share_tokens[token] = {
+            "path": pdf_path,
+            "label": label,
+            "expires_at": time.time() + WHATSAPP_SHARE_TOKEN_TTL_SECONDS,
+            "first_downloaded_at": None,
+        }
+    return token
+
+
+def revoke_whatsapp_share(token):
+    """Invalide immédiatement `token` (demande explicite du 2026-10-11,
+    point 2 : "Nouveau QR code" doit révoquer l'ancien jeton tout de
+    suite, jamais le laisser simplement expirer de son côté ; même
+    chose à la fermeture de la fenêtre de partage, point 5). Sans effet
+    si ce jeton n'existe pas (ou plus) — jamais une exception."""
+    with _whatsapp_share_lock:
+        _whatsapp_share_tokens.pop(token, None)
+
+
+def _get_valid_whatsapp_share(token):
+    """Renvoie une COPIE de l'entrée de `token` si elle existe et n'a
+    pas expiré — None sinon (jeton inconnu, révoqué, ou expiré ; une
+    entrée expirée est purgée immédiatement ici). Ne déclenche JAMAIS la
+    fenêtre de grâce (voir _consume_whatsapp_share pour ça) : utilisée
+    uniquement pour la page de confirmation, rechargeable sans limite
+    tant que le délai n'est pas écoulé — voir register_whatsapp_share."""
+    with _whatsapp_share_lock:
+        entry = _whatsapp_share_tokens.get(token)
+        if entry is None:
+            return None
+        if time.time() > entry["expires_at"]:
+            _whatsapp_share_tokens.pop(token, None)
+            return None
+        return dict(entry)
+
+
+def _consume_whatsapp_share(token):
+    """Valide un téléchargement RÉEL (voir register_whatsapp_share pour
+    le principe de la fenêtre de grâce) : renvoie une copie de l'entrée
+    si on est soit AVANT la première réussite (qui la déclenche alors),
+    soit DANS la fenêtre de grâce suivant celle-ci — toujours borné par
+    `expires_at` (jamais prolongé au-delà des 5 minutes depuis la
+    création, demande explicite du 2026-10-11, point 3 : "le lien
+    expire au plus tard 5 minutes après sa création, même si la fenêtre
+    de grâce n'est pas terminée"). None si le jeton est inconnu, expiré,
+    ou si la fenêtre de grâce est dépassée (l'entrée est alors purgée
+    immédiatement). Verrouillé pour qu'un double appui/deux requêtes de
+    téléchargement quasi simultanées ne puissent jamais provoquer une
+    incohérence (ex. deux premières réussites concurrentes)."""
+    with _whatsapp_share_lock:
+        entry = _whatsapp_share_tokens.get(token)
+        if entry is None:
+            return None
+        now = time.time()
+        if now > entry["expires_at"]:
+            _whatsapp_share_tokens.pop(token, None)
+            return None
+        if entry["first_downloaded_at"] is None:
+            entry["first_downloaded_at"] = now
+            return dict(entry)
+        grace_deadline = min(
+            entry["first_downloaded_at"] + WHATSAPP_SHARE_DOWNLOAD_GRACE_SECONDS,
+            entry["expires_at"],
+        )
+        if now <= grace_deadline:
+            return dict(entry)
+        _whatsapp_share_tokens.pop(token, None)
+        return None
+
+
+_WHATSAPP_SHARE_EXPIRED_HTML = """<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Senaco</title></head>
+<body style="font-family:-apple-system,sans-serif;text-align:center;padding:48px 20px;background:#0b3d24;color:#f5f0e6;">
+<p style="font-size:22px;">⌛ Ce lien n'est plus valide.</p>
+<p>Demandez au responsable d'afficher un nouveau QR code depuis Senaco.</p>
+</body></html>"""
+
+
+def _build_whatsapp_share_confirm_page(label, pid, token):
+    download_url = f"/whatsapp_share/{pid}/{token}/download"
+    return f"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Senaco</title></head>
+<body style="font-family:-apple-system,sans-serif;text-align:center;padding:48px 20px;background:#0b3d24;color:#f5f0e6;">
+<p style="font-size:20px;">✅ {_escape_html(label)}</p>
+<p>Fichier prêt, envoyé par Senaco depuis l'ordinateur du club.</p>
+<p style="margin-top:28px;">
+<a href="{download_url}" style="display:inline-block;padding:16px 32px;background:#d4af37;
+color:#1a1a1a;border-radius:10px;text-decoration:none;font-size:18px;font-weight:bold;">
+📄 Télécharger le PDF</a></p>
+<p style="margin-top:24px;font-size:13px;color:#cfae6e;">
+Une fois téléchargé, utilisez le partage de votre téléphone pour l'envoyer sur WhatsApp.</p>
+</body></html>"""
+
+
+def _send_html_response(handler, html, status=200):
+    body = html.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _send_pdf_file_response(handler, pdf_path):
+    try:
+        with open(pdf_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        _send_html_response(handler, _WHATSAPP_SHARE_EXPIRED_HTML, status=404)
+        return
+    # Nom de fichier RÉEL (demande explicite du 2026-10-11, point 8) —
+    # plutôt que le générique "partage.pdf" d'avant : celui que
+    # l'utilisateur a lui-même choisi à l'export, jamais une valeur
+    # reçue du réseau (`pdf_path` vient toujours de l'appelant local,
+    # voir register_whatsapp_share). filename= (repli ASCII, jamais vide
+    # ni porteur d'un retour chariot) ET filename*= (RFC 6266, UTF-8
+    # encodé) pour les noms accentués courants en français — les deux
+    # formes couvertes "sans risque" : ce chemin n'est jamais une
+    # valeur arbitraire fournie par le téléphone.
+    real_name = os.path.basename(pdf_path) or "partage.pdf"
+    ascii_name = real_name.encode("ascii", "ignore").decode("ascii").replace("\r", "").replace("\n", "")
+    if not ascii_name:
+        ascii_name = "partage.pdf"
+    encoded_name = urllib.parse.quote(real_name)
+    handler.send_response(200)
+    handler.send_header("Content-Type", "application/pdf")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header(
+        "Content-Disposition",
+        f"inline; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}",
+    )
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def _relay_whatsapp_share(handler, target_port):
+    """Relaie telle quelle une requête /whatsapp_share/... vers le VRAI
+    port d'un AUTRE tournoi (127.0.0.1 — jamais le réseau externe),
+    exactement comme Handler._proxy (même esprit), mais VOLONTAIREMENT
+    une fonction séparée, jamais partagée avec elle — pour ne jamais
+    risquer de modifier le comportement déjà testé du relais existant
+    du contrôle à distance (aucune régression). Ne relaie et n'exige
+    aucun cookie : cette route a sa propre autorisation (le jeton),
+    indépendante de toute session de contrôle à distance."""
+    url = f"http://127.0.0.1:{target_port}{handler.path}"
+    req = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read()
+            handler.send_response(resp.status)
+            handler.send_header(
+                "Content-Type", resp.headers.get("Content-Type", "application/octet-stream")
+            )
+            handler.send_header("Content-Length", str(len(data)))
+            handler.end_headers()
+            handler.wfile.write(data)
+    except (OSError, urllib.error.URLError):
+        handler.send_error(502, "Ce PDF n'est momentanément plus joignable")
+
+
+def handle_whatsapp_share_path(handler, path):
+    """Point d'entrée UNIQUE pour toute requête GET dont le chemin
+    commence par "/whatsapp_share/" — appelée par RemoteControlServer
+    ET WhatsAppShareServer, TOUJOURS avant toute vérification
+    d'authentification du contrôle à distance (jamais après un
+    _is_authenticated(), jamais dépendante de lui — demande explicite
+    du 2026-10-11, point 1). `path` : déjà débarrassé de la chaîne de
+    requête par l'appelant. Renvoie True si cette requête a été traitée
+    ici (y compris en cas d'erreur/jeton invalide/inconnu), False si
+    `path` ne correspond pas à cette route (l'appelant continue alors
+    son propre routage, inchangé).
+
+    Format attendu : "/whatsapp_share/<pid>/<jeton>" (page de
+    confirmation) ou ".../<jeton>/download" (téléchargement réel, voir
+    register_whatsapp_share pour la fenêtre de grâce après la première
+    réussite). `<pid>` identifie le PROCESSUS qui a émis ce jeton — si
+    ce n'est pas CE processus-ci, la requête est relayée (127.0.0.1,
+    voir _relay_whatsapp_share) vers le port enregistré par ce pid dans
+    le registre partagé (open_windows.list_whatsapp_share_targets) :
+    permet à un QR code de fonctionner pour N'IMPORTE QUEL tournoi
+    ouvert, même si un AUTRE processus occupe le port 8765 — le
+    téléphone ne parle jamais qu'à ce port, jamais directement à un
+    port secondaire potentiellement bloqué par le pare-feu du club.
+
+    Codes HTTP (demande explicite du 2026-10-11, point 7 — jamais une
+    réponse d'erreur présentée comme un PDF, toujours text/html via
+    _send_html_response) : 404 pour un chemin malformé ou un pid
+    inconnu du registre (n'a jamais existé ICI) ; 410 Gone pour un
+    jeton reconnu mais expiré/hors fenêtre de grâce (a existé, n'est
+    plus disponible) — distinction purement sémantique, aucun des deux
+    ne renvoie jamais de contenu PDF."""
+    if not path.startswith("/whatsapp_share/"):
+        return False
+
+    parts = path.split("/")  # ["", "whatsapp_share", "<pid>", "<jeton>", ...]
+    if len(parts) not in (4, 5) or (len(parts) == 5 and parts[4] != "download"):
+        handler.send_error(404)
+        return True
+    try:
+        target_pid = int(parts[2])
+    except ValueError:
+        handler.send_error(404)
+        return True
+    token = parts[3]
+    is_download = len(parts) == 5
+
+    if target_pid != os.getpid():
+        targets = {t["pid"]: t["port"] for t in open_windows.list_whatsapp_share_targets()}
+        target_port = targets.get(target_pid)
+        if target_port is None:
+            _send_html_response(handler, _WHATSAPP_SHARE_EXPIRED_HTML, status=404)
+            return True
+        _relay_whatsapp_share(handler, target_port)
+        return True
+
+    if is_download:
+        entry = _consume_whatsapp_share(token)
+        if entry is None:
+            _send_html_response(handler, _WHATSAPP_SHARE_EXPIRED_HTML, status=410)
+            return True
+        _send_pdf_file_response(handler, entry["path"])
+    else:
+        entry = _get_valid_whatsapp_share(token)
+        if entry is None:
+            _send_html_response(handler, _WHATSAPP_SHARE_EXPIRED_HTML, status=410)
+            return True
+        _send_html_response(handler, _build_whatsapp_share_confirm_page(entry["label"], target_pid, token))
+    return True
+
+
+class WhatsAppShareServer:
+    """Serveur HTTP minimal (bibliothèque standard uniquement), démarré
+    UNIQUEMENT pour servir /whatsapp_share quand le contrôle à distance
+    est désactivé pour ce tournoi (voir App._get_or_start_whatsapp_
+    share_port) — demande explicite du 2026-10-11, point 1 : "le
+    serveur utilisé pour le partage PDF ne doit permettre aucune
+    commande de gestion du tournoi". Son Handler ne connaît QU'UNE SEULE
+    route : aucune commande (élimination, mouvement, absence...)
+    n'existe dans son code, pas seulement "non autorisée sans
+    session" — ABSENTE, aucun risque qu'une erreur d'autorisation
+    future ne l'expose. Classe entièrement séparée de
+    RemoteControlServer, qui n'est jamais instanciée ni modifiée ici.
+
+    Même stratégie de port que RemoteControlServer.start() (DEFAULT_PORT
+    en priorité, repli sur un port libre quelconque sinon — voir
+    _ExclusiveThreadingHTTPServer), par cohérence avec le pare-feu du
+    club (qui n'autorise en général que 8765) : si ce tournoi n'obtient
+    pas 8765 (déjà pris par un AUTRE tournoi), son port réel est
+    enregistré dans le registre partagé (open_windows.update_whatsapp_
+    share_port) pour que le processus qui occupe réellement 8765 puisse
+    relayer vers lui (voir handle_whatsapp_share_path)."""
+
+    def __init__(self, port=DEFAULT_PORT):
+        self.port = port
+        self._httpd = None
+        self._thread = None
+
+    def start(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if handle_whatsapp_share_path(self, path):
+                    return
+                self.send_error(404)
+
+        try:
+            self._httpd = _ExclusiveThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        except OSError:
+            self._httpd = _ExclusiveThreadingHTTPServer(("0.0.0.0", 0), Handler)
+        self.port = self._httpd.server_address[1]
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.join_request_threads(_STOP_REQUEST_THREADS_TIMEOUT_SECONDS)
+            self._httpd.server_close()
+            self._httpd = None
+        self._thread = None
+
+    @property
+    def is_running(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def url(self):
+        return f"http://{local_ip()}:{self.port}"
+
+
 # Budget TOTAL (jamais par thread) laissé à RemoteControlServer.stop()/
 # try_reclaim_default_port() pour attendre la fin des threads de requêtes
 # encore en cours avant de considérer l'arrêt terminé (demande du
@@ -4595,6 +5137,17 @@ class RemoteControlServer:
                 # ont besoin de la chaîne de requête d'origine, continuent
                 # eux d'utiliser self.path tel quel).
                 path = self.path.split("?", 1)[0]
+
+                # Partage PDF par QR code (demande du 2026-10-11) :
+                # traité avant TOUT le reste, y compris l'authentification
+                # du contrôle à distance ci-dessous — cette route a sa
+                # propre autorisation (le jeton, voir handle_whatsapp_
+                # share_path) et doit rester TOTALEMENT indépendante de
+                # celle du contrôle à distance (point 1 explicite de la
+                # demande) : jamais _is_authenticated(), jamais
+                # _AUTH_EXEMPT_PATHS.
+                if handle_whatsapp_share_path(self, path):
+                    return
 
                 # Authentification (demande du 2026-09-09) : traitée
                 # avant TOUT le reste, y compris /lobbylist et le relais

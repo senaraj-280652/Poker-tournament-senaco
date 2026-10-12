@@ -46,6 +46,12 @@ _LOG_METHODS = (
     "_on_log_row_double_click", "_show_log_detail_window",
     "_show_log_date_picker", "_confirm_log_purge", "_log_purge_filter_summary",
     "_on_log_purge", "_refresh_all",
+    # "🗑 Purger" ouvre désormais un choix LOG/DONNÉES (chantier "Purger
+    # Données", 2026-10-07) avant d'appeler _on_log_purge — voir
+    # main.App._on_purge_choice/DataPurgeDialog. Ajoutée ici pour que
+    # log_purge_btn continue de se construire sans AttributeError ; le
+    # câblage LOG lui-même reste inchangé.
+    "_on_purge_choice",
 )
 _LOG_STATIC_METHODS = ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text")
 

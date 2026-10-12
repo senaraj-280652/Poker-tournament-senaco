@@ -20,7 +20,11 @@ a = Analysis(
     # F1, voir help_browser.py), lu au runtime via sys._MEIPASS — sans
     # cette entrée, l'aide s'ouvrirait vide dans l'app packagée.
     datas=[(str(ROOT / "help_content.json"), ".")],
-    hiddenimports=[],
+    # AppKit (PyObjC) : import conditionnel dans main.py (voir
+    # NSPASTEBOARD_AVAILABLE, copy_file_to_clipboard — bouton "Envoi
+    # WhatsApp") que PyInstaller peut ne pas détecter automatiquement
+    # par analyse statique seule, listé explicitement par précaution.
+    hiddenimports=["AppKit"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

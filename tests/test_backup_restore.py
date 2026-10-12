@@ -197,6 +197,321 @@ class CreateBackupTest(unittest.TestCase):
         self.assertTrue(os.path.isdir(r2["backup_dir"]))
 
 
+class TournamentFolderExtraneousFilesTest(unittest.TestCase):
+    """Incident RÉEL du 2026-10-09 (HP, PokerTournament-TEST-12) :
+    "Fichier manquant après la copie : primes_To170926.pdf" — le dossier
+    de tournois contenait un PDF d'export (prix), jamais copié (seuls
+    les .tournoi le sont, voir find_tournament_files), mais que l'ancien
+    _verify_copied_tree(tournament_folder, ...) cherchait quand même
+    dans la destination, en parcourant TOUT le dossier source sans
+    filtre — asymétrie copie/vérification, corrigée en vérifiant
+    désormais UNIQUEMENT les paires réellement copiées
+    (tournament_copy_pairs). Généralisé ici à plusieurs types de
+    fichiers annexes (PDF, CSV, fichiers techniques OS) — jamais un
+    traitement particulier pour un seul nom de fichier."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_extraneous_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        # Fichiers annexes réels (PDF d'export, CSV répertoire, fichiers
+        # techniques OS) — exactement le type de mélange déjà observé
+        # dans l'usage réel du club, jamais copiés ni attendus dans la
+        # sauvegarde.
+        _write(os.path.join(self.env.tournament_folder, "dimanche", "primes_To170926.pdf"), "PDF PRIMES")
+        _write(os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv"), "nom;club\nJean;CPC")
+        _write(os.path.join(self.env.tournament_folder, "Vendredi", "placement_sitngo.pdf"), "PDF PLACEMENT")
+        _write(os.path.join(self.env.tournament_folder, ".DS_Store"), "FAUX FICHIER TECHNIQUE MAC")
+
+    def test_fichiers_annexes_ne_bloquent_plus_la_sauvegarde(self):
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="POSTE-TEST",
+        )
+        self.assertEqual(result["tournament_file_count"], 2)  # toujours les 2 .tournoi de _SyntheticEnv
+
+    def test_les_tournois_restent_bien_copies_et_corrects(self):
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        backed_up = os.path.join(result["backup_dir"], backup_restore.TOURNAMENTS_SUBDIR, "dimanche", "tournoi14.tournoi")
+        with open(backed_up) as f:
+            self.assertEqual(f.read(), "DB tournoi 14")
+
+    def test_fichiers_annexes_ne_sont_jamais_copies_dans_la_sauvegarde(self):
+        """Comportement de COPIE inchangé (demande explicite : ne pas
+        corriger en commençant à copier ce qui n'a rien à faire dans
+        tournois/) — seule la VÉRIFICATION change."""
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        tournois_dst = os.path.join(result["backup_dir"], backup_restore.TOURNAMENTS_SUBDIR)
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, "dimanche", "primes_To170926.pdf")))
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, "repertoire_joueurs.csv")))
+        self.assertFalse(os.path.exists(os.path.join(tournois_dst, ".DS_Store")))
+
+    def test_fichiers_annexes_restent_intacts_sur_le_disque_dorigine(self):
+        """Point explicite : les données et fichiers annexes existants
+        doivent rester intacts — jamais modifiés ni supprimés par la
+        sauvegarde."""
+        pdf_path = os.path.join(self.env.tournament_folder, "dimanche", "primes_To170926.pdf")
+        csv_path = os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv")
+        backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )
+        with open(pdf_path) as f:
+            self.assertEqual(f.read(), "PDF PRIMES")
+        with open(csv_path) as f:
+            self.assertEqual(f.read(), "nom;club\nJean;CPC")
+
+    def test_un_vrai_tournoi_manquant_reste_bien_detecte(self):
+        """Non-régression centrale : la correction ne doit jamais
+        masquer un VRAI fichier .tournoi manquant après la copie —
+        simulé en supprimant la copie juste après coup."""
+        orig_copy2 = backup_restore.shutil.copy2
+
+        def _copy2_puis_supprime_un_tournoi(src, dst):
+            orig_copy2(src, dst)
+            if os.path.basename(dst) == "tournoi14.tournoi":
+                os.remove(dst)
+
+        with patch.object(backup_restore.shutil, "copy2", side_effect=_copy2_puis_supprime_un_tournoi):
+            with self.assertRaises(backup_restore.BackupError) as ctx:
+                backup_restore.create_backup(
+                    self.usb, tournament_folder=self.env.tournament_folder,
+                    poker_data_dir=self.env.poker_data_dir,
+                )
+        self.assertIn("tournoi14.tournoi", str(ctx.exception))
+
+    def test_plusieurs_sauvegardes_et_restaurations_successives_avec_fichiers_annexes(self):
+        """Point explicite : plusieurs sauvegardes/restaurations
+        successives avec les fichiers annexes toujours présents."""
+        restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        os.makedirs(restore_tournament_folder)
+        for i in range(3):
+            result = backup_restore.create_backup(
+                self.usb, tournament_folder=self.env.tournament_folder,
+                poker_data_dir=self.env.poker_data_dir,
+            )
+            self.assertEqual(result["tournament_file_count"], 2)
+            restore_result = backup_restore.restore_backup(
+                result["backup_dir"],
+                tournament_folder=restore_tournament_folder,
+                poker_data_dir=restore_poker_data_dir,
+                pre_restore_root=os.path.join(self._tmp.name, f"pre_restore_{i}"),
+                open_tournament_paths=[],
+            )
+            self.assertEqual(restore_result["restored_tournament_files"], 2)
+        # Les fichiers annexes d'origine n'ont jamais bougé après 3 cycles.
+        with open(os.path.join(self.env.tournament_folder, "repertoire_joueurs.csv")) as f:
+            self.assertEqual(f.read(), "nom;club\nJean;CPC")
+
+
+class MultiSourceBackupTest(unittest.TestCase):
+    """Sélection EXPLICITE de fichiers (demande explicite du 2026-10-08,
+    revue de sécurité "Purger Données" : "la sauvegarde lancée depuis
+    Purger Données doit couvrir EXACTEMENT les fichiers sélectionnés,
+    sans redécouverte indépendante dans le seul Dossier par défaut")
+    — paramètre `tournament_files` de create_backup, avec regroupement
+    par dossier d'origine réel (`tournament_source_folders`) pour
+    éviter toute collision entre fichiers de même nom provenant de
+    dossiers différents (ex. plusieurs "dimanche", un par source)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_multi_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+
+    def test_un_seul_dossier_source_produit_un_manifeste_identique_a_lancien_schema(self):
+        """Non-régression explicite : quand TOUS les fichiers de la
+        sélection appartiennent au même dossier (cas le plus courant),
+        le manifeste reste STRICTEMENT identique à celui du schéma
+        historique — aucun champ "tournament_source_folders", chemins
+        relatifs SANS préfixe."""
+        folder = os.path.join(self._tmp.name, "club", "dimanche")
+        p1 = os.path.join(folder, "To1.tournoi")
+        p2 = os.path.join(folder, "To2.tournoi")
+        _write(p1, "contenu 1")
+        _write(p2, "contenu 2")
+        result = backup_restore.create_backup(
+            self.usb, tournament_files=[p1, p2],
+            tournament_source_folders=[folder],
+        )
+        with open(os.path.join(result["backup_dir"], backup_restore.MANIFEST_FILENAME)) as f:
+            manifest = json.load(f)
+        self.assertNotIn("tournament_source_folders", manifest)
+        self.assertEqual(manifest["source_tournament_folder"], folder)
+        self.assertEqual(sorted(manifest["tournament_files"]), ["To1.tournoi", "To2.tournoi"])
+        self.assertEqual(result["tournament_file_count"], 2)
+
+    def test_deux_fichiers_de_meme_nom_dans_des_dossiers_distincts_jamais_de_collision(self):
+        """Le scénario exact signalé par l'utilisateur : dimanche_A et
+        dimanche_B contiennent CHACUN un "To1.tournoi" — les deux
+        doivent être sauvegardés séparément, avec leur contenu propre
+        intact, jamais l'un écrasant l'autre."""
+        folder_a = os.path.join(self._tmp.name, "poste1", "dimanche")
+        folder_b = os.path.join(self._tmp.name, "poste2", "dimanche")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To1.tournoi")
+        _write(p_a, "CONTENU DU POSTE 1")
+        _write(p_b, "CONTENU DU POSTE 2 (different)")
+        result = backup_restore.create_backup(
+            self.usb, tournament_files=[p_a, p_b],
+            tournament_source_folders=[folder_a, folder_b],
+        )
+        self.assertEqual(result["tournament_file_count"], 2)
+        with open(os.path.join(result["backup_dir"], backup_restore.MANIFEST_FILENAME)) as f:
+            manifest = json.load(f)
+        self.assertIsNone(manifest["source_tournament_folder"])
+        self.assertEqual(manifest["tournament_source_folders"], [folder_a, folder_b])
+        self.assertEqual(
+            sorted(manifest["tournament_files"]),
+            sorted(["0_dimanche/To1.tournoi", "1_dimanche/To1.tournoi"]),
+        )
+        backed_a = os.path.join(result["backup_dir"], "tournois", "0_dimanche", "To1.tournoi")
+        backed_b = os.path.join(result["backup_dir"], "tournois", "1_dimanche", "To1.tournoi")
+        with open(backed_a) as f:
+            self.assertEqual(f.read(), "CONTENU DU POSTE 1")
+        with open(backed_b) as f:
+            self.assertEqual(f.read(), "CONTENU DU POSTE 2 (different)")
+        # Les empreintes SHA-256 doivent elles aussi être distinctes et
+        # correctes pour chaque copie (jamais mélangées entre les deux).
+        self.assertNotEqual(
+            manifest["tournament_file_hashes"]["0_dimanche/To1.tournoi"],
+            manifest["tournament_file_hashes"]["1_dimanche/To1.tournoi"],
+        )
+        self.assertEqual(
+            manifest["tournament_file_hashes"]["0_dimanche/To1.tournoi"],
+            backup_restore.sha256_of_file(backed_a),
+        )
+
+    def test_dossier_ajoute_manuellement_imbrique_dans_le_dossier_par_defaut(self):
+        """Un dossier candidat SOUS un autre (ex. ajout manuel d'un
+        sous-dossier du dossier par défaut) doit être reconnu comme le
+        propriétaire le plus SPÉCIFIQUE — jamais le plus large."""
+        base = os.path.join(self._tmp.name, "club")
+        nested = os.path.join(base, "dimanche")
+        p = os.path.join(nested, "sous_dossier", "To1.tournoi")
+        _write(p, "contenu")
+        result = backup_restore.create_backup(
+            self.usb, tournament_files=[p], tournament_source_folders=[base, nested],
+        )
+        with open(os.path.join(result["backup_dir"], backup_restore.MANIFEST_FILENAME)) as f:
+            manifest = json.load(f)
+        # Un seul dossier RÉELLEMENT utilisé (nested, le plus spécifique
+        # qui contient p) -> schéma à un seul dossier, chemin relatif à
+        # NESTED, pas à base.
+        self.assertEqual(manifest["source_tournament_folder"], nested)
+        self.assertEqual(manifest["tournament_files"], ["sous_dossier/To1.tournoi"])
+
+    def test_sans_dossiers_candidats_fournis_repli_sur_un_seul_ancetre_commun(self):
+        """Sans tournament_source_folders (appelant qui ne les connaît
+        pas) : repli sur UN SEUL groupe (l'ancêtre commun) — jamais une
+        exception, jamais un groupe par sous-dossier."""
+        folder_a = os.path.join(self._tmp.name, "club", "dimanche")
+        folder_b = os.path.join(self._tmp.name, "club", "lundi")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To2.tournoi")
+        _write(p_a, "a")
+        _write(p_b, "b")
+        result = backup_restore.create_backup(self.usb, tournament_files=[p_a, p_b])
+        with open(os.path.join(result["backup_dir"], backup_restore.MANIFEST_FILENAME)) as f:
+            manifest = json.load(f)
+        self.assertNotIn("tournament_source_folders", manifest)
+        self.assertEqual(manifest["source_tournament_folder"], os.path.join(self._tmp.name, "club"))
+        self.assertEqual(
+            sorted(manifest["tournament_files"]),
+            sorted(["dimanche/To1.tournoi", "lundi/To2.tournoi"]),
+        )
+
+    def test_selection_explicite_vide_sauvegarde_zero_tournoi_sans_erreur(self):
+        result = backup_restore.create_backup(self.usb, tournament_files=[])
+        self.assertEqual(result["tournament_file_count"], 0)
+
+    def test_fichier_disparu_pendant_la_copie_annule_toute_la_sauvegarde(self):
+        """Une sélection explicite qui référence un fichier disparu
+        (supprimé entre le scan et la sauvegarde) doit échouer
+        intégralement — jamais une sauvegarde partielle silencieuse."""
+        folder = os.path.join(self._tmp.name, "club", "dimanche")
+        p1 = os.path.join(folder, "To1.tournoi")
+        _write(p1, "contenu")
+        p_missing = os.path.join(folder, "introuvable.tournoi")
+        with self.assertRaises(backup_restore.BackupError):
+            backup_restore.create_backup(
+                self.usb, tournament_files=[p1, p_missing], tournament_source_folders=[folder],
+            )
+        leftovers = [n for n in os.listdir(self.usb) if n.startswith(backup_restore.BACKUP_FOLDER_PREFIX)]
+        self.assertEqual(leftovers, [])
+
+    def test_restauration_dune_sauvegarde_multi_dossiers_preserve_les_deux_fichiers_de_meme_nom(self):
+        """Demande explicite du 2026-10-08, point 7 : test de
+        restauration avec deux fichiers de même nom provenant de
+        dossiers distincts — UNIQUEMENT des dossiers temporaires, jamais
+        les vraies données. restore_backup() n'a besoin d'AUCUNE
+        modification (vérifié dans le diagnostic) : elle recrée
+        fidèlement chaque chemin relatif du manifeste, préfixe
+        "<index>_<nom>/" inclus, sous le dossier de tournoi CIBLE —
+        documenté ici explicitement pour que cette structure technique
+        ne soit jamais une surprise."""
+        folder_a = os.path.join(self._tmp.name, "poste1", "dimanche")
+        folder_b = os.path.join(self._tmp.name, "poste2", "dimanche")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To1.tournoi")
+        _write(p_a, "CONTENU POSTE 1")
+        _write(p_b, "CONTENU POSTE 2")
+        backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p_a, p_b], tournament_source_folders=[folder_a, folder_b],
+        )["backup_dir"]
+
+        restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+        os.makedirs(restore_tournament_folder)
+
+        result = backup_restore.restore_backup(
+            backup_dir,
+            tournament_folder=restore_tournament_folder,
+            poker_data_dir=restore_poker_data_dir,
+            pre_restore_root=pre_restore_root,
+            open_tournament_paths=[],
+        )
+        self.assertEqual(result["restored_tournament_files"], 2)
+
+        restored_a = os.path.join(restore_tournament_folder, "0_dimanche", "To1.tournoi")
+        restored_b = os.path.join(restore_tournament_folder, "1_dimanche", "To1.tournoi")
+        self.assertTrue(os.path.isfile(restored_a))
+        self.assertTrue(os.path.isfile(restored_b))
+        with open(restored_a) as f:
+            self.assertEqual(f.read(), "CONTENU POSTE 1")
+        with open(restored_b) as f:
+            self.assertEqual(f.read(), "CONTENU POSTE 2")
+        # Aucune collision : les deux fichiers restaurés restent DEUX
+        # fichiers distincts sur le disque, jamais l'un écrasant l'autre.
+        self.assertNotEqual(os.path.abspath(restored_a), os.path.abspath(restored_b))
+
+    def test_ne_modifie_jamais_les_fichiers_source_en_selection_explicite(self):
+        folder_a = os.path.join(self._tmp.name, "poste1", "dimanche")
+        folder_b = os.path.join(self._tmp.name, "poste2", "dimanche")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To1.tournoi")
+        _write(p_a, "A")
+        _write(p_b, "B")
+        backup_restore.create_backup(
+            self.usb, tournament_files=[p_a, p_b], tournament_source_folders=[folder_a, folder_b],
+        )
+        with open(p_a) as f:
+            self.assertEqual(f.read(), "A")
+        with open(p_b) as f:
+            self.assertEqual(f.read(), "B")
+
+
 class ValidateBackupFolderTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
@@ -254,6 +569,10 @@ class RestoreBackupTest(unittest.TestCase):
         self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
 
     def test_2_restauration_reproduit_correctement_les_donnees(self):
+        # Depuis le 2026-10-10 : le dossier de destination doit déjà
+        # exister (refusé sinon, jamais créé silencieusement) — voir
+        # TournamentFolderValidationTest pour ce comportement lui-même.
+        os.makedirs(self.restore_tournament_folder)
         result = backup_restore.restore_backup(
             self.backup,
             tournament_folder=self.restore_tournament_folder,
@@ -336,6 +655,7 @@ class RestoreBackupTest(unittest.TestCase):
         cible : un fichier présent seulement dans la cible (pas dans la
         sauvegarde) doit survivre à la restauration."""
         _write(os.path.join(self.restore_poker_data_dir, "un_fichier_local_non_sauvegarde.txt"), "reste")
+        os.makedirs(self.restore_tournament_folder)
         backup_restore.restore_backup(
             self.backup,
             tournament_folder=self.restore_tournament_folder,
@@ -346,6 +666,347 @@ class RestoreBackupTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(
             os.path.join(self.restore_poker_data_dir, "un_fichier_local_non_sauvegarde.txt")
         ))
+
+
+class TournamentFolderValidationTest(unittest.TestCase):
+    """Demande explicite du 2026-10-10 : la restauration doit utiliser
+    EXCLUSIVEMENT le « Dossier par défaut » réellement configuré sur LA
+    MACHINE DE DESTINATION (tournament_prefs.load_last_settings, jamais
+    default_tournament_folder() ni le chemin de la machine source), le
+    refuser explicitement s'il est vide/inexistant/non accessible en
+    écriture, et ne jamais rien créer/modifier avant que ces validations
+    aient toutes réussi. Sauvegarde créée avec un dossier de tournoi
+    "source" distinct (imite une autre machine), tournament_folder=None
+    passé à restore_backup à chaque fois pour bien exercer le chemin de
+    résolution via tournament_prefs (jamais explicitement injecté)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        self.backup = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="MAC-SOURCE",
+        )["backup_dir"]
+        self.restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+
+    def _restore_with_configured_folder(self, configured_folder):
+        with patch.object(
+            backup_restore.tournament_prefs, "load_last_settings",
+            return_value={"tournament_day_folder": configured_folder},
+        ):
+            return backup_restore.restore_backup(
+                self.backup,
+                tournament_folder=None,
+                poker_data_dir=self.restore_poker_data_dir,
+                pre_restore_root=self.pre_restore_root,
+                open_tournament_paths=[],
+            )
+
+    def test_refuse_si_le_dossier_par_defaut_est_vide(self):
+        with self.assertRaises(backup_restore.BackupError) as ctx:
+            self._restore_with_configured_folder("")
+        self.assertIn("Dossier par défaut", str(ctx.exception))
+        self.assertIn("Paramètres", str(ctx.exception))
+        # Validation AVANT toute écriture : aucune sauvegarde de
+        # sécurité ni dossier de destination ne doit avoir été créé.
+        self.assertFalse(os.path.exists(self.pre_restore_root))
+        self.assertFalse(os.path.exists(self.restore_poker_data_dir))
+
+    def test_refuse_si_la_cle_tournament_day_folder_est_absente(self):
+        """Aucune valeur n'a jamais été enregistrée du tout (poste
+        tout neuf) : même refus explicite que pour une chaîne vide."""
+        with patch.object(
+            backup_restore.tournament_prefs, "load_last_settings", return_value={},
+        ):
+            with self.assertRaises(backup_restore.BackupError) as ctx:
+                backup_restore.restore_backup(
+                    self.backup,
+                    tournament_folder=None,
+                    poker_data_dir=self.restore_poker_data_dir,
+                    pre_restore_root=self.pre_restore_root,
+                    open_tournament_paths=[],
+                )
+        self.assertIn("Dossier par défaut", str(ctx.exception))
+        self.assertFalse(os.path.exists(self.pre_restore_root))
+
+    def test_refuse_si_le_dossier_configure_nexiste_pas(self):
+        chemin_inexistant = os.path.join(self._tmp.name, "nexiste_pas_du_tout")
+        with self.assertRaises(backup_restore.BackupError) as ctx:
+            self._restore_with_configured_folder(chemin_inexistant)
+        self.assertIn(chemin_inexistant, str(ctx.exception))
+        self.assertFalse(os.path.exists(self.pre_restore_root))
+        # Le dossier configuré lui-même ne doit jamais être créé
+        # silencieusement par la restauration.
+        self.assertFalse(os.path.exists(chemin_inexistant))
+
+    def test_refuse_si_le_dossier_configure_nest_pas_accessible_en_ecriture(self):
+        non_writable = os.path.join(self._tmp.name, "dossier_lecture_seule")
+        os.makedirs(non_writable)
+        os.chmod(non_writable, 0o555)
+        self.addCleanup(os.chmod, non_writable, 0o755)
+        if os.access(non_writable, os.W_OK):
+            self.skipTest("os.access ne reflète pas chmod sur ce système (ex. exécuté en root)")
+        with self.assertRaises(backup_restore.BackupError) as ctx:
+            self._restore_with_configured_folder(non_writable)
+        self.assertIn("écriture", str(ctx.exception))
+        self.assertFalse(os.path.exists(self.pre_restore_root))
+
+    def test_la_validation_du_dossier_decriture_ne_cree_ni_ne_modifie_aucun_fichier(self):
+        """Précaution explicite du 2026-10-10 : la vérification
+        d'accessibilité en écriture elle-même (os.path.isdir/os.access,
+        AVANT la moindre copie réelle) ne doit créer ni modifier aucun
+        fichier dans le dossier configuré. Isolé de la copie réelle qui
+        suit en faisant échouer l'étape SUIVANTE (sauvegarde de
+        sécurité) : si la validation elle-même avait écrit quoi que ce
+        soit (ex. un fichier-sonde), ce serait visible ici, avant même
+        que l'exception ne se propage."""
+        configured = os.path.join(self._tmp.name, "dossier_configure")
+        os.makedirs(configured)
+        avant = sorted(os.listdir(configured))
+        with patch.object(
+            backup_restore, "create_backup", side_effect=RuntimeError("échec simulé de la sauvegarde de sécurité"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self._restore_with_configured_folder(configured)
+        apres = sorted(os.listdir(configured))
+        self.assertEqual(avant, apres)
+
+    def test_dossier_valide_la_restauration_reussit(self):
+        """Confirmation positive : un « Dossier par défaut » valide
+        (existant, accessible en écriture) ne bloque jamais une
+        restauration légitime."""
+        configured = os.path.join(self._tmp.name, "dossier_configure_valide")
+        os.makedirs(configured)
+        result = self._restore_with_configured_folder(configured)
+        self.assertEqual(result["restored_tournament_files"], 2)
+        self.assertTrue(os.path.isfile(os.path.join(configured, "dimanche", "tournoi14.tournoi")))
+
+    def test_ne_reutilise_jamais_le_chemin_de_la_machine_source(self):
+        """La sauvegarde a été créée depuis self.env.tournament_folder
+        (simule la machine Mac source) : la restauration doit utiliser
+        UNIQUEMENT le dossier configuré localement, jamais ce chemin
+        source, même si ce dernier existe toujours sur cette machine."""
+        manifest = backup_restore.validate_backup_folder(self.backup)
+        self.assertEqual(manifest["source_tournament_folder"], self.env.tournament_folder)
+        configured = os.path.join(self._tmp.name, "dossier_configure_different_du_source")
+        os.makedirs(configured)
+        self._restore_with_configured_folder(configured)
+        # Les fichiers sont bien arrivés dans le dossier CONFIGURÉ...
+        self.assertTrue(os.path.isfile(os.path.join(configured, "dimanche", "tournoi14.tournoi")))
+        # ...et le dossier source (toujours présent) n'a reçu aucune
+        # écriture de la restauration (il contient encore EXACTEMENT
+        # ce qu'il avait avant, rien de plus).
+        with open(os.path.join(self.env.tournament_folder, "dimanche", "tournoi14.tournoi")) as f:
+            self.assertEqual(f.read(), "DB tournoi 14")
+
+
+class TournamentFolderOverwriteBehaviorTest(unittest.TestCase):
+    """Précaution explicite du 2026-10-10 : un fichier .tournoi de même
+    nom relatif déjà présent dans le dossier de destination doit être
+    ÉCRASÉ par la restauration (comportement de restauration voulu,
+    jamais un écrasement "non prévu") — mais récupérable via la
+    sauvegarde de sécurité pré-restauration existante, jamais perdu."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        self.backup = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )["backup_dir"]
+        self.restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        self.restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+        os.makedirs(self.restore_tournament_folder)
+        # Fichier de même nom relatif que celui de la sauvegarde
+        # ("dimanche/tournoi14.tournoi"), contenu DIFFÉRENT.
+        _write(
+            os.path.join(self.restore_tournament_folder, "dimanche", "tournoi14.tournoi"),
+            "ANCIEN CONTENU AVANT RESTAURATION",
+        )
+
+    def test_le_fichier_de_meme_nom_est_ecrase_par_celui_de_la_sauvegarde(self):
+        backup_restore.restore_backup(
+            self.backup,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+        with open(os.path.join(self.restore_tournament_folder, "dimanche", "tournoi14.tournoi")) as f:
+            self.assertEqual(f.read(), "DB tournoi 14")
+
+    def test_lancien_contenu_reste_recuperable_via_la_sauvegarde_de_securite(self):
+        result = backup_restore.restore_backup(
+            self.backup,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+        safety_dir = result["safety_backup_dir"]
+        with open(os.path.join(safety_dir, "tournois", "dimanche", "tournoi14.tournoi")) as f:
+            self.assertEqual(f.read(), "ANCIEN CONTENU AVANT RESTAURATION")
+
+
+class TournamentDayFolderPreservationTest(unittest.TestCase):
+    """Demande explicite du 2026-10-10 (points 5 et 6) : le « Dossier
+    par défaut » (tournament_day_folder, dans last_settings.json) de la
+    machine de destination ne doit JAMAIS être remplacé par celui de la
+    machine source lors de la restauration des autres préférences — et
+    réciproquement, jamais importer un chemin absent localement. Les
+    AUTRES préférences de last_settings.json (buyin_amount, etc.)
+    doivent, elles, continuer à être mises à jour normalement depuis la
+    sauvegarde."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        self.restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        self.restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+        os.makedirs(self.restore_tournament_folder)
+
+    def _create_backup_with_source_last_settings(self, source_day_folder):
+        _write(
+            os.path.join(self.env.poker_data_dir, "last_settings.json"),
+            json.dumps({"tournament_day_folder": source_day_folder, "buyin_amount": 20}),
+        )
+        return backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="MAC-SOURCE",
+        )["backup_dir"]
+
+    def test_preserve_le_dossier_local_meme_si_la_sauvegarde_contient_une_autre_valeur(self):
+        backup = self._create_backup_with_source_last_settings("/Users/raj/tournois_mac")
+        local_settings_path = os.path.join(self.restore_poker_data_dir, "last_settings.json")
+        _write(local_settings_path, json.dumps({"tournament_day_folder": "C:\\poker\\tournois_hp"}))
+        backup_restore.restore_backup(
+            backup,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+        with open(local_settings_path) as f:
+            data = json.load(f)
+        # Valeur LOCALE préservée, jamais remplacée par celle du Mac.
+        self.assertEqual(data["tournament_day_folder"], "C:\\poker\\tournois_hp")
+        # Les AUTRES préférences, elles, sont bien mises à jour.
+        self.assertEqual(data["buyin_amount"], 20)
+
+    def test_dossier_local_absent_reste_absent_apres_restauration(self):
+        """Aucune valeur locale avant restauration : la sauvegarde en
+        contient pourtant une (machine source) — elle ne doit jamais
+        être importée."""
+        backup = self._create_backup_with_source_last_settings("/Users/raj/tournois_mac")
+        backup_restore.restore_backup(
+            backup,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+        local_settings_path = os.path.join(self.restore_poker_data_dir, "last_settings.json")
+        with open(local_settings_path) as f:
+            data = json.load(f)
+        self.assertNotIn("tournament_day_folder", data)
+        # L'autre préférence, elle, est bien arrivée.
+        self.assertEqual(data["buyin_amount"], 20)
+
+    def test_aucun_last_settings_json_cree_si_ni_source_ni_destination_nen_ont(self):
+        """Non-régression (bug réel rencontré et corrigé pendant ce
+        chantier) : si NI la sauvegarde NI la destination n'ont jamais
+        eu de last_settings.json, la restauration ne doit en créer
+        aucun pour rien — un fichier vide créé "pour rien" avait fait
+        grossir artificiellement le compte de fichiers d'une
+        sauvegarde de sécurité à l'autre (voir PreRestoreBackupsRecursionTest)."""
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir,
+        )["backup_dir"]
+        backup_restore.restore_backup(
+            backup,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.restore_poker_data_dir, "last_settings.json"))
+        )
+
+    def test_plusieurs_restaurations_successives_preservent_la_valeur_locale_a_chaque_fois(self):
+        backup = self._create_backup_with_source_last_settings("/Users/raj/tournois_mac")
+        local_settings_path = os.path.join(self.restore_poker_data_dir, "last_settings.json")
+        _write(local_settings_path, json.dumps({"tournament_day_folder": "C:\\poker\\tournois_hp"}))
+        for _ in range(3):
+            backup_restore.restore_backup(
+                backup,
+                tournament_folder=self.restore_tournament_folder,
+                poker_data_dir=self.restore_poker_data_dir,
+                pre_restore_root=self.pre_restore_root,
+                open_tournament_paths=[],
+            )
+            with open(local_settings_path) as f:
+                data = json.load(f)
+            self.assertEqual(data["tournament_day_folder"], "C:\\poker\\tournois_hp")
+
+
+class TournamentDayFolderHelperUnitTest(unittest.TestCase):
+    """Tests unitaires directs des deux fonctions internes qui opèrent
+    sur last_settings.json pendant une restauration — _read_
+    tournament_day_folder/_restore_tournament_day_folder — notamment la
+    garde "n'écrit rien si rien ne change" (correction du bug [6, 7, 7]
+    rencontré pendant ce chantier)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.path = os.path.join(self._tmp.name, "last_settings.json")
+
+    def test_lecture_renvoie_none_si_fichier_absent(self):
+        self.assertIsNone(backup_restore._read_tournament_day_folder(self.path))
+
+    def test_lecture_renvoie_la_valeur_presente(self):
+        _write(self.path, json.dumps({"tournament_day_folder": "/x/y"}))
+        self.assertEqual(backup_restore._read_tournament_day_folder(self.path), "/x/y")
+
+    def test_restore_ne_cree_aucun_fichier_si_value_none_et_fichier_absent(self):
+        backup_restore._restore_tournament_day_folder(self.path, None)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_restore_ecrit_la_valeur_si_fichier_absent_et_value_fournie(self):
+        backup_restore._restore_tournament_day_folder(self.path, "/local/jour")
+        with open(self.path) as f:
+            data = json.load(f)
+        self.assertEqual(data["tournament_day_folder"], "/local/jour")
+
+    def test_restore_retire_la_cle_si_value_none_et_cle_presente(self):
+        _write(self.path, json.dumps({"tournament_day_folder": "/source/jour", "buyin_amount": 20}))
+        backup_restore._restore_tournament_day_folder(self.path, None)
+        with open(self.path) as f:
+            data = json.load(f)
+        self.assertNotIn("tournament_day_folder", data)
+        self.assertEqual(data["buyin_amount"], 20)
+
+    def test_restore_ne_reecrit_pas_le_fichier_si_la_valeur_est_deja_correcte(self):
+        _write(self.path, json.dumps({"tournament_day_folder": "/local/jour", "buyin_amount": 20}))
+        mtime_avant = os.path.getmtime(self.path)
+        import time
+        time.sleep(0.01)
+        backup_restore._restore_tournament_day_folder(self.path, "/local/jour")
+        self.assertEqual(os.path.getmtime(self.path), mtime_avant)
 
 
 class RestoreExcludesSessionStateFilesTest(unittest.TestCase):
@@ -369,6 +1030,9 @@ class RestoreExcludesSessionStateFilesTest(unittest.TestCase):
         self.restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
         self.restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
         self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+        # Depuis le 2026-10-10 : le dossier de destination doit déjà
+        # exister (refusé sinon, jamais créé silencieusement).
+        os.makedirs(self.restore_tournament_folder)
 
     def test_ne_cree_ni_open_windows_ni_phone_pid_si_absents_de_la_cible(self):
         """La cible n'a ni l'un ni l'autre avant restauration : la
@@ -454,6 +1118,147 @@ class RestoreExcludesSessionStateFilesTest(unittest.TestCase):
             self.assertEqual(f.read(), '{"/tmp/etat_avant_restauration.tournoi": {"pid": 42}}')
 
 
+class PreRestoreBackupsRecursionTest(unittest.TestCase):
+    """Incident RÉEL du 2026-10-09 (HP, Senaco TEST v1.2.44) :
+    restore_backup() avec pre_restore_root=None — le vrai défaut,
+    jamais utilisé ailleurs dans ce fichier (tous les autres tests
+    injectent délibérément un pre_restore_root séparé, ce qui masquait
+    ce bug) — calcule pre_restore_root À L'INTÉRIEUR MÊME de
+    poker_data_dir. La sauvegarde de sécurité se recopiait alors
+    indéfiniment dans elle-même ("WinError 206 : nom de fichier...
+    trop long" sur Windows). Ces tests patchent default_poker_data_dir
+    pour reproduire EXACTEMENT ce calcul par défaut, sur un dossier
+    synthétique — jamais le vrai ~/.poker_tournament."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_pre_restore_")
+        self.addCleanup(self._tmp.cleanup)
+        self.env = _SyntheticEnv(self._tmp.name)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+
+        self._patchers = [
+            patch.object(backup_restore, "default_poker_data_dir", return_value=self.env.poker_data_dir),
+            patch.object(backup_restore, "default_tournament_folder", return_value=self.env.tournament_folder),
+        ]
+        for p in self._patchers:
+            self.addCleanup(p.stop)
+            p.start()
+
+        self.backup_dir = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder,
+            poker_data_dir=self.env.poker_data_dir, computer_name="POSTE-TEST",
+        )["backup_dir"]
+
+    def _restore(self, **overrides):
+        """`poker_data_dir`/`pre_restore_root` volontairement LAISSÉS À
+        None (sauf override explicite) : c'est exactement ce qui
+        déclenchait l'incident réel — reproduire autre chose ici
+        reviendrait à ne jamais tester le vrai défaut."""
+        kwargs = dict(
+            tournament_folder=self.env.tournament_folder,
+            poker_data_dir=None,
+            pre_restore_root=None,
+            open_tournament_paths=[],
+        )
+        kwargs.update(overrides)
+        return backup_restore.restore_backup(self.backup_dir, **kwargs)
+
+    def test_restauration_avec_le_vrai_defaut_pre_restore_root_ne_plante_pas(self):
+        result = self._restore()
+        self.assertTrue(result["restored_data"])
+        pre_restore_root = os.path.join(self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)
+        self.assertEqual(len(os.listdir(pre_restore_root)), 1, "une seule sauvegarde de sécurité créée")
+
+    def test_la_sauvegarde_de_securite_nest_jamais_imbriquee_dans_elle_meme(self):
+        result = self._restore()
+        safety_data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertFalse(
+            os.path.exists(os.path.join(safety_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)),
+            "la sauvegarde de sécurité ne doit jamais contenir pre_restore_backups (ni elle-même, ni une ancienne)",
+        )
+
+    def test_fichiers_reels_restent_inclus_dans_la_sauvegarde_de_securite(self):
+        """Point 4 explicite : l'exclusion ne doit jamais faire perdre
+        les fichiers réellement nécessaires à une restauration."""
+        result = self._restore()
+        data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "export_prefs.json")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "roster.json")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "photos", "jean.jpg")))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "license.json")))
+
+    def test_trois_restaurations_successives_ne_font_pas_grossir_chaque_sauvegarde(self):
+        """Point 6 explicite : plusieurs sauvegardes/restaurations
+        successives — chaque nouvelle sauvegarde de sécurité doit
+        contenir le MÊME nombre de fichiers (celui de poker_data_dir à
+        cet instant), jamais une progression 1x/2x/3x qui inclurait les
+        sauvegardes de sécurité précédentes."""
+        file_counts = []
+        safety_dirs = []
+        for _ in range(3):
+            result = self._restore()
+            safety_dirs.append(result["safety_backup_dir"])
+            data_dir = os.path.join(result["safety_backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+            file_counts.append(sum(len(files) for _, _, files in os.walk(data_dir)))
+        self.assertEqual(len(set(safety_dirs)), 3, "3 sauvegardes de sécurité bien distinctes")
+        self.assertEqual(len(set(file_counts)), 1, f"décomptes attendus identiques, obtenus {file_counts}")
+
+    def test_sauvegarde_de_securite_precedente_reste_intacte_sur_le_disque(self):
+        """Point 3 explicite : une sauvegarde de sécurité déjà présente
+        ne doit jamais être supprimée ni modifiée par une restauration
+        suivante."""
+        result1 = self._restore()
+        first_safety_dir = result1["safety_backup_dir"]
+        before_path = os.path.join(first_safety_dir, backup_restore.POKER_DATA_SUBDIR, "export_prefs.json")
+        with open(before_path) as f:
+            before = f.read()
+
+        result2 = self._restore()
+        self.assertNotEqual(first_safety_dir, result2["safety_backup_dir"])
+        self.assertTrue(os.path.isdir(first_safety_dir), "la première sauvegarde de sécurité doit toujours exister")
+        with open(before_path) as f:
+            after = f.read()
+        self.assertEqual(before, after)
+
+    def test_sauvegarde_manuelle_classique_exclut_aussi_pre_restore_backups(self):
+        """Point 2 explicite : l'exclusion s'applique aussi à une
+        sauvegarde manuelle classique (Menu principal/Purger Données),
+        pas seulement à la sauvegarde de sécurité interne de
+        restore_backup."""
+        _write(
+            os.path.join(
+                self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "ancien", "x.json",
+            ),
+            "ancien contenu",
+        )
+        result = backup_restore.create_backup(
+            self.usb, tournament_folder=self.env.tournament_folder, poker_data_dir=self.env.poker_data_dir,
+        )
+        data_dir = os.path.join(result["backup_dir"], backup_restore.POKER_DATA_SUBDIR)
+        self.assertFalse(os.path.exists(os.path.join(data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME)))
+        self.assertTrue(os.path.isfile(os.path.join(data_dir, "export_prefs.json")))
+
+    def test_restauration_depuis_une_ancienne_sauvegarde_contenant_deja_pre_restore_backups_ne_le_reinjecte_pas(self):
+        """Défense en profondeur : si une sauvegarde créée AVANT ce
+        correctif contient déjà un pre_restore_backups gonflé dans son
+        poker_tournament_data/, la restauration ne doit jamais le
+        réinjecter dans le poker_data_dir réel."""
+        _write(
+            os.path.join(
+                self.backup_dir, backup_restore.POKER_DATA_SUBDIR,
+                backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "vieux", "y.json",
+            ),
+            "vieux contenu",
+        )
+        self._restore()
+        self.assertFalse(
+            os.path.exists(
+                os.path.join(self.env.poker_data_dir, backup_restore.PRE_RESTORE_BACKUPS_DIRNAME, "vieux"),
+            ),
+        )
+
+
 class CopyTreeExclusionUnitTest(unittest.TestCase):
     """Test unitaire ciblé de _copy_tree_file_by_file(..., exclude_relpaths=...),
     indépendamment de tout le mécanisme de sauvegarde/restauration."""
@@ -481,12 +1286,54 @@ class CopyTreeExclusionUnitTest(unittest.TestCase):
         self.assertEqual(count, 3)
         self.assertTrue(os.path.isfile(os.path.join(self.dst, "a.json")))
 
-    def test_constante_exclusion_restauration_contient_bien_les_deux_fichiers_attendus(self):
+    def test_constante_exclusion_restauration_contient_bien_les_fichiers_attendus(self):
+        # backup_history.json ajouté le 2026-10-07 (garde-fou "Purger
+        # Données") : l'historique RÉEL des sauvegardes de CETTE machine
+        # ne doit jamais être écrasé par une restauration — voir
+        # tests/test_backup_history.py pour la couverture dédiée.
         self.assertEqual(
             backup_restore.RESTORE_EXCLUDED_DATA_FILENAMES,
-            frozenset({"open_windows.json", "phone_selected_pid.json"}),
+            frozenset({"open_windows.json", "phone_selected_pid.json", "backup_history.json"}),
         )
         self.assertNotIn("license.json", backup_restore.RESTORE_EXCLUDED_DATA_FILENAMES)
+
+    # ------------------------------------------------------------------
+    # exclude_dir_names (incident réel du 2026-10-09, "WinError 206" —
+    # pre_restore_backups recopié dans lui-même)
+    # ------------------------------------------------------------------
+
+    def test_exclude_dir_names_elague_bien_le_sous_dossier_a_toute_profondeur(self):
+        _write(os.path.join(self.src, "pre_restore_backups", "ancien", "x.json"), "X")
+        _write(os.path.join(self.src, "sous_dossier", "pre_restore_backups", "y.json"), "Y")
+        count = backup_restore._copy_tree_file_by_file(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+        # Seuls a.json, b.json, sous_dossier/c.json (3 fichiers déjà
+        # présents dans setUp) doivent être copiés — rien de ce qui est
+        # sous un "pre_restore_backups", à aucune profondeur.
+        self.assertEqual(count, 3)
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "pre_restore_backups")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst, "sous_dossier", "pre_restore_backups")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dst, "sous_dossier", "c.json")))
+
+    def test_verify_copied_tree_avec_exclude_dir_names_ne_signale_jamais_lexclu_comme_manquant(self):
+        _write(os.path.join(self.src, "pre_restore_backups", "ancien", "x.json"), "X")
+        backup_restore._copy_tree_file_by_file(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+        # Ne doit JAMAIS lever BackupError — le dossier exclu n'a jamais
+        # été copié, donc jamais "manquant" au sens de cette vérification.
+        backup_restore._verify_copied_tree(
+            self.src, self.dst, exclude_dir_names={"pre_restore_backups"},
+        )
+
+    def test_verify_copied_tree_sans_exclude_dir_names_detecte_bien_un_vrai_manquant(self):
+        """Non-régression : la vérification doit continuer à détecter un
+        VRAI fichier manquant quand on ne lui demande d'exclure rien."""
+        backup_restore._copy_tree_file_by_file(self.src, self.dst)
+        os.remove(os.path.join(self.dst, "b.json"))
+        with self.assertRaises(backup_restore.BackupError):
+            backup_restore._verify_copied_tree(self.src, self.dst)
 
 
 class NoOpOnCancellationTest(unittest.TestCase):
@@ -500,19 +1347,41 @@ class NoOpOnCancellationTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        backup_start = source.index("def backup_now():")
-        backup_end = source.index("def restore_now():")
-        backup_body = source[backup_start:backup_end]
-        self.assertIn("if not dest:\n                return", backup_body)
-        self.assertIn("result_info = backup_restore.create_backup(dest)", backup_body)
-        # L'appel réel (pas sa mention dans la docstring) doit venir
-        # APRÈS le retour anticipé.
+        # backup_now() délègue désormais entièrement à App._run_backup_flow
+        # (demande du 2026-10-07 : même mécanisme réutilisé par le bouton
+        # "Faire une sauvegarde maintenant..." de la purge Données, voir
+        # tests/test_data_purge.py) — la logique "annulation = retour
+        # immédiat" vit donc maintenant dans _run_backup_flow, jamais plus
+        # dans backup_now() elle-même.
+        backup_now_start = source.index("def backup_now():")
+        backup_now_end = source.index("def restore_now():")
+        backup_now_body = source[backup_now_start:backup_now_end]
+        self.assertIn("self._run_backup_flow(win)", backup_now_body)
+
+        flow_start = source.index(
+            "def _run_backup_flow(self, parent, tournament_files=None, tournament_source_folders=None):"
+        )
+        flow_end = source.index("def _choose_tournament_file(self):")
+        flow_body = source[flow_start:flow_end]
+        self.assertIn("if not dest:\n            return None", flow_body)
+        # La sauvegarde elle-même passe désormais par _run_blocking_with_
+        # progress (demande du 2026-10-12, barres de progression RÉELLES
+        # pour Menu principal ET Purge Données, qui partagent toutes deux
+        # _run_backup_flow) — backup_restore.create_backup reste bien
+        # l'opération réellement effectuée, simplement appelée depuis un
+        # thread d'arrière-plan via un lambda transmis à ce helper.
+        self.assertIn("result_info = _run_blocking_with_progress(", flow_body)
+        self.assertIn("backup_restore.create_backup(", flow_body)
         self.assertLess(
-            backup_body.index("if not dest:"),
-            backup_body.index("result_info = backup_restore.create_backup(dest)"),
+            flow_body.index("if not dest:"),
+            flow_body.index("result_info = _run_blocking_with_progress("),
+        )
+        self.assertLess(
+            flow_body.index("result_info = _run_blocking_with_progress("),
+            flow_body.index("backup_restore.create_backup("),
         )
 
-        restore_start = backup_end
+        restore_start = backup_now_end
         restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
         restore_body = source[restore_start:restore_end]
         self.assertIn("if not src:\n                return", restore_body)
@@ -521,6 +1390,79 @@ class NoOpOnCancellationTest(unittest.TestCase):
             restore_body.index("if not src:"),
             restore_body.index("backup_restore.restore_backup"),
         )
+
+
+class RestoreMultiFolderTransparencyTest(unittest.TestCase):
+    """Transparence EXPLICITE sur l'arborescence technique d'une
+    sauvegarde multi-dossiers AVANT confirmation de restauration
+    (demande explicite du 2026-10-08, point 3 : "la restauration ne
+    doit pas créer silencieusement une organisation différente de
+    celle attendue") — restore_now() est une closure imbriquée dans
+    _choose_tournament_file, difficile à invoquer isolément (construit
+    une vraie fenêtre Toplevel) : vérification STRUCTURELLE du code
+    source, même convention déjà établie par NoOpOnCancellationTest
+    ci-dessus pour cette même fonction."""
+
+    def test_le_mapping_index_vers_dossier_dorigine_est_annonce_avant_confirmation(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        restore_start = source.index("def restore_now():")
+        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_body = source[restore_start:restore_end]
+
+        self.assertIn('manifest.get("tournament_source_folders")', restore_body)
+        self.assertIn("backup_restore.sanitize_folder_label(folder)", restore_body)
+        # Le mapping (multi_note) doit être calculé et inclus dans le
+        # message AVANT l'appel à askyesno — jamais une restauration
+        # déjà lancée puis expliquée après coup.
+        self.assertLess(
+            restore_body.index("multi_note = "),
+            restore_body.index("messagebox.askyesno("),
+        )
+        self.assertIn("multi_note", restore_body[restore_body.index("messagebox.askyesno("):])
+
+
+class RestoreOverwriteWarningTest(unittest.TestCase):
+    """Demande explicite du 2026-10-10 : la confirmation de
+    restauration doit avertir explicitement que les fichiers .tournoi
+    de même nom déjà présents seront REMPLACÉS — jusqu'ici seule la
+    création automatique d'une sauvegarde de sécurité était mentionnée,
+    rien sur le remplacement lui-même. Vérification STRUCTURELLE du
+    code source (restore_now() construit une vraie fenêtre Toplevel,
+    difficile à invoquer isolément) — même convention déjà établie par
+    NoOpOnCancellationTest/RestoreMultiFolderTransparencyTest pour
+    cette même fonction."""
+
+    def _restore_now_body(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        restore_start = source.index("def restore_now():")
+        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        return source[restore_start:restore_end]
+
+    def test_avertissement_de_remplacement_present_et_avant_confirmation(self):
+        restore_body = self._restore_now_body()
+        self.assertIn(".tournoi", restore_body)
+        self.assertIn("REMPLACÉS", restore_body)
+        # Calculé AVANT askyesno, jamais une restauration déjà lancée
+        # puis expliquée après coup (même exigence que pour multi_note).
+        self.assertLess(
+            restore_body.index("overwrite_note = "),
+            restore_body.index("messagebox.askyesno("),
+        )
+        self.assertIn("overwrite_note", restore_body[restore_body.index("messagebox.askyesno("):])
+
+    def test_avertissement_conditionne_a_la_presence_reelle_de_tournois(self):
+        """Pas d'avertissement trompeur si la sauvegarde ne contient
+        aucun fichier .tournoi (count == 0) : rien à remplacer dans ce
+        cas."""
+        restore_body = self._restore_now_body()
+        note_def = restore_body[
+            restore_body.index("overwrite_note = "):restore_body.index("messagebox.askyesno(")
+        ]
+        self.assertIn("if count else", note_def)
 
 
 class MenuPrincipalPlacementTest(unittest.TestCase):

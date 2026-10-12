@@ -42,7 +42,7 @@ from database import (
 )
 from structures import (
     default_blind_structure, standard_payout_structure, generate_blind_structure,
-    GENERATED_ROUNDS_COUNT,
+    GENERATED_ROUNDS_COUNT, save_custom_standard_structure,
 )
 from clock_window import ClockWindow
 import roster
@@ -50,6 +50,7 @@ import tournament_prefs
 import export_prefs
 import blind_templates
 import settings_templates
+import moves_tab_columns
 import chip_templates
 import chip_images
 import player_photos
@@ -58,6 +59,8 @@ import remote_control
 import open_windows
 import action_log
 import backup_restore
+import backup_history
+import data_purge
 from help_browser import HelpBrowser, TAB_TO_CHAPTER
 import license as licensing
 from version import APP_NAME, APP_VERSION, dev_suffix
@@ -334,6 +337,49 @@ try:
 except ImportError:
     CV2_AVAILABLE = False
 
+# NSPasteboard/NSURL (PyObjC — voir copy_file_to_clipboard, demande du
+# 2026-10-11) : copie un FICHIER (pas son chemin en texte, pas une
+# simple référence legacy "furl" comme le produisait un premier essai
+# via osascript, insuffisante pour WhatsApp Desktop) sur le
+# presse-papiers macOS — testé avec succès en conditions réelles
+# (WhatsApp Desktop, macOS Monterey 12.7.6, voir le diagnostic du
+# 2026-10-11). Uniquement sur macOS ; absent sans drame sur Windows/
+# Linux (PIL_AVAILABLE/CV2_AVAILABLE ci-dessus, même principe).
+try:
+    if sys.platform == "darwin":
+        from AppKit import NSPasteboard, NSURL, NSWorkspace
+        NSPASTEBOARD_AVAILABLE = True
+    else:
+        NSPASTEBOARD_AVAILABLE = False
+except ImportError:
+    NSPASTEBOARD_AVAILABLE = False
+
+# winreg (stdlib, demande du 2026-10-12) : UNIQUEMENT pour is_whatsapp_
+# desktop_installed() sur Windows — réutilise le MÊME protocole
+# "whatsapp:" déjà enregistré par l'application Bureau officielle
+# (Microsoft Store comme installateur classique) et déjà exploité par
+# open_whatsapp_desktop_or_web() pour le LANCEMENT (os.startfile) :
+# jamais un chemin d'installation codé en dur.
+try:
+    if sys.platform.startswith("win"):
+        import winreg
+        WINREG_AVAILABLE = True
+    else:
+        WINREG_AVAILABLE = False
+except ImportError:
+    WINREG_AVAILABLE = False
+
+# qrcode (demande du 2026-10-11, "📱 Mon téléphone") : génère l'image du
+# QR code affiché dans WhatsAppQRShareDialog — pur Python, Pillow (déjà
+# une dépendance de ce fichier, PIL_AVAILABLE ci-dessus) comme moteur de
+# rendu de l'image. Cross-plateforme, aucun code spécifique à Mac/
+# Windows ici contrairement à copy_file_to_clipboard.
+try:
+    import qrcode
+    QRCODE_AVAILABLE = True
+except ImportError:
+    QRCODE_AVAILABLE = False
+
 PLAYER_THUMB_SIZE = 28  # taille des vignettes dans le tableau des joueurs
 ROSTER_PREVIEW_SIZE = 160  # taille de l'aperçu dans le répertoire
 ROSTER_ROW_THUMB_SIZE = 28  # taille des vignettes dans le tableau du répertoire (colonne Photo)
@@ -354,6 +400,465 @@ def open_file_with_default_app(path):
             subprocess.Popen(["xdg-open", path])
     except OSError:
         pass
+
+
+def reveal_file_in_file_manager(path):
+    """Révèle `path` déjà sélectionné dans le Finder (Mac) ou
+    l'Explorateur (Windows) — contrairement à open_file_with_default_app
+    ci-dessus (qui OUVRE le fichier avec son application associée), on
+    veut ici simplement le rendre visible et déjà sélectionné, prêt à
+    être glissé dans une autre application (voir prompt_whatsapp_share).
+    Best-effort : une erreur ici n'empêche jamais la suite (lancement de
+    WhatsApp) ni l'export déjà réussi."""
+    try:
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        elif sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", "/select,", path])
+        else:
+            subprocess.Popen(["xdg-open", os.path.dirname(path)])
+    except OSError:
+        pass
+
+
+def copy_file_to_clipboard(path):
+    """Copie `path` LUI-MÊME (référence de fichier — pas son contenu, ni
+    son chemin en simple texte) sur le presse-papiers natif du système :
+    l'équivalent exact d'un Cmd+C/Ctrl+C fait sur ce fichier dans le
+    Finder/l'Explorateur. Permet ensuite un collage (Cmd+V/Ctrl+V,
+    demande explicite du 2026-10-11 — testé avec succès dans WhatsApp
+    Desktop sur Mac par l'utilisateur) sans jamais faire apparaître le
+    Finder/l'Explorateur à l'écran — voir prompt_whatsapp_share, qui les
+    garde malgré tout en secours (reveal_file_in_file_manager).
+
+    Mécanisme OFFICIEL du système dans les deux cas, jamais une
+    automatisation de WhatsApp lui-même (qui reste seul maître du
+    comportement du collage) :
+    - macOS : NSPasteboard.writeObjects_([NSURL...]) via PyObjC (voir
+      NSPASTEBOARD_AVAILABLE). Remplace un premier essai via osascript/
+      AppleScript ("set the clipboard to (POSIX file ...)"), qui
+      n'écrivait que l'ancien type "furl" — insuffisant pour WhatsApp
+      Desktop (document affiché mais "ne peut pas être prévisualisé",
+      envoi en échec, incident réel du 2026-10-11). NSPasteboard écrit
+      EN PLUS les types modernes (public.file-url) et historiques
+      (NSFilenamesPboardType) que les applications (dont WhatsApp,
+      basée sur Chromium) savent réellement résoudre en octets — testé
+      avec succès en conditions réelles (WhatsApp Desktop, macOS
+      Monterey 12.7.6, voir le diagnostic du 2026-10-11 : PDF
+      prévisualisable, envoyé, reçu et ouvert correctement) ;
+    - Windows : PowerShell/.NET (System.Windows.Forms.Clipboard),
+      fourni avec le système — pas de dépendance pywin32, même choix
+      déjà fait ailleurs dans ce projet (voir open_windows._bring_to_
+      front_windows, "pas de dépendance pywin32 supplémentaire
+      nécessaire"). Pas encore vérifiée en conditions réelles avec
+      WhatsApp Desktop sous Windows — à faire sur le HP.
+
+    Best-effort : renvoie True si la copie a réussi, False sinon
+    (jamais une exception) — un échec ici n'empêche jamais la suite
+    (voir prompt_whatsapp_share, qui garde alors le Finder/
+    l'Explorateur comme unique recours)."""
+    try:
+        if sys.platform == "darwin":
+            if not NSPASTEBOARD_AVAILABLE:
+                return False
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            url = NSURL.fileURLWithPath_(path)
+            return bool(pb.writeObjects_([url]))
+        elif sys.platform.startswith("win"):
+            # Échappement PowerShell (guillemet simple doublé) du
+            # chemin, inséré dans une chaîne entre guillemets simples.
+            # SetFileDropList pose le format CF_HDROP natif — le même
+            # que celui d'un Ctrl+C sur un fichier dans l'Explorateur.
+            escaped = path.replace("'", "''")
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$f = New-Object System.Collections.Specialized.StringCollection; "
+                f"$f.Add('{escaped}'); "
+                "[System.Windows.Forms.Clipboard]::SetFileDropList($f)"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return True
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    except Exception:
+        # Erreurs du pont PyObjC (branche macOS ci-dessus) — jamais
+        # garanties du type exact levé par l'API Cocoa sous-jacente ;
+        # best-effort comme le reste de cette fonction, voir sa
+        # docstring.
+        pass
+    return False
+
+
+def is_whatsapp_desktop_installed():
+    """True si WhatsApp Desktop est RÉELLEMENT installé et accessible sur
+    cette machine (demande explicite du 2026-10-12) — jamais un simple
+    chemin codé en dur : interroge le système d'enregistrement des
+    applications, ce qui couvre aussi bien une installation classique
+    qu'une installation depuis une boutique d'applications (Mac App
+    Store, Microsoft Store).
+
+    macOS : NSWorkspace.URLForApplicationWithBundleIdentifier_ (PyObjC)
+    avec l'identifiant de bundle officiel "net.whatsapp.WhatsApp" —
+    empiriquement vérifié sur un Mac de développement réel : renvoie
+    l'URL réelle de WhatsApp.app quand il est installé, None sinon
+    (identifiant inexistant testé en comparaison). Interroge le même
+    registre Launch Services que "open -a WhatsApp" (déjà utilisé par
+    open_whatsapp_desktop_or_web ci-dessous) utilise pour résoudre
+    l'application — jamais un chemin "/Applications/..." supposé.
+
+    Windows : présence de la clé HKEY_CLASSES_ROOT\\whatsapp (winreg,
+    stdlib) — le MÊME protocole "whatsapp:" déjà enregistré par
+    l'application Bureau officielle à l'installation et déjà utilisé
+    par open_whatsapp_desktop_or_web (os.startfile("whatsapp://")) pour
+    le lancement : si ce protocole n'est pas enregistré, le lancement
+    échouerait de toute façon, donc cette même clé est le bon
+    indicateur de disponibilité réelle, y compris pour une installation
+    Microsoft Store (qui enregistre également ce protocole).
+
+    Toute autre plateforme, ou le moindre souci d'interrogation
+    (PyObjC/winreg absent, erreur système) : False — jamais une
+    exception, jamais une supposition optimiste."""
+    try:
+        if sys.platform == "darwin" and NSPASTEBOARD_AVAILABLE:
+            url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(
+                "net.whatsapp.WhatsApp"
+            )
+            return url is not None
+        if sys.platform.startswith("win") and WINREG_AVAILABLE:
+            try:
+                key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "whatsapp")
+            except OSError:
+                return False
+            winreg.CloseKey(key)
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def open_whatsapp_desktop_or_web():
+    """Amène WhatsApp Desktop au premier plan (voir prompt_whatsapp_share
+    — demande explicite du 2026-10-10 : jamais Selenium, jamais
+    d'automatisation de l'interface WhatsApp, jamais de ciblage
+    automatique d'un groupe ou d'un envoi — on amène seulement WhatsApp à
+    l'écran, le responsable fait tout le reste lui-même).
+
+    AUCUN repli sur WhatsApp Web (demande explicite du 2026-10-12,
+    retrait du comportement précédent) : l'appelant (voir le bouton
+    "💬 Envoi WhatsApp" dans ClassementExportDialog/PeriodExportDialog)
+    n'appelle cette fonction QUE lorsque is_whatsapp_desktop_installed()
+    a déjà renvoyé True — ce bouton est grisé sinon. Best-effort :
+    si l'ouverture elle-même échoue malgré tout, échoue silencieusement
+    plutôt que de bloquer Senaco — le PDF reste de toute façon déjà
+    exporté et révélé dans le Finder/l'Explorateur (reveal_file_in_
+    file_manager, appelée séparément par l'appelant) si le collage a
+    échoué.
+
+    macOS (correctif du 2026-10-12, second incident réel rapporté :
+    "toujours pas de WhatsApp" APRÈS le premier correctif d'ordre
+    d'appel) : tente D'ABORD NSWorkspace.openURL_ sur l'URL de
+    l'application RÉSOLUE PAR BUNDLE ID (net.whatsapp.WhatsApp — EXACTEMENT
+    la même résolution que is_whatsapp_desktop_installed() ci-dessus,
+    jamais une résolution séparée qui pourrait diverger). C'est l'appel
+    Cocoa natif qui lance ET active réellement une application — plus
+    fiable pour ramener WhatsApp au premier plan que "open -a WhatsApp"
+    en sous-processus (résolution par NOM d'application via Launch
+    Services, potentiellement différente de la résolution par bundle id
+    si plusieurs copies sont installées, ou si le nom diffère
+    légèrement). "open -a WhatsApp" reste un repli UNIQUEMENT si
+    NSWorkspace n'est pas disponible ou échoue malgré tout."""
+    try:
+        if sys.platform == "darwin":
+            opened_via_nsworkspace = False
+            try:
+                if NSPASTEBOARD_AVAILABLE:
+                    url = NSWorkspace.sharedWorkspace().URLForApplicationWithBundleIdentifier_(
+                        "net.whatsapp.WhatsApp"
+                    )
+                    if url is not None:
+                        opened_via_nsworkspace = bool(
+                            NSWorkspace.sharedWorkspace().openURL_(url)
+                        )
+            except Exception:
+                opened_via_nsworkspace = False
+            if not opened_via_nsworkspace:
+                subprocess.run(["open", "-a", "WhatsApp"], check=True)
+        elif sys.platform.startswith("win"):
+            os.startfile("whatsapp://")  # type: ignore[attr-defined]
+    except (OSError, subprocess.CalledProcessError):
+        pass
+
+
+def prompt_whatsapp_share(parent, pdf_path):
+    """Partage manuel d'un PDF déjà généré et vérifié vers WhatsApp
+    (demande explicite du 2026-10-10, étendue le 2026-10-11, onglets
+    Classement/Statistiques) : copie `pdf_path` — LE fichier déjà
+    exporté par l'appelant, jamais régénéré ici — sur le presse-papiers
+    natif (copy_file_to_clipboard, collage Cmd+V/Ctrl+V déjà vérifié
+    fonctionnel dans WhatsApp Desktop sur Mac) ; révèle-le EN PLUS dans
+    le Finder/l'Explorateur UNIQUEMENT si cette copie a échoué (solution
+    de secours pour un glisser-déposer manuel — jamais ouvert quand le
+    presse-papiers a déjà réussi, voir le correctif du 2026-10-12 :
+    cette fenêtre supplémentaire pouvait sinon repasser devant WhatsApp
+    de façon imprévisible). Affiche un rappel adapté au résultat réel de
+    la copie, PUIS amène WhatsApp au premier plan. Jamais un envoi
+    automatique, jamais un ciblage
+    automatique du groupe (techniquement impossible avec des moyens
+    officiels à ce jour, voir le diagnostic du 2026-10-10) : c'est le
+    responsable qui vérifie lui-même la conversation ET le PDF, puis
+    clique lui-même sur Envoyer dans WhatsApp — Senaco ne transmet
+    jamais rien directement.
+
+    ORDRE DES APPELS CRITIQUE (correctif du 2026-10-12, incident réel :
+    "WhatsApp passe en arrière-plan" après son ouverture) : open_
+    whatsapp_desktop_or_web() est appelée EN TOUT DERNIER, APRÈS le
+    messagebox.showinfo ci-dessous — jamais avant. Sur macOS, AFFICHER
+    N'IMPORTE QUELLE fenêtre Tk (y compris un simple showinfo) ramène
+    TOUJOURS l'application entière (donc Senaco, et avec elle la
+    fenêtre d'export `parent`) au premier plan. L'ancien ordre (WhatsApp
+    activé, PUIS messagebox affiché) faisait donc immédiatement
+    repasser Senaco devant WhatsApp, juste après son ouverture — WhatsApp
+    restait bien lancé, mais masqué derrière Senaco. En activant WhatsApp
+    EN DERNIER, après que l'utilisateur a fermé ce rappel (ou immédiatement
+    s'il n'y en avait pas), plus aucune fenêtre Senaco n'est affichée
+    ensuite : WhatsApp reste donc bien au premier plan, prêt pour un
+    collage immédiat — sur Windows comme sur macOS (os.startfile comme
+    "open -a" sont tous deux appelés par la MÊME open_whatsapp_desktop_
+    or_web, voir sa docstring ; ce correctif ne change que l'ORDRE des
+    appels, jamais leur contenu)."""
+    clipboard_ok = copy_file_to_clipboard(pdf_path)
+    # Finder/l'Explorateur n'est révélé QUE si le presse-papiers a
+    # échoué (correctif du 2026-10-12, second incident réel : "toujours
+    # pas de WhatsApp") — l'ouvrir aussi dans le cas de succès (ancien
+    # comportement) faisait apparaître une fenêtre Finder/Explorateur
+    # SUPPLÉMENTAIRE, dont l'activation réelle à l'écran est asynchrone
+    # et peut retomber devant WhatsApp de façon imprévisible, APRÈS que
+    # celui-ci a déjà été activé — strictement inutile de toute façon
+    # quand le collage fonctionne déjà.
+    if not clipboard_ok:
+        reveal_file_in_file_manager(pdf_path)
+    group_name = (export_prefs.load_value("whatsapp_group_name", "") or "").strip()
+    reminder = f"Groupe cible (rappel, à sélectionner vous-même) : {group_name}\n\n" if group_name else ""
+    if clipboard_ok:
+        instruction = (
+            "Le PDF a été copié dans le presse-papiers : collez-le (⌘V / "
+            "Ctrl+V) dans la conversation du groupe du club."
+        )
+    else:
+        instruction = (
+            "Le dossier contenant le PDF a été ouvert : glissez-le dans la "
+            "conversation du groupe du club."
+        )
+    messagebox.showinfo(
+        "Envoi WhatsApp",
+        f"{reminder}WhatsApp va s'ouvrir au premier plan.\n\n{instruction}\n\n"
+        "Vérifiez la conversation ET le PDF, puis cliquez vous-même sur "
+        "Envoyer dans WhatsApp.",
+        parent=parent,
+    )
+    # EN TOUT DERNIER (voir le commentaire d'ORDRE dans la docstring
+    # ci-dessus) : aucune fenêtre Senaco ne doit plus s'afficher après
+    # cet appel, pour que WhatsApp reste réellement au premier plan.
+    open_whatsapp_desktop_or_web()
+
+
+def offer_whatsapp_share(dialog, pdf_path, label):
+    """Point d'entrée du bouton "💬 Envoi WhatsApp" (Classement/
+    Statistiques, demande explicite du 2026-10-11) : propose le choix
+    "💻 Cet ordinateur" (méthode déjà en place, voir prompt_whatsapp_
+    share) / "📱 Mon téléphone" (QR code temporaire, nouveau), puis
+    déclenche la méthode choisie. `dialog` : la fenêtre d'export
+    appelante (ClassementExportDialog/PeriodExportDialog) — son App
+    (fenêtre de tournoi) est retrouvée via dialog.master.winfo_toplevel()
+    pour fonctionner identiquement quelle que soit la profondeur
+    d'imbrication réelle de `dialog.master` (directement l'App pour
+    ClassementExportDialog, un onglet du notebook pour PeriodExportDialog
+    — winfo_toplevel() remonte jusqu'à la vraie fenêtre racine dans les
+    deux cas, jamais une hypothèse fragile sur cette profondeur).
+    `pdf_path` : LE fichier déjà exporté par l'appelant, jamais
+    régénéré ici. `label` : texte affiché sur la page de confirmation
+    côté téléphone pour la méthode "Mon téléphone" (ex. "Classement —
+    CPC Poker")."""
+    choice_dlg = WhatsAppDestinationChoiceDialog(dialog)
+    dialog.wait_window(choice_dlg)
+    if choice_dlg.result == "computer":
+        prompt_whatsapp_share(dialog, pdf_path)
+    elif choice_dlg.result == "phone":
+        app = dialog.master.winfo_toplevel()
+        WhatsAppQRShareDialog(dialog, app, pdf_path, label)
+
+
+class WhatsAppDestinationChoiceDialog(tk.Toplevel):
+    """Choix entre les deux méthodes de partage WhatsApp (demande
+    explicite du 2026-10-11, onglets Classement/Statistiques) : "Cet
+    ordinateur" (presse-papiers natif + WhatsApp Desktop/Web, déjà
+    implémenté) ou "Mon téléphone" (QR code temporaire). Un clic sur
+    l'un des deux boutons suffit, pas d'étape de confirmation
+    supplémentaire — résultat dans self.result ("computer"/"phone", ou
+    None si la fenêtre est fermée sans choix)."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Envoi WhatsApp")
+        self.configure(bg=FELT_DARK)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+
+        tk.Label(
+            self, text="Comment souhaitez-vous l'envoyer ?",
+            bg=FELT_DARK, fg=CREAM, font=("Helvetica", 11),
+        ).pack(padx=24, pady=(18, 14))
+
+        btns = ttk.Frame(self)
+        btns.pack(padx=20, pady=(0, 18))
+        ttk.Button(
+            btns, text="💻  Cet ordinateur", width=20,
+            command=lambda: self._choose("computer"),
+        ).pack(side="left", padx=6)
+        ttk.Button(
+            btns, text="📱  Mon téléphone", width=20,
+            command=lambda: self._choose("phone"),
+        ).pack(side="left", padx=6)
+
+    def _choose(self, value):
+        self.result = value
+        self.destroy()
+
+
+class WhatsAppQRShareDialog(tk.Toplevel):
+    """QR code temporaire pour récupérer un PDF depuis un téléphone sur
+    le même Wifi (demande explicite du 2026-10-11) : le responsable
+    scanne, la page de confirmation s'affiche sur son téléphone, il
+    télécharge le PDF puis utilise le partage NATIF de son téléphone
+    pour choisir WhatsApp — sur SON PROPRE compte, jamais connecté à ce
+    PC (voir le diagnostic du 2026-10-11 sur le partage par QR code).
+
+    Expire après remote_control.WHATSAPP_SHARE_TOKEN_TTL_SECONDS (5
+    minutes, affiché en compte à rebours). "🔄 Nouveau QR code" révoque
+    IMMÉDIATEMENT l'ancien jeton avant d'en créer un nouveau — un seul
+    actif à la fois POUR CETTE FENÊTRE (demande explicite, point 2).
+    "Fermer" révoque aussi le jeton actif, qu'il reste du temps ou non —
+    jamais un QR affiché laissé valide après la fermeture de cette
+    fenêtre."""
+
+    def __init__(self, master, app, pdf_path, label):
+        super().__init__(master)
+        self.app = app
+        self.pdf_path = pdf_path
+        self.label = label
+        self.title("Envoi WhatsApp — Mon téléphone")
+        self.configure(bg=FELT_DARK)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._token = None
+        self._expires_at = 0
+        self._tick_job = None
+
+        self.qr_label = tk.Label(self, bg=FELT_DARK)
+        self.qr_label.pack(padx=24, pady=(20, 10))
+        self.countdown_lbl = ttk.Label(self, foreground=MUTED)
+        self.countdown_lbl.pack(pady=(0, 12))
+
+        btns = ttk.Frame(self)
+        btns.pack(pady=(0, 18))
+        ttk.Button(btns, text="🔄 Nouveau QR code", command=self._generate).pack(side="left", padx=6)
+        ttk.Button(btns, text="Fermer", command=self._on_close).pack(side="left", padx=6)
+
+        self._generate()
+
+    def _generate(self):
+        """(Ré)génère le QR code : révoque IMMÉDIATEMENT le jeton actif
+        s'il y en a un (demande explicite du 2026-10-11, point 2 —
+        jamais deux jetons valides à la fois pour CETTE fenêtre) avant
+        d'en créer un nouveau."""
+        if self._token is not None:
+            remote_control.revoke_whatsapp_share(self._token)
+            self._token = None
+        if self._tick_job is not None:
+            self.after_cancel(self._tick_job)
+            self._tick_job = None
+
+        try:
+            self.app._get_or_start_whatsapp_share_port()
+        except Exception as e:
+            messagebox.showerror(
+                "Envoi WhatsApp", f"Impossible de démarrer le partage :\n{e}", parent=self,
+            )
+            self.destroy()
+            return
+
+        ip = remote_control.local_ip()
+        if ip.startswith("127."):
+            messagebox.showerror(
+                "Envoi WhatsApp",
+                "Impossible de déterminer l'adresse réseau de ce PC — "
+                "vérifiez qu'il est bien connecté au même Wifi que votre téléphone.",
+                parent=self,
+            )
+            self.destroy()
+            return
+        if not QRCODE_AVAILABLE or not PIL_AVAILABLE:
+            messagebox.showerror(
+                "Envoi WhatsApp",
+                "La génération de QR code n'est pas disponible sur cette installation.",
+                parent=self,
+            )
+            self.destroy()
+            return
+
+        self._token = remote_control.register_whatsapp_share(self.pdf_path, self.label)
+        # Toujours le port 8765 (DEFAULT_PORT), JAMAIS le port réel de
+        # self.app (qui peut être un port de repli si un autre tournoi
+        # occupe déjà 8765) — le téléphone ne parle jamais qu'à 8765 ;
+        # le relais inter-processus (voir remote_control.
+        # handle_whatsapp_share_path) se charge de joindre le bon
+        # tournoi si ce n'est pas celui-ci qui répond directement.
+        url = (
+            f"http://{ip}:{remote_control.DEFAULT_PORT}"
+            f"/whatsapp_share/{os.getpid()}/{self._token}"
+        )
+        self._expires_at = time.time() + remote_control.WHATSAPP_SHARE_TOKEN_TTL_SECONDS
+
+        qr_img = qrcode.make(url).resize((260, 260))
+        self._qr_photo = ImageTk.PhotoImage(qr_img)
+        self.qr_label.configure(image=self._qr_photo)
+        self._tick_countdown()
+
+    def _tick_countdown(self):
+        # Nom délibérément distinct de App._tick (le tick périodique
+        # PRINCIPAL de la fenêtre de tournoi) : tests/test_primes_
+        # enabled_toggle.py::WiringStructurelTest cherche "_tick" par son
+        # NOM SEUL dans tout main.py (ast.walk, sans distinction de
+        # classe) — un second "_tick" nommé pareil, même dans une classe
+        # différente, le rendrait ambigu et casserait ce test existant.
+        if not self.winfo_exists():
+            return
+        remaining = max(0, int(self._expires_at - time.time()))
+        if remaining <= 0:
+            self.countdown_lbl.configure(text="⌛ QR code expiré — cliquez sur « 🔄 Nouveau QR code »")
+            self._tick_job = None
+            return
+        minutes, seconds = divmod(remaining, 60)
+        self.countdown_lbl.configure(text=f"Expire dans {minutes}:{seconds:02d}")
+        self._tick_job = self.after(1000, self._tick_countdown)
+
+    def _on_close(self):
+        if self._token is not None:
+            remote_control.revoke_whatsapp_share(self._token)
+            self._token = None
+        if self._tick_job is not None:
+            self.after_cancel(self._tick_job)
+            self._tick_job = None
+        self.destroy()
 
 
 def show_missing_export_module(fmt):
@@ -407,6 +912,13 @@ TEXT_DARK = "#17281f"
 MUTED = "#b9c9bd"  # texte discret, lisible sur fond foncé
 DANGER_RED = "#8a1f1f"
 DANGER_RED_ACTIVE = "#a92c2c"
+# Jaune vif d'alerte (demande explicite du 2026-10-08) — réservé au
+# message clignotant "dates obligatoires" de DataPurgeDialog (voir
+# _blink_tick) : jamais utilisé ailleurs, aucune autre couleur du
+# thème n'est assez vive pour cet usage précis (GOLD, déjà utilisé
+# pour les titres de LabelFrame, est trop proche du feutre pour un
+# clignotement bien visible).
+ALERT_YELLOW = "#ffe14d"
 ELIMINATION_BLUE = "#1f4e8a"  # bandeau d'élimination (écran projecteur + onglet Chronomètre)
 # Variante plus claire pour l'état "survolé/pressé" du bouton "Annule
 # Eliminer" (demande du 2026-09-17) — même principe que DANGER_RED_ACTIVE
@@ -1953,6 +2465,7 @@ class RosterManagerDialog(ttk.Frame):
         self.app = app
         self._preview_photo = None  # référence gardée pour éviter le garbage collect
         self.roster_sort = {"column": "name", "ascending": True}
+        self._roster_entries_ordered = []  # voir _refresh() ; alimenté avant tout clic possible sur "Imprimer..."
 
         # Titre en flux normal (pack), compact — plus dans une rangée
         # partagée avec le tableau "Joueurs par club" : les deux forçaient
@@ -2066,6 +2579,9 @@ class RosterManagerDialog(ttk.Frame):
         ).pack(side="left")
         ttk.Button(
             btns_csv, text="Exporter (CSV)...", command=self._export_csv,
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(
+            btns_csv, text="Imprimer...", command=self._print_roster_pdf,
         ).pack(side="left", padx=(6, 0))
         reactivate_btn = ttk.Button(
             btns_csv, text="Tout réactiver...", command=self._reactivate_all,
@@ -2199,6 +2715,12 @@ class RosterManagerDialog(ttk.Frame):
             self.roster_tree.selection_set(selected)
         self._refresh_club_summary(entries)
         self._refresh_preview()
+        # Mémorisé pour l'impression PDF (demande du 2026-10-07) : le PDF
+        # doit reprendre le MÊME ordre que celui actuellement affiché à
+        # l'écran (self.roster_sort) — plutôt que de recalculer le tri une
+        # seconde fois (risque de divergence), _print_roster_pdf réutilise
+        # directement cette même liste déjà triée.
+        self._roster_entries_ordered = entries
 
     def _refresh_club_summary(self, entries):
         """Reconstruit le petit tableau 'Club / Nombre' au-dessus de
@@ -2769,6 +3291,16 @@ class RosterManagerDialog(ttk.Frame):
             parent=self,
         )
 
+    def _print_roster_pdf(self):
+        """Bouton "Imprimer..." (demande du 2026-10-07) : ouvre la fenêtre
+        de sélection des champs (RosterPdfDialog) — jamais une impression
+        directe. self._roster_entries_ordered (voir _refresh()) reprend
+        exactement l'ordre actuellement affiché à l'écran."""
+        if not self._roster_entries_ordered:
+            messagebox.showinfo("Info", "Le répertoire est vide, rien à imprimer.", parent=self)
+            return
+        RosterPdfDialog(self, self._roster_entries_ordered)
+
     def _reactivate_all(self):
         folder = filedialog.askdirectory(
             title="Choisir le dossier à vérifier", parent=self,
@@ -2808,6 +3340,92 @@ class RosterManagerDialog(ttk.Frame):
         messagebox.showinfo(
             "Tout réactiver", f"{freed} joueur(s) libéré(s).", parent=self,
         )
+
+
+class RosterPdfDialog(tk.Toplevel):
+    """Choix des champs à imprimer pour le Répertoire (demande du
+    2026-10-07) — PDF uniquement, pas de choix de format (contrairement à
+    PlayersExportDialog). Mémorise le dernier choix via export_prefs
+    (clé "roster_pdf"), totalement indépendant de roster.json et de toute
+    base de tournoi."""
+
+    def __init__(self, master, entries):
+        super().__init__(master)
+        self.entries = entries
+        self.title("Imprimer le Répertoire")
+        self.configure(bg=FELT_DARK)
+        self.geometry("300x400")
+        self.transient(master)
+        self.grab_set()
+
+        all_keys = [key for key, _ in roster.ROSTER_PDF_COLUMNS]
+        # load_columns(key, all_keys) utilise `all_keys` à la fois pour
+        # valider un choix déjà mémorisé ET comme valeur de repli si rien
+        # n'a encore été enregistré — toujours "tout cocher" dans ce 2e
+        # cas (voir sa docstring), jamais nos défauts spécifiques
+        # (Nom/Club/Téléphone). D'où le remplacement explicite ci-dessous
+        # quand le résultat vaut encore `all_keys` au complet (= rien de
+        # mémorisé) — passer directement ROSTER_PDF_DEFAULT_COLUMNS comme
+        # `all_keys` casserait au contraire la VALIDATION d'un choix déjà
+        # mémorisé contenant mail/pseudo/photo (filtrés à tort).
+        saved_cols = export_prefs.load_columns("roster_pdf", all_keys)
+        if saved_cols == all_keys:
+            saved_cols = roster.ROSTER_PDF_DEFAULT_COLUMNS
+        self.col_vars = {key: tk.BooleanVar(value=key in saved_cols) for key in all_keys}
+
+        ttk.Label(
+            self, text="Champs à imprimer", font=("Helvetica", 12, "bold"),
+        ).pack(padx=14, pady=(14, 6), anchor="w")
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", padx=14)
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+
+        list_frame = ttk.Frame(self)
+        list_frame.pack(fill="both", expand=True, padx=14, pady=10)
+        for key, header in roster.ROSTER_PDF_COLUMNS:
+            ttk.Checkbutton(list_frame, text=header, variable=self.col_vars[key]).pack(
+                anchor="w", pady=3,
+            )
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=14, pady=(0, 14))
+        ttk.Button(btns, text="Créer le PDF", command=self._do_export).pack(side="right")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right", padx=(0, 8))
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror(
+                "Erreur", "Sélectionnez au moins un champ à imprimer.", parent=self,
+            )
+            return
+        export_prefs.save_columns("roster_pdf", keys)
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        path = filedialog.asksaveasfilename(
+            title="Imprimer le Répertoire",
+            defaultextension=".pdf",
+            filetypes=[("Fichier PDF", "*.pdf")],
+            initialfile=f"repertoire_{date_str}.pdf",
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            roster.export_roster_pdf(path, self.entries, keys)
+        except ImportError:
+            show_missing_export_module("pdf")
+            return
+        self.destroy()
+        open_file_with_default_app(path)
 
 
 class LobbyDialog(tk.Toplevel):
@@ -4367,15 +4985,42 @@ class PeriodExportDialog(tk.Toplevel):
         self.player_vars = {
             key: tk.BooleanVar(value=key in saved_p) for key, _, _ in PERIOD_PLAYER_COLUMNS
         }
+        # Dernier PDF RÉELLEMENT généré depuis CETTE fenêtre, quel que
+        # soit le tableau qui l'a produit (demande explicite du
+        # 2026-10-12 : un seul bouton "💬 Envoi WhatsApp", partagé entre
+        # les deux tableaux — remplace les deux boutons par tableau de la
+        # version précédente, retirés ci-dessous dans _build_column_
+        # checks). Écrasé par le PDF le plus récent, quel que soit le
+        # tableau ("tournament" ou "player") qui vient de l'exporter —
+        # jamais régénéré par whatsapp_btn : c'est exactement ce fichier,
+        # déjà consulté par le responsable (ouvert automatiquement), qui
+        # est partagé.
+        self._last_pdf_path = None
 
-        # Barre du haut : juste le format et un bouton pour fermer sans
-        # exporter. Il n'y a volontairement plus de bouton "Exporter..."
-        # unique ici : chaque tableau ci-dessous a le sien (voir
-        # _build_column_checks), pour qu'il soit toujours sans ambiguïté
-        # de savoir lequel des deux tableaux on est en train d'exporter.
+        # Barre du haut : format, bouton "💬 Envoi WhatsApp" et "Fermer".
+        # Il n'y a volontairement pas de bouton "Exporter..." unique ici :
+        # chaque tableau ci-dessous a le sien (voir _build_column_checks),
+        # pour qu'il soit toujours sans ambiguïté de savoir lequel des
+        # deux tableaux on est en train d'exporter.
         top_bar = ttk.Frame(self)
         top_bar.pack(side="top", fill="x", padx=14, pady=(14, 0))
         ttk.Button(top_bar, text="Fermer", command=self.destroy).pack(side="right")
+        # "💬 Envoi WhatsApp" (demande explicite du 2026-10-12) : désactivé
+        # tant qu'aucun PDF n'a encore été généré dans CETTE fenêtre (voir
+        # _do_export_section) et désactivé AUSSI, quel que soit l'état de
+        # l'export, si WhatsApp Desktop n'est pas réellement installé sur
+        # cette machine (voir is_whatsapp_desktop_installed) — jamais pour
+        # un export CSV/Excel, dont le comportement reste strictement
+        # inchangé (fermeture immédiate de la fenêtre, voir _do_export_
+        # section : aucun risque d'envoyer un CSV/Excel à la place puisque
+        # la fenêtre — et donc ce bouton — n'existe alors plus).
+        self.whatsapp_btn = ttk.Button(
+            top_bar, text="💬 Envoi WhatsApp", state="disabled",
+            command=lambda: prompt_whatsapp_share(self, self._last_pdf_path),
+        )
+        self.whatsapp_btn.pack(side="right", padx=(0, 6))
+        if not is_whatsapp_desktop_installed():
+            Tooltip(self.whatsapp_btn, "WhatsApp Desktop n'est pas installé sur cet ordinateur.")
 
         fmt_frame = ttk.LabelFrame(self, text="Format")
         fmt_frame.pack(fill="x", padx=14, pady=(8, 8))
@@ -4418,7 +5063,10 @@ class PeriodExportDialog(tk.Toplevel):
         ).pack(side="left")
         # Bouton d'export propre à CE tableau, dans la barre du haut de sa
         # propre section (donc toujours visible, quelle que soit la
-        # hauteur prise par ses cases à cocher en dessous).
+        # hauteur prise par ses cases à cocher en dessous). Le partage
+        # WhatsApp, lui, est désormais un bouton UNIQUE dans la barre du
+        # haut de la fenêtre (demande explicite du 2026-10-12 — voir
+        # __init__/self.whatsapp_btn), jamais un bouton par tableau.
         ttk.Button(
             bar, text="Exporter ce tableau...",
             command=lambda: self._do_export_section(kind, var_map, prefs_key, title, filename_prefix),
@@ -4481,10 +5129,30 @@ class PeriodExportDialog(tk.Toplevel):
         except ImportError:
             show_missing_export_module(fmt)
             return
-        self.destroy()
-        # Ouvre directement le fichier généré (Excel/LibreOffice ou
-        # l'application associée aux .csv), sans avoir à aller le chercher.
-        open_file_with_default_app(path)
+        # PDF (demande du 2026-10-10, bouton unique depuis le 2026-10-12) :
+        # la fenêtre reste ouverte (pas de self.destroy() ici, contrairement
+        # à CSV/Excel juste en dessous, dont le comportement reste
+        # strictement inchangé) pour permettre "💬 Envoi WhatsApp" sur CE
+        # fichier précis, après que le responsable l'ait consulté (ouvert
+        # ci-dessous comme toujours). self._last_pdf_path est ÉCRASÉ par ce
+        # chemin, quel que soit `kind` : le bouton (unique, barre du haut)
+        # partage toujours le DERNIER PDF réellement généré dans cette
+        # fenêtre, qu'il vienne du tableau "tournament" ou "player" —
+        # jamais les deux chemins mémorisés séparément. "Fermer" (barre du
+        # haut) reste disponible pour fermer normalement sans jamais
+        # partager, à tout moment — y compris pour fermer après avoir
+        # exporté l'AUTRE tableau.
+        if fmt == "pdf":
+            self._last_pdf_path = path
+            if is_whatsapp_desktop_installed():
+                self.whatsapp_btn.config(state="normal")
+            open_file_with_default_app(path)
+        else:
+            self.destroy()
+            # Ouvre directement le fichier généré (Excel/LibreOffice ou
+            # l'application associée aux .csv), sans avoir à aller le
+            # chercher.
+            open_file_with_default_app(path)
 
 
 class ResultsExportDialog(tk.Toplevel):
@@ -4621,17 +5289,48 @@ class ClassementExportDialog(tk.Toplevel):
         self.db = db
         self.title("Exporter le classement")
         self.configure(bg=FELT_DARK)
-        self.geometry("340x260")
+        # 340x300 (340x260 avant l'ajout de la rangée "💬 Envoi WhatsApp",
+        # demande du 2026-10-10) : +40px estimés pour cette seule rangée
+        # supplémentaire (à ajuster après vérification visuelle réelle),
+        # sans toucher au reste de la disposition.
+        self.geometry("340x300")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
 
         self.format_var = tk.StringVar(value=export_prefs.load_format("classement"))
+        # Chemin du DERNIER PDF exporté par CETTE fenêtre — None tant
+        # qu'aucun export PDF n'a encore réussi (voir _do_export). Jamais
+        # régénéré par whatsapp_btn : c'est EXACTEMENT ce fichier, déjà
+        # vérifié par le responsable (ouvert automatiquement ci-dessous),
+        # qui est révélé/partagé.
+        self._last_pdf_path = None
 
         btns = ttk.Frame(self)
         btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
         ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
         ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        # Rangée séparée (demande du 2026-10-10, méthode unique confirmée
+        # le 2026-10-12 — plus de choix Ordinateur/Téléphone, jamais de
+        # QR code dans le parcours utilisateur) : désactivé tant qu'aucun
+        # export PDF n'a réussi dans CETTE fenêtre (voir _do_export) —
+        # jamais pour un export CSV/Excel, qui n'ont pas de sens à
+        # "partager" de la même façon et dont le comportement reste
+        # strictement inchangé (fermeture immédiate de la fenêtre).
+        whatsapp_row = ttk.Frame(self)
+        whatsapp_row.pack(side="top", fill="x", padx=14, pady=(0, 8))
+        self.whatsapp_btn = ttk.Button(
+            whatsapp_row, text="💬 Envoi WhatsApp", state="disabled",
+            command=lambda: prompt_whatsapp_share(self, self._last_pdf_path),
+        )
+        self.whatsapp_btn.pack(side="left")
+        # Désactivé AUSSI (demande du 2026-10-12), quel que soit l'état de
+        # l'export PDF, si WhatsApp Desktop n'est pas réellement installé
+        # sur cette machine — voir is_whatsapp_desktop_installed ; _do_
+        # export ne le réactive alors jamais.
+        if not is_whatsapp_desktop_installed():
+            Tooltip(self.whatsapp_btn, "WhatsApp Desktop n'est pas installé sur cet ordinateur.")
 
         fmt_frame = ttk.LabelFrame(self, text="Format")
         fmt_frame.pack(fill="x", padx=14, pady=8)
@@ -4683,8 +5382,21 @@ class ClassementExportDialog(tk.Toplevel):
         except ImportError:
             show_missing_export_module(fmt)
             return
-        self.destroy()
-        open_file_with_default_app(path)
+        # PDF (demande du 2026-10-10) : la fenêtre reste ouverte (pas de
+        # self.destroy() ici, contrairement à CSV/Excel juste en dessous,
+        # dont le comportement reste strictement inchangé) pour permettre
+        # "💬 Envoi WhatsApp" sur CE fichier précis, après que le
+        # responsable l'ait consulté (ouvert ci-dessous comme toujours).
+        # "Annuler" reste disponible pour fermer normalement sans jamais
+        # partager, à tout moment.
+        if fmt == "pdf":
+            self._last_pdf_path = path
+            if is_whatsapp_desktop_installed():
+                self.whatsapp_btn.config(state="normal")
+            open_file_with_default_app(path)
+        else:
+            self.destroy()
+            open_file_with_default_app(path)
 
 
 class PlayersSeatingPrintDialog(tk.Toplevel):
@@ -5353,6 +6065,1805 @@ class RemoteDeviceRequestWindow(tk.Toplevel):
                 pass
 
 
+class DataPurgeDialog(tk.Toplevel):
+    """"🗑 Purger" > "DONNÉES" (demande du 2026-10-07) — nettoyage
+    volontaire de vieux fichiers .tournoi par plage de dates + type(s),
+    avec garde-fous stricts avant toute suppression définitive. Toute la
+    logique métier (classification, recherche, vérification de
+    couverture par une sauvegarde encore accessible et vérifiable
+    MAINTENANT, détection de tournoi ouvert, suppression atomique avec
+    corbeille temporaire + rollback) vit dans data_purge.py — cette
+    classe ne fait que l'UI et l'orchestration des appels, jamais elle-
+    même le SQL ni la manipulation de fichiers.
+
+    Complètement SÉPARÉE de la purge du LOG (_on_log_purge, STRICTEMENT
+    inchangée) : voir App._on_purge_choice, qui propose les deux comme
+    deux chemins distincts.
+
+    Réutilise délibérément des mécanismes déjà validés plutôt que d'en
+    recréer des équivalents : le calendrier Du/Au de l'onglet LOG
+    (App._show_log_date_picker/_parse_log_date_field) et le circuit de
+    sauvegarde NORMAL (App._run_backup_flow — demande explicite "pas un
+    deuxième système parallèle") pour "Faire une sauvegarde
+    maintenant...".
+
+    Invariant central de l'interface : TOUTE modification d'un critère
+    (dates ou types) invalide immédiatement une vérification de
+    sauvegarde précédente (voir _invalidate_coverage) — le bouton
+    "Purger..." ne redevient utilisable qu'après une nouvelle
+    vérification RÉUSSIE portant sur les critères actuellement affichés,
+    jamais sur un état obsolète.
+
+    DÉCOUVERTE MULTI-DOSSIERS (demande du 2026-10-07, diagnostic "0
+    tournoi" quand "Dossier par défaut" est vide) : ne dépend plus
+    JAMAIS d'un unique dossier. Les dossiers candidats sont rassemblés
+    une fois à l'ouverture, à partir de 4 sources que Senaco connaît
+    déjà — "Dossier par défaut" (tournament_prefs), le dernier dossier
+    utilisé pour CRÉER un tournoi (export_prefs "last_tournament_dir"),
+    le dossier de chaque tournoi actuellement OUVERT (open_windows), et
+    les dossiers des tournoi_path connus du journal des actions à
+    distance (action_log) — voir data_purge.collect_candidate_folders,
+    JAMAIS un balayage du disque ni une remontée automatique au parent
+    d'un dossier déjà connu. L'utilisateur peut aussi AJOUTER un dossier
+    pour cette seule session via "Ajouter un dossier à vérifier..."
+    (self._manual_folders, jamais persisté, jamais "Dossier par
+    défaut"). Les dossiers réellement examinés ET ceux connus mais
+    actuellement inaccessibles (clé USB/disque externe débranché...)
+    sont toujours affichés explicitement (voir _update_folders_display)
+    — jamais une recherche silencieusement incomplète."""
+
+    _TYPE_LABELS = {
+        data_purge.PURGE_TYPE_TOURNOIS: "Tournois",
+        data_purge.PURGE_TYPE_SITNGO: "Sit & Go",
+        data_purge.PURGE_TYPE_OTHER: "Autres / non classés",
+    }
+    _SCAN_REASON_LABELS = {
+        data_purge.SCAN_REASON_MAX_SECONDS: "limite de temps atteinte",
+        data_purge.SCAN_REASON_MAX_ENTRIES: "limite du nombre d'éléments atteinte",
+        data_purge.SCAN_REASON_CANCELLED: "recherche annulée",
+    }
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.app = master
+        # Sources AUTOMATIQUES de la découverte multi-dossiers — résolues
+        # UNE SEULE FOIS à l'ouverture (jamais réévaluées en cours de
+        # session : un comportement stable et prévisible plutôt qu'une
+        # liste de dossiers qui changerait sous les yeux de l'utilisateur
+        # si, par exemple, un autre tournoi s'ouvre pendant ce temps).
+        # Voir data_purge.collect_candidate_folders pour le détail de
+        # chaque source et la règle "jamais de remontée automatique au
+        # dossier parent d'un dossier déjà connu".
+        self._auto_tournament_day_folder = backup_restore.default_tournament_folder()
+        self._auto_last_tournament_dir = export_prefs.load_value("last_tournament_dir")
+        self._auto_open_tournament_paths = list(open_windows.list_open_paths())
+        self._auto_action_log_paths = [e["tournament_path"] for e in action_log.list_tournaments()]
+        # Dossiers ajoutés MANUELLEMENT par l'utilisateur ("Ajouter un
+        # dossier à vérifier..."), pour CETTE session de purge
+        # UNIQUEMENT : jamais persistés, jamais "Dossier par défaut",
+        # jamais un autre réglage du tournoi.
+        self._manual_folders = []
+        # Portée (récursif ou non) choisie pour CHAQUE dossier ajouté
+        # manuellement (voir _on_add_folder/_ask_recursive_scope) —
+        # "ce dossier uniquement" (False) est la valeur PAR DÉFAUT/
+        # présélectionnée (demande explicite du 2026-10-08 : un choix
+        # récursif doit toujours être un geste explicite de
+        # l'utilisateur, jamais une valeur de repli silencieuse). Les
+        # 4 sources AUTOMATIQUES restent, elles, toujours explorées
+        # récursivement (comportement déjà validé, inchangé).
+        self._manual_folder_recursive = {}
+        self._accessible_folders = []
+        self._inaccessible_folders = []
+
+        # Scan BORNÉ, ANNULABLE, exécuté en ARRIÈRE-PLAN (incident macOS
+        # réel du 2026-10-08 : ajouter /Users/raj comme dossier candidat
+        # a bloqué Senaco indéfiniment — database.find_tournament_files/
+        # glob.glob("**", recursive=True), sur le thread Tk, sans aucune
+        # limite). Voir data_purge.scan_candidate_folders_for_purge
+        # (AUCUN appel Tkinter, directement ou indirectement) et
+        # _start_scan/_run_scan_worker/_poll_scan_queue ci-dessous pour
+        # l'orchestration complète du threading.
+        self._scan_generation = 0
+        self._scan_cancel_event = None
+        self._scan_in_progress = False
+        # Tant qu'aucune recherche n'a encore ABOUTI proprement (ni
+        # tronquée, ni annulée) pour les critères/dossiers actuellement
+        # affichés, la vérification de sauvegarde (donc la purge) reste
+        # bloquée (voir _update_verify_button_state) — demande explicite
+        # du 2026-10-08 : un résultat partiel peut être AFFICHÉ, jamais
+        # exploité pour vérifier/purger.
+        self._scan_incomplete = True
+        self._scan_cancelled = False
+        self._scan_queue = queue.Queue()
+        self._poll_after_id = None
+        self._truncated_folders = {}
+        self._skipped_dirs = []
+        # Transparence sur la classification réelle des tournois
+        # (demande du 2026-10-08, diagnostic "0 Sit & Go trouvé") — voir
+        # _update_classification_display. "Autres / non classés"
+        # consultables (nom/chemin) même décoché ; "illisibles" jamais
+        # éligibles à une purge, quels que soient les types cochés (voir
+        # data_purge.PURGE_TYPE_UNREADABLE).
+        self._other_files = []
+        self._unreadable_files = []
+
+        self.title("Purger Données")
+        self.configure(bg=FELT_DARK)
+        self.transient(master)
+        self.grab_set()
+        self.resizable(False, False)
+        # Drapeau de fermeture (correctif du 2026-10-07, risque de
+        # SIGSEGV) — posé à True AVANT tout appel à destroy(), jamais
+        # après : voir _close_dialog (point de passage UNIQUE pour
+        # fermer cette fenêtre) et _show_log_date_picker/
+        # _restore_dialog_grab, qui le consultent pour ne jamais
+        # appeler grab_set()/focus_force() sur self pendant que self
+        # est déjà engagé dans sa propre destruction.
+        self._closing = False
+        self.protocol("WM_DELETE_WINDOW", self._close_dialog)
+
+        self._purge_paths = []
+        # Dernier résultat de data_purge.check_purge_coverage — None tant
+        # qu'aucune vérification n'a encore été faite POUR LES CRITÈRES
+        # ACTUELLEMENT affichés (voir _invalidate_coverage).
+        self._coverage = None
+        # Sécurité des dates de purge (demande explicite du 2026-10-08,
+        # "ne jamais interpréter une date vide comme une période
+        # illimitée") — voir _parse_dates/_parse_purge_date_field.
+        # "missing" : état initial, Du/Au vides par défaut, cohérent
+        # avec _dates_required=True ci-dessous (voir data_purge.
+        # scan_candidate_folders_for_purge(require_date_range=True),
+        # seule garantie RÉELLE que purge_paths reste vide — ces deux
+        # attributs ne sont qu'un REFLET de cette garantie pour
+        # l'affichage, jamais la protection elle-même).
+        self._date_status = "missing"
+        self._dates_required = True
+        # Erreur IMPRÉVUE pendant la recherche en arrière-plan (voir
+        # _run_scan_worker/_on_scan_finished) — None tant qu'aucune
+        # n'est survenue ; jamais confondue avec _scan_incomplete
+        # (tronquée/annulée), affichage dédié (voir _update_scan_ui).
+        self._scan_error = None
+        # Clignotement du message Du/Au (demande explicite du
+        # 2026-10-08) — voir _start_date_status_blink/_blink_tick/
+        # _stop_date_status_blink ; annulé explicitement à la fermeture
+        # (_close_dialog), même discipline que self._poll_after_id.
+        self._blink_after_id = None
+        self._blink_on = False
+
+        period_frame = ttk.LabelFrame(self, text="Période")
+        period_frame.pack(fill="x", padx=14, pady=(14, 8))
+        ttk.Label(period_frame, text="Du :").grid(row=0, column=0, sticky="w", padx=(10, 4), pady=10)
+        date_from_row = ttk.Frame(period_frame)
+        date_from_row.grid(row=0, column=1, sticky="w", padx=(0, 16), pady=10)
+        self.date_from_var = tk.StringVar(value="")
+        ttk.Entry(date_from_row, textvariable=self.date_from_var, width=12).pack(side="left")
+        date_from_cal_btn = ttk.Button(date_from_row, text="📅", width=3)
+        date_from_cal_btn.pack(side="left", padx=(2, 0))
+        date_from_cal_btn.config(
+            command=lambda: self._show_log_date_picker(self.date_from_var, date_from_cal_btn)
+        )
+        ttk.Label(period_frame, text="Au :").grid(row=0, column=2, sticky="w", padx=(0, 4), pady=10)
+        date_to_row = ttk.Frame(period_frame)
+        date_to_row.grid(row=0, column=3, sticky="w", padx=(0, 10), pady=10)
+        self.date_to_var = tk.StringVar(value="")
+        ttk.Entry(date_to_row, textvariable=self.date_to_var, width=12).pack(side="left")
+        date_to_cal_btn = ttk.Button(date_to_row, text="📅", width=3)
+        date_to_cal_btn.pack(side="left", padx=(2, 0))
+        date_to_cal_btn.config(
+            command=lambda: self._show_log_date_picker(self.date_to_var, date_to_cal_btn)
+        )
+        # Du/Au OBLIGATOIRES ici (demande explicite du 2026-10-08,
+        # revue de sécurité "LOG → Purger → DONNÉES" : une date vide ne
+        # doit JAMAIS être interprétée comme une période illimitée) —
+        # contrairement à l'onglet LOG (App._current_log_filter_values/
+        # _parse_log_date_field, VOLONTAIREMENT INCHANGÉ : "Purgeons ce
+        # qui est dans les filtres en cours", décision distincte et
+        # déjà validée pour le journal). Toute frappe relance le
+        # recalcul du compte ET invalide la vérification en cours,
+        # SANS jamais de popup pendant la saisie (voir _parse_purge_
+        # date_field/_update_date_status_display) — seul un message non
+        # modal sous ces champs (self.date_status_lbl) explique
+        # pourquoi rien n'est sélectionnable tant que les deux dates ne
+        # sont pas valides et correctement ordonnées.
+        self.date_from_var.trace_add("write", self._on_criteria_changed)
+        self.date_to_var.trace_add("write", self._on_criteria_changed)
+        self.date_status_lbl = ttk.Label(
+            period_frame, text="", foreground=DANGER_RED, wraplength=460, justify="left",
+        )
+        self.date_status_lbl.grid(row=1, column=0, columnspan=4, sticky="w", padx=10, pady=(0, 10))
+
+        types_frame = ttk.LabelFrame(self, text="Types de tournoi concernés")
+        types_frame.pack(fill="x", padx=14, pady=8)
+        # "Autres / non classés" décoché par défaut (décision explicite
+        # du 2026-10-07 : "je préfère qu'ils puissent être purgés
+        # volontairement plutôt que de devenir impossibles à nettoyer") —
+        # voir data_purge.PURGE_TYPE_DEFAULT_CHECKED.
+        self.type_vars = {
+            t: tk.BooleanVar(value=t in data_purge.PURGE_TYPE_DEFAULT_CHECKED)
+            for t in data_purge.PURGE_TYPES
+        }
+        for idx, t in enumerate(data_purge.PURGE_TYPES):
+            ttk.Checkbutton(
+                types_frame, text=self._TYPE_LABELS[t], variable=self.type_vars[t],
+                command=self._on_criteria_changed,
+            ).grid(row=0, column=idx, sticky="w", padx=10, pady=10)
+
+        # Visibilité obligatoire de la découverte multi-dossiers (demande
+        # du 2026-10-07) : voir _update_folders_display, appelée par
+        # _refresh_folders (elle-même appelée par _refresh_count, donc à
+        # chaque changement de critère ET à chaque ajout manuel de
+        # dossier). AUCUN second Toplevel ici (contrairement au
+        # calendrier, qui en a légitimement besoin) : la liste des
+        # chemins s'affiche/se masque ENTIÈREMENT à l'intérieur de cette
+        # fenêtre (voir _make_toggle_list_row) — jamais un second grab à
+        # gérer pour une simple liste informative.
+        folders_frame = ttk.LabelFrame(self, text="Dossiers examinés")
+        folders_frame.pack(fill="x", padx=14, pady=8)
+        (
+            self._folders_examined_row, self.folders_examined_lbl,
+            self.folders_examined_list_lbl, _,
+        ) = self._make_toggle_list_row(folders_frame)
+        self._folders_examined_row.pack(fill="x", anchor="w", padx=10, pady=(10, 2))
+        (
+            self._folders_inaccessible_row, self.folders_inaccessible_lbl,
+            self.folders_inaccessible_list_lbl, _,
+        ) = self._make_toggle_list_row(folders_frame, foreground=DANGER_RED)
+        # Masqué par défaut (demande explicite : affiché "séparément,
+        # s'il y en a") — voir _update_folders_display.
+        # Dossiers PARTIELLEMENT examinés (limite de temps/nombre
+        # d'éléments atteinte — incident macOS du 2026-10-08) et sous-
+        # dossiers techniques/liens symboliques ignorés — mêmes lignes
+        # compactes repliées par défaut, mêmes règles de visibilité
+        # (masquées tant qu'il n'y en a aucun) — voir _update_folders_
+        # display.
+        (
+            self._folders_truncated_row, self.folders_truncated_lbl,
+            self.folders_truncated_list_lbl, _,
+        ) = self._make_toggle_list_row(folders_frame, foreground="#8a6d00")
+        (
+            self._folders_skipped_row, self.folders_skipped_lbl,
+            self.folders_skipped_list_lbl, _,
+        ) = self._make_toggle_list_row(folders_frame, foreground=MUTED)
+        ttk.Button(
+            folders_frame, text="Ajouter un dossier à vérifier...", command=self._on_add_folder,
+        ).pack(anchor="w", padx=10, pady=(4, 10))
+
+        # Transparence sur la classification réelle des tournois
+        # (demande explicite du 2026-10-08, diagnostic "0 Sit & Go
+        # trouvé" : des vrais Sit & Go existaient, simplement renommés
+        # à la création — voir data_purge.classify_tournament_for_
+        # purge). "Fichiers non classés" (Autres) reste consultable
+        # (nom + chemin) MÊME quand cette catégorie n'est pas cochée —
+        # jamais besoin de la cocher juste pour les identifier. Les
+        # fichiers illisibles/corrompus sont signalés séparément et ne
+        # sont JAMAIS éligibles à une purge, quels que soient les types
+        # cochés (voir data_purge.PURGE_TYPE_UNREADABLE). Mêmes lignes
+        # compactes repliées par défaut que ci-dessus — voir
+        # _update_classification_display.
+        classification_frame = ttk.LabelFrame(self, text="Classification des tournois")
+        classification_frame.pack(fill="x", padx=14, pady=8)
+        # Listes potentiellement LONGUES (demande explicite du
+        # 2026-10-08 : 25 fichiers "Autres" sans ascenseur débordaient
+        # du cadre, illisibles au-delà) — contrairement aux listes de
+        # dossiers ci-dessus (nombre de dossiers toujours restreint en
+        # pratique), ces deux-là utilisent _make_scrollable_list_section
+        # (hauteur FIXE + ascenseur) plutôt que _make_toggle_list_row.
+        (
+            self._other_files_row, self.other_files_lbl,
+            self.other_files_text, self._other_files_list_frame, self._other_files_toggle_btn,
+        ) = self._make_scrollable_list_section(classification_frame, foreground="#8a6d00")
+        (
+            self._unreadable_files_row, self.unreadable_files_lbl,
+            self.unreadable_files_text, self._unreadable_files_list_frame, self._unreadable_files_toggle_btn,
+        ) = self._make_scrollable_list_section(classification_frame, foreground=DANGER_RED)
+
+        # État/contrôle du scan en arrière-plan (demande explicite du
+        # 2026-10-08) : "Recherche en cours..."/avertissement "résultat
+        # incomplet" + bouton "Annuler la recherche", visible UNIQUEMENT
+        # pendant qu'une recherche est active — voir _update_scan_ui.
+        scan_status_row = ttk.Frame(self)
+        scan_status_row.pack(fill="x", padx=14, pady=(0, 2))
+        self.scan_status_lbl = ttk.Label(scan_status_row, text="", foreground=MUTED, wraplength=380, justify="left")
+        self.scan_status_lbl.pack(side="left")
+        self.cancel_scan_btn = ttk.Button(
+            scan_status_row, text="Annuler la recherche", command=self._on_cancel_scan,
+        )
+        # Jamais empaqueté ici — voir _update_scan_ui, seule méthode qui
+        # le pack()/pack_forget() selon self._scan_in_progress.
+
+        self.count_lbl = ttk.Label(self, text="Tournois concernés : 0", font=("Helvetica", 10, "bold"))
+        self.count_lbl.pack(anchor="w", padx=14, pady=(2, 10))
+
+        backup_frame = ttk.LabelFrame(self, text="Sauvegarde")
+        backup_frame.pack(fill="x", padx=14, pady=8)
+        self.backup_status_lbl = ttk.Label(
+            backup_frame, text="", foreground=MUTED, justify="left", wraplength=420,
+        )
+        self.backup_status_lbl.pack(anchor="w", padx=10, pady=(10, 6), fill="x")
+        backup_btn_row = ttk.Frame(backup_frame)
+        backup_btn_row.pack(anchor="w", padx=10, pady=(0, 10), fill="x")
+        self.verify_btn = ttk.Button(
+            backup_btn_row, text="Vérifier la sauvegarde...", command=self._on_verify_backup,
+        )
+        self.verify_btn.pack(side="left")
+        # Créé mais jamais empaqueté ici (demande explicite : visible
+        # UNIQUEMENT quand la vérification constate une couverture
+        # incomplète) — voir _render_coverage/_invalidate_coverage.
+        self.backup_now_btn = ttk.Button(
+            backup_btn_row, text="Faire une sauvegarde maintenant...", command=self._on_backup_now,
+        )
+
+        bottom = ttk.Frame(self)
+        bottom.pack(fill="x", padx=14, pady=(8, 14))
+        ttk.Button(bottom, text="Annuler", command=self._close_dialog).pack(side="right")
+        self.purge_btn = ttk.Button(bottom, text="Purger...", command=self._on_purge_clicked, state="disabled")
+        self.purge_btn.pack(side="right", padx=(0, 8))
+
+        self._refresh_count()
+
+    def _make_toggle_list_row(self, parent, foreground=None):
+        """Ligne compacte "Libellé : N" + bouton "Afficher.../Masquer" +
+        zone de texte listant des chemins (un par ligne), REPLIÉE par
+        défaut — AUCUN second Toplevel (jamais un second grab à gérer
+        en plus de celui de DataPurgeDialog lui-même, contrairement au
+        calendrier qui en a légitimement besoin) : tout reste à
+        l'intérieur de CETTE fenêtre. Renvoie (row, count_lbl, list_lbl,
+        toggle_btn) — l'appelant empaquette `row` lui-même (voir
+        __init__) et peut masquer la ligne ENTIÈRE via
+        row.pack_forget()."""
+        row = ttk.Frame(parent)
+        count_lbl = ttk.Label(row, text="", foreground=foreground)
+        count_lbl.pack(side="left")
+        toggle_btn = ttk.Button(row, text="Afficher...", width=11)
+        toggle_btn.pack(side="left", padx=(8, 0))
+        list_lbl = ttk.Label(
+            parent, text="", justify="left", foreground=MUTED, wraplength=440,
+        )
+
+        def _toggle():
+            if list_lbl.winfo_manager():
+                list_lbl.pack_forget()
+                toggle_btn.config(text="Afficher...")
+            else:
+                list_lbl.pack(anchor="w", padx=(10, 0), pady=(2, 8))
+                toggle_btn.config(text="Masquer")
+
+        toggle_btn.config(command=_toggle)
+        return row, count_lbl, list_lbl, toggle_btn
+
+    def _make_scrollable_list_section(self, parent, foreground=None):
+        """Variante de _make_toggle_list_row pour une liste
+        POTENTIELLEMENT LONGUE (demande explicite du 2026-10-08 : 25
+        fichiers "Autres / non classés" sans ascenseur débordaient du
+        cadre de la fenêtre, illisibles au-delà d'une certaine hauteur).
+
+        La liste défile dans une zone de hauteur FIXE (le widget Text
+        ci-dessous a une hauteur de 8 lignes quel que soit le nombre
+        d'entrées — jamais de débordement sur les autres éléments ou
+        les boutons de la fenêtre) via un widget tk.Text en lecture
+        seule (état "disabled" en dehors de _set_scrollable_text, pour
+        que ce ne soit jamais un champ éditable) + une ttk.Scrollbar
+        verticale classique. La molette ET l'ascenseur fonctionnent
+        nativement sur un widget Text (liaisons standard de Tk, y
+        compris sur Mac/Aqua — aucun code supplémentaire requis).
+        wrap="char" garantit qu'aucun chemin n'est jamais tronqué :
+        un chemin trop long pour la largeur disponible est simplement
+        renvoyé à la ligne caractère par caractère plutôt que coupé.
+
+        Couleurs (demande explicite du 2026-10-08, régression visuelle :
+        tk.Text ignore le thème ttk — fond blanc par défaut, illisible
+        avec un foreground clair) : fond FELT + texte CREAM, exactement
+        les couleurs déjà utilisées pour TFrame/TLabel sur fond vert
+        foncé ailleurs dans la fenêtre (voir style.configure("TFrame"/
+        "TLabel", ...)) — jamais de couleur arbitraire nouvelle.
+
+        Renvoie (row, count_lbl, text_widget, list_frame, toggle_btn) —
+        l'appelant empaquette `row` lui-même (voir __init__) et peut
+        masquer la ligne ENTIÈRE via row.pack_forget() ; `list_frame`
+        (Text + Scrollbar) est à masquer séparément via
+        list_frame.pack_forget() quand la catégorie redevient vide
+        (voir _update_classification_display), exactement comme
+        list_lbl.pack_forget() pour _make_toggle_list_row."""
+        row = ttk.Frame(parent)
+        count_lbl = ttk.Label(row, text="", foreground=foreground)
+        count_lbl.pack(side="left")
+        toggle_btn = ttk.Button(row, text="Afficher...", width=11)
+        toggle_btn.pack(side="left", padx=(8, 0))
+
+        list_frame = ttk.Frame(parent)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical")
+        text = tk.Text(
+            list_frame, height=8, wrap="char", background=FELT, foreground=CREAM,
+            yscrollcommand=scrollbar.set, state="disabled",
+            borderwidth=0, highlightthickness=0, padx=0, pady=0,
+        )
+        scrollbar.config(command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.pack(side="left", fill="both", expand=True)
+
+        def _toggle():
+            if list_frame.winfo_manager():
+                list_frame.pack_forget()
+                toggle_btn.config(text="Afficher...")
+            else:
+                list_frame.pack(fill="x", anchor="w", padx=(10, 0), pady=(2, 8))
+                toggle_btn.config(text="Masquer")
+
+        toggle_btn.config(command=_toggle)
+        return row, count_lbl, text, list_frame, toggle_btn
+
+    @staticmethod
+    def _set_scrollable_text(text_widget, content):
+        """Remplace le contenu d'un widget Text en LECTURE SEULE (voir
+        _make_scrollable_list_section) : repasse temporairement à
+        l'état "normal" pour pouvoir écrire, puis revient à "disabled"
+        — ce texte n'est qu'une liste informative, jamais un champ que
+        l'utilisateur pourrait modifier."""
+        text_widget.config(state="normal")
+        text_widget.delete("1.0", "end")
+        text_widget.insert("1.0", content)
+        text_widget.config(state="disabled")
+
+    def _refresh_folders(self):
+        """Reconstruit l'ensemble dédoublonné des dossiers candidats
+        (voir data_purge.collect_candidate_folders) à partir des sources
+        automatiques figées à l'ouverture (self._auto_*) PLUS les
+        dossiers ajoutés manuellement pour cette session
+        (self._manual_folders, qui peut grandir via "Ajouter un dossier
+        à vérifier..."). Appelée par _refresh_count — donc à chaque
+        changement de critère ET à chaque ajout manuel de dossier — pour
+        que la liste affichée (_update_folders_display) et le compte de
+        tournois restent toujours cohérents entre eux."""
+        candidates = data_purge.collect_candidate_folders(
+            tournament_day_folder=self._auto_tournament_day_folder,
+            last_tournament_dir=self._auto_last_tournament_dir,
+            open_tournament_paths=self._auto_open_tournament_paths,
+            action_log_tournament_paths=self._auto_action_log_paths,
+            extra_folders=self._manual_folders,
+        )
+        self._accessible_folders, self._inaccessible_folders = data_purge.split_accessible_folders(candidates)
+        # Les limites/exclusions ne sont connues qu'APRÈS un scan
+        # complet (voir _on_scan_finished) — jamais laissées à une
+        # valeur périmée pendant qu'une nouvelle recherche s'apprête à
+        # démarrer (voir _refresh_count, qui appelle toujours cette
+        # méthode avant _start_scan).
+        self._truncated_folders = {}
+        self._skipped_dirs = []
+        self._other_files = []
+        self._unreadable_files = []
+        self._update_folders_display()
+        self._update_classification_display()
+
+    def _update_folders_display(self):
+        """Visibilité OBLIGATOIRE (demande explicite du 2026-10-07,
+        étendue le 2026-10-08) : affiche toujours le nombre ET (sur
+        demande, voir _make_toggle_list_row) la liste complète des
+        dossiers RÉELLEMENT examinés, signale SÉPARÉMENT les dossiers
+        connus mais actuellement inaccessibles (clé USB/disque externe
+        débranché, dossier supprimé...), les dossiers PARTIELLEMENT
+        examinés (limite de temps/nombre d'éléments atteinte pendant le
+        scan — voir data_purge.scan_folder_for_tournaments) et les
+        sous-dossiers techniques/liens symboliques ignorés — jamais une
+        recherche silencieusement incomplète sans le dire."""
+        n_ok = len(self._accessible_folders)
+        mot_ok = "dossier" if n_ok <= 1 else "dossiers"
+        self.folders_examined_lbl.config(text=f"Dossiers examinés : {n_ok} {mot_ok}")
+        self.folders_examined_list_lbl.config(text="\n".join(self._accessible_folders) or "(aucun)")
+
+        n_bad = len(self._inaccessible_folders)
+        if n_bad:
+            mot_bad = "dossier" if n_bad <= 1 else "dossiers"
+            self.folders_inaccessible_lbl.config(
+                text=f"Dossiers connus mais actuellement inaccessibles : {n_bad} {mot_bad}",
+            )
+            self.folders_inaccessible_list_lbl.config(text="\n".join(self._inaccessible_folders))
+            if not self._folders_inaccessible_row.winfo_manager():
+                self._folders_inaccessible_row.pack(fill="x", anchor="w", padx=10, pady=(0, 2))
+        else:
+            self.folders_inaccessible_list_lbl.pack_forget()
+            self._folders_inaccessible_row.pack_forget()
+
+        n_trunc = len(self._truncated_folders)
+        if n_trunc:
+            mot_trunc = "dossier" if n_trunc <= 1 else "dossiers"
+            lines = [
+                f"{folder} ({self._SCAN_REASON_LABELS.get(reason, reason)})"
+                for folder, reason in self._truncated_folders.items()
+            ]
+            self.folders_truncated_lbl.config(
+                text=f"Dossiers partiellement examinés : {n_trunc} {mot_trunc}",
+            )
+            self.folders_truncated_list_lbl.config(text="\n".join(lines))
+            if not self._folders_truncated_row.winfo_manager():
+                self._folders_truncated_row.pack(fill="x", anchor="w", padx=10, pady=(0, 2))
+        else:
+            self.folders_truncated_list_lbl.pack_forget()
+            self._folders_truncated_row.pack_forget()
+
+        n_skip = len(self._skipped_dirs)
+        if n_skip:
+            mot_skip = "sous-dossier" if n_skip <= 1 else "sous-dossiers"
+            self.folders_skipped_lbl.config(
+                text=f"Sous-dossiers techniques/liens ignorés : {n_skip} {mot_skip}",
+            )
+            self.folders_skipped_list_lbl.config(text="\n".join(self._skipped_dirs))
+            if not self._folders_skipped_row.winfo_manager():
+                self._folders_skipped_row.pack(fill="x", anchor="w", padx=10, pady=(0, 2))
+        else:
+            self.folders_skipped_list_lbl.pack_forget()
+            self._folders_skipped_row.pack_forget()
+
+    def _update_classification_display(self):
+        """Affiche séparément (demande explicite du 2026-10-08, voir
+        data_purge.classify_tournament_for_purge) les fichiers "Autres /
+        non classés" — consultables (nom + chemin) même quand cette
+        catégorie n'est pas cochée, jamais besoin de la cocher juste
+        pour les identifier — et les fichiers illisibles/corrompus,
+        chacun avec son message d'erreur ; ces derniers ne sont JAMAIS
+        comptés dans self._purge_paths (voir data_purge.
+        scan_candidate_folders_for_purge) donc jamais éligibles à une
+        purge.
+
+        Visibilité REVUE le 2026-10-08 (bis) : contrairement à
+        _update_folders_display, la ligne entière (compteur + bouton)
+        reste TOUJOURS affichée, même à 0 — demande explicite pour
+        stabiliser la présentation (plus de "saut" de mise en page à
+        chaque recherche). Seul le bouton "Afficher..." est désactivé
+        (jamais masqué) quand le compteur est à 0, et la liste
+        défilante reste repliée dans ce cas."""
+        n_other = len(self._other_files)
+        mot_other = "fichier" if n_other <= 1 else "fichiers"
+        self.other_files_lbl.config(text=f"Autres / non classés : {n_other} {mot_other}")
+        if not self._other_files_row.winfo_manager():
+            self._other_files_row.pack(fill="x", anchor="w", padx=10, pady=(10, 2))
+        if n_other:
+            self._set_scrollable_text(self.other_files_text, "\n".join(self._other_files))
+            self._other_files_toggle_btn.config(state="normal")
+        else:
+            self._other_files_list_frame.pack_forget()
+            self._other_files_toggle_btn.config(state="disabled", text="Afficher...")
+
+        n_unreadable = len(self._unreadable_files)
+        mot_unreadable = "fichier" if n_unreadable <= 1 else "fichiers"
+        self.unreadable_files_lbl.config(
+            text=f"Fichiers illisibles ou corrompus : {n_unreadable} {mot_unreadable}",
+        )
+        if not self._unreadable_files_row.winfo_manager():
+            self._unreadable_files_row.pack(fill="x", anchor="w", padx=10, pady=(2, 10))
+        if n_unreadable:
+            lines = [
+                f"{entry['path']} ({entry['error']})"
+                for entry in self._unreadable_files
+            ]
+            self._set_scrollable_text(self.unreadable_files_text, "\n".join(lines))
+            self._unreadable_files_toggle_btn.config(state="normal")
+        else:
+            self._unreadable_files_list_frame.pack_forget()
+            self._unreadable_files_toggle_btn.config(state="disabled", text="Afficher...")
+
+    def _on_add_folder(self):
+        """"Ajouter un dossier à vérifier..." (demande explicite du
+        2026-10-07) : sélection explicite par l'utilisateur, pour CETTE
+        session de purge UNIQUEMENT — self._manual_folders n'est JAMAIS
+        persisté, ne touche JAMAIS "Dossier par défaut" ni aucun autre
+        réglage du tournoi.
+
+        ÉTENDU le 2026-10-08 (incident macOS réel : /Users/raj ajouté
+        ici, exploré récursivement sans limite, a bloqué Senaco
+        indéfiniment) : demande maintenant EXPLICITEMENT la portée de
+        la recherche pour CE dossier (voir _ask_recursive_scope) —
+        "ce dossier uniquement" présélectionné par défaut, un choix
+        récursif exige un geste explicite. Annuler ce second choix
+        n'ajoute AUCUN dossier.
+
+        Relance _refresh_count (donc _refresh_folders ET une nouvelle
+        recherche en arrière-plan), qui invalide aussi toute
+        vérification de sauvegarde précédente — cohérent avec
+        l'invariant déjà en place pour un changement de date/type."""
+        path = filedialog.askdirectory(
+            title="Choisir un dossier supplémentaire à examiner pour cette purge", parent=self,
+        )
+        if not path:
+            return
+        recursive = self._ask_recursive_scope(path)
+        if recursive is None:
+            return
+        ap = os.path.abspath(path)
+        if ap not in self._manual_folders:
+            self._manual_folders.append(ap)
+        self._manual_folder_recursive[ap] = recursive
+        self._refresh_count()
+
+    def _build_recursive_scope_dialog(self, path):
+        """Construit (SANS l'afficher modalement — aucun grab, aucun
+        wait_window ici) le petit Toplevel de choix de portée pour le
+        dossier `path` qu'on vient d'ajouter manuellement. Séparé de
+        _ask_recursive_scope EXPRÈS (2026-10-08) : un essai automatisé
+        déclenchant un clic via self.after PENDANT le wait_window du
+        dialogue réel a provoqué un VRAI SIGSEGV, reproduit de façon
+        fiable (même famille que les crashs déjà rencontrés pendant ce
+        chantier — un appel Tk réentrant déclenché par un after()
+        pendant un wait_window()/une transition de grab). Cette
+        séparation permet de vérifier le choix PRÉSÉLECTIONNÉ par
+        défaut (« Ce dossier uniquement ») sans jamais passer par ce
+        chemin dangereux : on construit, on lit recursive_var.get(),
+        on détruit — jamais de wait_window dans ce test.
+
+        Renvoie (win, recursive_var, result) — `result` est un dict
+        mutable {"value": None} rempli par les boutons OK ("ce dossier
+        uniquement" = False ou récursif = True) / Annuler (None),
+        juste avant que `win` se détruise lui-même."""
+        result = {"value": None}
+        recursive_var = tk.BooleanVar(value=False)
+
+        win = tk.Toplevel(self)
+        win.title("Portée de la recherche")
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(
+            win, text=f"Dossier choisi :\n{path}", justify="left", wraplength=380,
+        ).pack(padx=16, pady=(16, 10))
+        ttk.Radiobutton(
+            win, text="Ce dossier uniquement (recommandé)",
+            variable=recursive_var, value=False,
+        ).pack(anchor="w", padx=16)
+        ttk.Radiobutton(
+            win, text="Ce dossier et ses sous-dossiers (recherche récursive)",
+            variable=recursive_var, value=True,
+        ).pack(anchor="w", padx=16, pady=(2, 12))
+
+        def _ok():
+            result["value"] = recursive_var.get()
+            win.destroy()
+
+        def _cancel():
+            result["value"] = None
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(pady=(0, 16))
+        ttk.Button(btns, text="Annuler", command=_cancel).pack(side="left", padx=5)
+        ttk.Button(btns, text="OK", command=_ok).pack(side="left", padx=5)
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        return win, recursive_var, result
+
+    def _ask_recursive_scope(self, path):
+        """Demande à l'utilisateur la portée de la recherche pour le
+        dossier `path` qu'il vient de choisir (demande explicite du
+        2026-10-08, suite à l'incident macOS où /Users/raj exploré
+        récursivement sans limite a bloqué l'application). Renvoie
+        True (récursif), False (« Ce dossier uniquement » — choix
+        PRÉSÉLECTIONNÉ par défaut, voir _build_recursive_scope_dialog),
+        ou None si l'utilisateur annule (aucun dossier n'est alors
+        ajouté par l'appelant).
+
+        Ouvre un second Toplevel-enfant de DataPurgeDialog — voir
+        _show_child_modal_window, qui généralise la gestion de grab
+        déjà validée manuellement pour le calendrier
+        (_show_log_date_picker, laissé intact et séparé : son propre
+        correctif n'est jamais touché ici)."""
+        win, _recursive_var, result = self._build_recursive_scope_dialog(path)
+        self._show_child_modal_window(win)
+        return result["value"]
+
+    def _begin_child_modal(self, child):
+        """Transfère le grab de DataPurgeDialog à `child` (un Toplevel-
+        enfant DÉJÀ CONSTRUIT, qui ne doit pas avoir posé son propre
+        grab) — lift/focus_force/grab_set — et pose la restauration
+        AUTOMATIQUE du grab/focus de DataPurgeDialog sur la destruction
+        de `child`, EXACTEMENT le même mécanisme que _show_log_date_
+        picker (voir son historique complet : jamais deux grabs actifs
+        en même temps, jamais d'appel réentrant sur self pendant sa
+        propre destruction).
+
+        Séparée de _show_child_modal_window (qui appelle CECI puis
+        child.wait_window(child)) EXPRÈS : un test a provoqué un VRAI
+        SIGSEGV, reproduit de façon fiable, en déclenchant un clic via
+        self.after PENDANT un wait_window() réel (même famille de crash
+        Tk/Aqua réentrant que les autres rencontrées pendant ce
+        chantier) — cette méthode-ci permet de mettre en place
+        EXACTEMENT le même état de grab qu'un dialogue enfant réellement
+        affiché, pour des tests qui vérifient ce qui se passe ENSUITE
+        (ex. fermeture de DataPurgeDialog pendant que l'enfant est
+        ouvert) SANS jamais appeler wait_window."""
+        self.grab_release()
+        child.lift()
+        child.focus_force()
+        child.grab_set()
+
+        restored = {"done": False}
+
+        def _restore(event, _child=child):
+            if event.widget is not _child:
+                return
+            if restored["done"]:
+                return
+            restored["done"] = True
+            if self._closing:
+                return
+            try:
+                if self.winfo_exists():
+                    self.grab_set()
+                    self.focus_force()
+            except tk.TclError:
+                pass
+
+        child.bind("<Destroy>", _restore)
+
+    def _show_child_modal_window(self, child):
+        """Affiche un Toplevel-enfant DÉJÀ CONSTRUIT modalement — voir
+        _begin_child_modal pour le transfert de grab lui-même.
+        Généralisé le 2026-10-08 pour les petits dialogues enfants de
+        DataPurgeDialog — _ask_recursive_scope (choix de portée à
+        l'ajout manuel d'un dossier) PUIS _confirm_purge (confirmation
+        finale avant suppression, qui posait auparavant son propre
+        grab_set() sans rien céder : même défaut structurel, corrigé à
+        son tour le 2026-10-08) — SANS jamais toucher à
+        _show_log_date_picker lui-même, dont le correctif déjà validé
+        manuellement sur macOS reste intact et strictement séparé.
+
+        Bloque (wait_window) jusqu'à la fermeture de l'enfant — par
+        n'importe quelle voie (bouton "OK"/"Annuler"/"Purger", croix
+        macOS via WM_DELETE_WINDOW, ou cascade de destruction si
+        DataPurgeDialog lui-même se ferme pendant que cet enfant est
+        encore ouvert : la restauration posée par _begin_child_modal
+        vérifie self._closing pour ne JAMAIS restaurer grab/focus sur
+        une fenêtre déjà engagée dans sa propre destruction)."""
+        self._begin_child_modal(child)
+        child.wait_window(child)
+
+    def _close_dialog(self):
+        """Point de passage UNIQUE pour fermer DataPurgeDialog — utilisé
+        à la fois par "Annuler" et par WM_DELETE_WINDOW (fermeture
+        native), jamais self.destroy() directement ailleurs dans cette
+        classe (correctif du 2026-10-07, risque de SIGSEGV).
+
+        Pose self._closing = True AVANT tout appel à destroy() :
+        Tk détruit les enfants d'une fenêtre AVANT la fenêtre elle-même,
+        donc si un calendrier est encore ouvert à cet instant (il tient
+        alors le grab, voir _show_log_date_picker), son <Destroy> se
+        déclenche PENDANT ce destroy()-ci, alors que self existe encore
+        au sens de winfo_exists() mais est déjà engagé dans sa propre
+        destruction. _restore_dialog_grab vérifie ce drapeau et
+        n'appelle alors JAMAIS grab_set()/focus_force() sur self — sans
+        ce drapeau, cet appel réentrant pendant la destruction est
+        exactement ce qui a provoqué le SIGSEGV réel rapporté sur
+        macOS.
+
+        Garde `if self._closing: return` : rend cette méthode sûre à
+        appeler plusieurs fois (ex. Annuler cliqué puis fermeture
+        native) sans jamais appeler destroy() deux fois.
+
+        ÉTENDU le 2026-10-08 (scan borné en arrière-plan) : signale
+        aussi l'annulation à toute recherche encore en cours
+        (self._scan_cancel_event) — le thread ne touche JAMAIS Tkinter
+        lui-même, donc rien ici n'attend sa fin (self.destroy() se
+        poursuit immédiatement, "pas de blocage à la fermeture" demandé
+        explicitement) — et désarme le sondage programmé via self.after
+        (self._poll_after_id), pour qu'aucun _poll_scan_queue différé
+        ne se déclenche après coup sur une fenêtre détruite (en plus de
+        la garde self._closing/winfo_exists() déjà posée au tout début
+        de _poll_scan_queue, défense en profondeur)."""
+        if self._closing:
+            return
+        self._closing = True
+        if self._scan_cancel_event is not None:
+            self._scan_cancel_event.set()
+        if self._poll_after_id is not None:
+            try:
+                self.after_cancel(self._poll_after_id)
+            except tk.TclError:
+                pass
+            self._poll_after_id = None
+        # Clignotement du message Du/Au (demande explicite du
+        # 2026-10-08) : même discipline que self._poll_after_id
+        # ci-dessus — jamais un self.after() différé qui se déclenche
+        # après coup sur une fenêtre détruite (voir _blink_tick, qui se
+        # garde aussi elle-même via self._closing/winfo_exists(),
+        # défense en profondeur).
+        self._stop_date_status_blink()
+        self.destroy()
+
+    def _show_log_date_picker(self, target_var, anchor_widget):
+        """Délègue entièrement à App._show_log_date_picker (AUCUNE copie
+        ni réécriture de sa logique — toujours le même calendrier, celui
+        de l'onglet LOG, jamais régressé ici) — mais appelé avec `self` =
+        CETTE instance de DataPurgeDialog (jamais self.app), et avec une
+        gestion EXPLICITE du grab autour de l'appel : voir le long
+        historique ci-dessous, issu de deux correctifs successifs pour
+        le même bug rapporté le 2026-10-07 ("calendrier visible mais
+        inutilisable depuis Purger Données").
+
+        PREMIER CORRECTIF (insuffisant en usage réel sur macOS) :
+        appeler self.app._show_log_date_picker(...) exécutait la
+        méthode avec self=App, ce qui construisait le calendrier comme
+        tk.Toplevel(self.app) — un Toplevel FRÈRE de DataPurgeDialog
+        (tous deux enfants de la fenêtre racine), jamais un DESCENDANT.
+        Le premier correctif a changé cela pour tk.Toplevel(self) avec
+        self=DataPurgeDialog, rendant le calendrier structurellement
+        DESCENDANT de DataPurgeDialog. Des tests automatisés ET un essai
+        avec de VRAIS événements Tk synthétiques (event_generate, qui
+        passe par la file d'événements réelle — contrairement à
+        Button.invoke()) ont confirmé que ce point précis fonctionne
+        correctement dans ce mécanisme Tk.
+
+        CAUSE RÉELLE DU BLOCAGE RESTANT (rapporté le 2026-10-07 malgré
+        le premier correctif) : DataPurgeDialog pose son PROPRE
+        grab_set() ET reste grabbing pendant toute l'ouverture du
+        calendrier — un grab IMBRIQUÉ (DataPurgeDialog ET le calendrier
+        actifs "en même temps"). Le mécanisme de grab de Tk sur macOS/
+        Aqua n'est qu'un filtre logiciel côté Tcl/Tk, jamais une vraie
+        capture au niveau du système de fenêtres (WindowServer) : rien
+        ne garantit que la nouvelle fenêtre (NSWindow) du calendrier
+        devienne réellement la fenêtre "key"/active au niveau de l'OS
+        tant que DataPurgeDialog reste, lui, le détenteur du grab —
+        focus_set() (utilisé par App._show_log_date_picker, PARTAGÉ
+        avec le LOG, jamais modifié) ne force qu'un focus INTERNE à Tk,
+        jamais le focus réel du système. Un clic souris RÉEL peut alors
+        continuer d'être délivré par macOS à DataPurgeDialog plutôt
+        qu'au calendrier, même si Tk lui-même (winfo_parent/
+        grab_current/focus_get) rapporte un état cohérent — ce qui
+        explique que les tests automatisés (y compris avec de vrais
+        événements synthétiques) passent alors que le bug persiste
+        réellement à l'usage.
+
+        CORRECTIF DU TRANSFERT DE GRAB : ne JAMAIS avoir deux grabs
+        actifs en même temps. DataPurgeDialog CÈDE EXPLICITEMENT son
+        grab au calendrier pendant que celui-ci est ouvert
+        (grab_release() puis picker.grab_set(), après avoir forcé le
+        focus RÉEL avec focus_force() — jamais le simple focus_set()
+        interne) — le calendrier se comporte alors exactement comme
+        n'importe quelle AUTRE fenêtre modale autonome de cette
+        application (toutes suivent déjà ce même schéma à un seul grab,
+        jamais imbriqué, voir les nombreux autres grab_set() de ce
+        fichier). Dès que le calendrier se ferme — qu'un jour ait été
+        choisi (_select) ou que sa fenêtre ait été fermée nativement —,
+        l'événement <Destroy> restaure le grab et le focus réel de
+        DataPurgeDialog, pour qu'il reste pleinement modal ensuite.
+
+        CORRECTIF SUPPLÉMENTAIRE (SIGSEGV réel rapporté le 2026-10-07,
+        APRÈS le correctif de transfert de grab ci-dessus) : fermer
+        DataPurgeDialog (Annuler ou fermeture native) PENDANT que le
+        calendrier est encore ouvert fait détruire le calendrier — donc
+        déclencher son <Destroy>, donc appeler self.grab_set()/
+        self.focus_force() — PENDANT que self (DataPurgeDialog)
+        lui-même est déjà engagé dans sa propre destruction (Tk détruit
+        les enfants avant le parent). self.winfo_exists() reste True à
+        cet instant précis, donc la seule garde précédente ne détectait
+        rien d'anormal — cet appel Tk réentrant pendant une destruction
+        a été démontré expérimentalement et est la cause la plus
+        probable du SIGSEGV réel observé. Voir _close_dialog ci-dessus :
+        seul point d'entrée pour fermer cette fenêtre, qui pose
+        self._closing = True AVANT tout destroy() ; _restore_dialog_grab
+        (plus bas) vérifie ce drapeau et renonce silencieusement à
+        grab_set()/focus_force() si la fermeture est déjà engagée.
+
+        _LOG_CALENDAR_MONTH_NAMES_FR (seul autre attribut lu par
+        App._show_log_date_picker) est fourni ici sur l'instance pour
+        la même raison que self : cette méthode partagée ne doit jamais
+        être dupliquée ni modifiée pour le LOG."""
+        self._LOG_CALENDAR_MONTH_NAMES_FR = App._LOG_CALENDAR_MONTH_NAMES_FR
+        before = {w for w in self.winfo_children() if isinstance(w, tk.Toplevel)}
+        App._show_log_date_picker(self, target_var, anchor_widget)
+        created = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel) and w not in before]
+        if not created:
+            return
+        picker = created[0]
+
+        # IMPORTANT (trouvé par un crash RÉEL — SIGSEGV, pas une simple
+        # exception Python — reproduit via les tests automatisés eux-
+        # mêmes) : ne JAMAIS appeler update()/update_idletasks() ICI,
+        # SYNCHRONE, DEPUIS LE CALLBACK du bouton 📅 qui vient d'ouvrir
+        # ce calendrier. Forcer un passage de la boucle d'événements
+        # alors qu'on est déjà réentrant à l'intérieur du traitement de
+        # CET événement (le clic sur 📅) a fait planter l'interpréteur
+        # Tcl/Tk pendant la transition de grab qui suit. Ni nécessaire
+        # (grab_set() réussit directement sur le Toplevel qui vient
+        # d'être créé, déjà "viewable") ni sûr : ne JAMAIS le réajouter
+        # ici, même pour "sécuriser" un futur appel à grab_set().
+        self.grab_release()
+        picker.lift()
+        picker.focus_force()
+        picker.grab_set()
+
+        # Garde LOCALE à CETTE ouverture du calendrier (un dict neuf par
+        # appel, jamais un attribut partagé de self) — garantit que la
+        # restauration du grab/focus ne s'exécute qu'UNE SEULE FOIS pour
+        # CE calendrier précis, même si <Destroy> se déclenche plusieurs
+        # fois pour `picker` par un autre mécanisme que prévu.
+        restored = {"done": False}
+
+        def _restore_dialog_grab(event, _picker=picker):
+            # Se déclenche aussi pour CHAQUE widget enfant du calendrier
+            # détruit par la cascade (bouton de jour, frame...) — les
+            # bindtags d'un enfant incluent le chemin de son Toplevel ;
+            # ce garde-fou ne réagit qu'à la destruction de `picker`
+            # lui-même, jamais à celle d'un de ses enfants.
+            if event.widget is not _picker:
+                return
+            if restored["done"]:
+                return
+            restored["done"] = True
+            # Correctif du 2026-10-07 (SIGSEGV réel sur macOS) : si
+            # DataPurgeDialog est déjà engagé dans sa propre fermeture
+            # (voir _close_dialog, seul point d'entrée qui pose ce
+            # drapeau AVANT destroy()), ce <Destroy> du calendrier fait
+            # PARTIE de la cascade de destruction de self elle-même —
+            # self existe encore au sens de winfo_exists() à cet instant
+            # précis, mais est déjà en cours de démolition. Appeler
+            # grab_set()/focus_force() sur self ICI serait un appel Tk
+            # réentrant PENDANT sa propre destruction : c'est exactement
+            # la séquence qui a provoqué le SIGSEGV réel rapporté — ne
+            # JAMAIS retirer cette vérification.
+            if self._closing:
+                return
+            try:
+                if self.winfo_exists():
+                    self.grab_set()
+                    self.focus_force()
+            except tk.TclError:
+                pass
+
+        picker.bind("<Destroy>", _restore_dialog_grab)
+
+    def _checked_types(self):
+        return {t for t, v in self.type_vars.items() if v.get()}
+
+    def _parse_purge_date_field(self, raw_value):
+        """Analyse SILENCIEUSE d'un champ Du/Au de CE dialogue
+        uniquement — jamais de popup ici (contrairement à App._parse_
+        log_date_field, utilisé par l'onglet LOG, VOLONTAIREMENT
+        INCHANGÉ) : cette méthode est appelée à CHAQUE frappe (voir
+        _on_criteria_changed), une saisie manuelle progressive ("3",
+        "31", "31/", "31/0"...) ne doit jamais déclencher une erreur
+        tant qu'elle n'est pas terminée (demande explicite du
+        2026-10-08, "éviter les popups répétitives pendant la saisie
+        manuelle").
+
+        Renvoie (date_ou_None, statut) :
+        - "empty" : champ vide (aucune date) ;
+        - "incomplete" : non vide, ne correspond pas ENCORE au format
+          complet JJ/MM/AAAA — saisie probablement en cours, jamais
+          traité comme une erreur ;
+        - "invalid" : format complet mais date impossible (ex.
+          31/02/2026) — protection CONSERVÉE, seulement affichée de
+          façon non modale (voir _update_date_status_display) plutôt
+          que par une popup ;
+        - "ok" : date valide."""
+        raw = (raw_value or "").strip()
+        if not raw:
+            return None, "empty"
+        if not _LOG_DATE_RE.match(raw):
+            return None, "incomplete"
+        try:
+            return datetime.strptime(raw, "%d/%m/%Y"), "ok"
+        except ValueError:
+            return None, "invalid"
+
+    def _parse_dates(self):
+        """(date_from, date_to, status) — chaînes "AAAA-MM-JJ" ou None,
+        status valant "ok"/"missing"/"incomplete"/"invalid"/"inverted".
+
+        Les DEUX dates sont désormais OBLIGATOIRES pour "Purger
+        Données" (demande explicite du 2026-10-08, revue de sécurité :
+        "ne jamais interpréter une date vide comme une période
+        illimitée" — contrairement à l'onglet LOG, volontairement
+        inchangé). Cette méthode ne fait QUE calculer le statut pour
+        l'affichage (_update_date_status_display) et pour décider si
+        une recherche a un sens maintenant (_start_scan) : elle ne
+        constitue PAS, à elle seule, la protection contre une purge
+        sans dates valides — cette garantie vit dans data_purge.
+        scan_candidate_folders_for_purge(require_date_range=True),
+        appelée systématiquement par _run_scan_worker, y compris pour
+        une période "inverted" (voir ci-dessous, transmise telle
+        quelle pour que data_purge.py la rejette lui-même)."""
+        date_from, status_from = self._parse_purge_date_field(self.date_from_var.get())
+        date_to, status_to = self._parse_purge_date_field(self.date_to_var.get())
+        if status_from == "incomplete" or status_to == "incomplete":
+            return None, None, "incomplete"
+        if status_from == "invalid" or status_to == "invalid":
+            return None, None, "invalid"
+        if status_from == "empty" or status_to == "empty":
+            return None, None, "missing"
+        date_from_s = date_from.strftime("%Y-%m-%d")
+        date_to_s = date_to.strftime("%Y-%m-%d")
+        if date_from > date_to:
+            return date_from_s, date_to_s, "inverted"
+        return date_from_s, date_to_s, "ok"
+
+    _DATE_STATUS_TEXTS = {
+        "missing": (
+            "⚠ Renseignez les deux dates (Du et Au) : aucun tournoi ne peut être "
+            "sélectionné pour la purge sans période complète."
+        ),
+        "invalid": "⚠ Date invalide : vérifiez le format JJ/MM/AAAA et qu'elle correspond à un jour réel.",
+        "inverted": "⚠ « Du » doit être antérieur ou égal à « Au ».",
+        "incomplete": "Saisie de la date en cours...",
+        "ok": "",
+    }
+    _BLINK_INTERVAL_MS = 500
+    _DATE_STATUS_FONT_BOLD = ("Helvetica", 10, "bold")
+    _DATE_STATUS_FONT_NORMAL = ("Helvetica", 10)
+
+    def _update_date_status_display(self):
+        """Message NON MODAL, affiché en permanence sous les champs
+        Du/Au (demande explicite du 2026-10-08, "de préférence sous
+        les champs de dates") — jamais une popup : contrairement à
+        l'ancien comportement (App._parse_log_date_field, qui affiche
+        une messagebox), ce label reflète self._date_status en continu,
+        y compris pendant une saisie manuelle progressive.
+
+        Mise en évidence REVUE le 2026-10-08 (ter) : tant qu'une date
+        manque, est incomplète ou invalide, ou que la période est
+        inversée (tout statut != "ok"), le message clignote en jaune
+        vif/gras — voir _start_date_status_blink/_blink_tick. Dès que
+        les deux dates sont valides et correctement ordonnées, le
+        clignotement s'arrête IMMÉDIATEMENT et le statut redevient
+        normal (texte vide, police normale) — jamais un clignotement
+        qui continuerait "encore un peu" après résolution."""
+        self.date_status_lbl.config(text=self._DATE_STATUS_TEXTS.get(self._date_status, ""))
+        if self._date_status == "ok":
+            self._stop_date_status_blink()
+            self.date_status_lbl.config(foreground=MUTED, font=self._DATE_STATUS_FONT_NORMAL)
+        else:
+            self._start_date_status_blink()
+
+    def _start_date_status_blink(self):
+        """Démarre le clignotement (jamais un second self.after() en
+        double si déjà en cours, voir self._blink_after_id) — affiche
+        immédiatement la couleur jaune vif sans attendre le premier
+        intervalle, pour que le message soit visible dès l'apparition
+        du problème plutôt que de potentiellement démarrer "éteint"."""
+        self.date_status_lbl.config(font=self._DATE_STATUS_FONT_BOLD)
+        if self._blink_after_id is not None:
+            return
+        self._blink_on = True
+        self.date_status_lbl.config(foreground=ALERT_YELLOW)
+        self._blink_after_id = self.after(self._BLINK_INTERVAL_MS, self._blink_tick)
+
+    def _blink_tick(self):
+        """Alterne jaune vif <-> couleur de fond normale (FELT, celle
+        de period_frame — jamais une autre couleur de texte) toutes les
+        self._BLINK_INTERVAL_MS (~500 ms) — UNIQUEMENT ce label, aucun
+        autre élément de la fenêtre. Jamais appelée autrement que via
+        self.after (même discipline que _poll_scan_queue) : se garde
+        elle-même via self._closing/winfo_exists() (défense en
+        profondeur en plus de l'annulation explicite dans
+        _close_dialog) ET s'arrête d'elle-même dès que le statut est
+        redevenu "ok" entre deux intervalles — jamais besoin d'attendre
+        le prochain appel à _update_date_status_display pour stopper."""
+        if self._closing or not self.winfo_exists():
+            self._blink_after_id = None
+            return
+        if self._date_status == "ok":
+            self._blink_after_id = None
+            return
+        self._blink_on = not self._blink_on
+        self.date_status_lbl.config(foreground=ALERT_YELLOW if self._blink_on else FELT)
+        self._blink_after_id = self.after(self._BLINK_INTERVAL_MS, self._blink_tick)
+
+    def _stop_date_status_blink(self):
+        """Annule le rappel self.after() en attente, s'il y en a un —
+        appelée à la fois par _update_date_status_display (dès que le
+        statut redevient "ok") et par _close_dialog (fermeture du
+        dialogue, pour n'avoir JAMAIS de rappel après() orphelin)."""
+        if self._blink_after_id is not None:
+            try:
+                self.after_cancel(self._blink_after_id)
+            except tk.TclError:
+                pass
+            self._blink_after_id = None
+        self._blink_on = False
+
+    def _on_criteria_changed(self, *_args):
+        self._refresh_count()
+
+    def _refresh_count(self):
+        """Point d'entrée commun (changement de critère Date/Type, ajout
+        manuel de dossier, ouverture du dialogue) — recalcule D'ABORD
+        l'ensemble des dossiers candidats (rapide, _refresh_folders :
+        de simples vérifications os.path.isdir, jamais une lecture de
+        contenu de dossier), PUIS lance une recherche BORNÉE ET
+        ANNULABLE en ARRIÈRE-PLAN pour trouver les fichiers .tournoi
+        eux-mêmes (_start_scan) — JAMAIS plus sur le thread Tk (incident
+        macOS réel du 2026-10-08 : /Users/raj ajouté comme dossier
+        candidat, exploré sans aucune limite, a bloqué Senaco
+        indéfiniment — curseur arc-en-ciel, forçage de fermeture)."""
+        self._refresh_folders()
+        self._start_scan()
+
+    def _start_scan(self):
+        """Lance une recherche BORNÉE ET ANNULABLE (data_purge.
+        scan_candidate_folders_for_purge — AUCUN appel Tkinter, direct
+        ou indirect) sur un THREAD SÉPARÉ, jamais sur le thread
+        principal. Le thread ne communique avec l'interface QUE par
+        self._scan_queue (queue.Queue, thread-safe) ; seul
+        _poll_scan_queue (toujours appelée via self.after, donc
+        toujours sur le thread principal) la lit et touche les widgets.
+
+        Annule d'abord toute recherche précédente encore active
+        (self._scan_cancel_event) et incrémente self._scan_generation :
+        un résultat tardif d'un ANCIEN appel (génération différente,
+        voir _poll_scan_queue) est silencieusement ignoré — jamais
+        appliqué après un changement de critère survenu entre-temps.
+
+        Invalide immédiatement tournois concernés/couverture de
+        sauvegarde — un résultat affiché ne doit JAMAIS survivre au
+        lancement d'une nouvelle recherche (demande explicite du
+        2026-10-08).
+
+        IMPORTANT (trouvé en écrivant les tests de cette fonctionnalité
+        — SIGSEGV réel, reproduit de façon fiable, même famille que le
+        update_idletasks() déjà interdit près du calendrier) : ne JAMAIS
+        appeler self.update()/self.update_idletasks() juste après
+        self.grab_set() (posé dans __init__) ni nulle part près de ce
+        mécanisme de scan. _poll_scan_queue n'est JAMAIS appelée
+        autrement que via self.after — jamais directement, jamais
+        encadrée par un update() censé "faire avancer les choses"."""
+        if self._scan_cancel_event is not None:
+            self._scan_cancel_event.set()
+        self._scan_generation += 1
+        generation = self._scan_generation
+        cancel_event = threading.Event()
+        self._scan_cancel_event = cancel_event
+        self._scan_in_progress = True
+        self._scan_incomplete = True
+        self._scan_cancelled = False
+        self._scan_error = None
+        self._purge_paths = []
+        self._update_scan_ui()
+        self._invalidate_coverage()
+        self._update_verify_button_state()
+
+        date_from, date_to, status = self._parse_dates()
+        self._date_status = status
+        self._update_date_status_display()
+        if status in ("missing", "incomplete", "invalid"):
+            # Date(s) manquante(s), en cours de saisie, ou impossible :
+            # aucune recherche de tournois à purger n'a de sens ici
+            # (demande explicite du 2026-10-08 : les deux dates sont
+            # désormais OBLIGATOIRES) — jamais de popup (voir le
+            # message non modal déjà posé ci-dessus), jamais non plus
+            # une nouvelle recherche en arrière-plan pour une saisie
+            # non résolue.
+            self._dates_required = True
+            self._scan_in_progress = False
+            self._scan_incomplete = True
+            self._update_scan_ui()
+            self.count_lbl.config(text="Tournois concernés : 0 tournoi")
+            self._update_verify_button_state()
+            return
+        # status in ("ok", "inverted") : on lance quand même la VRAIE
+        # recherche, y compris pour "inverted" (Du > Au, les deux
+        # syntaxiquement valides) — c'est data_purge.
+        # scan_candidate_folders_for_purge(require_date_range=True),
+        # PAS cette validation locale, qui doit garantir qu'une période
+        # inversée ne sélectionne jamais rien (voir _run_scan_worker) :
+        # la transmettre telle quelle exerce réellement cette garantie
+        # métier plutôt que de s'y substituer ici.
+
+        folders = list(self._accessible_folders)
+        recursive_folders = {
+            f for f in folders
+            if f not in self._manual_folder_recursive or self._manual_folder_recursive[f]
+        }
+        types = self._checked_types()
+
+        thread = threading.Thread(
+            target=DataPurgeDialog._run_scan_worker,
+            args=(self._scan_queue, generation, folders, recursive_folders, date_from, date_to, types, cancel_event),
+            daemon=True,
+        )
+        thread.start()
+        self._poll_after_id = self.after(100, self._poll_scan_queue)
+
+    @staticmethod
+    def _run_scan_worker(scan_queue, generation, folders, recursive_folders, date_from, date_to, types, cancel_event):
+        """MÉTHODE STATIQUE délibérément (demande explicite du
+        2026-10-08, "aucun appel Tkinter depuis le thread de
+        recherche") : exécutée sur un thread séparé, elle ne reçoit
+        JAMAIS `self` (l'instance Tk) — seulement `scan_queue` (une
+        queue.Queue, sans aucun rapport avec Tkinter, thread-safe par
+        construction) et des valeurs Python simples. Impossible, PAR
+        CONSTRUCTION, d'appeler accidentellement une méthode Tk d'ici :
+        aucune référence à un widget n'existe dans sa portée.
+
+        require_date_range=True TOUJOURS (demande explicite du
+        2026-10-08) : seul chemin d'exécution réel menant à une purge,
+        voir data_purge.scan_candidate_folders_for_purge — garantit
+        qu'aucun fichier n'est jamais sélectionné sans les deux dates,
+        valides et correctement ordonnées, même si _parse_dates/
+        _start_scan étaient un jour modifiés par erreur.
+
+        Toute exception IMPRÉVUE est interceptée ICI (sur le thread de
+        recherche, jamais ailleurs) et transformée en résultat
+        {"error": str(e)} déposé dans la même queue — défaut identifié
+        le 2026-10-08 : un thread qui meurt silencieusement sans jamais
+        déposer de résultat bloquait sinon _poll_scan_queue
+        indéfiniment sur "Recherche en cours...". Construire ce dict
+        reste une opération Python pure, aucune manipulation de widget
+        même en cas d'erreur (voir _on_scan_finished, seul endroit qui
+        touche l'affichage, toujours via self.after)."""
+        try:
+            result = data_purge.scan_candidate_folders_for_purge(
+                folders, recursive_folders=recursive_folders, date_from=date_from, date_to=date_to,
+                types=types, cancel_event=cancel_event, require_date_range=True,
+            )
+        except Exception as e:  # noqa: BLE001 - voir docstring : jamais un thread mort sans résultat
+            scan_queue.put((generation, {"error": str(e)}))
+            return
+        scan_queue.put((generation, result))
+
+    def _poll_scan_queue(self):
+        """Appelée UNIQUEMENT via self.after (jamais directement depuis
+        un thread de fond) — seul endroit, avec _on_scan_finished
+        qu'elle appelle, qui lit self._scan_queue et touche les widgets.
+        Se reprogramme elle-même tant qu'aucun résultat n'est encore
+        disponible ; ignore silencieusement tout résultat d'une
+        génération périmée (une recherche plus récente a déjà démarré,
+        voir _start_scan) en continuant de surveiller la file pour le
+        résultat ACTUEL.
+
+        Garde self._closing/winfo_exists() en tout premier (défense en
+        profondeur en plus de self.after_cancel déjà posé par
+        _close_dialog) : aucun callback vers cette fenêtre après le
+        début de sa destruction."""
+        self._poll_after_id = None
+        if self._closing or not self.winfo_exists():
+            return
+        try:
+            generation, result = self._scan_queue.get_nowait()
+        except queue.Empty:
+            self._poll_after_id = self.after(100, self._poll_scan_queue)
+            return
+        if generation != self._scan_generation:
+            self._poll_after_id = self.after(100, self._poll_scan_queue)
+            return
+        self._on_scan_finished(result)
+
+    def _on_scan_finished(self, result):
+        """Reçoit le résultat d'une recherche RÉELLEMENT terminée pour
+        les critères/dossiers ACTUELS (jamais périmée, voir
+        _poll_scan_queue) — seul endroit qui met à jour self.
+        _purge_paths et l'affichage à la suite d'une recherche.
+
+        Une recherche TRONQUÉE ou ANNULÉE reste explicitement marquée
+        "incomplète" (self._scan_incomplete) : le compte affiché REFLÈTE
+        ce qui a déjà été trouvé (demande explicite : "la recherche
+        partielle peut afficher les tournois déjà trouvés"), mais la
+        vérification de sauvegarde — et donc la purge — restent
+        bloquées (voir _update_verify_button_state) tant qu'une
+        recherche complète et non annulée n'a pas abouti.
+
+        Une erreur IMPRÉVUE pendant le scan (voir _run_scan_worker,
+        résultat {"error": ...} plutôt que les clés habituelles) est
+        traitée à part : jamais un blocage silencieux sur "Recherche en
+        cours...", résultat marqué incomplet, aucune sélection,
+        Vérifier/Purger désactivés, message explicite affiché (voir
+        _update_scan_ui)."""
+        if "error" in result:
+            self._scan_in_progress = False
+            self._purge_paths = []
+            self._scan_cancelled = False
+            self._scan_incomplete = True
+            self._scan_error = result["error"]
+            self._update_scan_ui()
+            self.count_lbl.config(text="Tournois concernés : 0 tournoi")
+            self._invalidate_coverage()
+            self._update_verify_button_state()
+            return
+        self._scan_error = None
+        self._scan_in_progress = False
+        self._purge_paths = result["purge_paths"]
+        self._truncated_folders = result["truncated_folders"]
+        self._skipped_dirs = result["skipped_dirs"]
+        self._other_files = result["other_files"]
+        self._unreadable_files = result["unreadable_files"]
+        self._dates_required = bool(result.get("dates_required", False))
+        self._scan_cancelled = bool(result["cancelled"])
+        self._scan_incomplete = self._scan_cancelled or bool(self._truncated_folders)
+        self._update_folders_display()
+        self._update_classification_display()
+        self._update_scan_ui()
+
+        n = len(self._purge_paths)
+        mot = "tournoi" if n <= 1 else "tournois"
+        self.count_lbl.config(text=f"Tournois concernés : {n} {mot}")
+        self._invalidate_coverage()
+        self._update_verify_button_state()
+
+    def _on_cancel_scan(self):
+        """"Annuler la recherche" — ne fait que poser le drapeau
+        partagé ; c'est le thread de recherche lui-même (data_purge.
+        scan_folder_for_tournaments/scan_candidate_folders) qui
+        s'arrête PROPREMENT à la prochaine vérification, jamais ici de
+        façon forcée. Le résultat (marqué "cancelled") arrive ensuite
+        normalement par la même file — voir _on_scan_finished."""
+        if self._scan_cancel_event is not None:
+            self._scan_cancel_event.set()
+
+    def _update_scan_ui(self):
+        """Affiche "Recherche en cours..." + le bouton "Annuler la
+        recherche" pendant un scan ; une fois terminé, affiche un
+        avertissement EXPLICITE si le résultat est incomplet (tronqué
+        ou annulé — demande explicite du 2026-10-08 : jamais une
+        recherche partielle présentée comme si elle était complète).
+
+        self._scan_error (voir _run_scan_worker/_on_scan_finished) est
+        vérifié EN PREMIER (hors "en cours") : une exception imprévue
+        ne doit jamais laisser la fenêtre bloquée indéfiniment sur
+        "Recherche en cours..." ni être confondue avec une simple
+        troncature/annulation — message dédié, explicite."""
+        if self._scan_in_progress:
+            self.scan_status_lbl.config(text="Recherche en cours...", foreground=MUTED)
+            if not self.cancel_scan_btn.winfo_manager():
+                self.cancel_scan_btn.pack(side="left", padx=(10, 0))
+            return
+        self.cancel_scan_btn.pack_forget()
+        if self._scan_error:
+            self.scan_status_lbl.config(
+                text=(
+                    "⚠ La recherche a échoué de façon inattendue "
+                    f"({self._scan_error}) — résultat incomplet, aucune purge "
+                    "possible. Modifiez un critère ou fermez puis rouvrez ce dialogue."
+                ),
+                foreground=DANGER_RED,
+            )
+        elif self._scan_cancelled:
+            self.scan_status_lbl.config(
+                text="⚠ Recherche annulée — résultat incomplet, ne peut pas être vérifié ni purgé.",
+                foreground=DANGER_RED,
+            )
+        elif self._truncated_folders:
+            n_t = len(self._truncated_folders)
+            mot_t = "dossier" if n_t <= 1 else "dossiers"
+            self.scan_status_lbl.config(
+                text=(
+                    f"⚠ {n_t} {mot_t} partiellement examiné(s) (limite atteinte) — "
+                    "résultat incomplet, ne peut pas être vérifié ni purgé."
+                ),
+                foreground=DANGER_RED,
+            )
+        else:
+            self.scan_status_lbl.config(text="", foreground=MUTED)
+
+    def _update_verify_button_state(self):
+        """"Vérifier la sauvegarde..." doit rester DÉSACTIVÉ pendant une
+        recherche en cours ET après une recherche incomplète (tronquée
+        ou annulée) — demande explicite du 2026-10-08 : une recherche
+        partielle peut afficher les tournois déjà trouvés, mais ne doit
+        JAMAIS autoriser la suite (vérification, puis purge)."""
+        if self._scan_in_progress or self._scan_incomplete or not self._purge_paths:
+            self.verify_btn.config(state="disabled")
+        else:
+            self.verify_btn.config(state="normal")
+
+    def _invalidate_coverage(self):
+        self._coverage = None
+        self.purge_btn.config(state="disabled")
+        self.backup_now_btn.pack_forget()
+        if not self._purge_paths:
+            self.backup_status_lbl.config(
+                text="Aucun tournoi ne correspond actuellement aux critères sélectionnés.",
+                foreground=MUTED,
+            )
+        else:
+            self.backup_status_lbl.config(
+                text="Cliquez sur « Vérifier la sauvegarde... » avant de purger.",
+                foreground=MUTED,
+            )
+
+    def _on_verify_backup(self):
+        if self._scan_in_progress:
+            return  # bouton normalement désactivé dans ce cas — garde-fou défensif
+        if self._dates_required:
+            # Garde-fou défensif supplémentaire (ne devrait jamais
+            # arriver : le bouton dépend de self._purge_paths, déjà
+            # vide dans ce cas) — message explicite dédié aux dates,
+            # jamais confondu avec une recherche tronquée/annulée (voir
+            # self.date_status_lbl pour le détail exact : manquante(s),
+            # invalide(s) ou inversée(s)).
+            messagebox.showinfo(
+                "Dates obligatoires",
+                "Renseignez les deux dates (Du et Au), valides et correctement "
+                "ordonnées, avant de pouvoir vérifier la sauvegarde ou purger.",
+                parent=self,
+            )
+            return
+        if self._scan_incomplete:
+            messagebox.showinfo(
+                "Recherche incomplète",
+                "La recherche des tournois concernés est incomplète (tronquée "
+                "ou annulée) — relancez une recherche complète (changez un "
+                "critère ou le dossier) avant de vérifier la sauvegarde.",
+                parent=self,
+            )
+            return
+        if not self._purge_paths:
+            messagebox.showinfo(
+                "Aucun tournoi concerné",
+                "Aucun tournoi ne correspond actuellement aux critères sélectionnés.",
+                parent=self,
+            )
+            return
+        self._run_coverage_check()
+
+    def _run_coverage_check(self):
+        """Revérifie TOUJOURS en direct (jamais une confiance aveugle
+        dans backup_history.json, fournie ici seulement comme liste de
+        candidats à re-tester — voir data_purge.check_purge_coverage/
+        _covering_backup_for)."""
+        history = backup_history.load_history()
+        coverage = data_purge.check_purge_coverage(self._purge_paths, history)
+        self._coverage = coverage
+        self._render_coverage(coverage)
+
+    def _render_coverage(self, coverage):
+        if coverage["all_covered"]:
+            lines = []
+            for b in coverage["backups_used"]:
+                if b["hash_verified"]:
+                    lines.append(f"✓ Sauvegarde vérifiée (SHA-256) — {b['backup_dir']}")
+                else:
+                    # Formulation EXACTE demandée (2026-10-07) — ne
+                    # transforme jamais une ancienne sauvegarde en
+                    # sauvegarde vérifiée par hash.
+                    lines.append(
+                        "✓ Ancienne sauvegarde vérifiée — contrôle d'intégrité "
+                        f"SHA-256 indisponible — {b['backup_dir']}"
+                    )
+            self.backup_status_lbl.config(text="\n".join(lines), foreground="#1f6b3a")
+            self.backup_now_btn.pack_forget()
+            self.purge_btn.config(state="normal")
+        else:
+            n_uncovered = len(coverage["uncovered"])
+            mot = "tournoi" if n_uncovered <= 1 else "tournois"
+            self.backup_status_lbl.config(
+                text=(
+                    f"{n_uncovered} {mot} non couvert(s) par une sauvegarde actuellement "
+                    "accessible et vérifiable. Reconnectez le support de sauvegarde "
+                    "concerné, ou faites une nouvelle sauvegarde avant de purger."
+                ),
+                foreground=DANGER_RED,
+            )
+            self.backup_now_btn.pack(side="left", padx=(10, 0))
+            self.purge_btn.config(state="disabled")
+
+    def _on_backup_now(self):
+        """"Faire une sauvegarde maintenant..." — appelle EXACTEMENT le
+        même circuit que "💾 Sauvegarder sur clé USB" du Menu principal
+        (App._run_backup_flow, jamais un second mécanisme), puis relance
+        automatiquement la vérification de couverture en cas de succès
+        (demande explicite : "retour au dialogue de purge, relance
+        automatiquement la vérification, autorise à continuer si
+        désormais entièrement couvert").
+
+        Transmet désormais EXPLICITEMENT self._purge_paths (demande du
+        2026-10-08, revue de sécurité : "la sauvegarde doit utiliser
+        exactement la sélection validée dans Purger Données, sans
+        effectuer une recherche indépendante dans le seul dossier par
+        défaut" — correction du défaut réel diagnostiqué, "Tournois
+        sauvegardés : 0" malgré une sélection non vide) ET self.
+        _accessible_folders (pour que backup_restore.create_backup
+        regroupe correctement les fichiers par dossier d'origine RÉEL
+        — jamais une redécouverte, jamais le seul "Dossier par
+        défaut")."""
+        result = self.app._run_backup_flow(
+            self, tournament_files=self._purge_paths,
+            tournament_source_folders=self._accessible_folders,
+        )
+        if result is not None and self._purge_paths:
+            self._run_coverage_check()
+
+    def _on_purge_clicked(self):
+        if self._scan_in_progress or self._scan_incomplete:
+            # Ne devrait jamais arriver (le bouton "Purger..." dépend de
+            # self._coverage, lui-même jamais mis à jour tant que le
+            # scan est incomplet/en cours) — garde-fou défensif
+            # supplémentaire demandé explicitement le 2026-10-08 : une
+            # recherche tronquée ou annulée ne doit JAMAIS autoriser une
+            # purge, même par un chemin inattendu.
+            messagebox.showerror(
+                "Recherche incomplète",
+                "La recherche des tournois concernés doit être complète et "
+                "non annulée avant de purger.", parent=self,
+            )
+            return
+        if not self._purge_paths:
+            return
+        if self._coverage is None or not self._coverage["all_covered"]:
+            # Ne devrait jamais arriver (le bouton est désactivé dans ce
+            # cas) — garde-fou défensif supplémentaire, jamais un coût
+            # réel : défense en profondeur, comme purge_tournaments
+            # revérifie elle-même l'absence de tournoi ouvert.
+            messagebox.showerror(
+                "Sauvegarde non vérifiée",
+                "Vérifiez d'abord la sauvegarde avant de purger.", parent=self,
+            )
+            return
+
+        still_open = data_purge.find_open_tournaments(self._purge_paths)
+        if still_open:
+            names = "\n".join(os.path.basename(p) for p in still_open)
+            messagebox.showerror(
+                "Tournoi(s) ouvert(s)",
+                "Fermez le(s) tournoi(s) suivant(s) avant de purger :\n\n" + names,
+                parent=self,
+            )
+            return
+
+        if not self._confirm_purge():
+            return
+
+        try:
+            n = data_purge.purge_tournaments(self._purge_paths)
+        except data_purge.PurgeError as e:
+            messagebox.showerror("Erreur de purge", str(e), parent=self)
+            return
+
+        mot = "fichier" if n <= 1 else "fichiers"
+        supprime = "supprimé" if n <= 1 else "supprimés"
+        messagebox.showinfo(
+            "Purge terminée",
+            f"{n} {mot} .tournoi {supprime} définitivement.", parent=self,
+        )
+        self.destroy()
+
+    def _build_confirm_purge_dialog(self):
+        """Construit (SANS l'afficher modalement — aucun grab, aucun
+        wait_window ici) la fenêtre de confirmation finale, avec le
+        contenu propre à "Purger Données" (période/types/compte exact/
+        état de la sauvegarde vérifiée), conformément au visuel validé
+        par l'utilisateur — mêmes libellés de boutons ("Annuler"/
+        "Purger") que _confirm_log_purge. Séparée de _confirm_purge
+        EXPRÈS (2026-10-08, même raison que _build_recursive_scope_
+        dialog) : permet d'inspecter/interagir avec cette fenêtre dans
+        un test SANS jamais passer par wait_window.
+
+        Renvoie (win, result) — `result` est un dict mutable
+        {"confirmed": False} mis à True UNIQUEMENT si "Purger" est
+        cliqué explicitement, juste avant que `win` se détruise
+        lui-même (Annuler/croix laissent "confirmed" à False)."""
+        raw_from = self.date_from_var.get().strip()
+        raw_to = self.date_to_var.get().strip()
+        if raw_from and raw_to:
+            period_text = f"entre le {raw_from} et le {raw_to} inclus"
+        elif raw_from:
+            period_text = f"à partir du {raw_from} (jusqu'à la fin)"
+        elif raw_to:
+            period_text = f"jusqu'au {raw_to} inclus (depuis le début)"
+        else:
+            period_text = "sur toute la période disponible"
+
+        checked = [self._TYPE_LABELS[t] for t in data_purge.PURGE_TYPES if t in self._checked_types()]
+        types_text = ", ".join(checked)
+
+        n = len(self._purge_paths)
+        mot = "tournoi" if n <= 1 else "tournois"
+        backup_note = self.backup_status_lbl.cget("text")
+
+        message = (
+            f"Supprimer définitivement {n} {mot} (fichiers .tournoi),\n"
+            f"{period_text},\n"
+            f"types concernés : {types_text}.\n\n"
+            f"Sauvegarde vérifiée :\n{backup_note}\n\n"
+            "Cette opération est irréversible."
+        )
+
+        result = {"confirmed": False}
+        win = tk.Toplevel(self)
+        win.title("Confirmer la purge")
+        win.transient(self)
+
+        ttk.Label(win, text=message, justify="left", wraplength=400).grid(
+            row=0, column=0, columnspan=2, padx=16, pady=16,
+        )
+
+        def _cancel():
+            result["confirmed"] = False
+            win.destroy()
+
+        def _purge():
+            result["confirmed"] = True
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=1, column=0, columnspan=2, pady=(0, 16))
+        ttk.Button(btns, text="Annuler", command=_cancel).pack(side="left", padx=5)
+        ttk.Button(btns, text="Purger", command=_purge).pack(side="left", padx=5)
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        return win, result
+
+    def _confirm_purge(self):
+        """Confirmation OBLIGATOIRE avant suppression définitive —
+        construit la fenêtre (voir _build_confirm_purge_dialog) puis
+        l'affiche modalement via _show_child_modal_window. Renvoie True
+        SEULEMENT si "Purger" est cliqué explicitement — Annuler et la
+        fermeture de la fenêtre renvoient False, sans aucune
+        suppression.
+
+        CORRECTIF DU 2026-10-08 (risque de SIGSEGV identifié, jamais
+        encore déclenché manuellement) : cette fenêtre posait auparavant
+        son propre win.grab_set() SANS que DataPurgeDialog ne cède
+        d'abord le sien — un grab IMBRIQUÉ, exactement le même défaut
+        structurel déjà corrigé pour le calendrier (_show_log_date_
+        picker) puis pour le choix de portée (_ask_recursive_scope).
+        Utilise désormais _show_child_modal_window (transfert de grab
+        sécurisé, restauration UNIQUE, jamais réentrante pendant une
+        destruction — voir son historique complet) au lieu de poser son
+        propre grab_set()/appeler wait_window() directement. Aucun
+        changement de CE QUI est affiché ni de la logique de
+        suppression elle-même (toujours décidée par _purge/_cancel dans
+        _build_confirm_purge_dialog, toujours renvoyée via
+        `result["confirmed"]`)."""
+        win, result = self._build_confirm_purge_dialog()
+        self._show_child_modal_window(win)
+        return result["confirmed"]
+
+
+# Libellés affichés dans BackupProgressDialog selon (stage_prefix, stage) —
+# voir backup_restore.create_backup/restore_backup pour la signification de
+# ces deux valeurs. stage_prefix "backup" couvre AUSSI bien la sauvegarde du
+# Menu principal que celle de Purge Données (demande explicite du
+# 2026-10-12 : "comme pour les opérations du Menu principal") — les DEUX
+# passent par _run_backup_flow, qui n'utilise jamais stage_prefix="safety_
+# backup"/"restore" (réservés à restore_backup, voir plus bas).
+_BACKUP_STAGE_LABELS = {
+    ("backup", "tournament_files"): "Copie des fichiers de tournoi…",
+    ("backup", "poker_data"): "Copie des données de l'application…",
+    ("safety_backup", "tournament_files"): "Sauvegarde de sécurité — fichiers de tournoi…",
+    ("safety_backup", "poker_data"): "Sauvegarde de sécurité — données de l'application…",
+    ("restore", "tournament_files"): "Restauration des fichiers de tournoi…",
+    ("restore", "poker_data"): "Restauration des données de l'application…",
+}
+
+
+class BackupProgressDialog(tk.Toplevel):
+    """Fenêtre modale de progression RÉELLE pour les sauvegardes/
+    restaurations (demande explicite du 2026-10-12, "y compris les barres
+    de progression", et "ne jamais annoncer 100% avant que l'opération
+    soit réellement terminée") — pilotée UNIQUEMENT par des événements
+    reçus via une queue.Queue() alimentée depuis le thread d'arrière-plan
+    qui exécute réellement la copie (voir _run_blocking_with_progress,
+    seul créateur de cette classe ; jamais une simulation ni une barre
+    indéterminée).
+
+    WM_DELETE_WINDOW désactivé : cette fenêtre ne se ferme JAMAIS d'elle-
+    même avant la réception de l'événement sentinel ("done",) — voir
+    handle_event, qui est aussi le seul endroit où la barre atteint
+    réellement 100% (tant qu'une copie est en cours, elle reste plafonnée
+    à 99%, même pour le tout dernier fichier d'une étape, puisque
+    l'étape suivante — ou la fin réelle de l'opération — n'est pas encore
+    garantie à cet instant)."""
+
+    def __init__(self, parent, title):
+        super().__init__(parent)
+        self.title(title)
+        self.configure(bg=FELT_DARK)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.stage_var = tk.StringVar(value="Préparation…")
+        self.file_var = tk.StringVar(value="")
+        tk.Label(
+            self, textvariable=self.stage_var, bg=FELT_DARK, fg="white",
+            font=("Helvetica", 11, "bold"),
+        ).pack(padx=24, pady=(18, 4))
+        tk.Label(
+            self, textvariable=self.file_var, bg=FELT_DARK, fg="white",
+            font=("Helvetica", 9),
+        ).pack(padx=24, pady=(0, 10))
+        self.progress = ttk.Progressbar(
+            self, orient="horizontal", mode="determinate", length=320, maximum=100,
+        )
+        self.progress.pack(padx=24, pady=(0, 18))
+
+    def handle_event(self, event):
+        """Traite UN événement de la queue — ("progress", stage_prefix,
+        stage, current, total, name) ou ("done",) — jamais appelé
+        ailleurs que depuis le poll() de _run_blocking_with_progress,
+        toujours dans le thread Tk principal."""
+        if event[0] == "done":
+            self.progress["value"] = 100
+            self.destroy()
+            return
+        _, stage_prefix, stage, current, total, name = event
+        self.stage_var.set(_BACKUP_STAGE_LABELS.get((stage_prefix, stage), "Copie en cours…"))
+        self.file_var.set(f"{name}  ({current}/{total})" if total else name)
+        self.progress["value"] = min(99, int(current * 100 / total)) if total else 0
+
+
+def _run_blocking_with_progress(parent, title, blocking_fn):
+    """Exécute `blocking_fn(progress_callback)` (soit backup_restore.
+    create_backup, soit backup_restore.restore_backup, appelée par
+    l'appelant via un lambda qui lui transmet ce `progress_callback`)
+    dans un thread d'arrière-plan, tout en affichant sa progression
+    RÉELLE dans une BackupProgressDialog.
+
+    N'utilise JAMAIS wait_window()/update()/mainloop() imbriqué pour
+    attendre la fin de l'opération (diagnostic réel du 2026-10-12, un
+    VRAI SIGSEGV macOS reproduit de façon fiable via la suite de tests —
+    crash natif AppKit/CALayer pendant Tcl_DoOneEvent/TclServiceIdle,
+    confirmé par rapport de plantage système — en entrant dans la boucle
+    d'événements Tcl de cette manière juste après la construction d'une
+    fenêtre complexe telle que DataPurgeDialog, qui n'a alors ENCORE
+    JAMAIS purgé sa propre file d'attente d'inactivité ; même famille de
+    risque que celle déjà identifiée indépendamment pour update()/
+    update_idletasks() par _pump_until_scan_idle, dans tests/test_data_
+    purge_dialog.py). À la place : une boucle Python MANUELLE
+    (time.sleep() + lecture directe de la queue), qui n'appelle QUE
+    dialog.update_idletasks() — jamais la boucle Tcl complète
+    (Tcl_DoOneEvent) — et assez fréquemment pour ne jamais laisser
+    s'accumuler le gros retard d'inactivité dont une seule purge massive
+    différée (via wait_window()/update() après coup) déclenchait le
+    crash.
+
+    Renvoie le résultat de `blocking_fn` de façon SYNCHRONE pour
+    l'appelant — si `blocking_fn` a levé une exception (typiquement
+    backup_restore.BackupError), elle est RE-LEVÉE ICI, dans le thread
+    principal, pour que le try/except déjà en place chez les deux
+    appelants réels (App._run_backup_flow, restore_now dans _choose_
+    tournament_file) continue de fonctionner SANS AUCUN changement à sa
+    propre logique.
+
+    Transfert de grab (`parent` est soit la fenêtre "Bienvenue" du Menu
+    principal, soit DataPurgeDialog lui-même, qui détient TOUJOURS son
+    propre grab au moment de cet appel) : jamais deux grabs actifs en
+    même temps — restauré sur `parent` une fois la boucle manuelle
+    terminée, en code séquentiel normal (plus aucun risque de rappel Tk
+    réentrant ici, puisque plus rien n'entre dans la boucle d'événements
+    Tcl entre-temps).
+
+    thread.join() (jamais un thread daemon simplement abandonné à son
+    sort) : garantit que ce thread a RÉELLEMENT terminé avant que cette
+    fonction ne rende la main à son appelant — en pratique quasi
+    instantané, puisque ("done",) n'est poussé sur la queue qu'en toute
+    dernière instruction de worker()."""
+    events = queue.Queue()
+    result_box = {}
+
+    def progress_callback(stage_prefix, stage, current, total, name):
+        events.put(("progress", stage_prefix, stage, current, total, name))
+
+    def worker():
+        try:
+            result_box["result"] = blocking_fn(progress_callback)
+        except Exception as e:
+            result_box["error"] = e
+        events.put(("done",))
+
+    dialog = BackupProgressDialog(parent, title)
+    parent.grab_release()
+    dialog.grab_set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    done = False
+    while not done:
+        time.sleep(0.05)
+        try:
+            while True:
+                event = events.get_nowait()
+                if event[0] == "done":
+                    done = True
+                dialog.handle_event(event)
+        except queue.Empty:
+            pass
+        if not done:
+            dialog.update_idletasks()
+    thread.join()
+
+    try:
+        if parent.winfo_exists():
+            parent.grab_set()
+    except tk.TclError:
+        pass
+
+    if "error" in result_box:
+        raise result_box["error"]
+    return result_box["result"]
+
+
 class App(tk.Tk):
     def report_callback_exception(self, exc, val, tb):
         """Tkinter appelle ceci pour toute exception levée dans un callback
@@ -5399,6 +7910,34 @@ class App(tk.Tk):
         # mouvement a eu lieu).
         self.voice_command_queue = queue.Queue()
         self.voice_awaiting_resume = False
+        # "Mode joueurs" de l'onglet Mouvements (demande du 2026-10-05) :
+        # True UNIQUEMENT entre une commande "Afficher Mouvements" reçue du
+        # téléphone (voir _on_voice_word, word == "mouvements") et le
+        # "Terminé" qui clôt le cycle (_finish_movement_alert) — jamais
+        # déclenché par un clic manuel de l'organisateur sur l'onglet
+        # (<<NotebookTabChanged>>/_on_notebook_tab_changed ne touche pas à
+        # ce drapeau).
+        self._moves_tab_player_mode = False
+        # _moves_tab_display_mode_applied : dernier mode RÉELLEMENT appliqué
+        # par _apply_moves_tab_display_mode (None avant le tout premier
+        # appel, pour qu'il s'exécute une fois même si le mode démarre à
+        # False) — permet de n'agir (style/displaycolumns/largeurs) que sur
+        # un changement réel, jamais à chaque _refresh_moves_tab (appelée,
+        # elle, une fois par seconde tant que l'onglet est affiché).
+        self._moves_tab_display_mode_applied = None
+        # Largeurs des 7 colonnes de l'affichage NORMAL, mémorisées au
+        # moment d'entrer en mode joueurs (voir _apply_moves_tab_display_
+        # mode) pour être restaurées à l'identique à la sortie — jamais
+        # écrasées par un redimensionnement fait en mode joueurs, qui lui
+        # est mémorisé séparément (voir moves_tab_columns.py).
+        self._moves_tab_normal_col_widths = None
+        # "Movt Précédent" (demande du 2026-10-06) : interrupteur d'AFFICHAGE
+        # pur — True = la dernière série terminée (previous_seat_moves) est
+        # ajoutée, en italique, à la suite des mouvements réellement en
+        # attente. Jamais lu par aucune logique métier (voir _refresh_moves_
+        # tab/_toggle_previous_moves_display) — remis à False par
+        # _finish_movement_alert à chaque "Terminé".
+        self._moves_tab_show_previous_moves = False
         # Bandeau d'élimination (écran projecteur + onglet Chronomètre,
         # voir _queue_elimination_banner / _advance_elimination_banner) :
         # file FIFO sans plafond des éliminations en attente d'affichage
@@ -5440,6 +7979,13 @@ class App(tk.Tk):
         # Contrôle à distance depuis un téléphone (voir remote_control.py).
         self.remote_control_server = None
         self._remote_control_tournament_name = "Tournoi"
+        # Serveur minimal de partage PDF par QR code (bouton "💬 Envoi
+        # WhatsApp" > "📱 Mon téléphone", demande du 2026-10-11) —
+        # démarré UNIQUEMENT si self.remote_control_server n'est pas
+        # déjà actif au moment du partage (voir _get_or_start_whatsapp_
+        # share_port) : totalement indépendant de remote_control_server
+        # ci-dessus, jamais confondu avec lui.
+        self._whatsapp_share_server = None
         # Identifiant STABLE du tournoi pour le journal LOG (action_log.py,
         # chantier "LOG", 2026-09-24) — même principe/même prudence que
         # _remote_control_tournament_name juste au-dessus (simple attribut
@@ -5863,6 +8409,27 @@ class App(tk.Tk):
             font=bold_font, relief="flat",
         )
         style.map("Players.Treeview.Heading", background=[("active", FELT)])
+        # Style dédié au "mode joueurs" de l'onglet Mouvements (demande du
+        # 2026-10-05, lisibilité à distance quand "Afficher Mouvements" est
+        # déclenché depuis le téléphone) : police et lignes nettement plus
+        # grandes, sur un style ttk SÉPARÉ de "Treeview"/"Players.Treeview"
+        # pour n'affecter aucun autre tableau (Joueurs, Paiements, Tables...).
+        # Voir _apply_moves_tab_display_mode pour le basculement à chaud.
+        style.configure(
+            "MovesBig.Treeview", background=CREAM, fieldbackground=CREAM,
+            foreground=TEXT_DARK, rowheight=48, borderwidth=0,
+            font=("Helvetica", 24, "bold"),
+        )
+        style.map(
+            "MovesBig.Treeview",
+            background=[("selected", GOLD)],
+            foreground=[("selected", TEXT_DARK)],
+        )
+        style.configure(
+            "MovesBig.Treeview.Heading", background=FELT_DARK, foreground=GOLD,
+            font=("Helvetica", 24, "bold"), relief="flat",
+        )
+        style.map("MovesBig.Treeview.Heading", background=[("active", FELT)])
         style.configure(
             "Vertical.TScrollbar", background=FELT_LIGHT, troughcolor=FELT_DARK,
             arrowcolor=GOLD, bordercolor=FELT_DARK,
@@ -6101,6 +8668,102 @@ class App(tk.Tk):
     # ---------------------------------------------------------------
     # Ouverture / création du fichier de tournoi
     # ---------------------------------------------------------------
+    def _run_backup_flow(self, parent, tournament_files=None, tournament_source_folders=None):
+        """Mécanisme NORMAL de sauvegarde de Senaco (demande du
+        2026-10-07) — SEUL point d'appel réel pour "💾 Sauvegarder sur clé
+        USB" (Menu principal) ET pour "Faire une sauvegarde maintenant..."
+        (fenêtre "Purger > Données", voir DataPurgeDialog) : jamais un
+        second circuit parallèle. Demande le dossier de destination,
+        appelle backup_restore.create_backup (jamais modifiée elle-même),
+        puis — UNIQUEMENT si la sauvegarde s'est terminée avec succès —
+        enregistre cette réussite dans l'historique (backup_history.
+        record_backup) à partir du manifeste RÉELLEMENT écrit sur le
+        disque de destination (jamais reconstruit indépendamment).
+
+        `tournament_files`/`tournament_source_folders` (demande
+        explicite du 2026-10-08, revue de sécurité : "la sauvegarde
+        lancée depuis Purger Données doit couvrir EXACTEMENT les
+        fichiers sélectionnés pour la purge, jamais une redécouverte
+        indépendante dans le seul Dossier par défaut" — diagnostic
+        d'une sauvegarde réelle annoncée "0 tournoi" alors que le scan
+        de Purger Données en trouvait) : transmis tels quels à
+        backup_restore.create_backup. `None` (défaut, INCHANGÉ) —
+        utilisé par "💾 Sauvegarder sur clé USB" du Menu principal, qui
+        continue de redécouvrir dans le seul dossier par défaut comme
+        avant.
+
+        Garde-fou défensif supplémentaire (ne devrait jamais arriver :
+        create_backup annule déjà tout au moindre fichier manquant
+        pendant la copie) : si `tournament_files` est fourni et non
+        vide mais que le nombre réellement sauvegardé diverge du nombre
+        demandé, erreur explicite et AUCUN enregistrement dans
+        l'historique — jamais le message de succès dans ce cas, pour ne
+        plus jamais répéter la confusion "0 tournoi" déjà rapportée.
+
+        Renvoie le dict résultat de create_backup en cas de succès
+        (utile à DataPurgeDialog pour relancer immédiatement sa
+        vérification de couverture), ou None si l'utilisateur a annulé
+        le choix de dossier, si la sauvegarde a échoué, ou si le
+        garde-fou ci-dessus s'est déclenché — dans tous ces cas,
+        strictement AUCUNE trace n'est ajoutée à l'historique (demande
+        explicite : une sauvegarde annulée, échouée ou incohérente
+        n'est jamais considérée valide)."""
+        dest = filedialog.askdirectory(
+            title="Choisir la clé USB ou le dossier de destination", parent=parent,
+        )
+        if not dest:
+            return None
+        requested_count = len(tournament_files) if tournament_files is not None else None
+        try:
+            result_info = _run_blocking_with_progress(
+                parent, "Sauvegarde en cours…",
+                lambda progress_callback: backup_restore.create_backup(
+                    dest, tournament_files=tournament_files,
+                    tournament_source_folders=tournament_source_folders,
+                    progress_callback=progress_callback,
+                ),
+            )
+        except backup_restore.BackupError as e:
+            messagebox.showerror("Erreur de sauvegarde", str(e), parent=parent)
+            return None
+        if requested_count and result_info["tournament_file_count"] != requested_count:
+            messagebox.showerror(
+                "Sauvegarde incomplète",
+                "La sauvegarde a été réalisée dans un état incohérent : "
+                f"{requested_count} tournoi(s) sélectionné(s), seulement "
+                f"{result_info['tournament_file_count']} réellement sauvegardé(s).\n\n"
+                "Par sécurité, cette sauvegarde n'est PAS enregistrée dans "
+                "l'historique et ne doit jamais être considérée comme valide "
+                "pour autoriser une purge.",
+                parent=parent,
+            )
+            return None
+        try:
+            manifest = backup_restore.validate_backup_folder(result_info["backup_dir"])
+            backup_history.record_backup(result_info["backup_dir"], manifest)
+        except backup_restore.BackupError:
+            # La sauvegarde elle-même a bien réussi (result_info est déjà
+            # renvoyé par create_backup sans exception) : une anomalie ici
+            # ne doit jamais faire croire à l'utilisateur que SA
+            # sauvegarde a échoué — seul l'historique ne serait pas à
+            # jour, jamais les données réelles sur le disque de
+            # destination.
+            pass
+        data_note = (
+            "Données de l'application (réglages, joueurs, photos...) incluses."
+            if result_info["poker_tournament_data_included"]
+            else "Aucune donnée d'application (~/.poker_tournament) trouvée à sauvegarder."
+        )
+        messagebox.showinfo(
+            "Sauvegarde terminée avec succès",
+            "Sauvegarde terminée avec succès.\n\n"
+            f"Emplacement : {result_info['backup_dir']}\n"
+            f"Tournois sauvegardés : {result_info['tournament_file_count']}\n"
+            f"{data_note}",
+            parent=parent,
+        )
+        return result_info
+
     def _choose_tournament_file(self):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
@@ -6266,36 +8929,12 @@ class App(tk.Tk):
                 win.destroy()
 
         def backup_now():
-            """"💾 Sauvegarder sur clé USB" : copie les .tournoi du
-            dossier de tournoi par défaut + tout ~/.poker_tournament
-            vers un sous-dossier horodaté du dossier choisi (voir
-            backup_restore.create_backup — jamais de modification des
-            fichiers d'origine, uniquement des lectures/copies).
-            Disponible même si un tournoi est ouvert ailleurs : ne fait
-            que LIRE ses fichiers, jamais les modifier."""
-            dest = filedialog.askdirectory(
-                title="Choisir la clé USB ou le dossier de destination", parent=win,
-            )
-            if not dest:
-                return
-            try:
-                result_info = backup_restore.create_backup(dest)
-            except backup_restore.BackupError as e:
-                messagebox.showerror("Erreur de sauvegarde", str(e), parent=win)
-                return
-            data_note = (
-                "Données de l'application (réglages, joueurs, photos...) incluses."
-                if result_info["poker_tournament_data_included"]
-                else "Aucune donnée d'application (~/.poker_tournament) trouvée à sauvegarder."
-            )
-            messagebox.showinfo(
-                "Sauvegarde terminée avec succès",
-                "Sauvegarde terminée avec succès.\n\n"
-                f"Emplacement : {result_info['backup_dir']}\n"
-                f"Tournois sauvegardés : {result_info['tournament_file_count']}\n"
-                f"{data_note}",
-                parent=win,
-            )
+            """"💾 Sauvegarder sur clé USB" — voir App._run_backup_flow,
+            seul point d'appel réel (demande du 2026-10-07 : le bouton
+            "Faire une sauvegarde maintenant..." de la purge Données doit
+            utiliser EXACTEMENT ce même mécanisme, jamais un second
+            circuit parallèle)."""
+            self._run_backup_flow(win)
 
         def restore_now():
             """"♻️ Restaurer depuis une clé USB" : voir backup_restore.
@@ -6326,6 +8965,46 @@ class App(tk.Tk):
                 return
             count = len(manifest.get("tournament_files", []))
             has_data = manifest.get("poker_tournament_data_included", False)
+            # Transparence EXPLICITE sur l'arborescence technique d'une
+            # sauvegarde MULTI-DOSSIERS (demande explicite du
+            # 2026-10-08, "la restauration ne doit pas créer
+            # silencieusement une organisation différente de celle
+            # attendue") : restore_backup() recrée chaque chemin
+            # relatif du manifeste tel quel sous le dossier de tournoi
+            # ACTUEL (voir sa docstring, inchangée) — pour une
+            # sauvegarde à plusieurs dossiers d'origine distincts, ces
+            # chemins commencent par un préfixe technique
+            # "<index>_<nom>/" (voir backup_restore.create_backup) :
+            # on l'annonce ICI, avant confirmation, avec la
+            # correspondance exacte index -> dossier d'origine réel,
+            # plutôt que de laisser cette structure apparaître sans
+            # explication après coup.
+            multi_folders = manifest.get("tournament_source_folders")
+            multi_note = ""
+            if multi_folders:
+                mapping_lines = "\n".join(
+                    f"  {index}_{backup_restore.sanitize_folder_label(folder)}  ->  {folder}"
+                    for index, folder in enumerate(multi_folders)
+                )
+                multi_note = (
+                    "\n\nCette sauvegarde provient de PLUSIEURS dossiers distincts. "
+                    "Les fichiers seront restaurés dans des sous-dossiers techniques "
+                    "sous le dossier de tournoi actuel, un par dossier d'origine "
+                    f"(jamais mélangés, jamais de collision) :\n{mapping_lines}"
+                )
+            # Avertissement explicite sur le remplacement (demande du
+            # 2026-10-10) : restore_backup() écrase bien un .tournoi de
+            # même nom relatif déjà présent à destination (comportement
+            # voulu, protégé par la sauvegarde de sécurité ci-dessous) —
+            # mais rien ne le disait jusqu'ici avant confirmation.
+            # Seulement si cette sauvegarde contient effectivement des
+            # .tournoi (count > 0) : sinon aucun fichier de tournoi
+            # n'est concerné par cette restauration.
+            overwrite_note = (
+                "\n\nLes fichiers de tournoi (.tournoi) de même nom déjà "
+                "présents dans le dossier de tournoi actuel seront "
+                "REMPLACÉS par ceux de la sauvegarde."
+            ) if count else ""
             if not messagebox.askyesno(
                 "Confirmer la restauration",
                 f"Sauvegarde du {manifest.get('created_at', '?')}\n"
@@ -6333,7 +9012,8 @@ class App(tk.Tk):
                 f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
                 f"Tournois : {count}\n"
                 "Données de l'application (réglages, joueurs, photos...) : "
-                f"{'oui' if has_data else 'non'}\n\n"
+                f"{'oui' if has_data else 'non'}"
+                f"{multi_note}{overwrite_note}\n\n"
                 "Une sauvegarde de sécurité des données actuelles sera créée "
                 "automatiquement avant toute modification.\n\n"
                 "Confirmer la restauration ?",
@@ -6341,7 +9021,12 @@ class App(tk.Tk):
             ):
                 return
             try:
-                restore_info = backup_restore.restore_backup(src)
+                restore_info = _run_blocking_with_progress(
+                    win, "Restauration en cours…",
+                    lambda progress_callback: backup_restore.restore_backup(
+                        src, progress_callback=progress_callback,
+                    ),
+                )
             except backup_restore.BackupError as e:
                 messagebox.showerror("Erreur de restauration", str(e), parent=win)
                 return
@@ -6355,6 +9040,70 @@ class App(tk.Tk):
                 f"{restore_info['safety_backup_dir']}",
                 parent=win,
             )
+
+        def open_basic_settings():
+            """"⚙️ Paramètres de base" (demande explicite du 2026-10-12) :
+            fenêtre MINIMALE, accessible SANS ouvrir ni créer aucun
+            tournoi — jamais le moindre accès à self.db ici. Réutilise
+            EXACTEMENT les mécanismes globaux déjà existants : export_
+            prefs pour le nom du club (même clé "club_name" que partout
+            ailleurs dans l'application) et tournament_prefs.load_last_
+            settings()/save_last_settings() pour le "Dossier par
+            défaut" — LE MÊME magasin global que celui déjà lu par
+            backup_restore.restore_backup() pour sa propre validation
+            (voir sa docstring). Ne modifie JAMAIS un réglage SPÉCIFIQUE
+            à un tournoi : aucun des deux réglages ici n'en est un."""
+            settings_win = tk.Toplevel(win)
+            settings_win.title("Paramètres de base")
+            settings_win.configure(bg=FELT_DARK)
+            settings_win.resizable(False, False)
+            settings_win.transient(win)
+
+            club_var = tk.StringVar(value=export_prefs.load_value("club_name", "") or "")
+            folder_var = tk.StringVar(
+                value=tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+            )
+
+            tk.Label(
+                settings_win, text="Nom du Club :", bg=FELT_DARK, fg="white",
+            ).grid(row=0, column=0, sticky="w", padx=12, pady=(18, 6))
+            ttk.Entry(settings_win, textvariable=club_var, width=34).grid(
+                row=0, column=1, columnspan=2, sticky="we", padx=(0, 12), pady=(18, 6),
+            )
+
+            tk.Label(
+                settings_win, text="Dossier par défaut :", bg=FELT_DARK, fg="white",
+            ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+            ttk.Entry(settings_win, textvariable=folder_var, width=34).grid(
+                row=1, column=1, sticky="we", padx=(0, 6), pady=(0, 6),
+            )
+
+            def browse_folder():
+                chosen = filedialog.askdirectory(
+                    title="Choisir le dossier par défaut", parent=settings_win,
+                )
+                if chosen:
+                    folder_var.set(chosen)
+
+            ttk.Button(settings_win, text="📂 Parcourir…", command=browse_folder).grid(
+                row=1, column=2, sticky="w", padx=(0, 12), pady=(0, 6),
+            )
+
+            def save_and_close():
+                export_prefs.save_value("club_name", club_var.get().strip())
+                tournament_prefs.save_last_settings(
+                    {"tournament_day_folder": folder_var.get().strip()}
+                )
+                settings_win.destroy()
+
+            btns = tk.Frame(settings_win, bg=FELT_DARK)
+            btns.grid(row=2, column=0, columnspan=3, pady=(14, 18))
+            ttk.Button(btns, text="Enregistrer", command=save_and_close).pack(side="left", padx=6)
+            ttk.Button(btns, text="Annuler", command=settings_win.destroy).pack(side="left", padx=6)
+
+            settings_win.columnconfigure(1, weight=1)
+            settings_win.grab_set()
+            settings_win.wait_window(settings_win)
 
         btn_frame = tk.Frame(win, bg=FELT_DARK)
         btn_frame.pack(pady=4)
@@ -6422,6 +9171,16 @@ class App(tk.Tk):
             restore_btn,
             "Permet de restaurer les tournois, joueurs, photos et\n"
             "réglages depuis une clé USB.",
+        )
+
+        settings_btn = ttk.Button(
+            btn_frame, text="⚙️  Paramètres de base", command=open_basic_settings, width=28,
+        )
+        settings_btn.pack(pady=6)
+        Tooltip(
+            settings_btn,
+            "Nom du club et dossier par défaut des tournois — réglages\n"
+            "généraux, accessibles sans ouvrir ni créer aucun tournoi.",
         )
 
         ttk.Button(
@@ -6607,6 +9366,7 @@ class App(tk.Tk):
         c'est précisément ce qui empêche un second lancement externe
         pendant qu'un tournoi est déjà affiché — voir App.__init__."""
         self._stop_remote_control()
+        self._stop_whatsapp_share_server()
         self._cancel_tables_blink()
         self._cancel_players_absent_blink()
         if self.db:
@@ -8877,9 +11637,33 @@ class App(tk.Tk):
         strictement inchangé pour eux."""
         self.db.set_settings({"movement_alert_active": 0})
         self.voice_awaiting_resume = False
+        # Retour automatique à l'affichage normal de l'onglet Mouvements
+        # (voir _apply_moves_tab_display_mode) : le "mode joueurs" ne doit
+        # jamais persister au-delà du cycle de mouvements qu'il accompagne.
+        self._moves_tab_player_mode = False
         self._clock_resume()
+        # "Movt Précédent" (demande du 2026-10-06) : mémorise la série
+        # COMPLÈTE (mouvements encore en attente + déjà validés depuis le
+        # téléphone, voir confirmed_moves_this_cycle) avant qu'elle ne soit
+        # vidée juste en dessous — ne fait rien si les deux sources sont
+        # vides (choix explicitement validé : un "Terminé" sans rien à
+        # archiver ne doit jamais effacer la vraie dernière série
+        # mémorisée). Puis masque systématiquement l'affichage "Movt
+        # Précédent" : la vue d'une série qu'on vient de clôturer ne doit
+        # jamais rester ouverte de son propre chef.
+        self.db.archive_seat_moves_as_previous()
+        self._moves_tab_show_previous_moves = False
         self.db.clear_seat_moves()
+        self.db.clear_confirmed_moves_this_cycle()
         self._refresh_moves_tab()
+        # Arrêt propre du défilement automatique du mode joueurs (voir
+        # _moves_player_autoscroll_tick, qui s'arrête de lui-même au tick
+        # suivant grâce à self._moves_tab_player_mode ci-dessus, mais sans
+        # jamais remettre la liste en haut ni lever la pause de son propre
+        # chef) : remis à zéro ici pour que le prochain "Afficher
+        # Mouvements" reparte toujours d'un état propre.
+        self.moves_tree.yview_moveto(0.0)
+        self._moves_player_scroll_paused = False
         if switch_to_clock:
             self.notebook.select(self.clock_tab)
         self._refresh_clock_tab()
@@ -9308,6 +12092,41 @@ class App(tk.Tk):
             self.remote_control_server.stop()
             self.remote_control_server = None
         self._refresh_remote_control_status()
+
+    def _get_or_start_whatsapp_share_port(self):
+        """Port sur lequel CE tournoi sert /whatsapp_share (bouton "💬
+        Envoi WhatsApp" > "📱 Mon téléphone", demande explicite du
+        2026-10-11, point 1 : "indépendant de l'autorisation du
+        contrôle à distance"). Réutilise self.remote_control_server
+        s'il tourne déjà (même port, juste une route de plus sur un
+        serveur déjà actif) ; sinon démarre un remote_control.
+        WhatsAppShareServer dédié — un serveur MINIMAL qui ne connaît
+        aucune commande de gestion de tournoi, jamais
+        RemoteControlServer, jamais lié à son activation. Enregistre ce
+        port dans le registre partagé (open_windows.update_whatsapp_
+        share_port) pour qu'un AUTRE tournoi puisse y relayer une
+        requête reçue sur son propre port 8765 (voir remote_control.
+        handle_whatsapp_share_path) si CE tournoi-ci n'a pas pu
+        l'obtenir lui-même."""
+        if self.remote_control_server is not None and self.remote_control_server.is_running:
+            port = self.remote_control_server.port
+        else:
+            if self._whatsapp_share_server is None or not self._whatsapp_share_server.is_running:
+                self._whatsapp_share_server = remote_control.WhatsAppShareServer()
+                self._whatsapp_share_server.start()
+            port = self._whatsapp_share_server.port
+        open_windows.update_whatsapp_share_port(self.db.path, port)
+        return port
+
+    def _stop_whatsapp_share_server(self):
+        """Arrête le serveur minimal de partage PDF par QR code s'il
+        tourne (voir _get_or_start_whatsapp_share_port) — totalement
+        indépendant de _stop_remote_control juste au-dessus (demande
+        explicite du 2026-10-11, point 1), mais arrêté comme lui à la
+        fermeture de ce tournoi (voir _cleanup_for_close)."""
+        if self._whatsapp_share_server is not None:
+            self._whatsapp_share_server.stop()
+            self._whatsapp_share_server = None
 
     def _bind_personal_code_section_shortcut(self):
         """Ctrl+Maj+P : affiche/masque la section "Code personnel"
@@ -11153,8 +13972,22 @@ class App(tk.Tk):
             self.lift()
             self.focus_force()
         elif word == "mouvements":
+            # "Mode joueurs" (demande du 2026-10-05) : UNIQUEMENT quand cet
+            # affichage est demandé depuis le téléphone (ce branchement-ci),
+            # jamais pour un clic manuel de l'organisateur sur l'onglet
+            # (qui passe par <<NotebookTabChanged>> sans jamais toucher ce
+            # drapeau) — voir _apply_moves_tab_display_mode et
+            # _finish_movement_alert (retour à la normale sur "Terminé").
+            self._moves_tab_player_mode = True
             self.notebook.select(self.moves_tab)
             self._refresh_moves_tab()
+            # Repart toujours du haut (jamais depuis _refresh_moves_tab,
+            # appelée périodiquement — voir _moves_player_autoscroll_tick)
+            # : un nouvel "Afficher Mouvements" doit toujours recommencer
+            # au début de la liste, pause levée, même si un affichage
+            # précédent s'était arrêté ailleurs.
+            self.moves_tree.yview_moveto(0.0)
+            self._moves_player_scroll_paused = False
             self.lift()
             self.focus_force()
         elif word == "tables_zoom_moins":
@@ -12180,6 +15013,21 @@ class App(tk.Tk):
     # ---------------------------------------------------------------
     # Onglet Mouvements (historique des changements de table/siège)
     # ---------------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Onglet Mouvements — "mode joueurs" (demande du 2026-10-05)
+    # ---------------------------------------------------------------
+    MOVES_TAB_ALL_COLUMNS = ("time", "player", "old_table", "old_seat", "new_table", "new_seat", "reason")
+    MOVES_TAB_PLAYER_COLUMNS = ("player", "old_table", "old_seat", "new_table", "new_seat")
+    MOVES_TAB_PLAYER_DEFAULT_WIDTHS = {
+        "player": 260, "old_table": 230, "old_seat": 190, "new_table": 230, "new_seat": 190,
+    }
+    # Mêmes valeurs que l'onglet Classement (CLASSEMENT_AUTOSCROLL_*,
+    # voir _classement_autoscroll_tick) : une ligne toutes les 700 ms,
+    # pause de 2500 ms en haut et en bas — repris comme référence éprouvée,
+    # jamais modifié ici.
+    MOVES_PLAYER_AUTOSCROLL_INTERVAL_MS = 700
+    MOVES_PLAYER_AUTOSCROLL_PAUSE_MS = 2500
+
     def _build_moves_tab(self):
         top = ttk.Frame(self.moves_tab)
         top.pack(fill="x", padx=10, pady=10)
@@ -12196,6 +15044,18 @@ class App(tk.Tk):
             "À cliquer une fois que tous les joueurs déplacés ont rejoint\n"
             "leur nouvelle table : referme le bandeau \"Changement de tables\n"
             "en cours\" et relance le chronomètre.",
+        )
+        previous_moves_btn = ttk.Button(
+            top, text="Movt Précédent", command=self._toggle_previous_moves_display,
+        )
+        previous_moves_btn.pack(side="right", padx=3)
+        Tooltip(
+            previous_moves_btn,
+            "Réaffiche (en italique) la dernière série de mouvements déjà\n"
+            "déclarée terminée — utile si \"Terminé\" a été cliqué trop tôt\n"
+            "et que vous ne savez plus où un joueur devait aller. Un simple\n"
+            "rappel visuel : un second clic le masque, sans jamais modifier\n"
+            "de table, de siège ni les mouvements réellement en attente.",
         )
         print_filled_btn = ttk.Button(
             top, text="🖨️ Imprimer", command=self._print_movement_slips_filled,
@@ -12227,7 +15087,7 @@ class App(tk.Tk):
         # un joueur a été déplacé (contrainte de capacité, fusion de
         # table, équilibrage automatique, ou choix guidé par la grosse
         # blinde) — voir database.py: MOVE_REASON_LABELS.
-        cols = ("time", "player", "old_table", "old_seat", "new_table", "new_seat", "reason")
+        cols = self.MOVES_TAB_ALL_COLUMNS
         headers = [
             "Heure", "Joueur", "Ancienne table", "Ancien siège", "Nouvelle table",
             "Nouveau siège", "Raison",
@@ -12239,8 +15099,145 @@ class App(tk.Tk):
         self.moves_tree.column("player", width=180, anchor="w")
         self.moves_tree.column("reason", width=170, anchor="w")
         self.moves_tree.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        # Mémorise une largeur personnalisée par l'utilisateur en mode
+        # joueurs (voir _on_moves_tree_button_release) — sans effet en
+        # affichage normal (gardé dans le handler lui-même).
+        self.moves_tree.bind("<ButtonRelease-1>", self._on_moves_tree_button_release)
+
+        # Défilement automatique du mode joueurs (voir _moves_player_
+        # autoscroll_tick) : boucle perpétuelle démarrée UNE SEULE FOIS ici
+        # (jamais recréée), sur le même principe que l'onglet Classement
+        # (_classement_autoscroll_tick/_build_payouts_tab) — ne défile
+        # réellement que si le mode joueurs est actif, sinon se
+        # reprogramme sans rien faire.
+        self._moves_player_scroll_after_id = None
+        self._moves_player_scroll_paused = False
+        self._moves_player_autoscroll_tick()
+
+    def _apply_moves_tab_display_mode(self):
+        """Bascule la présentation de self.moves_tree entre l'affichage
+        normal (organisateur, 7 colonnes, style "Treeview" habituel, ses
+        PROPRES largeurs) et le "mode joueurs" (self._moves_tab_player_
+        mode, voir son commentaire dans __init__) : 5 colonnes utiles à
+        distance, style "MovesBig.Treeview" (police/lignes plus grandes,
+        défini dans _apply_theme), largeurs mémorisées séparément (voir
+        moves_tab_columns.py). N'efface ni ne recrée jamais les lignes
+        elles-mêmes (Heure/Raison restent dans les données, seulement
+        masquées de l'affichage).
+
+        N'agit QUE sur un changement RÉEL de mode depuis le dernier appel
+        (self._moves_tab_display_mode_applied) : appelée par _refresh_
+        moves_tab, elle-même invoquée une fois par seconde tant que
+        l'onglet est affiché (_tick) — sans cette garde, chaque tick
+        réafecterait displaycolumns/style et écraserait un redimension-
+        nement en cours fait à la souris."""
+        if self._moves_tab_display_mode_applied == self._moves_tab_player_mode:
+            return
+        previous = self._moves_tab_display_mode_applied
+        self._moves_tab_display_mode_applied = self._moves_tab_player_mode
+
+        if self._moves_tab_player_mode:
+            # Entrée en mode joueurs : mémorise les largeurs NORMALES
+            # actuelles (potentiellement déjà personnalisées par
+            # l'organisateur) avant de les remplacer, pour les restaurer
+            # intactes à la sortie — jamais les valeurs par défaut
+            # d'origine si l'organisateur avait lui-même déjà ajusté sa
+            # propre vue.
+            self._moves_tab_normal_col_widths = {
+                c: self.moves_tree.column(c, "width") for c in self.MOVES_TAB_ALL_COLUMNS
+            }
+            self.moves_tree.configure(style="MovesBig.Treeview")
+            self.moves_tree["displaycolumns"] = self.MOVES_TAB_PLAYER_COLUMNS
+            player_widths = (
+                moves_tab_columns.load_player_column_widths()
+                or self.MOVES_TAB_PLAYER_DEFAULT_WIDTHS
+            )
+            for c in self.MOVES_TAB_PLAYER_COLUMNS:
+                self.moves_tree.column(
+                    c, width=player_widths.get(c, self.MOVES_TAB_PLAYER_DEFAULT_WIDTHS[c])
+                )
+            # "Movt Précédent" (demande du 2026-10-06) : même police que le
+            # reste du mode joueurs (24 bold), simplement penchée en plus —
+            # jamais une taille à part.
+            self.moves_tree.tag_configure("previous_move", font=("Helvetica", 24, "bold italic"))
+        else:
+            if previous:
+                # On sort RÉELLEMENT du mode joueurs (pas le tout premier
+                # appel, où `previous` est None et où le tableau n'a
+                # jamais porté de largeurs "mode joueurs" à sauvegarder).
+                self._save_moves_player_column_widths_if_changed()
+            self.moves_tree.configure(style="Treeview")
+            self.moves_tree["displaycolumns"] = self.MOVES_TAB_ALL_COLUMNS
+            if self._moves_tab_normal_col_widths:
+                for c, w in self._moves_tab_normal_col_widths.items():
+                    self.moves_tree.column(c, width=w)
+            self.moves_tree.tag_configure("previous_move", font=("Helvetica", 11, "italic"))
+
+    def _on_moves_tree_button_release(self, event):
+        """Capture un redimensionnement manuel de colonne (glisser une
+        bordure d'en-tête à la souris) — UNIQUEMENT en mode joueurs,
+        jamais en affichage normal (là, aucune mémorisation n'est
+        demandée ; ttk ne distingue pas "relâché après un redimension-
+        nement" d'un simple clic, donc ce handler se contente de
+        comparer les largeurs actuelles à ce qui est déjà mémorisé —
+        inoffensif et peu coûteux sur un clic ordinaire)."""
+        if not self._moves_tab_player_mode:
+            return
+        self._save_moves_player_column_widths_if_changed()
+
+    def _save_moves_player_column_widths_if_changed(self):
+        widths = {c: self.moves_tree.column(c, "width") for c in self.MOVES_TAB_PLAYER_COLUMNS}
+        current = moves_tab_columns.load_player_column_widths() or self.MOVES_TAB_PLAYER_DEFAULT_WIDTHS
+        if widths == current:
+            return
+        moves_tab_columns.save_player_column_widths(widths)
+
+    def _toggle_previous_moves_display(self):
+        """Bouton "Movt Précédent" (demande du 2026-10-06) : interrupteur
+        d'AFFICHAGE pur — bascule self._moves_tab_show_previous_moves puis
+        rafraîchit immédiatement (_refresh_moves_tab ajoute/retire les
+        lignes de la dernière série terminée en fonction de ce drapeau).
+        Ne touche JAMAIS seat_moves, ni aucune table/siège/joueur."""
+        self._moves_tab_show_previous_moves = not self._moves_tab_show_previous_moves
+        self._refresh_moves_tab()
+
+    def _moves_player_autoscroll_tick(self):
+        """Défilement automatique et lent du mode joueurs de l'onglet
+        Mouvements — copie fidèle du principe de _classement_autoscroll_
+        tick (onglet Classement, JAMAIS modifié par ce chantier), avec
+        une garde supplémentaire : ne défile que si le mode joueurs est
+        actif (jamais en affichage normal pour l'organisateur)."""
+        if not self.winfo_exists() or not self.moves_tree.winfo_exists():
+            return
+
+        if (not self._moves_tab_player_mode
+                or self.notebook.tab(self.notebook.select(), "text") != "Mouvements"):
+            self._moves_player_scroll_after_id = self.after(500, self._moves_player_autoscroll_tick)
+            return
+
+        if not self._moves_player_scroll_paused:
+            top_frac, bottom_frac = self.moves_tree.yview()
+            if bottom_frac < 1.0:
+                self.moves_tree.yview_scroll(1, "units")
+            elif top_frac > 0.0:
+                self._moves_player_scroll_paused = True
+                self.after(self.MOVES_PLAYER_AUTOSCROLL_PAUSE_MS, self._moves_player_reset_to_top)
+
+        self._moves_player_scroll_after_id = self.after(
+            self.MOVES_PLAYER_AUTOSCROLL_INTERVAL_MS, self._moves_player_autoscroll_tick
+        )
+
+    def _moves_player_reset_to_top(self):
+        if not self.moves_tree.winfo_exists():
+            return
+        self.moves_tree.yview_moveto(0.0)
+        self.after(self.MOVES_PLAYER_AUTOSCROLL_PAUSE_MS, self._moves_player_resume_autoscroll)
+
+    def _moves_player_resume_autoscroll(self):
+        self._moves_player_scroll_paused = False
 
     def _refresh_moves_tab(self):
+        self._apply_moves_tab_display_mode()
         for row in self.moves_tree.get_children():
             self.moves_tree.delete(row)
         highlight_minutes = self.db.get_setting_int("highlight_duration_minutes", 5)
@@ -12278,6 +15275,35 @@ class App(tk.Tk):
         self.moves_tree.tag_configure("evenrow", background=CREAM)
         self.moves_tree.tag_configure("oddrow", background=CREAM_ALT)
         self.moves_tree.tag_configure("recent", background=GOLD, foreground=TEXT_DARK)
+
+        # "Movt Précédent" (demande du 2026-10-06, libellé ajusté le
+        # 2026-10-06) : ajoutées À LA SUITE des mouvements réellement en
+        # attente ci-dessus, jamais mélangées à eux ni insérées dans
+        # seat_moves — purement consultatif. Raison TOUJOURS forcée ici, à
+        # l'affichage seulement, selon le `status` archivé ("Déjà Validé"
+        # pour un mouvement confirmé avant "Terminé", "Non Validé" sinon —
+        # les valeurs internes 'confirmed'/'pending' ne changent pas,
+        # seul le texte affiché change) : previous_seat_moves conserve sa
+        # vraie valeur de `reason` d'origine, jamais modifiée. Le tag
+        # "previous_move" (police italique adaptée au mode normal/
+        # joueurs) est configuré par _apply_moves_tab_display_mode, appelé
+        # juste au-dessus.
+        if self._moves_tab_show_previous_moves:
+            for m in self.db.get_previous_seat_moves():
+                reason_label = "Déjà Validé" if m["status"] == "confirmed" else "Non Validé"
+                self.moves_tree.insert(
+                    "", "end",
+                    values=(
+                        format_datetime_fr(m["moved_at"]),
+                        m["player_name"],
+                        m["old_table_name"] or "—",
+                        m["old_seat"] or "—",
+                        m["new_table_name"] or "—",
+                        m["new_seat"] or "—",
+                        reason_label,
+                    ),
+                    tags=("previous_move",),
+                )
 
     # ---------------------------------------------------------------
     # Onglet Primes (bounty / PKO)
@@ -13367,6 +16393,7 @@ class App(tk.Tk):
         top_btns = ttk.Frame(self.blinds_tab)
         top_btns.pack(fill="x", padx=15, pady=(0, 10))
         ttk.Button(top_btns, text="➕ Ajouter un round", command=lambda: self._add_blind_round()).pack(side="left", padx=3)
+        ttk.Button(top_btns, text="Enr. Struc. Std", command=self._save_current_as_standard_structure).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Structure standard", command=self._reset_blind_structure_from_tab).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Appliquer", command=self._apply_blinds_from_tab).pack(side="left", padx=3)
 
@@ -14094,6 +17121,43 @@ class App(tk.Tk):
         self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
         self._refresh_blinds_tab()
 
+    def _save_current_as_standard_structure(self):
+        """"Enr. Struc. Std" (demande du 2026-10-05) — enregistre la
+        structure ACTUELLEMENT affichée dans ce tableau (y compris non
+        encore appliquée au tournoi, comme "Appliquer"/"Enregistrer
+        Blindes sous...", voir _collect_blinds_from_widgets) comme
+        nouvelle Structure Standard PERSISTANTE (structures.py,
+        ~/.poker_tournament/standard_blind_structure.json) — distincte
+        des modèles nommés de blind_templates.py (jamais listée par
+        "Récupérer Blindes...").
+
+        N'applique PAS cette structure à CE tournoi (différence
+        volontaire avec "Enregistrer Blindes sous...") : un simple
+        "mémorise ceci pour l'avenir", sans effet sur la partie en
+        cours — seuls les boutons "Structure standard" (ici et onglet
+        Chronomètre) et la création d'un nouveau tournoi (Database.
+        _init_defaults) utiliseront cette structure ENSUITE, via
+        structures.default_blind_structure() qui vérifie désormais cet
+        enregistrement en premier (voir sa docstring) — ces trois
+        points ne sont pas modifiés ici, ils héritent automatiquement
+        de ce changement."""
+        rounds = self._collect_blinds_from_widgets()
+        if rounds is None:
+            return
+        if not messagebox.askyesno(
+            "Confirmer", "Enregistrer la structure actuelle comme Structure Standard ?"
+        ):
+            return
+        flat = self._rounds_to_flat_structure(rounds)
+        save_custom_standard_structure(flat)
+        messagebox.showinfo(
+            "Structure Standard enregistrée",
+            "La structure actuellement affichée a été enregistrée comme Structure "
+            "Standard. Le bouton « Structure standard » (ici et dans l'onglet "
+            "Chronomètre), ainsi que tout nouveau tournoi créé désormais, "
+            "l'appliqueront à la place de l'ancienne structure par défaut.",
+        )
+
     def _reset_blind_structure_from_tab(self):
         if messagebox.askyesno("Confirmer", "Remplacer la structure actuelle par la structure standard ?"):
             self.db.set_blind_structure(default_blind_structure())
@@ -14579,6 +17643,7 @@ class App(tk.Tk):
         # -- Colonne gauche : réglages généraux --------------------
         fields = [
             ("club_name", "Nom du Club"),
+            ("whatsapp_group_name", "Nom du groupe WhatsApp"),
             ("tournament_name", "Nom du tournoi"),
             ("buyin_amount", "Montant du buy-in (€)"),
             ("rebuy_amount", "Montant d'un rebuy (€)"),
@@ -14596,6 +17661,16 @@ class App(tk.Tk):
             "min_players_per_table": "En dessous de ce seuil sur une table, le\nrééquilibrage la vide en priorité vers les autres.",
             "highlight_duration_minutes": "Durée pendant laquelle un joueur\ndéplacé reste surligné dans l'onglet Mouvements.",
             "rake_percent": "Prélevé sur le prize pool avant répartition des\ngains (0 = tout le prize pool est reversé aux joueurs).",
+            # Rappel explicite (demande du 2026-10-10) : il ne doit jamais
+            # laisser croire que ce groupe est sélectionné automatiquement
+            # — voir prompt_whatsapp_share, qui ne fait qu'afficher ce nom
+            # en rappel, jamais un ciblage réel (techniquement impossible
+            # avec des moyens officiels à ce jour).
+            "whatsapp_group_name": "Simple rappel affiché au moment du partage\n"
+                                    "(\"💬 Envoi WhatsApp\", onglets Classement/\n"
+                                    "Statistiques) — ne sélectionne JAMAIS ce\n"
+                                    "groupe automatiquement, à choisir vous-même\n"
+                                    "dans WhatsApp à chaque fois.",
         }
         for i, (key, label) in enumerate(fields):
             lbl = ttk.Label(left, text=label + " :")
@@ -14610,6 +17685,14 @@ class App(tk.Tk):
                 initial = export_prefs.load_value("club_name", "")
                 var = tk.StringVar(value=initial)
                 var.trace_add("write", lambda *a: self._save_club_name())
+            elif key == "whatsapp_group_name":
+                # Même principe que "club_name" juste au-dessus : préférence
+                # partagée (export_prefs), jamais écrite dans ce fichier
+                # .tournoi (voir _save_whatsapp_group_name et l'exclusion
+                # correspondante dans _collect_and_save_all_settings).
+                initial = export_prefs.load_value("whatsapp_group_name", "")
+                var = tk.StringVar(value=initial)
+                var.trace_add("write", lambda *a: self._save_whatsapp_group_name())
             elif key == "tournament_name":
                 # Auto-enregistré à la frappe (voir _save_tournament_name) :
                 # un champ purement cosmétique, sans effet de bord sur les
@@ -15930,7 +19013,7 @@ class App(tk.Tk):
         self.log_export_btn = ttk.Button(log_actions_row, text="Exporter", command=self._on_log_export)
         self.log_export_btn.pack(side="left", padx=(8, 0))
         ttk.Separator(log_actions_row, orient="vertical").pack(side="left", fill="y", padx=(12, 12))
-        self.log_purge_btn = ttk.Button(log_actions_row, text="🗑 Purger", command=self._on_log_purge)
+        self.log_purge_btn = ttk.Button(log_actions_row, text="🗑 Purger", command=self._on_purge_choice)
         self.log_purge_btn.pack(side="left")
 
     # -----------------------------------------------------------------
@@ -16470,6 +19553,39 @@ class App(tk.Tk):
         win.protocol("WM_DELETE_WINDOW", _cancel)
         win.wait_window(win)
         return result["confirmed"]
+
+    def _on_purge_choice(self):
+        """"🗑 Purger" (demande du 2026-10-07) : première étape — choisir
+        LOG (comportement actuel _on_log_purge, STRICTEMENT inchangé, voir
+        sa propre docstring plus bas) ou DONNÉES (nouvelle purge de vieux
+        fichiers .tournoi par date/type, avec garde-fous de sauvegarde —
+        voir DataPurgeDialog). Une simple fenêtre de choix, jamais une
+        troisième option ni un comportement par défaut sans clic
+        explicite."""
+        win = tk.Toplevel(self)
+        win.title("Purger")
+        win.configure(bg=FELT_DARK)
+        win.transient(self)
+        win.grab_set()
+        win.resizable(False, False)
+
+        ttk.Label(
+            win, text="Que souhaitez-vous purger ?", font=("Helvetica", 12, "bold"),
+        ).pack(padx=20, pady=(18, 12))
+
+        def _choose_log():
+            win.destroy()
+            self._on_log_purge()
+
+        def _choose_data():
+            win.destroy()
+            DataPurgeDialog(self)
+
+        btns = ttk.Frame(win)
+        btns.pack(padx=20, pady=(0, 18))
+        ttk.Button(btns, text="LOG", command=_choose_log, width=14).pack(side="left", padx=6)
+        ttk.Button(btns, text="DONNÉES", command=_choose_data, width=14).pack(side="left", padx=6)
+        ttk.Button(win, text="Annuler", command=win.destroy).pack(pady=(0, 14))
 
     def _on_log_purge(self):
         """Purger (revu le 2026-09-25, "Purgeons ce qui est dans les
@@ -17033,10 +20149,11 @@ class App(tk.Tk):
                     "Effectuez d'abord le rééquilibrage de cette table.",
                 )
 
-        # "club_name" est commun à tous les tournois/Sit & Go (préférences
-        # partagées, voir le trace_add posé sur sa StringVar) : jamais
-        # écrit dans ce fichier .tournoi, pour éviter une copie qui
-        # divergerait silencieusement de la valeur réellement affichée.
+        # "club_name"/"whatsapp_group_name" sont communs à tous les
+        # tournois/Sit & Go (préférences partagées, voir les trace_add
+        # posés sur leurs StringVar) : jamais écrits dans ce fichier
+        # .tournoi, pour éviter une copie qui divergerait silencieusement
+        # de la valeur réellement affichée.
         #
         # "ranking_formula" vide ("") : ce tournoi utilise encore la
         # valeur fixe historique (ranking_bonus_points, voir Database.
@@ -17048,7 +20165,7 @@ class App(tk.Tk):
         # "Appliquer"/"Enregistrer" portant sur d'AUTRES réglages.
         db_values = {
             k: v for k, v in values.items()
-            if k != "club_name" and not (k == "ranking_formula" and v == "")
+            if k not in ("club_name", "whatsapp_group_name") and not (k == "ranking_formula" and v == "")
         }
         self.db.set_settings(db_values)
         # Même exclusion que db_values ci-dessus pour "ranking_formula"
@@ -17211,6 +20328,15 @@ class App(tk.Tk):
         commune à tous les tournois/Sit & Go — voir _build_settings_tab)
         au fur et à mesure de la saisie, comme pour les jetons."""
         export_prefs.save_value("club_name", self.settings_vars["club_name"].get())
+
+    def _save_whatsapp_group_name(self):
+        """Enregistre en continu le "Nom du groupe WhatsApp" (préférence
+        partagée, commune à tous les tournois/Sit & Go — voir
+        _build_settings_tab/prompt_whatsapp_share), même principe que
+        _save_club_name juste au-dessus. Un simple RAPPEL affiché au
+        moment du partage ("💬 Envoi WhatsApp") — ne sélectionne jamais ce
+        groupe automatiquement."""
+        export_prefs.save_value("whatsapp_group_name", self.settings_vars["whatsapp_group_name"].get())
 
     def _save_tournament_name(self):
         """Enregistre en continu le "Nom du tournoi" pour CE tournoi, au fur

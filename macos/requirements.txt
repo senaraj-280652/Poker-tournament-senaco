@@ -9,3 +9,13 @@ openpyxl>=3.1
 fpdf2>=2.7
 opencv-python>=4.8
 pillow>=10.0
+# Copie native d'un fichier PDF sur le presse-papiers (NSPasteboard,
+# bouton "Envoi WhatsApp" des onglets Classement/Statistiques, voir
+# main.py: copy_file_to_clipboard) — validé en conditions réelles le
+# 2026-10-11 (WhatsApp Desktop, macOS Monterey 12.7.6). Remplace un
+# premier essai via osascript/AppleScript, insuffisant pour WhatsApp.
+pyobjc-framework-Cocoa>=10.0
+# Génère l'image du QR code "Envoi WhatsApp > Mon téléphone" (voir
+# main.py: WhatsAppQRShareDialog) — pur Python, pillow ci-dessus comme
+# moteur de rendu.
+qrcode>=7.4

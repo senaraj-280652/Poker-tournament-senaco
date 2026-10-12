@@ -139,6 +139,10 @@ class OnVoiceWordMouvementsNudgeTest(unittest.TestCase):
         class _FakeMovesTab:
             pass
 
+        class _FakeMovesTree:
+            def yview_moveto(self, frac):
+                calls.append(("yview_moveto", frac))
+
         class _FakeNotebook:
             def select(self, tab):
                 calls.append(("select", tab))
@@ -148,6 +152,9 @@ class OnVoiceWordMouvementsNudgeTest(unittest.TestCase):
             clock_window = None
             notebook = _FakeNotebook()
             moves_tab = _FakeMovesTab()
+            moves_tree = _FakeMovesTree()
+            _moves_tab_player_mode = False
+            _moves_player_scroll_paused = True
 
             def _refresh_moves_tab(self):
                 calls.append("refresh_moves_tab")
@@ -162,7 +169,10 @@ class OnVoiceWordMouvementsNudgeTest(unittest.TestCase):
         main.App._on_voice_word(fake, "mouvements")
         self.assertEqual(
             calls,
-            [("select", fake.moves_tab), "refresh_moves_tab", "lift", "focus_force"],
+            [
+                ("select", fake.moves_tab), "refresh_moves_tab", ("yview_moveto", 0.0),
+                "lift", "focus_force",
+            ],
         )
 
     def test_sans_fenetre_chrono_ouverte_ne_leve_jamais(self):

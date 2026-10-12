@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """Générateurs de structures par défaut : blindes et grille de gains."""
+import json
+import os
 
 # Progression de référence (paliers relatifs), utilisée comme base pour
 # générer une structure à l'échelle du small blind / big blind de départ
@@ -179,10 +181,75 @@ def generate_blind_structure(start_small_blind=25, start_big_blind=50,
     return rows
 
 
+def _standard_structure_path():
+    """~/.poker_tournament/standard_blind_structure.json — demande du
+    2026-10-05, "enregistrer la structure affichée comme nouvelle
+    Structure Standard". UN SEUL fichier dédié (jamais un dossier comme
+    blind_templates.py) : il n'y a qu'UNE structure standard possible,
+    pas une collection de modèles nommés — ne doit JAMAIS apparaître
+    parmi les modèles listés par blind_templates.list_templates()
+    (demande explicite), d'où ce fichier séparé plutôt qu'un nom réservé
+    dans blind_templates.py (qui aurait pu entrer en collision avec un
+    modèle que l'utilisateur nommerait lui-même "Structure Standard").
+    Même répertoire que roster.py/tournament_prefs.py/blind_templates.py
+    (~/.poker_tournament) : déjà couvert tel quel par la sauvegarde/
+    restauration générale (backup_restore.py copie "l'intégralité de
+    ~/.poker_tournament, aucune exception"), sans rien à ajouter là-bas."""
+    home = os.path.expanduser("~")
+    d = os.path.join(home, ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "standard_blind_structure.json")
+
+
+def save_custom_standard_structure(levels):
+    """Enregistre `levels` (structure plate, voir Database.set_blind_
+    structure) comme nouvelle Structure Standard personnalisée,
+    persistante d'une session à l'autre. Écrase silencieusement un
+    enregistrement précédent (l'appelant demande déjà confirmation en
+    amont, voir App._save_current_as_standard_structure)."""
+    with open(_standard_structure_path(), "w", encoding="utf-8") as f:
+        json.dump({"levels": levels}, f, ensure_ascii=False, indent=2)
+
+
+def load_custom_standard_structure():
+    """Structure Standard personnalisée (liste plate de dicts), ou None
+    si jamais enregistrée ou illisible — c'est ce None qui garantit le
+    comportement HISTORIQUE strictement inchangé (voir default_blind_
+    structure ci-dessous) pour tout poste/tournoi n'ayant jamais utilisé
+    cette fonctionnalité."""
+    path = _standard_structure_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        levels = data.get("levels")
+        return levels if isinstance(levels, list) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def default_blind_structure():
-    """Structure de blindes standard (25/50, antes de 25 à partir du
-    niveau 4, paliers de 15 minutes avec pauses régulières). Convient à un
-    tournoi multi-tables classique."""
+    """Structure Standard — demande du 2026-10-05, "enregistrer la
+    structure affichée comme nouvelle Structure Standard" : renvoie
+    désormais la structure personnalisée si l'utilisateur en a
+    enregistré une (voir save_custom_standard_structure), sinon la
+    structure historique ci-dessous, STRICTEMENT inchangée (25/50,
+    antes de 25 à partir du niveau 4, paliers de 15 minutes avec pauses
+    régulières) — convient à un tournoi multi-tables classique.
+
+    Point de passage UNIQUE déjà utilisé par les trois endroits qui
+    doivent refléter la Structure Standard (jamais dupliqué) : les deux
+    boutons "Structure standard" (onglets Blindes et Chronomètre,
+    App._reset_blind_structure_from_tab/_reset_blind_structure) ET la
+    création d'un nouveau tournoi (Database._init_defaults, qui
+    préremplit blind_levels d'un fichier .tournoi tout neuf) — modifier
+    CETTE seule fonction suffit à les faire bénéficier tous les trois
+    de la personnalisation, de façon cohérente, sans toucher à leur
+    propre code."""
+    custom = load_custom_standard_structure()
+    if custom is not None:
+        return custom
     return generate_blind_structure(
         start_small_blind=25, start_big_blind=50, ante_start_level=4,
         start_ante=25, duration_minutes=15, break_duration_minutes=15,

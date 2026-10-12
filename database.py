@@ -87,18 +87,66 @@ def _pdf_fit_font_size(pdf, texts, col_width, bold=False, max_size=9, min_size=5
     return min_size
 
 
-def _write_pdf_table(path, title, subtitle_lines, headers, rows):
+def _write_pdf_table(path, title, subtitle_lines, headers, rows,
+                      repeat_header=False, page_numbers=False):
     """Génère un PDF simple (titre, sous-titres, puis un tableau) à partir
     de lignes déjà calculées (mêmes valeurs que pour les exports CSV/
     Excel). `subtitle_lines` : liste de lignes de texte optionnelles sous
     le titre (ex : entrées/prize pool). Paysage automatique au-delà de 6
     colonnes, pour laisser assez de place à chacune. La taille de police
     des en-têtes et des valeurs s'ajuste automatiquement (voir
-    _pdf_fit_font_size) pour ne jamais déborder d'une colonne."""
+    _pdf_fit_font_size) pour ne jamais déborder d'une colonne.
+
+    `repeat_header`/`page_numbers` (demande du 2026-10-07, impression du
+    Répertoire) : False par défaut — comportement STRICTEMENT inchangé
+    pour tous les appelants existants (Joueurs, Primes, Résultats,
+    Synthèse période). Si True, redessine l'en-tête coloré sur chaque
+    page suivante, et/ou ajoute "Page X/Y" en pied de page — via les
+    callbacks header()/footer() de fpdf2 (jamais sur la 1ère page : son
+    titre/sous-titres sont déjà dessinés manuellement juste après
+    add_page(), inchangé). Le découpage en pages reste entièrement gouverné
+    par set_auto_page_break ci-dessous ; comme toutes les cellules d'une
+    même ligne partagent la même hauteur et la même position Y de départ,
+    un saut de page ne peut jamais couper une ligne en deux (si la 1ère
+    cellule d'une ligne déclenche le saut, Y est déjà réinitialisé avant
+    que les cellules suivantes de cette même ligne ne soient dessinées)."""
     from fpdf import FPDF
 
     orientation = "L" if len(headers) > 6 else "P"
-    pdf = FPDF(orientation=orientation, unit="mm", format="A4")
+    header_texts = [_pdf_text(h) for h in headers]
+    row_height = 7
+
+    class _TablePDF(FPDF):
+        _col_width = 0.0
+        _header_font_size = 9
+
+        def header(self):
+            # Jamais sur la 1ère page (titre/sous-titres dessinés "à la
+            # main" juste après add_page(), plus bas) — et jamais si
+            # repeat_header n'est pas demandé (no-op, comme FPDF.header()
+            # par défaut : comportement des appelants existants inchangé).
+            if not repeat_header or self.page_no() == 1:
+                return
+            self.set_font("Helvetica", "B", self._header_font_size)
+            self.set_fill_color(31, 78, 36)
+            self.set_text_color(255, 255, 255)
+            for h in header_texts:
+                self.cell(self._col_width, row_height + 1, h, border=1, align="C", fill=True)
+            self.ln(row_height + 1)
+            self.set_text_color(0, 0, 0)
+
+        def footer(self):
+            if not page_numbers:
+                return
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 8)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8, f"Page {self.page_no()}/{{nb}}", align="C")
+            self.set_text_color(0, 0, 0)
+
+    pdf = _TablePDF(orientation=orientation, unit="mm", format="A4")
+    if page_numbers:
+        pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
@@ -116,10 +164,10 @@ def _write_pdf_table(path, title, subtitle_lines, headers, rows):
 
     avail_width = pdf.w - pdf.l_margin - pdf.r_margin
     col_width = avail_width / max(1, len(headers))
-    row_height = 7
+    pdf._col_width = col_width
 
-    header_texts = [_pdf_text(h) for h in headers]
-    _pdf_fit_font_size(pdf, header_texts, col_width, bold=True)
+    header_font_size = _pdf_fit_font_size(pdf, header_texts, col_width, bold=True)
+    pdf._header_font_size = header_font_size
     pdf.set_fill_color(31, 78, 36)
     pdf.set_text_color(255, 255, 255)
     for h in header_texts:
@@ -127,10 +175,16 @@ def _write_pdf_table(path, title, subtitle_lines, headers, rows):
     pdf.ln(row_height + 1)
 
     body_texts = [_pdf_text(c) for row in rows for c in row] or [""]
-    _pdf_fit_font_size(pdf, body_texts, col_width, bold=False)
+    body_font_size = _pdf_fit_font_size(pdf, body_texts, col_width, bold=False)
     pdf.set_text_color(0, 0, 0)
     fill_toggle = False
     for row in rows:
+        # Police explicitement réaffirmée à chaque ligne (coût négligeable) :
+        # si un saut de page vient de se produire, header() ci-dessus a
+        # laissé la police en gras/taille d'en-tête — sans cette ligne,
+        # le corps du tableau continuerait à tort dans cette police après
+        # chaque saut de page.
+        pdf.set_font("Helvetica", "", body_font_size)
         if fill_toggle:
             pdf.set_fill_color(247, 241, 227)
         else:
@@ -208,6 +262,51 @@ CREATE TABLE IF NOT EXISTS seat_moves (
     -- mouvement archivé par une version antérieure à cette colonne (voir
     -- _migrate) : affiché comme "Équilibrage" générique, jamais une
     -- valeur inventée a posteriori.
+    reason TEXT NOT NULL DEFAULT ''
+);
+
+-- Dernière série de mouvements TERMINÉE (demande du 2026-10-06, bouton
+-- "Movt Précédent" de l'onglet Mouvements) : un seul emplacement, jamais
+-- un historique — remplacé en entier à chaque "Terminé" réellement
+-- déclenché sur des mouvements non vides (voir App._finish_movement_alert
+-- / Database.archive_seat_moves_as_previous). Simple copie à but
+-- CONSULTATIF uniquement : jamais lue par count_seat_moves/get_seat_moves/
+-- confirm_seat_move/rebalance_tables/has_pending_moves — aucune des
+-- fonctions existantes ne référence cette table, par construction.
+CREATE TABLE IF NOT EXISTS previous_seat_moves (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name TEXT NOT NULL,
+    old_table_name TEXT,
+    old_seat INTEGER,
+    new_table_name TEXT,
+    new_seat INTEGER,
+    moved_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    -- 'pending' (encore non validé au moment de "Terminé") ou 'confirmed'
+    -- (déjà validé avant "Terminé" — voir confirmed_moves_this_cycle plus
+    -- bas) — demande du 2026-10-06 : seul ce champ pilote le libellé
+    -- affiché ("Non Validé"/"Déjà Validé"), jamais `reason`
+    -- lui-même, qui garde sa vraie valeur d'origine intacte.
+    status TEXT NOT NULL DEFAULT 'pending'
+);
+
+-- Journal ATOMIQUE des mouvements réellement confirmés DEPUIS le dernier
+-- "Terminé" (demande du 2026-10-06, complète previous_seat_moves pour
+-- "Movt Précédent") : alimentée UNIQUEMENT par confirm_seat_move, juste
+-- avant qu'elle ne supprime la ligne de seat_moves — jamais par
+-- _sync_seat_moves (qui réécrit/consolide des lignes encore en attente,
+-- jamais confirmées) ni par aucune autre fonction. Vidée à chaque
+-- "Terminé" (App._finish_movement_alert), une fois la série archivée
+-- dans previous_seat_moves. Jamais lue par count_seat_moves/
+-- get_seat_moves/rebalance_tables/has_pending_moves.
+CREATE TABLE IF NOT EXISTS confirmed_moves_this_cycle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    player_name TEXT NOT NULL,
+    old_table_name TEXT,
+    old_seat INTEGER,
+    new_table_name TEXT,
+    new_seat INTEGER,
+    moved_at TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT ''
 );
 
@@ -704,6 +803,19 @@ class Database:
         seat_moves_cols = {row["name"] for row in self.conn.execute("PRAGMA table_info(seat_moves)")}
         if "reason" not in seat_moves_cols:
             self.conn.execute("ALTER TABLE seat_moves ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+        # "status" (demande du 2026-10-06, "Movt Précédent" distingue
+        # désormais les mouvements déjà validés des mouvements encore en
+        # attente au moment de "Terminé") : absent sur tout fichier créé
+        # avant cette colonne (y compris pendant les tests manuels de ce
+        # chantier) -> traité comme 'pending' par défaut, jamais une
+        # valeur inventée.
+        previous_seat_moves_cols = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(previous_seat_moves)")
+        }
+        if "status" not in previous_seat_moves_cols:
+            self.conn.execute(
+                "ALTER TABLE previous_seat_moves ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
         # "arrived_at" (Lot 1, "Accueil des joueurs", 2026-09-27) : horodatage
         # epoch de la confirmation d'arrivée physique au poste d'accueil,
         # NULL tant qu'un joueur pré-inscrit n'a pas encore été confirmé —
@@ -3324,6 +3436,68 @@ class Database:
         self.conn.execute("DELETE FROM seat_moves")
         self.conn.commit()
 
+    def clear_confirmed_moves_this_cycle(self):
+        """Vide le journal des mouvements confirmés DEPUIS le dernier
+        "Terminé" (voir confirmed_moves_this_cycle) — appelé par
+        App._finish_movement_alert juste après avoir archivé la série
+        complète dans previous_seat_moves, pour que le prochain cycle
+        reparte de zéro."""
+        self.conn.execute("DELETE FROM confirmed_moves_this_cycle")
+        self.conn.commit()
+
+    def archive_seat_moves_as_previous(self):
+        """Bouton "Movt Précédent" (demande du 2026-10-06) : mémorise la
+        DERNIÈRE série de mouvements terminée — l'UNION des mouvements
+        encore en attente dans seat_moves (status='pending') ET de ceux
+        déjà validés depuis le dernier "Terminé" (confirmed_moves_this_
+        cycle, status='confirmed') — avant que App._finish_movement_alert
+        n'appelle clear_seat_moves()/clear_confirmed_moves_this_cycle()
+        juste après. Un seul emplacement (jamais un historique) : remplace
+        entièrement ce qui y était mémorisé avant.
+
+        Ne fait RIEN si LES DEUX sources sont vides (choix explicitement
+        validé, étendu au 2ᵉ scénario découvert en test manuel : si tous
+        les mouvements d'une série ont déjà été validés depuis le
+        téléphone — y compris le tout dernier, qui déclenche lui-même
+        automatiquement cette fonction via _finish_movement_alert — rien
+        ne doit être perdu ; à l'inverse, un "Terminé" sans RIEN à
+        archiver ne doit jamais effacer la vraie dernière série
+        mémorisée). N'est JAMAIS lue par count_seat_moves/get_seat_moves/
+        confirm_seat_move/rebalance_tables/has_pending_moves — aucun effet
+        métier, par construction (tables séparées, jamais référencées par
+        ces fonctions)."""
+        confirmed_rows = self.conn.execute(
+            "SELECT player_name, old_table_name, old_seat, new_table_name, "
+            "new_seat, moved_at, reason FROM confirmed_moves_this_cycle ORDER BY id"
+        ).fetchall()
+        pending_rows = self.conn.execute(
+            "SELECT player_name, old_table_name, old_seat, new_table_name, "
+            "new_seat, moved_at, reason FROM seat_moves ORDER BY id"
+        ).fetchall()
+        if not confirmed_rows and not pending_rows:
+            return
+        self.conn.execute("DELETE FROM previous_seat_moves")
+        for status, rows in (("confirmed", confirmed_rows), ("pending", pending_rows)):
+            for row in rows:
+                self.conn.execute(
+                    "INSERT INTO previous_seat_moves(player_name, old_table_name, "
+                    "old_seat, new_table_name, new_seat, moved_at, reason, status) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (row["player_name"], row["old_table_name"], row["old_seat"],
+                     row["new_table_name"], row["new_seat"], row["moved_at"],
+                     row["reason"], status),
+                )
+        self.conn.commit()
+
+    def get_previous_seat_moves(self):
+        """Dernière série de mouvements terminée (voir
+        archive_seat_moves_as_previous), chaque ligne portant son `status`
+        ('pending'/'confirmed') — affichage UNIQUEMENT consultatif (bouton
+        "Movt Précédent"), jamais des mouvements en attente."""
+        return self.conn.execute(
+            "SELECT * FROM previous_seat_moves ORDER BY id"
+        ).fetchall()
+
     def confirm_seat_move(self, move_id):
         """Confirmation INDIVIDUELLE d'un mouvement (demande du
         2026-09-19, bouton [OK] par ligne sur la page "Mouvements" du
@@ -3342,9 +3516,39 @@ class Database:
         Idempotent : un id déjà confirmé (ligne déjà supprimée) ou
         totalement inconnu ne lève jamais d'exception et n'a aucun
         effet — un double-tap ou un retry réseau côté téléphone reste
-        donc toujours sans risque."""
-        self.conn.execute("DELETE FROM seat_moves WHERE id=?", (move_id,))
-        self.conn.commit()
+        donc toujours sans risque.
+
+        Demande du 2026-10-06 ("Movt Précédent" doit pouvoir retrouver
+        aussi les mouvements déjà validés) : copie D'ABORD la ligne
+        complète dans confirmed_moves_this_cycle avant de la supprimer de
+        seat_moves — jamais l'inverse —, les deux dans LA MÊME transaction
+        SQLite (un seul commit final ; rollback intégral si quoi que ce
+        soit échoue), pour ne jamais risquer un mouvement supprimé de
+        seat_moves sans copie réussie. Aucune copie si la ligne n'existe
+        déjà plus (id déjà confirmé ou inconnu) : ne crée jamais de
+        doublon dans confirmed_moves_this_cycle même si cette fonction est
+        appelée deux fois pour le même id (retry réseau/double-tap
+        téléphone). Valeur de retour et comportement observable sur
+        seat_moves strictement inchangés pour _remote_confirm_move (seul
+        appelant existant, voir main.py)."""
+        try:
+            row = self.conn.execute(
+                "SELECT player_name, old_table_name, old_seat, new_table_name, "
+                "new_seat, moved_at, reason FROM seat_moves WHERE id=?", (move_id,)
+            ).fetchone()
+            if row is not None:
+                self.conn.execute(
+                    "INSERT INTO confirmed_moves_this_cycle(player_name, old_table_name, "
+                    "old_seat, new_table_name, new_seat, moved_at, reason) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (row["player_name"], row["old_table_name"], row["old_seat"],
+                     row["new_table_name"], row["new_seat"], row["moved_at"], row["reason"]),
+                )
+                self.conn.execute("DELETE FROM seat_moves WHERE id=?", (move_id,))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # ---------- primes (bounty) ----------
     def get_bounty_events(self, limit=500):

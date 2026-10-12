@@ -99,6 +99,8 @@ class TablesTabMovementPendingTest(unittest.TestCase):
         self.win.notebook = MagicMock()
         self.win.clock_tab = MagicMock()
         self.win.moves_tab = MagicMock()
+        self.win.moves_tree = MagicMock()
+        self.win._moves_player_scroll_paused = False
         self.win._refresh_clock_tab = lambda: None
         self.win._refresh_moves_tab = lambda: None
         self.win._clock_resume = lambda: None

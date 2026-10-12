@@ -472,6 +472,52 @@ def list_remote_tournaments():
     return result
 
 
+def update_whatsapp_share_port(path, port):
+    """Port sur lequel CE processus sert la route /whatsapp_share
+    (bouton "💬 Envoi WhatsApp" > "📱 Mon téléphone", onglets Classement/
+    Statistiques — voir remote_control.py: handle_whatsapp_share_path)
+    — demande explicite du 2026-10-11, point 1 : "le partage doit
+    rester indépendant de l'autorisation du contrôle à distance".
+    Champ SÉPARÉ de "remote_port" (jamais confondu avec lui) : un
+    tournoi peut avoir ce champ renseigné alors que le contrôle à
+    distance est désactivé pour lui (remote_port absent), et
+    réciproquement les deux peuvent coexister en pointant vers le MÊME
+    port quand le contrôle à distance tourne déjà (voir App._get_or_
+    start_whatsapp_share_port, qui réutilise alors son port au lieu
+    d'en démarrer un second). Aucun code existant du contrôle à
+    distance ne lit jamais ce champ — list_remote_tournaments() continue
+    de ne considérer que remote_port, sans aucun changement.
+
+    Même garde-fou que update_remote_info : sans effet si `path` n'est
+    pas (ou plus) enregistré par CE processus."""
+    if not path:
+        return
+    data = _prune(_load())
+    abs_path = os.path.abspath(path)
+    entry = data.get(abs_path)
+    if entry and entry.get("pid") == os.getpid():
+        entry["whatsapp_share_port"] = port
+        _save(data)
+
+
+def list_whatsapp_share_targets():
+    """{"pid", "port"} pour chaque tournoi ouvert (tous processus vivants
+    confondus) ayant un port de partage PDF par QR code actif — QU'IL
+    AIT OU NON le contrôle à distance activé (voir update_whatsapp_
+    share_port ci-dessus). Sert uniquement à remote_control.py:
+    handle_whatsapp_share_path à relayer (127.0.0.1, jamais le réseau
+    externe) une requête /whatsapp_share reçue sur le port 8765 d'UN
+    AUTRE tournoi — jamais utilisé par le reste du contrôle à distance,
+    qui continue d'utiliser exclusivement list_remote_tournaments()."""
+    data = _prune(_load())
+    result = []
+    for entry in data.values():
+        port = entry.get("whatsapp_share_port")
+        if port:
+            result.append({"pid": entry.get("pid"), "port": port})
+    return result
+
+
 def unregister(path):
     """Retire l'entrée de `path` si elle appartient au processus courant
     (par précaution, pour ne jamais effacer par erreur celle d'un autre

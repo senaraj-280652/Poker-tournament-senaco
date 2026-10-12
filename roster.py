@@ -44,6 +44,26 @@ ROSTER_GROUP_ADMIN = "ADMIN"
 ROSTER_GROUP_DIRTO = "DIRTO"
 ROSTER_GROUPS = (ROSTER_GROUP_ADMIN, ROSTER_GROUP_DIRTO)
 
+# Impression PDF du Répertoire (demande du 2026-10-07) : liste ordonnée des
+# champs proposés à l'impression, (clé technique, libellé) — reprend
+# EXACTEMENT les 6 champs réels de load_roster_entries()/save_roster_
+# entries ci-dessous, plus "photo" (stockage séparé, voir player_photos.py,
+# jamais une clé de roster.json) ; aucun champ inventé. Ordre = celui déjà
+# affiché dans le Treeview du Répertoire (main.py: RosterManagerDialog).
+ROSTER_PDF_COLUMNS = [
+    ("photo", "Photo"),
+    ("name", "Nom"),
+    ("club", "Club"),
+    ("group", "Groupe"),
+    ("phone", "Téléphone"),
+    ("mail", "Mail"),
+    ("pseudo", "Pseudo"),
+]
+# Choix par défaut validés explicitement par l'utilisateur (liste de
+# contact classique) — Photo/Groupe/Mail/Pseudo restent décochés par
+# défaut (plus sensibles ou, pour Photo, plus lourds à produire).
+ROSTER_PDF_DEFAULT_COLUMNS = ["name", "club", "phone"]
+
 def _roster_dir():
     home = os.path.expanduser("~")
     d = os.path.join(home, ".poker_tournament")
@@ -336,3 +356,248 @@ def rename_in_roster(old_name, new_name):
     }
     entries.append(merged)
     save_roster_entries(entries)
+
+
+# =========================================================================
+# Impression PDF du Répertoire (demande du 2026-10-07) — voir ROSTER_PDF_
+# COLUMNS/ROSTER_PDF_DEFAULT_COLUMNS plus haut. Purement un export/
+# affichage à partir des données déjà en mémoire (`entries`, fournies par
+# l'appelant dans l'ordre voulu) : ne modifie JAMAIS roster.json, ni le
+# stockage des photos (player_photos.py), ni aucune base de tournoi —
+# lecture seule de bout en bout.
+# =========================================================================
+
+def export_roster_pdf(path, entries, columns):
+    """Génère le PDF du Répertoire à `path`, pour les `entries` fournies
+    (déjà dans l'ordre voulu — voir main.py: RosterManagerDialog, qui
+    reprend l'ordre actuellement affiché à l'écran) et UNIQUEMENT les
+    champs listés dans `columns` (sous-ensemble de clés de ROSTER_PDF_
+    COLUMNS). Un champ absent de `columns` n'est jamais lu pour
+    construire une ligne/un en-tête — confidentialité par construction,
+    jamais par masquage après coup.
+
+    Lève ValueError si `columns` ne contient aucun champ reconnu (garde-
+    fou supplémentaire : le bouton "Créer le PDF" refuse déjà ce cas
+    avant même d'appeler cette fonction, voir RosterPdfDialog._do_export
+    dans main.py). Lève ImportError si fpdf2 n'est pas installé — propagée
+    telle quelle, voir App.show_missing_export_module, même convention
+    que les autres exports PDF de Senaco."""
+    selected = [(key, header) for key, header in ROSTER_PDF_COLUMNS if key in columns]
+    if not selected:
+        raise ValueError("Aucun champ sélectionné pour l'impression du Répertoire.")
+    if any(key == "photo" for key, _ in selected):
+        return _export_roster_pdf_with_photos(path, entries, selected)
+    return _export_roster_pdf_text_only(path, entries, selected)
+
+
+def _export_roster_pdf_text_only(path, entries, selected):
+    """Aucune colonne Photo cochée : réutilise _write_pdf_table
+    (database.py) à l'identique du reste de Senaco pour une présentation
+    homogène (repeat_header/page_numbers activés, nouveaux paramètres
+    optionnels — voir leur docstring, comportement des autres exports
+    strictement inchangé). Pré-assainit les textes avec action_log.
+    _pdf_text (gère accents/apostrophes/tirets/points de suspension de
+    façon robuste, contrairement à la version plus simple de
+    database._pdf_text — qui s'applique ensuite une seconde fois, sans
+    effet puisque le texte est déjà sûr à ce stade)."""
+    from database import _write_pdf_table
+    from action_log import _pdf_text as _safe_pdf_text
+
+    headers = [_safe_pdf_text(header) for _, header in selected]
+    rows = [
+        [_safe_pdf_text(entry.get(key, "")) for key, _ in selected]
+        for entry in entries
+    ]
+    return _write_pdf_table(
+        path, _safe_pdf_text("Répertoire"), [], headers, rows,
+        repeat_header=True, page_numbers=True,
+    )
+
+
+# Dimensions fixes (mm) de la colonne/ligne Photo — suffisamment grandes
+# pour rester lisibles (demande explicite : "privilégier un résultat
+# lisible... plutôt que de chercher à mettre trop de joueurs sur chaque
+# page"), sans chercher à les maximiser — environ 9-10 lignes par page en
+# A4, marges incluses.
+_ROSTER_PDF_PHOTO_COL_WIDTH_MM = 22
+_ROSTER_PDF_PHOTO_ROW_HEIGHT_MM = 24
+_ROSTER_PDF_HEADER_ROW_HEIGHT_MM = 8
+# Hauteur de ligne COMPACTE (demande du 2026-10-07, correction) : utilisée
+# UNIQUEMENT pour un joueur sans photo alors que la colonne Photo est
+# cochée — même hauteur que le tableau texte seul (_write_pdf_table,
+# row_height=7) pour rester cohérente avec "le rendu actuel est déjà
+# validé" ailleurs. Un joueur AVEC photo garde toujours
+# _ROSTER_PDF_PHOTO_ROW_HEIGHT_MM, intégralement inchangée.
+_ROSTER_PDF_COMPACT_ROW_HEIGHT_MM = 7
+
+
+def _fit_image_box(image_path, max_w, max_h):
+    """(largeur, hauteur) en mm de l'image mise à l'échelle pour tenir
+    dans un rectangle max_w x max_h SANS jamais dépasser ni déformer —
+    proportions conservées (jamais un simple max_w x max_h, qui
+    étirerait une photo non carrée). Nécessite Pillow (déjà une
+    dépendance du projet — voir player_photos.save_photo_from_image,
+    requirements.txt Mac/Windows) ; repli sur le plein cadre si la
+    taille réelle ne peut pas être lue (fichier illisible/corrompu)
+    plutôt que de faire échouer tout le PDF pour une seule photo."""
+    try:
+        from PIL import Image
+        with Image.open(image_path) as img:
+            iw, ih = img.size
+    except Exception:
+        return max_w, max_h
+    if iw <= 0 or ih <= 0:
+        return max_w, max_h
+    scale = min(max_w / iw, max_h / ih)
+    return iw * scale, ih * scale
+
+
+def _export_roster_pdf_with_photos(path, entries, selected):
+    """Variante dédiée (demande explicite du 2026-10-07, confirmée après
+    le diagnostic) : _write_pdf_table (database.py) n'est pas conçue pour
+    des images — dessin manuel ligne par ligne avec fpdf2 directement,
+    mais en reprenant la MÊME présentation (police/couleurs d'en-tête,
+    lignes alternées... en l'occurrence header seul ici par simplicité,
+    voir plus bas) et le même mécanisme repeat_header/page_numbers que
+    _write_pdf_table, via les callbacks header()/footer() de fpdf2, pour
+    une présentation homogène.
+
+    Une photo manquante laisse la cellule vide (jamais une erreur) ; une
+    photo illisible est ignorée (try/except autour de pdf.image()) plutôt
+    que de faire échouer tout le document pour une seule ligne. Les
+    proportions de chaque photo sont conservées (voir _fit_image_box),
+    jamais étirées — centrée dans sa cellule. Toutes les cellules d'une
+    même ligne (photo + texte) partagent la même hauteur fixe : le nom et
+    les autres champs restent alignés avec la photo."""
+    import player_photos
+    from fpdf import FPDF
+    from action_log import _pdf_text as _safe_pdf_text
+    from database import _pdf_fit_font_size
+
+    text_cols = [(key, header) for key, header in selected if key != "photo"]
+    photo_col_width = _ROSTER_PDF_PHOTO_COL_WIDTH_MM
+    row_height = _ROSTER_PDF_PHOTO_ROW_HEIGHT_MM
+    header_height = _ROSTER_PDF_HEADER_ROW_HEIGHT_MM
+
+    # Même principe que _write_pdf_table (paysage au-delà de 6 colonnes) :
+    # la colonne Photo occupe à elle seule une largeur comparable à ~2
+    # colonnes de texte, donc comptée comme telle ici plutôt que comme
+    # une simple colonne de plus.
+    orientation = "L" if len(text_cols) > 4 else "P"
+
+    headers = [_safe_pdf_text(h) for _, h in text_cols]
+    photo_header = _safe_pdf_text("Photo")
+
+    class _RosterPhotoPDF(FPDF):
+        _text_col_width = 0.0
+        _header_font_size = 9
+
+        def header(self):
+            # Jamais sur la 1ère page (titre dessiné "à la main" juste
+            # après add_page(), plus bas) — seulement les pages suivantes.
+            if self.page_no() == 1:
+                return
+            self._draw_header_row()
+
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 8)
+            self.set_text_color(120, 120, 120)
+            self.cell(0, 8, f"Page {self.page_no()}/{{nb}}", align="C")
+            self.set_text_color(0, 0, 0)
+
+        def _draw_header_row(self):
+            self.set_font("Helvetica", "B", self._header_font_size)
+            self.set_fill_color(31, 78, 36)
+            self.set_text_color(255, 255, 255)
+            self.cell(photo_col_width, header_height, photo_header, border=1, align="C", fill=True)
+            for h in headers:
+                self.cell(self._text_col_width, header_height, h, border=1, align="C", fill=True)
+            self.ln(header_height)
+            self.set_text_color(0, 0, 0)
+
+    pdf = _RosterPhotoPDF(orientation=orientation, unit="mm", format="A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, _safe_pdf_text("Répertoire"), border=0)
+    pdf.ln(12)
+
+    avail_width = pdf.w - pdf.l_margin - pdf.r_margin
+    text_col_width = (avail_width - photo_col_width) / max(1, len(text_cols))
+    pdf._text_col_width = text_col_width
+
+    header_font_size = _pdf_fit_font_size(pdf, [photo_header] + headers, text_col_width, bold=True)
+    pdf._header_font_size = header_font_size
+    pdf._draw_header_row()
+
+    body_texts = [
+        _safe_pdf_text(entry.get(key, "")) for entry in entries for key, _ in text_cols
+    ] or [""]
+    body_font_size = _pdf_fit_font_size(pdf, body_texts, text_col_width, bold=False)
+
+    for entry in entries:
+        # Hauteur de ligne VARIABLE (correction du 2026-10-07) : haute
+        # (row_height, intégralement inchangée) UNIQUEMENT si ce joueur a
+        # réellement une photo ; compacte (adaptée au texte) sinon — la
+        # cellule Photo reste vide, Nom/Club/etc. restent centrés dans une
+        # ligne normale, exactement comme le rendu texte seul déjà validé.
+        # Déterminé AVANT tout dessin pour que le calcul de saut de page
+        # ci-dessous utilise la hauteur RÉELLE de CETTE ligne précise.
+        photo_path = player_photos.get_photo_path(entry.get("name", ""))
+        row_h = row_height if photo_path else _ROSTER_PDF_COMPACT_ROW_HEIGHT_MM
+
+        # Saut de page déclenché NOUS-MÊMES, avant de capturer x0/y0
+        # (correctif trouvé par un test direct avant livraison) : laisser
+        # le pdf.cell() ci-dessous déclencher SON PROPRE saut de page
+        # automatique (set_auto_page_break) capturait x0/y0 sur l'ANCIENNE
+        # page juste avant, puis plaçait l'image et les cellules de texte
+        # à ces coordonnées désormais invalides sur la page suivante
+        # (page 2 quasi vide, ligne scindée sur la page 3) — reproduit et
+        # corrigé par tests/test_roster_pdf_export.py. En vérifiant nous-
+        # mêmes AVANT de dessiner quoi que ce soit, avec la hauteur RÉELLE
+        # de cette ligne (row_h, jamais la constante haute fixe — sinon
+        # une ligne compacte sans photo, suivie d'une ligne AVEC photo,
+        # pourrait voir cette dernière coupée entre deux pages), pdf.cell()
+        # ci-dessous ne peut plus jamais déclencher de saut de page en
+        # cours de ligne : x0/y0 restent valides pour toute la ligne, et
+        # une photo n'est jamais scindée entre deux pages.
+        if pdf.get_y() + row_h > pdf.page_break_trigger:
+            pdf.add_page()
+        # Police explicitement réaffirmée à chaque ligne (après un saut de
+        # page éventuel, header() — voir au-dessus — laisse la police en
+        # gras/taille d'en-tête ; sans cette ligne, le corps du tableau
+        # continuerait à tort dans cette police, même précaution que
+        # _write_pdf_table).
+        pdf.set_font("Helvetica", "", body_font_size)
+        pdf.set_text_color(0, 0, 0)
+        x0 = pdf.get_x()
+        y0 = pdf.get_y()
+        pdf.cell(photo_col_width, row_h, "", border=1)
+
+        if photo_path:
+            # row_h vaut ici forcément row_height (la hauteur haute,
+            # inchangée) : mêmes marges/mise à l'échelle qu'avant cette
+            # correction, proportions et taille de la photo identiques.
+            max_w = photo_col_width - 4
+            max_h = row_h - 4
+            try:
+                w, h = _fit_image_box(photo_path, max_w, max_h)
+                img_x = x0 + (photo_col_width - w) / 2
+                img_y = y0 + (row_h - h) / 2
+                pdf.image(photo_path, x=img_x, y=img_y, w=w, h=h)
+            except Exception:
+                pass  # photo illisible : cellule laissée vide, jamais une erreur bloquante
+
+        pdf.set_xy(x0 + photo_col_width, y0)
+        for key, _ in text_cols:
+            pdf.cell(
+                text_col_width, row_h, _safe_pdf_text(entry.get(key, "")),
+                border=1, align="C",
+            )
+        pdf.ln(row_h)
+
+    pdf.output(path)
+    return path

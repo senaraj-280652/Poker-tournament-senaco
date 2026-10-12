@@ -145,6 +145,14 @@ class _StubWindow:
     def _stop_remote_control(self):
         pass
 
+    def _stop_whatsapp_share_server(self):
+        # Appelé inconditionnellement par _cleanup_for_close depuis le
+        # 2026-10-11 (partage PDF par QR code, voir main.py) — sans
+        # rapport avec ce que teste ce fichier (verrou "Menu principal"),
+        # donc un simple no-op ici, même principe que _stop_remote_
+        # control juste au-dessus.
+        pass
+
     def _cancel_tables_blink(self):
         # Appelé inconditionnellement par _cleanup_for_close (voir
         # tests/test_tables_tab_movement_pending_banner.py pour le vrai
