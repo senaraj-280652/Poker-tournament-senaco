@@ -143,6 +143,14 @@ class RemoteDevicePopupWindowTest(unittest.TestCase):
         self.win.log_tab = self.log_tab
         self.win.remote_devices_container = ttk.Frame(self.ca_tab)
 
+        # Sentinel non-None (voir App._check_remote_device_requests,
+        # gardée "if self.db is None: return" depuis le chantier "Ouvrir
+        # Senaco" du 2026-10-13) : ce harnais simule un TOURNOI réel avec
+        # contrôle à distance (onglets CA/LOG, demandes de téléphone),
+        # jamais le mode sans tournoi — self.db doit donc rester non-None
+        # pour que ce sondage continue de s'exécuter normalement, comme
+        # avant ce chantier.
+        self.win.db = "sentinel-tournoi-reel"
         self.win._remote_device_snoozed_keys = set()
         self.win._remote_device_popup = None
         self.win._remote_device_popup_current_key = None

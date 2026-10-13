@@ -45,6 +45,14 @@ class _BlindsTabHarness:
     _toggle_blinds_start_time = main.App._toggle_blinds_start_time
 
     def __init__(self, root, rounds):
+        # self.db : simple sentinel non-None (voir App._refresh_blinds_tab,
+        # qui depuis le chantier "Ouvrir Senaco" du 2026-10-13 choisit entre
+        # _blind_rounds_from_db() et self._standalone_blind_rounds selon
+        # self.db) — cette doublure simule un TOURNOI réel (pas le mode
+        # sans tournoi), donc self.db doit être non-None pour continuer à
+        # passer par _blind_rounds_from_db() ci-dessous, comme avant ce
+        # chantier.
+        self.db = "sentinel-tournoi-reel"
         self.blinds_rows_frame = ttk.Frame(root)
         self.blinds_field_width_var = tk.IntVar(value=10)
         self._blinds_start_now_minutes = None

@@ -675,6 +675,12 @@ class OfferWhatsappShareDispatchTest(unittest.TestCase):
     def setUpClass(cls):
         cls.root = tk.Tk()
         cls.root.withdraw()
+        # Sentinel non-None (voir App.offer_whatsapp_share, qui depuis le
+        # chantier "Ouvrir Senaco" du 2026-10-13 calcule phone_available=
+        # app.db is not None) : cls.root simule ici l'App d'un TOURNOI
+        # réel (export Classement/Statistiques), jamais le mode sans
+        # tournoi — self.db doit donc rester non-None.
+        cls.root.db = "sentinel-tournoi-reel"
 
     @classmethod
     def tearDownClass(cls):

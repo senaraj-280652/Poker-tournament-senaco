@@ -181,9 +181,20 @@ class TabsWiringStructurelTest(unittest.TestCase):
     def test_ordre_des_onglets_statistiques_ca_log_parametres(self):
         """Ordre demandé : "...Répertoire / Statistiques / CA / LOG /
         Paramètres" — vérifié via l'ordre RÉEL des appels notebook.add
-        dans le code source (jamais un ordre supposé)."""
+        dans le code source (jamais un ordre supposé).
+
+        Recherche volontairement bornée APRÈS la branche standalone
+        ("🖥️ Ouvrir Senaco" sans tournoi, demande du 2026-10-13/14) : cette
+        branche construit elle aussi Statistiques ET Paramètres (mais
+        jamais CA/LOG, tournoi-spécifiques) — une recherche non bornée
+        y trouverait un "Paramètres" qui ne respecte pas cet ordre (ce
+        n'est pas le même onglet ni la même méthode de construction, voir
+        _build_settings_tab_standalone), sans rapport avec cette
+        vérification."""
         func = self._find_method("App", "_build_tabs")
         func_source = ast.get_source_segment(self.source, func) or ""
+        standalone_end = func_source.index("self.players_tab = ttk.Frame(self.notebook)")
+        func_source = func_source[standalone_end:]
         pos_stats = func_source.index('text="Statistiques"')
         pos_ca = func_source.index('text="CA"')
         pos_log = func_source.index('text="LOG"')

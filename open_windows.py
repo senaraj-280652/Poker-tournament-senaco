@@ -547,9 +547,23 @@ def unregister(path):
     register() ci-dessus : lecture, retrait, décision "reste-t-il
     quelque chose ?" et nettoyage éventuel forment UNE SEULE section
     critique, jamais entrelacée avec le register()/unregister() d'un
-    autre process."""
+    autre process.
+
+    Renvoie True si CE retrait a vidé le registre (ce tournoi était bien
+    le dernier ouvert, tous processus confondus, morts déjà purgés par
+    _prune) — False dans tous les autres cas, y compris `path` absent du
+    registre ou appartenant à un AUTRE pid (demande explicite du
+    2026-10-14, "Ouvrir Senaco" sans tournoi à la fermeture du dernier
+    tournoi, voir App._on_close/_cleanup_for_close, seuls appelants réels
+    qui exploitent cette valeur de retour — ne JAMAIS supposer "c'était
+    le dernier" dans un cas incertain/anormal, uniquement quand ce
+    process a RÉELLEMENT retiré sa propre entrée et que plus rien ne
+    reste). Chaque appelant PRÉEXISTANT (main.py, toute la suite de
+    tests) ignore déjà cette valeur (simple instruction `open_windows.
+    unregister(path)`) — ajout strictement additif, vérifié exhaustivement
+    avant ce changement, aucun ne peut en être affecté."""
     if not path:
-        return
+        return False
     with _registry_lock():
         data = _prune(_load())
         abs_path = os.path.abspath(path)
@@ -561,6 +575,9 @@ def unregister(path):
                 _clear_primes_session_started()
                 _clear_primes_enabled_proposed()
                 _clear_remote_control_session_files()
+                return True
+            return False
+        return False
 
 
 def find_open_pid(path):

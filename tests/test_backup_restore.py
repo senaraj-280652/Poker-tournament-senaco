@@ -1699,7 +1699,7 @@ class NoOpOnCancellationTest(unittest.TestCase):
         flow_start = source.index(
             "def _run_backup_flow(self, parent, tournament_files=None, tournament_source_folders=None):"
         )
-        flow_end = source.index("def _choose_tournament_file(self):")
+        flow_end = source.index("def _run_restore_flow(self, parent):")
         flow_body = source[flow_start:flow_end]
         self.assertIn("if not dest:\n            return None", flow_body)
         # La sauvegarde elle-même passe désormais par _run_blocking_with_
@@ -1719,10 +1719,21 @@ class NoOpOnCancellationTest(unittest.TestCase):
             flow_body.index("backup_restore.create_backup("),
         )
 
-        restore_start = backup_now_end
-        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        # restore_now() délègue désormais entièrement à App._run_restore_
+        # flow (extraction du 2026-10-13, même raison que backup_now/
+        # _run_backup_flow ci-dessus, réutilisable DEPUIS Senaco sans
+        # tournoi) — la logique "annulation = retour immédiat" vit donc
+        # maintenant dans _run_restore_flow, jamais plus dans restore_now()
+        # elle-même.
+        restore_now_start = source.index("def restore_now():")
+        restore_now_end = source.index("def purge_now():")
+        restore_now_body = source[restore_now_start:restore_now_end]
+        self.assertIn("self._run_restore_flow(win)", restore_now_body)
+
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
         restore_body = source[restore_start:restore_end]
-        self.assertIn("if not src:\n                return", restore_body)
+        self.assertIn("if not src:\n            return", restore_body)
         self.assertIn("backup_restore.restore_backup", restore_body)
         self.assertLess(
             restore_body.index("if not src:"),
@@ -1751,8 +1762,8 @@ class RestoreMultiFolderTransparencyTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        restore_start = source.index("def restore_now():")
-        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
         restore_body = source[restore_start:restore_end]
 
         self.assertIn('manifest.get("tournament_source_folders")', restore_body)
@@ -1773,8 +1784,8 @@ class RestoreMultiFolderTransparencyTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        restore_start = source.index("def restore_now():")
-        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
         restore_body = source[restore_start:restore_end]
         self.assertIn("noms de dossiers lisibles", restore_body)
 
@@ -1786,8 +1797,8 @@ class RestoreMultiFolderTransparencyTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        restore_start = source.index("def restore_now():")
-        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
         restore_body = source[restore_start:restore_end]
         self.assertNotIn('f"  {index}_{backup_restore', restore_body)
         self.assertNotIn("sous-dossiers techniques", restore_body)
@@ -1808,8 +1819,8 @@ class RestoreOverwriteWarningTest(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
-        restore_start = source.index("def restore_now():")
-        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
         return source[restore_start:restore_end]
 
     def test_avertissement_de_remplacement_present_et_avant_confirmation(self):

@@ -69,8 +69,15 @@ class ButtonWiringStructuralTest(unittest.TestCase):
         )
 
     def test_bouton_appliquer_packe_dans_top_btns_a_gauche(self):
+        """Depuis le chantier "Ouvrir Senaco" du 2026-10-13, ce bouton est
+        imbriqué dans `if self.db is not None:` (masqué sans tournoi) —
+        on cherche donc le statement PORTANT "Appliquer" dans TOUT
+        l'arbre de la méthode (ast.walk), plus seulement au premier
+        niveau de func.body."""
         func = self._find_method("App", "_build_blinds_tab")
-        for stmt in func.body:
+        for stmt in ast.walk(func):
+            if not isinstance(stmt, (ast.Expr, ast.Assign)):
+                continue
             seg = ast.get_source_segment(self.source, stmt) or ""
             if 'text="Appliquer"' in seg:
                 self.assertTrue(seg.startswith("ttk.Button(top_btns,"), seg)
@@ -78,6 +85,19 @@ class ButtonWiringStructuralTest(unittest.TestCase):
                 self.assertIn("command=self._apply_blinds_from_tab", seg)
                 return
         self.fail("bouton 'Appliquer' introuvable")
+
+    def test_bouton_appliquer_masque_sans_tournoi(self):
+        """Demande explicite du 2026-10-13 ("fonctions nécessitant un
+        tournoi masquées ou désactivées") : "Appliquer" n'a de sens que
+        pour committer au tournoi ouvert — doit être gardé par
+        `if self.db is not None`, jamais construit sans tournoi."""
+        func = self._find_method("App", "_build_blinds_tab")
+        if_node = next(
+            n for n in ast.walk(func)
+            if isinstance(n, ast.If) and ast.get_source_segment(self.source, n.test) == "self.db is not None"
+        )
+        branch_seg = "\n".join(ast.get_source_segment(self.source, s) or "" for s in if_node.body)
+        self.assertIn('text="Appliquer"', branch_seg)
 
     def test_apply_blinds_from_tab_ne_demande_aucune_confirmation(self):
         """Décision explicite du 2026-09-24 : contrairement à 'Structure
@@ -152,6 +172,8 @@ class _FakeApp:
 
     _collect_blinds_from_widgets = main.App._collect_blinds_from_widgets
     _rounds_to_flat_structure = main.App._rounds_to_flat_structure
+    _flat_structure_to_rounds = main.App._flat_structure_to_rounds
+    _commit_blind_rounds = main.App._commit_blind_rounds
     _apply_blinds_from_tab = main.App._apply_blinds_from_tab
     _reset_blind_structure_from_tab = main.App._reset_blind_structure_from_tab
     _go_to_level = main.App._go_to_level

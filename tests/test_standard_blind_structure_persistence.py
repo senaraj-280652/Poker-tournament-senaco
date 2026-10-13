@@ -225,6 +225,15 @@ class ResetButtonsUseCustomStandardTest(unittest.TestCase):
     def test_bouton_blindes_tab_applique_loverride(self):
         win = types.SimpleNamespace(db=self.db)
         win._refresh_blinds_tab = lambda: None
+        # Méthodes réelles greffées (voir App._reset_blind_structure_from_
+        # tab, qui depuis le chantier "Ouvrir Senaco" du 2026-10-13 passe
+        # par _commit_blind_rounds/_flat_structure_to_rounds plutôt que
+        # self.db.set_blind_structure directement) — win.db étant non-None
+        # ici (vrai tournoi), _commit_blind_rounds continuera d'écrire
+        # dans self.db comme avant ce chantier.
+        win._flat_structure_to_rounds = types.MethodType(main.App._flat_structure_to_rounds, win)
+        win._rounds_to_flat_structure = types.MethodType(main.App._rounds_to_flat_structure, win)
+        win._commit_blind_rounds = types.MethodType(main.App._commit_blind_rounds, win)
         with patch.object(main.messagebox, "askyesno", return_value=True):
             main.App._reset_blind_structure_from_tab(win)
 

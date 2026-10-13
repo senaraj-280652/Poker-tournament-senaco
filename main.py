@@ -683,12 +683,12 @@ def offer_whatsapp_share(dialog, pdf_path, label):
     régénéré ici. `label` : texte affiché sur la page de confirmation
     côté téléphone pour la méthode "Mon téléphone" (ex. "Classement —
     CPC Poker")."""
-    choice_dlg = WhatsAppDestinationChoiceDialog(dialog)
+    app = dialog.master.winfo_toplevel()
+    choice_dlg = WhatsAppDestinationChoiceDialog(dialog, phone_available=app.db is not None)
     dialog.wait_window(choice_dlg)
     if choice_dlg.result == "computer":
         prompt_whatsapp_share(dialog, pdf_path)
     elif choice_dlg.result == "phone":
-        app = dialog.master.winfo_toplevel()
         WhatsAppQRShareDialog(dialog, app, pdf_path, label)
 
 
@@ -699,9 +699,17 @@ class WhatsAppDestinationChoiceDialog(tk.Toplevel):
     implémenté) ou "Mon téléphone" (QR code temporaire). Un clic sur
     l'un des deux boutons suffit, pas d'étape de confirmation
     supplémentaire — résultat dans self.result ("computer"/"phone", ou
-    None si la fenêtre est fermée sans choix)."""
+    None si la fenêtre est fermée sans choix).
 
-    def __init__(self, master):
+    `phone_available` (demande du 2026-10-13, "Ouvrir Senaco" sans
+    tournoi) : False désactive "📱 Mon téléphone" — WhatsAppQRShareDialog
+    démarre un serveur et enregistre son port via self.app.db.path (voir
+    App._get_or_start_whatsapp_share_port), qui n'existe pas sans
+    tournoi ouvert (Statistiques, elle, reste accessible dans ce mode) ;
+    "💻 Cet ordinateur" (prompt_whatsapp_share) ne touche jamais self.db
+    et reste donc toujours proposé."""
+
+    def __init__(self, master, phone_available=True):
         super().__init__(master)
         self.title("Envoi WhatsApp")
         self.configure(bg=FELT_DARK)
@@ -721,10 +729,14 @@ class WhatsAppDestinationChoiceDialog(tk.Toplevel):
             btns, text="💻  Cet ordinateur", width=20,
             command=lambda: self._choose("computer"),
         ).pack(side="left", padx=6)
-        ttk.Button(
+        phone_btn = ttk.Button(
             btns, text="📱  Mon téléphone", width=20,
             command=lambda: self._choose("phone"),
-        ).pack(side="left", padx=6)
+            state="normal" if phone_available else "disabled",
+        )
+        phone_btn.pack(side="left", padx=6)
+        if not phone_available:
+            Tooltip(phone_btn, "Nécessite un tournoi ouvert.")
 
     def _choose(self, value):
         self.result = value
@@ -3780,7 +3792,15 @@ class BlindTemplatesDialog(tk.Toplevel):
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=12)
-        ttk.Button(btns, text="Charger sur ce tournoi", command=self._load_selected).pack(side="left")
+        ttk.Button(
+            btns,
+            # Sans tournoi ("🖥️ Ouvrir Senaco", self.app.db is None,
+            # demande du 2026-10-13) : "Charger" tout court — rien n'est
+            # affecté "à ce tournoi" puisqu'aucun n'est ouvert (voir
+            # _load_selected ci-dessous).
+            text="Charger sur ce tournoi" if self.app.db is not None else "Charger",
+            command=self._load_selected,
+        ).pack(side="left")
         ttk.Button(
             btns, text="Supprimer", command=self._delete_selected, style="Danger.TButton",
         ).pack(side="left", padx=6)
@@ -3818,12 +3838,21 @@ class BlindTemplatesDialog(tk.Toplevel):
             parent=self,
         ):
             return
-        self.app.db.set_blind_structure(levels)
+        # Sans tournoi ("🖥️ Ouvrir Senaco", self.app.db is None, demande
+        # du 2026-10-13) : _commit_blind_rounds écrit alors UNIQUEMENT
+        # dans self.app._standalone_blind_rounds EN MÉMOIRE (voir sa
+        # docstring) — jamais self.app.db.set_blind_structure.
+        self.app._commit_blind_rounds(self.app._flat_structure_to_rounds(levels))
         self.app._refresh_blinds_tab()
-        if hasattr(self.app, "blinds_tree"):
+        if self.app.db is not None and hasattr(self.app, "blinds_tree"):
             self.app._refresh_clock_tab()
         messagebox.showinfo(
-            "Récupérer Blindes", f"Structure « {name} » appliquée à ce tournoi.", parent=self,
+            "Récupérer Blindes",
+            f"Structure « {name} » appliquée à ce tournoi."
+            if self.app.db is not None else
+            f"Structure « {name} » chargée — prête à être modifiée ou "
+            f"réenregistrée (aucun tournoi n'est ouvert).",
+            parent=self,
         )
         self.destroy()
 
@@ -7898,7 +7927,7 @@ class App(tk.Tk):
         terminal visible (contrôle à distance, tests)."""
         _log_exception(exc, val, tb)
 
-    def __init__(self, open_path=None):
+    def __init__(self, open_path=None, start_standalone=False):
         super().__init__()
         self.withdraw()
         # Titre initial (Menu principal, avant tout choix de tournoi —
@@ -8272,7 +8301,18 @@ class App(tk.Tk):
                 # _acquire_menu_principal_lock_if_needed : self.after
                 # (destroy différé) déjà programmé, rien d'autre à faire.
                 return
-            if not self._choose_tournament_file():
+            # start_standalone (demande explicite du 2026-10-14, "la
+            # fermeture de la croix rouge/'Fin de la partie' iPhone ne
+            # doit plus faire disparaître tout Senaco") : équivalent
+            # d'un clic sur "🖥️ Ouvrir Senaco" sur l'écran Bienvenue,
+            # SANS l'afficher — self.db reste None (déjà initialisé plus
+            # haut), _choose_tournament_file() n'est même pas appelée.
+            # Le verrou de Menu principal ci-dessus a néanmoins déjà été
+            # posé/refusé EXACTEMENT comme pour un lancement normal : une
+            # seule fenêtre "sans tournoi/Bienvenue" possible à la fois
+            # sur ce poste, jamais deux en double (voir App._on_close,
+            # seul appelant réel de start_standalone=True).
+            if not start_standalone and not self._choose_tournament_file():
                 # _cleanup_for_close (pas juste self.destroy()) : libère
                 # aussi le verrou de Menu principal éventuellement posé
                 # juste au-dessus (voir self._holds_menu_principal_lock)
@@ -8296,7 +8336,8 @@ class App(tk.Tk):
         # settings_tab() ci-dessous, pour que la case et le grisement de
         # la section reflètent le bon état dès la toute première image,
         # jamais l'ancien état affiché puis corrigé au tick suivant.
-        _align_primes_enabled_on_open(self.db)
+        if self.db is not None:
+            _align_primes_enabled_on_open(self.db)
         # Détection SEULE (aucune réparation automatique, demande
         # explicite du 2026-09-10) d'une incohérence de capacité déjà
         # présente dans le fichier ouvert — ex. un ancien fichier créé
@@ -8321,7 +8362,12 @@ class App(tk.Tk):
         # peut déjà être pris par une autre fenêtre de l'appli ouverte en
         # parallèle (Sit & Go multiples) — cas normal, pas la peine
         # d'interrompre l'ouverture avec une fenêtre d'erreur pour ça.
-        self._start_remote_control_if_enabled(silent=True)
+        # Jamais démarré sans tournoi (demande explicite du 2026-10-13,
+        # "Ouvrir Senaco" sans tournoi : self.db is None) — ce serveur
+        # expose un état de tournoi au téléphone, qui n'a aucun sens tant
+        # qu'aucun n'est ouvert.
+        if self.db is not None:
+            self._start_remote_control_if_enabled(silent=True)
         self._bind_voice_command_shortcuts()
         self._bind_personal_code_section_shortcut()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -8476,7 +8522,16 @@ class App(tk.Tk):
         # remplaçant celle-ci. Ordre affiché : Menu principal puis Lobby
         # (interverti par rapport à un tout premier essai).
         new_window_btn = ttk.Button(
-            inner, text="🏠  Menu principal", command=self._open_new_window,
+            inner, text="🏠  Menu principal",
+            # Sans tournoi (self.db is None, "🖥️ Ouvrir Senaco" — demande
+            # du 2026-10-13) : _new_tournament() (destroy() + nouvelle
+            # App() EN MÉMOIRE, mécanisme déjà existant et éprouvé pour
+            # Fichier > Nouveau tournoi/Ouvrir depuis un tournoi réel)
+            # plutôt que _open_new_window (qui lancerait un second
+            # PROCESSUS, superflu ici et explicitement à éviter) —
+            # ramène directement à l'écran Bienvenue, sans fenêtre ni
+            # processus supplémentaire.
+            command=self._open_new_window if self.db else self._new_tournament,
         )
         new_window_btn.pack(side="left", pady=14)
         Tooltip(
@@ -8485,7 +8540,10 @@ class App(tk.Tk):
             "fermer celle-ci — pratique pour gérer plusieurs Sit & Go (ou\n"
             "tournois) en même temps, chacun dans sa propre fenêtre. Vous\n"
             "y retrouverez l'écran d'accueil habituel (Nouveau tournoi /\n"
-            "Sit & Go rapide / Ouvrir).",
+            "Sit & Go rapide / Ouvrir)."
+            if self.db else
+            "Revient à l'écran Bienvenue (Nouveau tournoi / Sit & Go rapide\n"
+            "/ Ouvrir...), dans cette même fenêtre.",
         )
         lobby_header_btn = ttk.Button(
             inner, text="📋  Lobby", command=self._open_lobby,
@@ -8794,29 +8852,269 @@ class App(tk.Tk):
         )
         return result_info
 
+    def _run_restore_flow(self, parent):
+        """"♻️ Restaurer depuis une clé USB" : voir backup_restore.
+        restore_backup — refuse d'abord si un tournoi est ouvert
+        (open_windows.list_open_paths), affiche le contenu du manifeste
+        et exige une confirmation explicite AVANT toute écriture, puis
+        crée automatiquement une sauvegarde de sécurité de l'état actuel
+        avant d'écraser quoi que ce soit.
+
+        Extraite le 2026-10-13 de la fermeture `restore_now` de
+        _choose_tournament_file (écran "Bienvenue") pour être réutilisée
+        À L'IDENTIQUE depuis "🖥️ Ouvrir Senaco" sans tournoi (demande
+        explicite : "Réutilise impérativement les mêmes fonctions
+        métier et les mêmes protections, sans dupliquer leur logique
+        interne") — `parent` remplace simplement `win`, aucune autre
+        ligne changée."""
+        src = filedialog.askdirectory(
+            title="Sélectionner un dossier de sauvegarde PokerTournament_Backup_...",
+            parent=parent,
+        )
+        if not src:
+            return
+        if open_windows.list_open_paths():
+            messagebox.showerror(
+                "Tournoi(s) actuellement ouvert(s)",
+                "Au moins un tournoi est actuellement ouvert (ici ou dans "
+                "une autre fenêtre).\n\nFermez tous les tournois ouverts "
+                "avant de restaurer une sauvegarde.",
+                parent=parent,
+            )
+            return
+        try:
+            manifest = backup_restore.validate_backup_folder(src)
+        except backup_restore.BackupError as e:
+            messagebox.showerror("Sauvegarde invalide", str(e), parent=parent)
+            return
+        count = len(manifest.get("tournament_files", []))
+        has_data = manifest.get("poker_tournament_data_included", False)
+        # Transparence EXPLICITE sur l'arborescence d'une sauvegarde
+        # MULTI-DOSSIERS (demande explicite du 2026-10-08, "la
+        # restauration ne doit pas créer silencieusement une
+        # organisation différente de celle attendue") — mise à jour
+        # le 2026-10-13 ("dossiers techniques 4_mardi après
+        # restauration") : restore_backup() ne recrée plus le
+        # préfixe technique "<index>_<nom>" du manifeste à la
+        # destination (voir backup_restore.resolve_multi_folder_
+        # destination_labels, seule source de vérité pour ce calcul,
+        # jamais dupliquée ici) — annoncé ICI, avant confirmation,
+        # avec la correspondance exacte libellé lisible -> dossier
+        # d'origine réel.
+        multi_folders = manifest.get("tournament_source_folders")
+        multi_note = ""
+        if multi_folders:
+            configured_folder = (
+                tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+            ).strip()
+            if configured_folder:
+                resolved_labels = backup_restore.resolve_multi_folder_destination_labels(
+                    multi_folders, configured_folder,
+                )
+                mapping_lines = "\n".join(
+                    f"  {resolved_labels[index]}  <-  {folder}"
+                    for index, folder in enumerate(multi_folders)
+                )
+                multi_note = (
+                    "\n\nCette sauvegarde provient de plusieurs dossiers "
+                    "distincts. Les fichiers seront restaurés sous des noms "
+                    "de dossiers lisibles (fusionnés avec un dossier "
+                    "existant du même nom si besoin, jamais mélangés entre "
+                    f"dossiers d'origine différents) :\n{mapping_lines}"
+                )
+            else:
+                # « Dossier par défaut » pas encore configuré sur ce
+                # poste : restore_backup refusera de toute façon plus
+                # loin avec un message explicite (voir sa docstring,
+                # section 1bis) — aperçu simplifié ici, sans tenter de
+                # deviner un dossier de destination.
+                multi_note = (
+                    "\n\nCette sauvegarde provient de plusieurs dossiers "
+                    "distincts. Les fichiers seront restaurés sous des "
+                    "noms de dossiers lisibles."
+                )
+        # Avertissement explicite sur le remplacement (demande du
+        # 2026-10-10) : restore_backup() écrase bien un .tournoi de
+        # même nom relatif déjà présent à destination (comportement
+        # voulu, protégé par la sauvegarde de sécurité ci-dessous) —
+        # mais rien ne le disait jusqu'ici avant confirmation.
+        # Seulement si cette sauvegarde contient effectivement des
+        # .tournoi (count > 0) : sinon aucun fichier de tournoi
+        # n'est concerné par cette restauration.
+        overwrite_note = (
+            "\n\nLes fichiers de tournoi (.tournoi) de même nom déjà "
+            "présents dans le dossier de tournoi actuel seront "
+            "REMPLACÉS par ceux de la sauvegarde."
+        ) if count else ""
+        if not messagebox.askyesno(
+            "Confirmer la restauration",
+            f"Sauvegarde du {manifest.get('created_at', '?')}\n"
+            f"Version : {manifest.get('app_version', '?')}\n"
+            f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
+            f"Tournois : {count}\n"
+            "Données de l'application (réglages, joueurs, photos...) : "
+            f"{'oui' if has_data else 'non'}"
+            f"{multi_note}{overwrite_note}\n\n"
+            "Une sauvegarde de sécurité des données actuelles sera créée "
+            "automatiquement avant toute modification.\n\n"
+            "Confirmer la restauration ?",
+            icon="warning", default="no", parent=parent,
+        ):
+            return
+        try:
+            restore_info = _run_blocking_with_progress(
+                parent, "Restauration en cours…",
+                lambda progress_callback: backup_restore.restore_backup(
+                    src, progress_callback=progress_callback,
+                ),
+            )
+        except backup_restore.BackupError as e:
+            messagebox.showerror("Erreur de restauration", str(e), parent=parent)
+            return
+        messagebox.showinfo(
+            "Restauration terminée",
+            "Restauration terminée avec succès.\n\n"
+            f"Tournois restaurés : {restore_info['restored_tournament_files']}\n"
+            f"Données de l'application restaurées : "
+            f"{'oui' if restore_info['restored_data'] else 'non'}\n\n"
+            "Sauvegarde de sécurité de l'état précédent :\n"
+            f"{restore_info['safety_backup_dir']}",
+            parent=parent,
+        )
+
+    def _open_data_purge_dialog(self, parent):
+        """"🗑️ Purger les données" (demande du 2026-10-12) — ouvre
+        DIRECTEMENT la fenêtre "Purger Données" déjà existante
+        (DataPurgeDialog, voir sa docstring), sans ouvrir ni créer aucun
+        tournoi : AUCUNE logique de purge dupliquée ici, un point
+        d'entrée vers EXACTEMENT le même mécanisme que l'onglet LOG —
+        mêmes garde-fous (sélection des périodes/types/dossiers,
+        vérification de sauvegarde, confirmations), inchangés.
+
+        Même garde-fou cross-process (open_windows.list_open_paths, "ici
+        ou dans une autre fenêtre") : la purge reste strictement
+        interdite tant qu'un tournoi est ouvert, quelle que soit
+        l'instance Senaco qui le détient. DataPurgeDialog revérifie de
+        toute façon elle-même, tournoi par tournoi, au moment de purger
+        (défense en profondeur, jamais une confiance aveugle envers ce
+        seul contrôle d'entrée) — ce garde-fou-ci est une couche
+        SUPPLÉMENTAIRE, plus stricte : interdit même d'OUVRIR la fenêtre
+        tant qu'un seul tournoi, n'importe lequel, reste ouvert quelque
+        part.
+
+        Extraite le 2026-10-13 de la fermeture `purge_now` de
+        _choose_tournament_file (écran "Bienvenue") pour être réutilisée
+        À L'IDENTIQUE depuis "🖥️ Ouvrir Senaco" sans tournoi — `parent`
+        remplace `win` (ou `self`, la fenêtre principale, depuis le menu
+        Réglages de Senaco sans tournoi) : sans une fenêtre PARENT
+        réellement affichée, DataPurgeDialog resterait invisible, même
+        diagnostic déjà rencontré pour "Bienvenue" et ActivationDialog."""
+        if open_windows.list_open_paths():
+            messagebox.showerror(
+                "Tournoi(s) actuellement ouvert(s)",
+                "Au moins un tournoi est actuellement ouvert (ici ou "
+                "dans une autre fenêtre).\n\nFermez tous les tournois "
+                "ouverts avant de purger des données.",
+                parent=parent,
+            )
+            return
+        DataPurgeDialog(self, parent_window=parent)
+
+    def _open_basic_settings_dialog(self, parent):
+        """"⚙️ Paramètres de base" (demande explicite du 2026-10-12) :
+        fenêtre MINIMALE, accessible SANS ouvrir ni créer aucun tournoi —
+        jamais le moindre accès à self.db ici. Réutilise EXACTEMENT les
+        mécanismes globaux déjà existants : export_prefs pour le nom du
+        club (même clé "club_name" que partout ailleurs dans
+        l'application) et tournament_prefs.load_last_settings()/
+        save_last_settings() pour le "Dossier par défaut" — LE MÊME
+        magasin global que celui déjà lu par backup_restore.
+        restore_backup() pour sa propre validation (voir sa docstring).
+        Ne modifie JAMAIS un réglage SPÉCIFIQUE à un tournoi : aucun des
+        deux réglages ici n'en est un.
+
+        Extraite le 2026-10-13 de la fermeture `open_basic_settings` de
+        _choose_tournament_file (écran "Bienvenue") pour être également
+        reproposée depuis le menu Réglages de "🖥️ Ouvrir Senaco" sans
+        tournoi (voir _build_menu) — `parent` remplace `win`/`self`,
+        aucune autre ligne changée."""
+        settings_win = tk.Toplevel(parent)
+        settings_win.title("Paramètres de base")
+        settings_win.configure(bg=FELT_DARK)
+        settings_win.resizable(False, False)
+        settings_win.transient(parent)
+
+        club_var = tk.StringVar(value=export_prefs.load_value("club_name", "") or "")
+        folder_var = tk.StringVar(
+            value=tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+        )
+
+        tk.Label(
+            settings_win, text="Nom du Club :", bg=FELT_DARK, fg="white",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(18, 6))
+        ttk.Entry(settings_win, textvariable=club_var, width=34).grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=(0, 12), pady=(18, 6),
+        )
+
+        tk.Label(
+            settings_win, text="Dossier par défaut :", bg=FELT_DARK, fg="white",
+        ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
+        ttk.Entry(settings_win, textvariable=folder_var, width=34).grid(
+            row=1, column=1, sticky="we", padx=(0, 6), pady=(0, 6),
+        )
+
+        def browse_folder():
+            chosen = filedialog.askdirectory(
+                title="Choisir le dossier par défaut", parent=settings_win,
+            )
+            if chosen:
+                folder_var.set(chosen)
+
+        ttk.Button(settings_win, text="📂 Parcourir…", command=browse_folder).grid(
+            row=1, column=2, sticky="w", padx=(0, 12), pady=(0, 6),
+        )
+
+        def save_and_close():
+            export_prefs.save_value("club_name", club_var.get().strip())
+            tournament_prefs.save_last_settings(
+                {"tournament_day_folder": folder_var.get().strip()}
+            )
+            settings_win.destroy()
+
+        btns = tk.Frame(settings_win, bg=FELT_DARK)
+        btns.grid(row=2, column=0, columnspan=3, pady=(14, 18))
+        ttk.Button(btns, text="Enregistrer", command=save_and_close).pack(side="left", padx=6)
+        ttk.Button(btns, text="Annuler", command=settings_win.destroy).pack(side="left", padx=6)
+
+        settings_win.columnconfigure(1, weight=1)
+        settings_win.grab_set()
+        settings_win.wait_window(settings_win)
+
     def _choose_tournament_file(self):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        # 480x567 (480x527 avant l'ajout du bouton "🗑️ Purger les
+        # 480x607 (480x567 avant l'ajout du bouton "🖥️ Ouvrir Senaco" le
+        # 2026-10-13 ; 480x527 avant l'ajout du bouton "🗑️ Purger les
         # données" le 2026-10-12, qui dépassait sinon hors de la fenêtre,
         # toujours non redimensionnable — signalé après essai manuel ;
         # 480x460 avant l'ajout de la zone "Sauvegarde des données" ; 620
         # avec séparateur + texte explicatif sous le titre ; 570 avec
         # seulement le titre, sans séparateur/texte ; le titre lui-même a
-        # été retiré le 2026-09-08 — 43px de moins). +40px mesurés via
-        # winfo_reqheight() sur les mêmes widgets/police/largeur/pady
-        # qu'un bouton existant (icône + texte, ttk.Button width=28,
-        # pady=6) : largeur et dimensions des boutons INCHANGÉES, seule
-        # la hauteur de fenêtre grandit en conséquence, avec la même
-        # marge qu'avant en bas (jamais recalculée à l'aveugle). Aucun
-        # réglage de mise à l'échelle DPI Windows ici ni ailleurs dans ce
-        # fichier (voir par ex. self.geometry("480x560") plus haut,
-        # ligne ~4968, même motif) : cette fenêtre suit exactement le
-        # même modèle de géométrie fixe que toutes les autres, Tk gérant
-        # déjà seul la mise à l'échelle du système — rien de spécifique
-        # à régler pour ce bouton.
-        win.geometry("480x567")
+        # été retiré le 2026-09-08 — 43px de moins). +40px par bouton
+        # supplémentaire de même style (icône + texte, ttk.Button
+        # width=28, pady=6), MÊME delta déjà mesuré et validé pour
+        # "Purger les données" ci-dessus — pas de nouvelle mesure, le
+        # bouton suit le même modèle : largeur et dimensions des boutons
+        # INCHANGÉES, seule la hauteur de fenêtre grandit en conséquence,
+        # avec la même marge qu'avant en bas (jamais recalculée à
+        # l'aveugle). Aucun réglage de mise à l'échelle DPI Windows ici ni
+        # ailleurs dans ce fichier (voir par ex. self.geometry("480x560")
+        # plus haut, ligne ~4968, même motif) : cette fenêtre suit
+        # exactement le même modèle de géométrie fixe que toutes les
+        # autres, Tk gérant déjà seul la mise à l'échelle du système —
+        # rien de spécifique à régler pour ce bouton.
+        win.geometry("480x607")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -8829,6 +9127,23 @@ class App(tk.Tk):
         # (une fois l'appli affichée) doivent, elles, garder transient().
         win.grab_set()
         result = {"path": None}
+
+        def open_senaco():
+            """"🖥️ Ouvrir Senaco" (demande explicite du 2026-10-13) :
+            ouvre l'interface habituelle de Senaco SANS créer ni charger
+            aucun tournoi (self.db reste None, jamais de Database(...)
+            instancié) — pour préparer des structures de blindes, régler
+            les paramètres/sons globaux, consulter Statistiques/
+            Répertoire, et gérer les sauvegardes, sans y être forcé.
+            result["standalone"] = True (et PAS result["path"]) signale
+            ce choix à l'appelant juste après self.wait_window(win)
+            ci-dessous : AUCUN appel à open_windows.try_register (jamais
+            enregistré au Lobby, voir son docstring), self.db reste None
+            tout du long (voir App.__init__, _align_primes_enabled_on_
+            open/_start_remote_control_if_enabled désormais gardés par
+            "if self.db is not None")."""
+            result["standalone"] = True
+            win.destroy()
 
         tk.Label(
             win, text="♠ ♥ ♦ ♣",
@@ -8976,236 +9291,41 @@ class App(tk.Tk):
             self._run_backup_flow(win)
 
         def restore_now():
-            """"♻️ Restaurer depuis une clé USB" : voir backup_restore.
-            restore_backup — refuse d'abord si un tournoi est ouvert
-            (open_windows.list_open_paths), affiche le contenu du
-            manifeste et exige une confirmation explicite AVANT toute
-            écriture, puis crée automatiquement une sauvegarde de
-            sécurité de l'état actuel avant d'écraser quoi que ce soit."""
-            src = filedialog.askdirectory(
-                title="Sélectionner un dossier de sauvegarde PokerTournament_Backup_...",
-                parent=win,
-            )
-            if not src:
-                return
-            if open_windows.list_open_paths():
-                messagebox.showerror(
-                    "Tournoi(s) actuellement ouvert(s)",
-                    "Au moins un tournoi est actuellement ouvert (ici ou dans "
-                    "une autre fenêtre).\n\nFermez tous les tournois ouverts "
-                    "avant de restaurer une sauvegarde.",
-                    parent=win,
-                )
-                return
-            try:
-                manifest = backup_restore.validate_backup_folder(src)
-            except backup_restore.BackupError as e:
-                messagebox.showerror("Sauvegarde invalide", str(e), parent=win)
-                return
-            count = len(manifest.get("tournament_files", []))
-            has_data = manifest.get("poker_tournament_data_included", False)
-            # Transparence EXPLICITE sur l'arborescence d'une sauvegarde
-            # MULTI-DOSSIERS (demande explicite du 2026-10-08, "la
-            # restauration ne doit pas créer silencieusement une
-            # organisation différente de celle attendue") — mise à jour
-            # le 2026-10-13 ("dossiers techniques 4_mardi après
-            # restauration") : restore_backup() ne recrée plus le
-            # préfixe technique "<index>_<nom>" du manifeste à la
-            # destination (voir backup_restore.resolve_multi_folder_
-            # destination_labels, seule source de vérité pour ce calcul,
-            # jamais dupliquée ici) — annoncé ICI, avant confirmation,
-            # avec la correspondance exacte libellé lisible -> dossier
-            # d'origine réel.
-            multi_folders = manifest.get("tournament_source_folders")
-            multi_note = ""
-            if multi_folders:
-                configured_folder = (
-                    tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
-                ).strip()
-                if configured_folder:
-                    resolved_labels = backup_restore.resolve_multi_folder_destination_labels(
-                        multi_folders, configured_folder,
-                    )
-                    mapping_lines = "\n".join(
-                        f"  {resolved_labels[index]}  <-  {folder}"
-                        for index, folder in enumerate(multi_folders)
-                    )
-                    multi_note = (
-                        "\n\nCette sauvegarde provient de plusieurs dossiers "
-                        "distincts. Les fichiers seront restaurés sous des noms "
-                        "de dossiers lisibles (fusionnés avec un dossier "
-                        "existant du même nom si besoin, jamais mélangés entre "
-                        f"dossiers d'origine différents) :\n{mapping_lines}"
-                    )
-                else:
-                    # « Dossier par défaut » pas encore configuré sur ce
-                    # poste : restore_backup refusera de toute façon plus
-                    # loin avec un message explicite (voir sa docstring,
-                    # section 1bis) — aperçu simplifié ici, sans tenter de
-                    # deviner un dossier de destination.
-                    multi_note = (
-                        "\n\nCette sauvegarde provient de plusieurs dossiers "
-                        "distincts. Les fichiers seront restaurés sous des "
-                        "noms de dossiers lisibles."
-                    )
-            # Avertissement explicite sur le remplacement (demande du
-            # 2026-10-10) : restore_backup() écrase bien un .tournoi de
-            # même nom relatif déjà présent à destination (comportement
-            # voulu, protégé par la sauvegarde de sécurité ci-dessous) —
-            # mais rien ne le disait jusqu'ici avant confirmation.
-            # Seulement si cette sauvegarde contient effectivement des
-            # .tournoi (count > 0) : sinon aucun fichier de tournoi
-            # n'est concerné par cette restauration.
-            overwrite_note = (
-                "\n\nLes fichiers de tournoi (.tournoi) de même nom déjà "
-                "présents dans le dossier de tournoi actuel seront "
-                "REMPLACÉS par ceux de la sauvegarde."
-            ) if count else ""
-            if not messagebox.askyesno(
-                "Confirmer la restauration",
-                f"Sauvegarde du {manifest.get('created_at', '?')}\n"
-                f"Version : {manifest.get('app_version', '?')}\n"
-                f"Ordinateur d'origine : {manifest.get('computer_name', '?')}\n"
-                f"Tournois : {count}\n"
-                "Données de l'application (réglages, joueurs, photos...) : "
-                f"{'oui' if has_data else 'non'}"
-                f"{multi_note}{overwrite_note}\n\n"
-                "Une sauvegarde de sécurité des données actuelles sera créée "
-                "automatiquement avant toute modification.\n\n"
-                "Confirmer la restauration ?",
-                icon="warning", default="no", parent=win,
-            ):
-                return
-            try:
-                restore_info = _run_blocking_with_progress(
-                    win, "Restauration en cours…",
-                    lambda progress_callback: backup_restore.restore_backup(
-                        src, progress_callback=progress_callback,
-                    ),
-                )
-            except backup_restore.BackupError as e:
-                messagebox.showerror("Erreur de restauration", str(e), parent=win)
-                return
-            messagebox.showinfo(
-                "Restauration terminée",
-                "Restauration terminée avec succès.\n\n"
-                f"Tournois restaurés : {restore_info['restored_tournament_files']}\n"
-                f"Données de l'application restaurées : "
-                f"{'oui' if restore_info['restored_data'] else 'non'}\n\n"
-                "Sauvegarde de sécurité de l'état précédent :\n"
-                f"{restore_info['safety_backup_dir']}",
-                parent=win,
-            )
+            """"♻️ Restaurer depuis une clé USB" — voir App._run_restore_
+            flow, seul point d'appel réel (extrait ici le 2026-10-13 pour
+            être également réutilisable DEPUIS Senaco sans tournoi,
+            "🖥️ Ouvrir Senaco" > Données > Restaurer, SANS dupliquer la
+            moindre ligne de cette logique métier, option B explicitement
+            choisie)."""
+            self._run_restore_flow(win)
 
         def purge_now():
-            """"🗑️ Purger les données" au Menu principal (demande du
-            2026-10-12) — ouvre DIRECTEMENT la fenêtre "Purger Données"
-            déjà existante (DataPurgeDialog, voir sa docstring), sans
-            ouvrir ni créer aucun tournoi : AUCUNE logique de purge
-            dupliquée ici, un second point d'entrée vers EXACTEMENT le
-            même mécanisme que l'onglet LOG — mêmes garde-fous (sélection
-            des périodes/types/dossiers, vérification de sauvegarde,
-            confirmations), inchangés.
-
-            Même garde-fou cross-process que restore_now ci-dessus
-            (open_windows.list_open_paths, "ici ou dans une autre
-            fenêtre") : la purge reste strictement interdite tant qu'un
-            tournoi est ouvert, quelle que soit l'instance Senaco qui le
-            détient. DataPurgeDialog revérifie de toute façon elle-même,
-            tournoi par tournoi, au moment de purger (défense en
-            profondeur, jamais une confiance aveugle envers ce seul
-            contrôle d'entrée) — ce garde-fou-ci est une couche
-            SUPPLÉMENTAIRE, plus stricte : interdit même d'OUVRIR la
-            fenêtre tant qu'un seul tournoi, n'importe lequel, reste
-            ouvert quelque part.
-
-            parent_window=win (PAS self, l'App racine encore self.
-            withdraw() à ce stade — voir DataPurgeDialog.__init__) : sans
-            quoi la fenêtre resterait invisible, même diagnostic déjà
-            rencontré pour "Bienvenue" et ActivationDialog. self.app
-            reste `self` (l'App) : _show_log_date_picker/_run_backup_flow
-            continuent de fonctionner à l'identique. Fermeture : gérée
-            entièrement par DataPurgeDialog elle-même (grab_set/
-            transient) — revient seule à "Bienvenue" (win), déjà affichée
-            et jamais masquée ni détruite entre-temps, sans code
-            supplémentaire ici."""
-            if open_windows.list_open_paths():
-                messagebox.showerror(
-                    "Tournoi(s) actuellement ouvert(s)",
-                    "Au moins un tournoi est actuellement ouvert (ici ou "
-                    "dans une autre fenêtre).\n\nFermez tous les tournois "
-                    "ouverts avant de purger des données.",
-                    parent=win,
-                )
-                return
-            DataPurgeDialog(self, parent_window=win)
+            """"🗑️ Purger les données" — voir App._open_data_purge_dialog,
+            seul point d'appel réel (extrait ici le 2026-10-13, même
+            raison que restore_now ci-dessus)."""
+            self._open_data_purge_dialog(win)
 
         def open_basic_settings():
-            """"⚙️ Paramètres de base" (demande explicite du 2026-10-12) :
-            fenêtre MINIMALE, accessible SANS ouvrir ni créer aucun
-            tournoi — jamais le moindre accès à self.db ici. Réutilise
-            EXACTEMENT les mécanismes globaux déjà existants : export_
-            prefs pour le nom du club (même clé "club_name" que partout
-            ailleurs dans l'application) et tournament_prefs.load_last_
-            settings()/save_last_settings() pour le "Dossier par
-            défaut" — LE MÊME magasin global que celui déjà lu par
-            backup_restore.restore_backup() pour sa propre validation
-            (voir sa docstring). Ne modifie JAMAIS un réglage SPÉCIFIQUE
-            à un tournoi : aucun des deux réglages ici n'en est un."""
-            settings_win = tk.Toplevel(win)
-            settings_win.title("Paramètres de base")
-            settings_win.configure(bg=FELT_DARK)
-            settings_win.resizable(False, False)
-            settings_win.transient(win)
-
-            club_var = tk.StringVar(value=export_prefs.load_value("club_name", "") or "")
-            folder_var = tk.StringVar(
-                value=tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
-            )
-
-            tk.Label(
-                settings_win, text="Nom du Club :", bg=FELT_DARK, fg="white",
-            ).grid(row=0, column=0, sticky="w", padx=12, pady=(18, 6))
-            ttk.Entry(settings_win, textvariable=club_var, width=34).grid(
-                row=0, column=1, columnspan=2, sticky="we", padx=(0, 12), pady=(18, 6),
-            )
-
-            tk.Label(
-                settings_win, text="Dossier par défaut :", bg=FELT_DARK, fg="white",
-            ).grid(row=1, column=0, sticky="w", padx=12, pady=(0, 6))
-            ttk.Entry(settings_win, textvariable=folder_var, width=34).grid(
-                row=1, column=1, sticky="we", padx=(0, 6), pady=(0, 6),
-            )
-
-            def browse_folder():
-                chosen = filedialog.askdirectory(
-                    title="Choisir le dossier par défaut", parent=settings_win,
-                )
-                if chosen:
-                    folder_var.set(chosen)
-
-            ttk.Button(settings_win, text="📂 Parcourir…", command=browse_folder).grid(
-                row=1, column=2, sticky="w", padx=(0, 12), pady=(0, 6),
-            )
-
-            def save_and_close():
-                export_prefs.save_value("club_name", club_var.get().strip())
-                tournament_prefs.save_last_settings(
-                    {"tournament_day_folder": folder_var.get().strip()}
-                )
-                settings_win.destroy()
-
-            btns = tk.Frame(settings_win, bg=FELT_DARK)
-            btns.grid(row=2, column=0, columnspan=3, pady=(14, 18))
-            ttk.Button(btns, text="Enregistrer", command=save_and_close).pack(side="left", padx=6)
-            ttk.Button(btns, text="Annuler", command=settings_win.destroy).pack(side="left", padx=6)
-
-            settings_win.columnconfigure(1, weight=1)
-            settings_win.grab_set()
-            settings_win.wait_window(settings_win)
+            """"⚙️ Paramètres de base" — voir App._open_basic_settings_
+            dialog, seul point d'appel réel (extrait ici le 2026-10-13
+            pour être également réutilisable depuis le menu Réglages de
+            Senaco sans tournoi, voir _build_menu)."""
+            self._open_basic_settings_dialog(win)
 
         btn_frame = tk.Frame(win, bg=FELT_DARK)
         btn_frame.pack(pady=4)
+        ouvrir_senaco_btn = ttk.Button(
+            btn_frame, text="🖥️  Ouvrir Senaco", command=open_senaco, width=28,
+        )
+        ouvrir_senaco_btn.pack(pady=6)
+        Tooltip(
+            ouvrir_senaco_btn,
+            "Ouvre Senaco sans créer ni charger de tournoi : préparez une\n"
+            "structure de blindes, réglez les paramètres généraux et les\n"
+            "sons, consultez Statistiques/Répertoire, ou gérez vos\n"
+            "sauvegardes — « 🏠 Menu principal » permet d'y revenir\n"
+            "ensuite.",
+        )
         new_tournament_btn = ttk.Button(
             btn_frame, text="🆕  Nouveau tournoi", command=new_tournament, width=28,
         )
@@ -9304,6 +9424,12 @@ class App(tk.Tk):
         _refresh_launch_buttons_state(win, [new_tournament_btn, sng_btn, open_tournament_btn])
 
         self.wait_window(win)
+        if result.get("standalone"):
+            # "🖥️ Ouvrir Senaco" (voir open_senaco ci-dessus) : True sans
+            # jamais passer par open_windows.try_register ni Database(...)
+            # ci-dessous — self.db reste None, exactement comme avant cet
+            # appel.
+            return True
         if not result["path"]:
             return False
         # Réservation ATOMIQUE inter-processus AVANT toute ouverture réelle
@@ -9475,19 +9601,95 @@ class App(tk.Tk):
         atteint cette étape). Le verrou est gardé pendant TOUTE la vie
         de cette fenêtre, pas seulement le temps de l'écran Bienvenue :
         c'est précisément ce qui empêche un second lancement externe
-        pendant qu'un tournoi est déjà affiché — voir App.__init__."""
+        pendant qu'un tournoi est déjà affiché — voir App.__init__.
+
+        self._was_last_open_tournament (demande explicite du 2026-10-14,
+        suite à l'anomalie "fermer un tournoi parmi plusieurs rouvre
+        Senaco sans tournoi à tort") : capture la valeur de retour
+        d'open_windows.unregister(self.db.path) — True UNIQUEMENT si CE
+        retrait a réellement vidé le registre partagé (ce tournoi était
+        bien le dernier ouvert, tous processus vivants confondus, voir
+        sa docstring) — jamais supposé True par défaut : si self.db est
+        None (rien à fermer), ou si ce chemin n'était pas/plus
+        correctement présent dans le registre (cas anormal), reste
+        False, le plus sûr des deux repli possibles. Lu par App._on_close
+        juste après cet appel, seul exploitant réel de cette capture."""
         self._stop_remote_control()
         self._stop_whatsapp_share_server()
         self._cancel_tables_blink()
         self._cancel_players_absent_blink()
+        self._was_last_open_tournament = False
         if self.db:
-            open_windows.unregister(self.db.path)
+            self._was_last_open_tournament = open_windows.unregister(self.db.path)
             self.db.close()
         if getattr(self, "_holds_menu_principal_lock", False):
             open_windows.unregister_menu_principal(os.getpid(), _menu_principal_key())
             self._holds_menu_principal_lock = False
 
     def _on_close(self):
+        """Croix rouge de la fenêtre (WM_DELETE_WINDOW) ET "Fin de la
+        partie" côté iPhone (voir _remote_end_tournament, seul autre
+        appelant) — demande explicite du 2026-10-14 : fermer un tournoi
+        ne doit plus faire disparaître tout Senaco.
+
+        Sans tournoi ouvert (self.db is None, déjà "🖥️ Ouvrir Senaco") :
+        comportement INCHANGÉ, rien à quoi revenir — fermer cette
+        fenêtre quitte réellement l'application, comme avant.
+
+        Avec un tournoi ouvert : sauvegarde/nettoyage normal
+        (_cleanup_for_close, inchangée — mêmes données enregistrées
+        qu'avant cette demande) — PUIS reconstruction d'une App() EN
+        MÉMOIRE directement sur "Senaco sans tournoi" (start_standalone=
+        True, voir App.__init__) plutôt que sur l'écran Bienvenue,
+        MAIS UNIQUEMENT si self._was_last_open_tournament (posée par
+        _cleanup_for_close ci-dessus) est vraie — c'est-à-dire si CE
+        tournoi était bien le DERNIER ouvert, tous processus vivants
+        confondus (voir open_windows.unregister, seule source de
+        vérité ; jamais une simple absence de verrou Menu principal,
+        qui ne reflète PAS le nombre de tournois ouverts — diagnostic
+        du 2026-10-14, "fermer un tournoi parmi plusieurs rouvrait à
+        tort Senaco sans tournoi alors qu'un autre restait ouvert").
+        Si un AUTRE tournoi reste ouvert (self._was_last_open_tournament
+        est False) : cette fenêtre se contente de se fermer, exactement
+        comme avant tout ce chantier — les autres tournois, le Lobby et
+        leur éventuel contrôle à distance continuent de fonctionner sans
+        la moindre interruption (processus totalement indépendants).
+
+        Quand on tente bien la bascule (dernier tournoi) : même
+        mécanisme exact que _new_tournament() (destroy() + nouvelle
+        App().mainloop() dans ce même processus), seule la destination
+        change. start_standalone=True repasse par _acquire_menu_
+        principal_lock_if_needed (voir sa docstring) : si une AUTRE
+        fenêtre Senaco (Bienvenue ou sans tournoi) existe déjà ailleurs
+        sur ce poste — y compris en cas de fermetures simultanées de
+        deux derniers tournois, départagées par le verrou de fichier
+        inter-processus d'open_windows._registry_lock, jamais par ce
+        verrou-ci — cette nouvelle App() se retire silencieusement
+        d'elle-même (comportement déjà existant, jamais deux fenêtres
+        "sans tournoi" en double).
+
+        IMPORTANT : "Fichier > Quitter" n'utilise PAS cette méthode (voir
+        _quit_app ci-dessous) — un Quitter explicite doit toujours fermer
+        Senaco pour de bon, jamais rouvrir automatiquement quoi que ce
+        soit."""
+        if self.db is None:
+            self._cleanup_for_close()
+            self.destroy()
+            return
+        self._cleanup_for_close()
+        was_last = self._was_last_open_tournament
+        self.destroy()
+        if was_last:
+            App(start_standalone=True).mainloop()
+
+    def _quit_app(self):
+        """"Fichier > Quitter" (demande explicite du 2026-10-14, pour la
+        distinguer de la croix rouge/"Fin de la partie" iPhone ci-dessus,
+        voir _on_close) : sortie RÉELLE et DÉFINITIVE de Senaco, que
+        self.db soit None ou non — jamais de réouverture automatique sur
+        Senaco sans tournoi ni sur Bienvenue. Même nettoyage que _on_close
+        (_cleanup_for_close, inchangée), simplement sans jamais
+        reconstruire de nouvelle App() après."""
         self._cleanup_for_close()
         self.destroy()
 
@@ -9497,6 +9699,46 @@ class App(tk.Tk):
     def _build_menu(self):
         menubar = tk.Menu(self)
         filemenu = tk.Menu(menubar, tearoff=0)
+        if self.db is None:
+            # "🖥️ Ouvrir Senaco" (self.db is None, demande du 2026-10-13) :
+            # menu réduit aux seules fonctions réellement indépendantes
+            # d'un tournoi — ni Lobby (ce mode ne s'y enregistre jamais,
+            # voir open_windows), ni Nouveau/Ouvrir tournoi (déjà
+            # accessibles via "🏠 Menu principal" ci-dessous, qui ramène à
+            # l'écran Bienvenue), ni Exporter (self._export_results
+            # resterait de toute façon un no-op sans self.db).
+            filemenu.add_command(label="🏠 Menu principal...", command=self._new_tournament)
+            filemenu.add_separator()
+            filemenu.add_command(label="Quitter", command=self._quit_app)
+            menubar.add_cascade(label="Fichier", menu=filemenu)
+
+            settingsmenu = tk.Menu(menubar, tearoff=0)
+            settingsmenu.add_command(label="⚙️ Paramètres de base...", command=lambda: self._open_basic_settings_dialog(self))
+            settingsmenu.add_command(label="🔊 Sons de fin de Round/Pause...", command=self._open_clock_sounds_dialog)
+            menubar.add_cascade(label="Réglages", menu=settingsmenu)
+
+            rostermenu = tk.Menu(menubar, tearoff=0)
+            rostermenu.add_command(label="Gérer le répertoire de joueurs...", command=self._manage_roster)
+            menubar.add_cascade(label="Répertoire", menu=rostermenu)
+
+            statsmenu = tk.Menu(menubar, tearoff=0)
+            statsmenu.add_command(label="Synthèse par période...", command=self._open_period_summary)
+            menubar.add_cascade(label="Statistiques", menu=statsmenu)
+
+            datamenu = tk.Menu(menubar, tearoff=0)
+            datamenu.add_command(label="💾 Sauvegarder sur clé USB...", command=lambda: self._run_backup_flow(self))
+            datamenu.add_command(label="♻️ Restaurer depuis une clé USB...", command=lambda: self._run_restore_flow(self))
+            datamenu.add_command(label="🗑️ Purger les données...", command=lambda: self._open_data_purge_dialog(self))
+            menubar.add_cascade(label="Données", menu=datamenu)
+
+            helpmenu = tk.Menu(menubar, tearoff=0)
+            helpmenu.add_command(label="Manuel (F1)...", command=self._show_context_help)
+            helpmenu.add_command(label="À propos...", command=self._show_about)
+            menubar.add_cascade(label="Aide", menu=helpmenu)
+
+            self.config(menu=menubar)
+            self.bind_all("<F1>", lambda e: self._show_context_help())
+            return
         # Voir le commentaire équivalent dans _build_header : mêmes deux
         # entrées, mêmes nouveaux libellés/rôles — la troisième
         # ("Lobby (plusieurs tournois)...") a disparu, son rôle étant
@@ -9509,7 +9751,7 @@ class App(tk.Tk):
         filemenu.add_separator()
         filemenu.add_command(label="Exporter les résultats (Excel/CSV)...", command=self._export_results)
         filemenu.add_separator()
-        filemenu.add_command(label="Quitter", command=self._on_close)
+        filemenu.add_command(label="Quitter", command=self._quit_app)
         menubar.add_cascade(label="Fichier", menu=filemenu)
 
         viewmenu = tk.Menu(menubar, tearoff=0)
@@ -9626,6 +9868,30 @@ class App(tk.Tk):
     def _build_tabs(self):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
+
+        if self.db is None:
+            # "🖥️ Ouvrir Senaco" sans tournoi (demande du 2026-10-13,
+            # Paramètres ajouté le 2026-10-14) : SEULS Blindes/Répertoire/
+            # Statistiques/Paramètres ont un sens sans self.db — tous les
+            # autres onglets (Joueurs, Tables, Mouvements, Primes,
+            # Chronomètre, Classement, CA, LOG) ne sont même pas créés,
+            # jamais juste masqués : ils dépendent tous directement d'un
+            # tournoi ouvert. self.notebook reste néanmoins créé
+            # INCONDITIONNELLEMENT juste au-dessus, avant toute autre
+            # chose — _tick()/_refresh_all() y accèdent sans jamais
+            # supposer un nombre précis d'onglets.
+            self.blinds_tab = ttk.Frame(self.notebook)
+            self.roster_tab = RosterManagerDialog(self.notebook, self)
+            self.stats_tab = PeriodSummaryDialog(self.notebook, self)
+            self.settings_tab = ttk.Frame(self.notebook)
+            self.notebook.add(self.blinds_tab, text="Blindes")
+            self.notebook.add(self.roster_tab, text="Répertoire")
+            self.notebook.add(self.stats_tab, text="Statistiques")
+            self.notebook.add(self.settings_tab, text="Paramètres")
+            self._build_blinds_tab()
+            self._build_settings_tab_standalone()
+            self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
+            return
 
         self.players_tab = ttk.Frame(self.notebook)
         self.tables_tab = ttk.Frame(self.notebook)
@@ -13224,6 +13490,14 @@ class App(tk.Tk):
         popup_later) : revenir sur CA fait ainsi réapparaître une
         demande "Plus tard"-ée plus tôt, sans attendre une nouvelle
         tentative du téléphone."""
+        if self.db is None:
+            # Sans tournoi ("🖥️ Ouvrir Senaco", demande du 2026-10-13) :
+            # aucun onglet "CA"/panneau DIRTO construit (voir _build_tabs)
+            # — rien à mettre à jour ici, qu'une demande de téléphone
+            # soit en attente ou non ailleurs dans l'appli (ce sondage
+            # global ne doit affecter QUE l'interface réelle d'un
+            # tournoi ouvert).
+            return
         ca_active_now = self._is_ca_tab_active()
         if ca_active_now and not self._last_ca_tab_active:
             self._remote_device_snoozed_keys.clear()
@@ -13984,15 +14258,27 @@ class App(tk.Tk):
         contrôle à distance, voir remote_control.py) : ferme proprement
         CE tournoi-ci — ce processus n'en gère jamais qu'un seul à la
         fois — en réutilisant EXACTEMENT le même chemin que fermer la
-        fenêtre ou "Fichier > Quitter" (_on_close : arrête le contrôle à
+        fenêtre avec la croix rouge (_on_close : arrête le contrôle à
         distance, désinscrit ce tournoi du registre open_windows.py,
-        ferme la base, puis détruit la fenêtre — jamais de
-        os._exit()/kill() ni d'autre raccourci brutal). Ne peut jamais
-        fermer un AUTRE tournoi : remote_control.py a déjà vérifié, avant
-        même de déposer cette demande dans la file d'attente, que le pid
-        envoyé par le téléphone correspond à CE processus précis (voir
-        RemoteControlServer.start, route /end_tournament) — ce module-ci
-        n'a donc besoin d'aucune vérification supplémentaire d'identité.
+        ferme la base, détruit la fenêtre, PUIS — demande explicite du
+        2026-10-14, affinée le même jour — revient à "Senaco sans
+        tournoi" dans ce même processus UNIQUEMENT si ce tournoi était
+        le DERNIER ouvert (voir open_windows.unregister/self._was_last_
+        open_tournament) ; si un AUTRE tournoi reste ouvert ailleurs,
+        cette fenêtre se contente de se fermer, sans jamais perturber
+        les autres tournois/le Lobby/leur éventuel contrôle à distance,
+        chacun dans son propre processus indépendant — jamais de
+        os._exit()/kill() ni d'autre raccourci brutal). Chemin
+        DÉLIBÉRÉMENT DIFFÉRENT de "Fichier > Quitter" (_quit_app), qui
+        reste lui une sortie réelle et définitive sans réouverture — "Fin
+        de la partie" depuis le téléphone, comme la croix rouge, doit au
+        contraire laisser Senaco utilisable pour le tournoi suivant. Ne
+        peut jamais fermer un AUTRE tournoi : remote_control.py a déjà
+        vérifié, avant même de déposer cette demande dans la file
+        d'attente, que le pid envoyé par le téléphone correspond à CE
+        processus précis (voir RemoteControlServer.start, route
+        /end_tournament) — ce module-ci n'a donc besoin d'aucune
+        vérification supplémentaire d'identité.
 
         Idempotent (voir _remote_end_tournament_triggered, initialisé à
         False dans __init__) : si cette fermeture a déjà été déclenchée
@@ -16506,7 +16792,13 @@ class App(tk.Tk):
         ttk.Button(top_btns, text="➕ Ajouter un round", command=lambda: self._add_blind_round()).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Enr. Struc. Std", command=self._save_current_as_standard_structure).pack(side="left", padx=3)
         ttk.Button(top_btns, text="Structure standard", command=self._reset_blind_structure_from_tab).pack(side="left", padx=3)
-        ttk.Button(top_btns, text="Appliquer", command=self._apply_blinds_from_tab).pack(side="left", padx=3)
+        if self.db is not None:
+            # "Appliquer" n'a de sens que pour committer au tournoi
+            # actuellement ouvert les valeurs visibles dans ce tableau
+            # (voir _apply_blinds_from_tab) — sans objet et donc masqué
+            # sans tournoi ("🖥️ Ouvrir Senaco", demande du 2026-10-13),
+            # jamais demandé dans ce mode.
+            ttk.Button(top_btns, text="Appliquer", command=self._apply_blinds_from_tab).pack(side="left", padx=3)
 
         # Largeur (en caractères) des champs Durée/Petite Blind/Grosse
         # Blind/Ante/Durée Pause du tableau ci-dessous — réglable par
@@ -16541,8 +16833,8 @@ class App(tk.Tk):
         Tooltip(
             load_btn,
             "Ouvre la liste des structures de blindes déjà enregistrées\n"
-            "(via \"Enregistrer Blindes sous...\") pour en appliquer une à\n"
-            "ce tournoi.",
+            "(via \"Enregistrer Blindes sous...\") pour en appliquer une"
+            + (" à ce tournoi." if self.db is not None else "."),
         )
         save_as_btn = ttk.Button(
             top_btns, text="💾 Enregistrer Blindes sous...", command=self._save_blinds_as_template,
@@ -16560,8 +16852,13 @@ class App(tk.Tk):
         # tableau de rounds ci-dessous, pour qu'il réserve sa place à
         # droite en premier — sinon le tableau de rounds (expand=True)
         # capterait tout l'espace disponible et ne laisserait rien pour
-        # ce panneau. Voir _build_chips_panel.
-        self._build_chips_panel()
+        # ce panneau. Voir _build_chips_panel. Entièrement omis sans
+        # tournoi ("🖥️ Ouvrir Senaco", demande du 2026-10-13) : les
+        # couleurs/valeurs de jetons sont strictement liées à un tournoi
+        # précis (voir ses tooltips "ce tournoi"), hors du périmètre
+        # demandé (seules les structures de blindes le sont).
+        if self.db is not None:
+            self._build_chips_panel()
 
         # Conteneur défilable : le nombre de rounds peut largement dépasser
         # la hauteur de l'écran.
@@ -16602,6 +16899,18 @@ class App(tk.Tk):
         # aperçu de planification, remis à 00:00 à chaque redémarrage.
         self._blinds_start_now_minutes = None
         self._blind_row_vars = []
+        if self.db is None:
+            # Sans tournoi ("🖥️ Ouvrir Senaco", demande du 2026-10-13) :
+            # aucune base où lire/écrire une structure (voir
+            # _blind_rounds_from_db, _add_blind_round, etc.) — simple
+            # support EN MÉMOIRE, initialisé sur la Structure Standard
+            # (structures.default_blind_structure(), le même point de
+            # départ qu'un tournoi flambant neuf), jamais persisté tant
+            # qu'"Enregistrer Blindes sous..."/"Enr. Struc. Std" n'est
+            # pas cliqué explicitement (voir leurs docstrings).
+            self._standalone_blind_rounds = self._flat_structure_to_rounds(
+                default_blind_structure()
+            )
         self._refresh_blinds_tab()
 
     # ---------------------------------------------------------------
@@ -17000,8 +17309,18 @@ class App(tk.Tk):
     def _blind_rounds_from_db(self):
         """Regroupe la liste plate de la base (niveaux + pauses) en rounds
         {duration, sb, bb, ante, pause}, un round par niveau de blindes."""
+        return self._flat_structure_to_rounds(self.db.get_blind_structure())
+
+    def _flat_structure_to_rounds(self, flat):
+        """Même conversion que _blind_rounds_from_db ci-dessus, mais à
+        partir d'une liste plate déjà en main (niveaux + pauses), SANS
+        jamais lire self.db — extraite le 2026-10-13 pour être
+        réutilisable sans tournoi ("🖥️ Ouvrir Senaco", voir
+        self._standalone_blind_rounds) : fonction pure, comportement de
+        conversion strictement identique à avant pour l'appelant
+        existant ci-dessus."""
         rounds = []
-        for lvl in self.db.get_blind_structure():
+        for lvl in flat:
             if lvl["is_break"]:
                 if rounds:
                     rounds[-1]["pause"] += lvl["duration_minutes"]
@@ -17070,7 +17389,11 @@ class App(tk.Tk):
                     "point de départ de toute la colonne.",
                 )
 
-        rounds = self._blind_rounds_from_db()
+        # Sans tournoi ("🖥️ Ouvrir Senaco", self.db is None) : pas de
+        # base où lire — self._standalone_blind_rounds (support EN
+        # MÉMOIRE, voir _build_blinds_tab) remplace self._blind_rounds_
+        # from_db() à l'identique pour tout le reste de cette fonction.
+        rounds = self._blind_rounds_from_db() if self.db is not None else self._standalone_blind_rounds
         if not rounds:
             rounds = [{"duration": 15, "sb": 25, "bb": 50, "ante": 0, "pause": 0}]
 
@@ -17191,18 +17514,47 @@ class App(tk.Tk):
                 return
         blind_templates.save_template(name, flat)
 
-        self.db.set_blind_structure(flat)
+        # "Enregistrer Blindes sous..." sans tournoi ("🖥️ Ouvrir Senaco",
+        # demande explicite du 2026-10-13, "aucune structure ne doit être
+        # affectée à un tournoi puisqu'aucun tournoi n'est ouvert") :
+        # blind_templates.save_template ci-dessus (magasin global) reste
+        # la SEULE écriture — _commit_blind_rounds n'écrit alors que dans
+        # self._standalone_blind_rounds, jamais self.db.set_blind_
+        # structure.
+        self._commit_blind_rounds(rounds)
         self._refresh_blinds_tab()
-        if hasattr(self, "blinds_tree"):
+        if self.db is not None and hasattr(self, "blinds_tree"):
             self._refresh_clock_tab()
-        messagebox.showinfo(
-            "Structure enregistrée",
-            f"La structure de blindes a été mise à jour pour ce tournoi, "
-            f"et enregistrée sous « {name} » pour une réutilisation future.",
-        )
+        if self.db is not None:
+            messagebox.showinfo(
+                "Structure enregistrée",
+                f"La structure de blindes a été mise à jour pour ce tournoi, "
+                f"et enregistrée sous « {name} » pour une réutilisation future.",
+            )
+        else:
+            messagebox.showinfo(
+                "Modèle enregistré",
+                f"La structure a été enregistrée sous « {name} » pour une "
+                f"réutilisation future (aucun tournoi n'est ouvert — rien "
+                f"d'autre n'a été modifié).",
+            )
 
     def _open_blind_templates(self):
         BlindTemplatesDialog(self)
+
+    def _commit_blind_rounds(self, rounds):
+        """Écrit `rounds` (liste déjà validée par _collect_blinds_from_
+        widgets ou équivalente) comme nouvelle structure de blindes
+        courante : self.db.set_blind_structure si un tournoi est ouvert,
+        sinon self._standalone_blind_rounds EN MÉMOIRE uniquement
+        ("🖥️ Ouvrir Senaco" sans tournoi, demande du 2026-10-13 —
+        jamais aucune écriture base dans ce second cas). Point d'écriture
+        UNIQUE pour _add_blind_round/_delete_blind_round/_reset_blind_
+        structure_from_tab, pour ne jamais dupliquer ce branchement."""
+        if self.db is not None:
+            self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        else:
+            self._standalone_blind_rounds = rounds
 
     def _add_blind_round(self, after_index=None):
         rounds = self._collect_blinds_from_widgets()
@@ -17216,7 +17568,7 @@ class App(tk.Tk):
             new_round = dict(rounds[after_index - 1])
             new_round["pause"] = 0
             rounds.insert(after_index, new_round)
-        self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        self._commit_blind_rounds(rounds)
         self._refresh_blinds_tab()
 
     def _delete_blind_round(self, index):
@@ -17229,7 +17581,7 @@ class App(tk.Tk):
         if not messagebox.askyesno("Confirmer", f"Supprimer le round {index} ?"):
             return
         del rounds[index - 1]
-        self.db.set_blind_structure(self._rounds_to_flat_structure(rounds))
+        self._commit_blind_rounds(rounds)
         self._refresh_blinds_tab()
 
     def _save_current_as_standard_structure(self):
@@ -17271,7 +17623,7 @@ class App(tk.Tk):
 
     def _reset_blind_structure_from_tab(self):
         if messagebox.askyesno("Confirmer", "Remplacer la structure actuelle par la structure standard ?"):
-            self.db.set_blind_structure(default_blind_structure())
+            self._commit_blind_rounds(self._flat_structure_to_rounds(default_blind_structure()))
             self._refresh_blinds_tab()
             if hasattr(self, "blinds_tree"):
                 self._go_to_level(1)
@@ -17702,6 +18054,357 @@ class App(tk.Tk):
         return (
             ranking_lbl, ranking_row, ranking_combo,
             self.ranking_formula_short_lbl, ranking_legacy_note,
+        )
+
+    # ---------------------------------------------------------------
+    # Onglet Paramètres — variante "🖥️ Ouvrir Senaco" sans tournoi
+    # ---------------------------------------------------------------
+    def _save_standalone_tournament_pref(self, key):
+        """Enregistre EN CONTINU, dans tournament_prefs UNIQUEMENT (self.db
+        est None ici, "🖥️ Ouvrir Senaco" sans tournoi, demande du
+        2026-10-14), la valeur actuelle de self.settings_vars[key] — sert
+        de "réglage par défaut pour le prochain tournoi", exactement le
+        même magasin global que _save_day_folder/_save_tournament_days/
+        _save_elimination_banner_seconds écrivent déjà EN PLUS de self.db
+        pour chacun des champs listés dans tournament_prefs.
+        PERSISTED_KEYS — simplement rien à mettre à jour côté tournoi
+        ici, puisqu'aucun n'est ouvert."""
+        tournament_prefs.save_last_settings({key: self.settings_vars[key].get()})
+
+    def _save_standalone_tournament_days(self):
+        """Équivalent sans tournoi de _save_tournament_days (voir sa
+        docstring) : écrit UNIQUEMENT dans tournament_prefs."""
+        checked = sorted(idx for idx, var in self.tournament_day_vars.items() if var.get())
+        value = ",".join(str(i) for i in checked)
+        tournament_prefs.save_last_settings({"tournament_days_of_week": value})
+
+    def _save_standalone_elimination_banner_seconds(self, var):
+        """Équivalent sans tournoi de _save_elimination_banner_seconds
+        (voir sa docstring, même validation) : écrit UNIQUEMENT dans
+        tournament_prefs."""
+        try:
+            seconds = max(0, min(30, int(var.get())))
+        except (tk.TclError, ValueError):
+            return
+        tournament_prefs.save_last_settings({"elimination_banner_seconds": seconds})
+
+    def _build_settings_tab_standalone(self):
+        """Onglet "Paramètres" affiché par "🖥️ Ouvrir Senaco" SANS
+        tournoi (demande explicite du 2026-10-14, "ajouter l'onglet
+        Paramètres habituel en mode sans tournoi... en conservant les
+        réglages généraux... et les réglages par défaut des futurs
+        tournois, mais sans les fonctions nécessitant un tournoi") —
+        volontairement une méthode SÉPARÉE de _build_settings_tab
+        (~1040 lignes, une seule grille continue avec des décalages de
+        ligne calculés les uns par rapport aux autres : y retrancher des
+        champs à la volée aurait exigé de retoucher cette arithmétique
+        partout, fragile et risqué) plutôt qu'une variante conditionnelle
+        de celle-ci — AUCUNE ligne de _build_settings_tab n'est modifiée
+        par cette méthode, zéro risque de régression sur l'onglet
+        Paramètres habituel d'un tournoi réel.
+
+        Champs INCLUS (réglages déjà globaux, inchangés, OU réglages
+        normalement propres à un tournoi mais déjà prévus comme
+        "défaut pour le prochain tournoi" via tournament_prefs.
+        PERSISTED_KEYS — ici la SEULE écriture possible, voir
+        _save_standalone_tournament_pref ci-dessus) :
+        Nom du Club, Nom du groupe WhatsApp (export_prefs, réutilisés
+        À L'IDENTIQUE) ; buy-in/rebuy/add-on (montant + chips), sièges
+        par table, joueurs minimum avant rééquilibrage, durée de
+        surbrillance, rake ; Signal de mouvements (fichier son + durée,
+        _choose_clock_sound/_clear_clock_sound/_test_movement_signal
+        réutilisées À L'IDENTIQUE, déjà 100% export_prefs) ; Dossier par
+        défaut ; Jours de tournoi / Sit & Go ; Équilibrage guidé par UTG
+        et Un seul tournoi à la fois (export_prefs, réutilisés À
+        L'IDENTIQUE) ; Durée du bandeau d'élimination ; "Éviter qu'un
+        joueur joue à deux tables" (export_prefs, réutilisé À
+        L'IDENTIQUE).
+
+        Champs EXCLUS (nécessitent réellement un tournoi, ou un
+        mécanisme de session couplé à un tournoi déjà ouvert) : Nom du
+        tournoi, Mode Test, Gestion de l'accueil + Durée d'une absence,
+        TOUTE la section Primes (case "Calculer les primes" verrouillée
+        par session, formule de classement, bounty/PKO — tous couplés à
+        l'état d'une session de tournois en cours), Timeout "Annuler
+        Eliminer" (concerne une élimination réelle), Raccourcis clavier
+        (Joueurs/Chronomètre, inexistants ici). La structure de blindes
+        (niveau 1/antes, durées de round, pauses programmables) et son
+        bouton "Régénérer..." sont également exclus ICI : strictement
+        redondants avec l'onglet Blindes, qui dispose déjà de son propre
+        mécanisme "Structure standard"/"Enr. Struc. Std" pour préparer
+        une structure par défaut sans tournoi (voir _build_blinds_tab) —
+        jamais une seconde voie parallèle vers le même résultat.
+
+        Aucun bouton "Enregistrer Paramètres sous.../Récupérer/
+        Imprimer..." ici (contrairement à l'onglet habituel) : chaque
+        champ s'enregistre EN CONTINU (comme Nom du Club/Dossier par
+        défaut le font déjà dans l'onglet habituel), non demandé
+        explicitement et hors du périmètre "réglages généraux + sons +
+        défauts" de cette demande."""
+        canvas = tk.Canvas(self.settings_tab, bg=FELT, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self.settings_tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vscroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+        outer = ttk.Frame(canvas)
+        outer_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda e: canvas.itemconfigure(outer_id, width=e.width)
+        )
+
+        is_mac = self.tk.call("tk", "windowingsystem") == "aqua"
+
+        def _on_mousewheel(event):
+            if is_mac:
+                canvas.yview_scroll(int(-1 * event.delta), "units")
+            else:
+                canvas.yview_scroll(int(-1 * event.delta / 120), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        columns = ttk.Frame(outer)
+        columns.pack(padx=20, pady=20, anchor="nw", fill="both")
+        left = ttk.Frame(columns)
+        left.pack(side="left", anchor="n", padx=(0, 40))
+        right = ttk.Frame(columns)
+        right.pack(side="left", anchor="n")
+
+        self.settings_vars = {}
+        last_settings = tournament_prefs.load_last_settings()
+
+        ttk.Label(
+            left, text="Réglages généraux", font=("Helvetica", 11, "bold"), foreground=GOLD,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        fields = [
+            ("club_name", "Nom du Club"),
+            ("whatsapp_group_name", "Nom du groupe WhatsApp"),
+            ("buyin_amount", "Montant du buy-in (€)"),
+            ("rebuy_amount", "Montant d'un rebuy (€)"),
+            ("addon_amount", "Montant d'un add-on (€)"),
+            ("starting_chips", "Tapis de départ (chips)"),
+            ("rebuy_chips", "Chips reçues pour un rebuy"),
+            ("addon_chips", "Chips reçues pour un add-on"),
+            ("max_seats_per_table", "Nombre de sièges par table"),
+            ("min_players_per_table", "Nombre minimum de joueurs par table avant rééquilibrage"),
+            ("highlight_duration_minutes", "Durée de surbrillance des derniers joueurs déplacés (minutes)"),
+            ("rake_percent", "Rake / frais d'organisation (%)"),
+        ]
+        field_tips = {
+            "max_seats_per_table": "S'appliquera par défaut à un nouveau tournoi.",
+            "min_players_per_table": "S'appliquera par défaut à un nouveau tournoi.",
+            "highlight_duration_minutes": "Durée pendant laquelle un joueur déplacé reste\nsurligné dans l'onglet Mouvements d'un futur tournoi.",
+            "rake_percent": "Prélevé sur le prize pool avant répartition des\ngains (0 = tout le prize pool est reversé aux joueurs).",
+            "whatsapp_group_name": "Simple rappel affiché au moment du partage\n"
+                                    "(\"💬 Envoi WhatsApp\") — ne sélectionne JAMAIS ce\n"
+                                    "groupe automatiquement, à choisir vous-même\n"
+                                    "dans WhatsApp à chaque fois.",
+        }
+        for i, (key, label) in enumerate(fields, start=1):
+            lbl = ttk.Label(left, text=label + " :")
+            lbl.grid(row=i, column=0, sticky="w", pady=4)
+            if key in field_tips:
+                Tooltip(lbl, field_tips[key])
+            if key == "club_name":
+                var = tk.StringVar(value=export_prefs.load_value("club_name", ""))
+                var.trace_add("write", lambda *a: self._save_club_name())
+            elif key == "whatsapp_group_name":
+                var = tk.StringVar(value=export_prefs.load_value("whatsapp_group_name", ""))
+                var.trace_add("write", lambda *a: self._save_whatsapp_group_name())
+            else:
+                var = tk.StringVar(value=last_settings.get(key, ""))
+                var.trace_add("write", lambda *a, k=key: self._save_standalone_tournament_pref(k))
+            ttk.Entry(left, textvariable=var, width=25).grid(row=i, column=1, pady=4, padx=10)
+            self.settings_vars[key] = var
+
+        ttk.Separator(left, orient="horizontal").grid(
+            row=len(fields) + 2, column=0, columnspan=2, sticky="ew", pady=(5, 15)
+        )
+        signal_title = ttk.Label(
+            left, text="Signal de mouvements",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        signal_title.grid(row=len(fields) + 3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        Tooltip(
+            signal_title,
+            "Bip sonore joué sur l'écran projecteur quand un joueur vient\n"
+            "d'être déplacé de table (voir Mouvements) — permet de le\n"
+            "repérer sans regarder l'écran en continu.",
+        )
+
+        signal_row = len(fields) + 4
+        movement_sound_btn = ttk.Button(
+            left, text=self._clock_sound_button_text("movement_signal_wav_path", "Fichier Wav"),
+        )
+        movement_sound_btn.grid(row=signal_row, column=0, sticky="ew", pady=4, padx=(0, 5))
+        movement_sound_btn.config(
+            command=lambda b=movement_sound_btn: self._choose_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            )
+        )
+        movement_sound_btn.bind(
+            "<Button-2>",
+            lambda e, b=movement_sound_btn: self._clear_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            ),
+        )
+        movement_sound_btn.bind(
+            "<Button-3>",
+            lambda e, b=movement_sound_btn: self._clear_clock_sound(
+                "movement_signal_wav_path", "Fichier Wav", b
+            ),
+        )
+        Tooltip(
+            movement_sound_btn,
+            "Fichier .wav joué à chaque déplacement de joueur entre\n"
+            "tables. Commun à tous les tournois/Sit & Go.\n"
+            "Clic gauche : choisir/remplacer le fichier.\n"
+            "Clic droit : retirer (repli sur un bip généré automatiquement).",
+        )
+        ttk.Button(
+            left, text="🔊  Tester le son",
+            command=self._test_movement_signal,
+        ).grid(row=signal_row, column=1, sticky="ew", pady=4, padx=(5, 0))
+
+        duration_row = signal_row + 1
+        duration_lbl = ttk.Label(left, text="Durée max. du signal (millisecondes, ex : 300) :")
+        duration_lbl.grid(row=duration_row, column=0, sticky="w", pady=4)
+        duration_var = tk.StringVar(value=last_settings.get("movement_signal_duration_ms", "300"))
+        duration_var.trace_add(
+            "write", lambda *a: self._save_standalone_tournament_pref("movement_signal_duration_ms")
+        )
+        ttk.Entry(left, textvariable=duration_var, width=25).grid(
+            row=duration_row, column=1, pady=4, padx=10
+        )
+        self.settings_vars["movement_signal_duration_ms"] = duration_var
+
+        folder_row = duration_row + 1
+        folder_lbl = ttk.Label(left, text="Dossier par défaut :")
+        folder_lbl.grid(row=folder_row, column=0, columnspan=2, sticky="w", pady=(14, 4))
+        Tooltip(
+            folder_lbl,
+            "Dossier choisi par vous où se trouve le tournoi du jour.\n"
+            "Cliquez « Parcourir... » pour le choisir — proposé ensuite\n"
+            "automatiquement pour créer un nouveau tournoi, l'ouvrir, ou\n"
+            "dans l'onglet Statistiques.",
+        )
+        day_folder_var = tk.StringVar(value=last_settings.get("tournament_day_folder", ""))
+        day_folder_var.trace_add(
+            "write", lambda *a: self._save_standalone_tournament_pref("tournament_day_folder")
+        )
+        self.settings_vars["tournament_day_folder"] = day_folder_var
+        ttk.Entry(left, textvariable=day_folder_var, width=25).grid(
+            row=folder_row + 1, column=0, sticky="ew", pady=4, padx=(0, 5)
+        )
+        ttk.Button(
+            left, text="📂 Parcourir...",
+            command=lambda: self._choose_day_folder(day_folder_var),
+        ).grid(row=folder_row + 1, column=1, sticky="ew", pady=4, padx=(5, 0))
+
+        multi_table_var = tk.BooleanVar(
+            value=export_prefs.load_value("check_multi_table_conflict", True)
+        )
+        multi_table_check = ttk.Checkbutton(
+            left, text="Éviter qu'un joueur joue à deux tables à la fois",
+            variable=multi_table_var,
+            command=lambda: export_prefs.save_value(
+                "check_multi_table_conflict", multi_table_var.get()
+            ),
+        )
+        multi_table_check.grid(row=folder_row + 2, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        Tooltip(
+            multi_table_check,
+            "Si décoché, le logiciel ne vérifie plus qu'un joueur est déjà\n"
+            "actif dans un autre tournoi/Sit & Go du même dossier avant de\n"
+            "l'ajouter ici — en pratique, ce cas reste rare.",
+        )
+
+        # -- Colonne droite --------------------------------------------
+        days_lbl = ttk.Label(
+            right, text="Jours de tournoi / Sit & Go",
+            font=("Helvetica", 11, "bold"), foreground=GOLD,
+        )
+        days_lbl.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        Tooltip(
+            days_lbl,
+            "Pour référence : les jours de la semaine où votre club\n"
+            "organise des tournois ou des Sit & Go.",
+        )
+        try:
+            saved_days = {
+                int(x) for x in last_settings.get("tournament_days_of_week", DEFAULT_TOURNAMENT_DAYS).split(",")
+                if x.strip() != ""
+            }
+        except ValueError:
+            saved_days = {4, 6}
+        self.tournament_day_vars = {}
+        days_grid = ttk.Frame(right)
+        days_grid.grid(row=1, column=0, columnspan=2, sticky="w")
+        for idx, day_name in enumerate(WEEKDAY_NAMES_FR):
+            var = tk.BooleanVar(value=idx in saved_days)
+            var.trace_add("write", lambda *a: self._save_standalone_tournament_days())
+            self.tournament_day_vars[idx] = var
+            ttk.Checkbutton(
+                days_grid, text=day_name.capitalize(), variable=var,
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2)
+
+        ttk.Separator(right, orient="horizontal").grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(15, 15)
+        )
+
+        self.bb_rebalance_prompt_var = tk.BooleanVar(
+            value=export_prefs.load_value(BB_REBALANCE_PROMPT_PREF_KEY, True) is not False
+        )
+        bb_prompt_check = ttk.Checkbutton(
+            right, text="Équilibrage guidé par UTG (demande sur le téléphone)",
+            variable=self.bb_rebalance_prompt_var, command=self._on_bb_rebalance_prompt_toggle,
+        )
+        bb_prompt_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        Tooltip(
+            bb_prompt_check,
+            "Activée (par défaut) : lors d'un simple rééquilibrage entre\n"
+            "tables, demande directement quel joueur est UTG — sur tous\n"
+            "les téléphones du contrôle à distance.",
+        )
+
+        self.single_tournament_var = tk.BooleanVar(value=_single_tournament_pref_enabled())
+        single_tournament_check = ttk.Checkbutton(
+            right, text="Un seul tournoi à la fois",
+            variable=self.single_tournament_var, command=self._on_single_tournament_toggle,
+        )
+        single_tournament_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 6))
+        Tooltip(
+            single_tournament_check,
+            "Activée (par défaut) : interdit d'ouvrir un deuxième tournoi\n"
+            "ou Sit&Go tant qu'un tournoi est déjà ouvert.",
+        )
+
+        banner_seconds_lbl = ttk.Label(right, text="Durée du bandeau d'élimination (secondes) :")
+        banner_seconds_lbl.grid(row=5, column=0, sticky="w", pady=(14, 4))
+        Tooltip(
+            banner_seconds_lbl,
+            "Durée d'affichage du bandeau « XXX est sorti par YYY » sur\n"
+            "l'écran projecteur, pour un futur tournoi — de 0 à 30\n"
+            "secondes, 5 par défaut.",
+        )
+        banner_seconds_var = tk.IntVar(
+            value=max(0, min(30, int(last_settings.get("elimination_banner_seconds", 5) or 5)))
+        )
+        banner_seconds_spin = ttk.Spinbox(
+            right, from_=0, to=30, width=5, textvariable=banner_seconds_var,
+            command=lambda: self._save_standalone_elimination_banner_seconds(banner_seconds_var),
+        )
+        banner_seconds_spin.grid(row=5, column=1, sticky="w", padx=10, pady=(14, 4))
+        banner_seconds_spin.bind(
+            "<Return>", lambda e: self._save_standalone_elimination_banner_seconds(banner_seconds_var)
+        )
+        banner_seconds_spin.bind(
+            "<FocusOut>", lambda e: self._save_standalone_elimination_banner_seconds(banner_seconds_var)
         )
 
     # ---------------------------------------------------------------

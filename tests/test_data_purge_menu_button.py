@@ -43,8 +43,15 @@ def _main_source():
 
 
 def _purge_now_body(source):
-    start = source.index("def purge_now():")
-    end = source.index("def open_basic_settings():")
+    """Depuis le 2026-10-13, la logique vit dans App._open_data_purge_
+    dialog (extraite pour être réutilisable depuis le menu Réglages de
+    "🖥️ Ouvrir Senaco" sans tournoi) — purge_now() elle-même n'est plus
+    qu'une délégation d'une ligne, voir tests/test_ouvrir_senaco_sans_
+    tournoi.py::ReuseNoDuplicationStructuralTest. `parent` y remplace
+    `win` (même paramètre, win est simplement ce qui lui est passé
+    depuis purge_now())."""
+    start = source.index("def _open_data_purge_dialog(self, parent):")
+    end = source.index("def _open_basic_settings_dialog(self, parent):")
     return source[start:end]
 
 
@@ -89,11 +96,12 @@ class PurgeNowBehaviorTest(unittest.TestCase):
         self.assertIn("return", guard_block)
 
     def test_ouvre_directement_datapurgedialog_avec_parent_window_win(self):
-        """parent_window=win (PAS self) : voir la docstring de purge_now
-        et DataPurgeDialog.__init__ — sans quoi la fenêtre resterait
-        invisible (App racine encore self.withdraw() à ce stade)."""
+        """parent_window=parent (PAS self) : voir la docstring de
+        App._open_data_purge_dialog et DataPurgeDialog.__init__ — sans
+        quoi la fenêtre resterait invisible (App racine encore self.
+        withdraw() à ce stade, quand appelée depuis "Bienvenue")."""
         body = _purge_now_body(_main_source())
-        self.assertIn("DataPurgeDialog(self, parent_window=win)", body)
+        self.assertIn("DataPurgeDialog(self, parent_window=parent)", body)
 
     def test_naccede_jamais_a_self_point_db(self):
         """Doit fonctionner SANS ouvrir ni créer aucun tournoi."""

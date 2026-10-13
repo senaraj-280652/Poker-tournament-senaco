@@ -37,8 +37,13 @@ def _main_source():
 
 
 def _open_basic_settings_body(source):
-    start = source.index("def open_basic_settings():")
-    end = source.index("btn_frame = tk.Frame(win, bg=FELT_DARK)")
+    """Depuis le 2026-10-13, la logique vit dans App._open_basic_settings_
+    dialog (extraite pour être réutilisable depuis le menu Réglages de
+    "🖥️ Ouvrir Senaco" sans tournoi) — open_basic_settings() elle-même
+    n'est plus qu'une délégation d'une ligne, voir
+    tests/test_ouvrir_senaco_sans_tournoi.py::ReuseNoDuplicationStructuralTest."""
+    start = source.index("def _open_basic_settings_dialog(self, parent):")
+    end = source.index("def _choose_tournament_file(self):")
     return source[start:end]
 
 
