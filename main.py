@@ -9004,33 +9004,50 @@ class App(tk.Tk):
                 return
             count = len(manifest.get("tournament_files", []))
             has_data = manifest.get("poker_tournament_data_included", False)
-            # Transparence EXPLICITE sur l'arborescence technique d'une
-            # sauvegarde MULTI-DOSSIERS (demande explicite du
-            # 2026-10-08, "la restauration ne doit pas créer
-            # silencieusement une organisation différente de celle
-            # attendue") : restore_backup() recrée chaque chemin
-            # relatif du manifeste tel quel sous le dossier de tournoi
-            # ACTUEL (voir sa docstring, inchangée) — pour une
-            # sauvegarde à plusieurs dossiers d'origine distincts, ces
-            # chemins commencent par un préfixe technique
-            # "<index>_<nom>/" (voir backup_restore.create_backup) :
-            # on l'annonce ICI, avant confirmation, avec la
-            # correspondance exacte index -> dossier d'origine réel,
-            # plutôt que de laisser cette structure apparaître sans
-            # explication après coup.
+            # Transparence EXPLICITE sur l'arborescence d'une sauvegarde
+            # MULTI-DOSSIERS (demande explicite du 2026-10-08, "la
+            # restauration ne doit pas créer silencieusement une
+            # organisation différente de celle attendue") — mise à jour
+            # le 2026-10-13 ("dossiers techniques 4_mardi après
+            # restauration") : restore_backup() ne recrée plus le
+            # préfixe technique "<index>_<nom>" du manifeste à la
+            # destination (voir backup_restore.resolve_multi_folder_
+            # destination_labels, seule source de vérité pour ce calcul,
+            # jamais dupliquée ici) — annoncé ICI, avant confirmation,
+            # avec la correspondance exacte libellé lisible -> dossier
+            # d'origine réel.
             multi_folders = manifest.get("tournament_source_folders")
             multi_note = ""
             if multi_folders:
-                mapping_lines = "\n".join(
-                    f"  {index}_{backup_restore.sanitize_folder_label(folder)}  ->  {folder}"
-                    for index, folder in enumerate(multi_folders)
-                )
-                multi_note = (
-                    "\n\nCette sauvegarde provient de PLUSIEURS dossiers distincts. "
-                    "Les fichiers seront restaurés dans des sous-dossiers techniques "
-                    "sous le dossier de tournoi actuel, un par dossier d'origine "
-                    f"(jamais mélangés, jamais de collision) :\n{mapping_lines}"
-                )
+                configured_folder = (
+                    tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+                ).strip()
+                if configured_folder:
+                    resolved_labels = backup_restore.resolve_multi_folder_destination_labels(
+                        multi_folders, configured_folder,
+                    )
+                    mapping_lines = "\n".join(
+                        f"  {resolved_labels[index]}  <-  {folder}"
+                        for index, folder in enumerate(multi_folders)
+                    )
+                    multi_note = (
+                        "\n\nCette sauvegarde provient de plusieurs dossiers "
+                        "distincts. Les fichiers seront restaurés sous des noms "
+                        "de dossiers lisibles (fusionnés avec un dossier "
+                        "existant du même nom si besoin, jamais mélangés entre "
+                        f"dossiers d'origine différents) :\n{mapping_lines}"
+                    )
+                else:
+                    # « Dossier par défaut » pas encore configuré sur ce
+                    # poste : restore_backup refusera de toute façon plus
+                    # loin avec un message explicite (voir sa docstring,
+                    # section 1bis) — aperçu simplifié ici, sans tenter de
+                    # deviner un dossier de destination.
+                    multi_note = (
+                        "\n\nCette sauvegarde provient de plusieurs dossiers "
+                        "distincts. Les fichiers seront restaurés sous des "
+                        "noms de dossiers lisibles."
+                    )
             # Avertissement explicite sur le remplacement (demande du
             # 2026-10-10) : restore_backup() écrase bien un .tournoi de
             # même nom relatif déjà présent à destination (comportement

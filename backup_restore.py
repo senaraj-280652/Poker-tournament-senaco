@@ -283,6 +283,77 @@ def sanitize_folder_label(folder):
     return name if name else "racine"
 
 
+def resolve_multi_folder_destination_labels(tournament_source_folders, tournament_folder):
+    """Calcule, pour une RESTAURATION multi-dossiers, le nom de sous-
+    dossier LISIBLE à utiliser pour CHAQUE dossier source d'origine
+    (correctif du 2026-10-13, suite à l'apparition de dossiers
+    techniques comme "4_mardi" dans le dossier de tournoi après une
+    restauration — voir restore_backup, seule appelante). Renvoie
+    {index: libellé}, un par position de `tournament_source_folders`
+    (même ordre que le manifeste, voir create_backup).
+
+    NE TOUCHE JAMAIS à la structure interne de l'ARCHIVE elle-même
+    (le préfixe "<index>_<nom>" écrit par create_backup dans tournament_
+    file_hashes/relative_tournament_files reste INCHANGÉ — c'est ce qui
+    garantit la compatibilité avec data_purge._covering_backup_for, qui
+    continue de reconstruire ce même préfixe pour vérifier la couverture
+    d'une sauvegarde). Cette fonction ne sert qu'à décider où ÉCRIRE,
+    côté restauration, jamais comment l'archive est structurée.
+
+    Règle de calcul : le libellé de base est sanitize_folder_label
+    (dossier), SANS le préfixe numérique technique. Si plusieurs
+    dossiers SOURCES de CETTE restauration partagent le même libellé de
+    base (deux chemins absolus différents tous deux nommés par ex.
+    "mardi" — possible si la sauvegarde d'origine couvrait déjà
+    plusieurs dossiers homonymes), seul le PREMIER (dans l'ordre des
+    index) reçoit le libellé simple ; les suivants reçoivent un suffixe
+    numéroté " (2)", " (3)"... — jamais fusionnés sous un même nom,
+    pour qu'aucun tournoi ne soit perdu ni écrasé par un AUTRE dossier
+    source de la même sauvegarde (demande explicite : "conserver tous
+    les tournois, même si plusieurs portent le même nom").
+
+    Le libellé simple (non numéroté) PEUT légitimement correspondre à un
+    dossier DÉJÀ PRÉSENT dans `tournament_folder` — c'est le cas normal
+    et voulu (fusion avec le dossier "mardi" habituel déjà utilisé par
+    le club, par exemple : restore_backup écrase alors un éventuel
+    fichier de même nom exactement comme pour une restauration à un seul
+    dossier, protégé par la même sauvegarde de sécurité automatique,
+    comportement INCHANGÉ). En revanche, un suffixe numéroté n'est
+    JAMAIS choisi s'il correspond à un dossier déjà présent à la
+    destination mais SANS RAPPORT avec cette restauration (demande
+    explicite : vérifier aussi les collisions avec les dossiers déjà
+    présents, pas seulement entre dossiers sources de la sauvegarde) —
+    cela éviterait de fusionner par accident deux ensembles de fichiers
+    totalement étrangers l'un à l'autre. Vérifié via un simple
+    os.listdir, au mieux (silencieusement traité comme "rien d'existant"
+    si `tournament_folder` n'existe pas encore ou n'est pas lisible —
+    purement informatif ici ; restore_backup revalide de toute façon ce
+    dossier séparément, AVANT d'écrire quoi que ce soit)."""
+    try:
+        existing_at_destination = {
+            name for name in os.listdir(tournament_folder)
+            if os.path.isdir(os.path.join(tournament_folder, name))
+        }
+    except OSError:
+        existing_at_destination = set()
+
+    claimed_this_restore = set()
+    resolved = {}
+    for index, folder in enumerate(tournament_source_folders):
+        base_label = sanitize_folder_label(folder)
+        if base_label not in claimed_this_restore:
+            candidate = base_label
+        else:
+            n = 2
+            candidate = f"{base_label} ({n})"
+            while candidate in claimed_this_restore or candidate in existing_at_destination:
+                n += 1
+                candidate = f"{base_label} ({n})"
+        claimed_this_restore.add(candidate)
+        resolved[index] = candidate
+    return resolved
+
+
 def _group_tournament_files_by_source(tournament_files, candidate_folders):
     """Regroupe `tournament_files` (chemins ABSOLUS, déjà dédoublonnés
     par l'appelant) par le dossier de `candidate_folders` qui les
@@ -709,7 +780,16 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
        la sauvegarde de sécurité de l'étape 2 reste disponible pour une
        récupération manuelle. Un .tournoi de même nom déjà présent à
        destination est ÉCRASÉ (restauration voulue, comportement
-       inchangé), protégé par cette même sauvegarde de sécurité.
+       inchangé), protégé par cette même sauvegarde de sécurité. Pour
+       une sauvegarde MULTI-DOSSIERS (manifeste avec "tournament_
+       source_folders"), le préfixe technique "<index>_<nom>" du
+       manifeste (structure de l'ARCHIVE, inchangée) n'est PLUS recopié
+       tel quel à la destination depuis le correctif du 2026-10-13 —
+       voir resolve_multi_folder_destination_labels, qui choisit un nom
+       de sous-dossier lisible (fusionné avec un dossier existant du
+       même nom si pertinent, jamais entre deux dossiers sources
+       DIFFÉRENTS de cette même restauration). Sauvegarde ANCIENNE ou à
+       un seul dossier : comportement STRICTEMENT inchangé.
        open_windows.json et phone_selected_pid.json ne sont
        volontairement JAMAIS restaurés (voir RESTORE_EXCLUDED_DATA_
        FILENAMES) ; license.json, lui, est restauré normalement, sans
@@ -818,11 +898,39 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
         if manifest["tournament_files"]:
             tournaments_src = os.path.join(backup_dir, TOURNAMENTS_SUBDIR)
             total_tournament_files = len(manifest["tournament_files"])
+            # Correctif du 2026-10-13 ("dossiers techniques 4_mardi
+            # après restauration") : pour une sauvegarde multi-dossiers
+            # (manifeste portant "tournament_source_folders"), le
+            # préfixe "<index>_<nom>" de CHAQUE chemin relatif — voir
+            # create_backup, structure de L'ARCHIVE, INCHANGÉE — n'est
+            # PLUS jamais recopié tel quel à la destination. Remplacé
+            # par un libellé lisible, calculé UNE SEULE FOIS ici (voir
+            # resolve_multi_folder_destination_labels). Sauvegarde
+            # ANCIENNE ou à UN SEUL dossier (pas de champ "tournament_
+            # source_folders" dans le manifeste) : resolved_labels reste
+            # None, le bloc ci-dessous retombe sur `rel` tel quel —
+            # comportement STRICTEMENT INCHANGÉ, jamais touché par ce
+            # correctif (compatibilité totale avec les anciennes
+            # sauvegardes).
+            multi_source_folders = manifest.get("tournament_source_folders")
+            resolved_labels = (
+                resolve_multi_folder_destination_labels(multi_source_folders, tournament_folder)
+                if multi_source_folders else None
+            )
             for rel in manifest["tournament_files"]:
                 src_path = os.path.join(tournaments_src, rel)
                 if not os.path.isfile(src_path):
                     raise BackupError(f"Fichier manquant dans la sauvegarde : {rel}")
-                dst_path = os.path.join(tournament_folder, *rel.split("/"))
+                if resolved_labels is not None:
+                    # rel == "<index>_<nom>/<reste>" par construction
+                    # (create_backup) — jamais sans "/" ici, un fichier a
+                    # toujours au moins un nom après le libellé de groupe.
+                    old_label, rest_within_group = rel.split("/", 1)
+                    index = int(old_label.split("_", 1)[0])
+                    rel_for_destination = f"{resolved_labels[index]}/{rest_within_group}"
+                else:
+                    rel_for_destination = rel
+                dst_path = os.path.join(tournament_folder, *rel_for_destination.split("/"))
                 os.makedirs(os.path.dirname(dst_path), exist_ok=True)
                 shutil.copy2(src_path, dst_path)
                 restored_tournament_files += 1

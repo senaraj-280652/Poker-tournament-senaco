@@ -454,12 +454,17 @@ class MultiSourceBackupTest(unittest.TestCase):
         """Demande explicite du 2026-10-08, point 7 : test de
         restauration avec deux fichiers de même nom provenant de
         dossiers distincts — UNIQUEMENT des dossiers temporaires, jamais
-        les vraies données. restore_backup() n'a besoin d'AUCUNE
-        modification (vérifié dans le diagnostic) : elle recrée
-        fidèlement chaque chemin relatif du manifeste, préfixe
-        "<index>_<nom>/" inclus, sous le dossier de tournoi CIBLE —
-        documenté ici explicitement pour que cette structure technique
-        ne soit jamais une surprise."""
+        les vraies données.
+
+        Mis à jour le 2026-10-13 (correctif "dossiers techniques
+        4_mardi après restauration") : restore_backup() ne recrée plus
+        le préfixe technique "<index>_<nom>/" à la destination — voir
+        backup_restore.resolve_multi_folder_destination_labels. Les deux
+        dossiers sources partagent ICI le même nom de base ("dimanche") :
+        c'est exactement le cas de collision que cette fonction doit
+        distinguer — le premier (index 0) reçoit le libellé simple
+        "dimanche", le second (index 1) le libellé numéroté
+        "dimanche (2)", jamais fusionnés sous un même nom."""
         folder_a = os.path.join(self._tmp.name, "poste1", "dimanche")
         folder_b = os.path.join(self._tmp.name, "poste2", "dimanche")
         p_a = os.path.join(folder_a, "To1.tournoi")
@@ -484,8 +489,8 @@ class MultiSourceBackupTest(unittest.TestCase):
         )
         self.assertEqual(result["restored_tournament_files"], 2)
 
-        restored_a = os.path.join(restore_tournament_folder, "0_dimanche", "To1.tournoi")
-        restored_b = os.path.join(restore_tournament_folder, "1_dimanche", "To1.tournoi")
+        restored_a = os.path.join(restore_tournament_folder, "dimanche", "To1.tournoi")
+        restored_b = os.path.join(restore_tournament_folder, "dimanche (2)", "To1.tournoi")
         self.assertTrue(os.path.isfile(restored_a))
         self.assertTrue(os.path.isfile(restored_b))
         with open(restored_a) as f:
@@ -495,6 +500,9 @@ class MultiSourceBackupTest(unittest.TestCase):
         # Aucune collision : les deux fichiers restaurés restent DEUX
         # fichiers distincts sur le disque, jamais l'un écrasant l'autre.
         self.assertNotEqual(os.path.abspath(restored_a), os.path.abspath(restored_b))
+        # Aucun dossier technique "<index>_<nom>" ne doit exister.
+        self.assertFalse(os.path.isdir(os.path.join(restore_tournament_folder, "0_dimanche")))
+        self.assertFalse(os.path.isdir(os.path.join(restore_tournament_folder, "1_dimanche")))
 
     def test_ne_modifie_jamais_les_fichiers_source_en_selection_explicite(self):
         folder_a = os.path.join(self._tmp.name, "poste1", "dimanche")
@@ -510,6 +518,336 @@ class MultiSourceBackupTest(unittest.TestCase):
             self.assertEqual(f.read(), "A")
         with open(p_b) as f:
             self.assertEqual(f.read(), "B")
+
+
+class ResolveMultiFolderDestinationLabelsUnitTest(unittest.TestCase):
+    """backup_restore.resolve_multi_folder_destination_labels — fonction
+    pure, testée isolément (demande du 2026-10-13, correctif "dossiers
+    techniques 4_mardi après restauration")."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="resolve_labels_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.destination = os.path.join(self._tmp.name, "destination")
+        os.makedirs(self.destination)
+
+    def test_libelles_tous_distincts_restent_simples(self):
+        folders = [
+            os.path.join(self._tmp.name, "a", "lundi"),
+            os.path.join(self._tmp.name, "b", "mardi"),
+            os.path.join(self._tmp.name, "c", "vendredi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "lundi", 1: "mardi", 2: "vendredi"})
+
+    def test_deux_dossiers_meme_nom_second_numerote(self):
+        folders = [
+            os.path.join(self._tmp.name, "poste1", "mardi"),
+            os.path.join(self._tmp.name, "poste2", "mardi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "mardi", 1: "mardi (2)"})
+
+    def test_trois_dossiers_meme_nom_numerotation_sequentielle(self):
+        folders = [
+            os.path.join(self._tmp.name, "a", "mardi"),
+            os.path.join(self._tmp.name, "b", "mardi"),
+            os.path.join(self._tmp.name, "c", "mardi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "mardi", 1: "mardi (2)", 2: "mardi (3)"})
+
+    def test_melange_collisions_et_noms_uniques(self):
+        folders = [
+            os.path.join(self._tmp.name, "a", "mardi"),
+            os.path.join(self._tmp.name, "b", "lundi"),
+            os.path.join(self._tmp.name, "c", "mardi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "mardi", 1: "lundi", 2: "mardi (2)"})
+
+    def test_evite_un_dossier_deja_present_sans_rapport_avec_la_restauration(self):
+        """Demande explicite du 2026-10-13, point 1 : vérifier aussi les
+        collisions avec les dossiers DÉJÀ PRÉSENTS à la destination, pas
+        seulement entre dossiers sources de la sauvegarde. "mardi (2)"
+        existe déjà (sans rapport avec cette restauration) : le second
+        groupe "mardi" ne doit JAMAIS s'y fondre, il doit sauter à
+        "mardi (3)"."""
+        os.makedirs(os.path.join(self.destination, "mardi (2)"))
+        folders = [
+            os.path.join(self._tmp.name, "poste1", "mardi"),
+            os.path.join(self._tmp.name, "poste2", "mardi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "mardi", 1: "mardi (3)"})
+
+    def test_libelle_simple_peut_correspondre_a_un_dossier_deja_present(self):
+        """Le cas NORMAL et VOULU : le dossier "mardi" existe déjà (usage
+        hebdomadaire habituel) — la fusion est intentionnelle, jamais
+        évitée pour le libellé simple (non numéroté)."""
+        os.makedirs(os.path.join(self.destination, "mardi"))
+        folders = [os.path.join(self._tmp.name, "poste1", "mardi")]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, self.destination)
+        self.assertEqual(resolved, {0: "mardi"})
+
+    def test_dossier_destination_inexistant_ne_leve_jamais(self):
+        """`tournament_folder` pas encore créé (cas normal avant la
+        validation de restore_backup) : jamais d'exception, simplement
+        aucune collision connue à éviter."""
+        missing = os.path.join(self._tmp.name, "n_existe_pas_encore")
+        folders = [
+            os.path.join(self._tmp.name, "poste1", "mardi"),
+            os.path.join(self._tmp.name, "poste2", "mardi"),
+        ]
+        resolved = backup_restore.resolve_multi_folder_destination_labels(folders, missing)
+        self.assertEqual(resolved, {0: "mardi", 1: "mardi (2)"})
+
+
+class RestoreMultiFolderReadableLabelsTest(unittest.TestCase):
+    """restore_backup() — destination sous des noms de dossiers LISIBLES
+    pour une sauvegarde multi-dossiers (correctif du 2026-10-13, suite à
+    l'apparition de dossiers techniques comme "4_mardi" après une
+    restauration réelle sur un poste Windows). Couvre la compatibilité
+    ascendante, le respect du Dossier par défaut, la non-perte de
+    tournois homonymes, et les collisions avec le contenu DÉJÀ PRÉSENT à
+    la destination (pas seulement entre dossiers sources de la
+    sauvegarde)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="restore_readable_labels_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        self.restore_tournament_folder = os.path.join(self._tmp.name, "cible_tournois")
+        os.makedirs(self.restore_tournament_folder)
+        self.restore_poker_data_dir = os.path.join(self._tmp.name, "cible_poker_data")
+        self.pre_restore_root = os.path.join(self._tmp.name, "cible_poker_data_pre_restore")
+
+    def _restore(self):
+        return backup_restore.restore_backup(
+            self._backup_dir,
+            tournament_folder=self.restore_tournament_folder,
+            poker_data_dir=self.restore_poker_data_dir,
+            pre_restore_root=self.pre_restore_root,
+            open_tournament_paths=[],
+        )
+
+    # -- 1. Compatibilité ascendante ---------------------------------------
+
+    def test_ancien_manifeste_sans_tournament_source_folders_comportement_inchange(self):
+        """Simule une ANCIENNE sauvegarde (créée avant ce correctif, et
+        même avant la fonctionnalité multi-dossiers elle-même) : aucun
+        champ "tournament_source_folders" dans le manifeste, chemins
+        relatifs SANS préfixe — restore_backup doit se comporter EXACTE-
+        MENT comme avant, sans jamais consulter resolve_multi_folder_
+        destination_labels."""
+        folder = os.path.join(self._tmp.name, "club", "mardi")
+        p1 = os.path.join(folder, "To1.tournoi")
+        _write(p1, "contenu historique")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_folder=folder,
+        )["backup_dir"]
+        # Confirme l'hypothèse : pas de champ multi-dossiers pour une
+        # sauvegarde à un seul dossier (schéma historique).
+        manifest = backup_restore.validate_backup_folder(self._backup_dir)
+        self.assertIsNone(manifest.get("tournament_source_folders"))
+
+        result = self._restore()
+
+        self.assertEqual(result["restored_tournament_files"], 1)
+        restored = os.path.join(self.restore_tournament_folder, "To1.tournoi")
+        self.assertTrue(os.path.isfile(restored))
+        with open(restored) as f:
+            self.assertEqual(f.read(), "contenu historique")
+
+    # -- 2. Cas courant : noms tous distincts -------------------------------
+
+    def test_sauvegarde_multi_dossiers_noms_distincts_aucun_prefixe_technique(self):
+        folder_lundi = os.path.join(self._tmp.name, "club", "lundi")
+        folder_mardi = os.path.join(self._tmp.name, "club", "mardi")
+        folder_vendredi = os.path.join(self._tmp.name, "club", "vendredi")
+        p1 = os.path.join(folder_lundi, "To1.tournoi")
+        p2 = os.path.join(folder_mardi, "To2.tournoi")
+        p3 = os.path.join(folder_vendredi, "To3.tournoi")
+        _write(p1, "L")
+        _write(p2, "M")
+        _write(p3, "V")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p1, p2, p3],
+            tournament_source_folders=[folder_lundi, folder_mardi, folder_vendredi],
+        )["backup_dir"]
+
+        result = self._restore()
+        self.assertEqual(result["restored_tournament_files"], 3)
+
+        self.assertTrue(os.path.isfile(os.path.join(self.restore_tournament_folder, "lundi", "To1.tournoi")))
+        self.assertTrue(os.path.isfile(os.path.join(self.restore_tournament_folder, "mardi", "To2.tournoi")))
+        self.assertTrue(os.path.isfile(os.path.join(self.restore_tournament_folder, "vendredi", "To3.tournoi")))
+        # Aucun dossier technique "<chiffre>_<nom>" — LE bug signalé.
+        for name in os.listdir(self.restore_tournament_folder):
+            self.assertNotRegex(name, r"^\d+_")
+
+    # -- 3. Intégrité en aller-retour ---------------------------------------
+
+    def test_aller_retour_integrite_complete_aucun_fichier_perdu(self):
+        folder_a = os.path.join(self._tmp.name, "posteA", "mardi")
+        folder_b = os.path.join(self._tmp.name, "posteB", "mardi")  # même nom, dossier distinct
+        folder_c = os.path.join(self._tmp.name, "posteC", "jeudi")
+        sources = {
+            os.path.join(folder_a, "To1.tournoi"): "contenu A1",
+            os.path.join(folder_a, "To2.tournoi"): "contenu A2",
+            os.path.join(folder_b, "To1.tournoi"): "contenu B1",  # même nom que A1 !
+            os.path.join(folder_c, "To9.tournoi"): "contenu C9",
+        }
+        for path, content in sources.items():
+            _write(path, content)
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=list(sources.keys()),
+            tournament_source_folders=[folder_a, folder_b, folder_c],
+        )["backup_dir"]
+
+        result = self._restore()
+        self.assertEqual(result["restored_tournament_files"], 4)
+
+        # Chaque contenu d'origine doit se retrouver QUELQUE PART sous la
+        # destination — aucun perdu, aucun écrasé par un AUTRE tournoi.
+        found_contents = set()
+        for root, _dirs, files in os.walk(self.restore_tournament_folder):
+            for name in files:
+                with open(os.path.join(root, name)) as f:
+                    found_contents.add(f.read())
+        self.assertEqual(found_contents, set(sources.values()))
+
+    # -- 4. Dossier par défaut respecté --------------------------------------
+
+    def test_racine_de_destination_est_toujours_le_dossier_par_defaut_configure(self):
+        folder_a = os.path.join(self._tmp.name, "machine_source_1", "chemin", "tres", "different", "mardi")
+        folder_b = os.path.join(self._tmp.name, "autre_machine", "ailleurs", "mardi")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To2.tournoi")
+        _write(p_a, "A")
+        _write(p_b, "B")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p_a, p_b], tournament_source_folders=[folder_a, folder_b],
+        )["backup_dir"]
+
+        self._restore()
+
+        # Tout doit être sous self.restore_tournament_folder — jamais sous
+        # un chemin dérivé des dossiers sources d'origine.
+        for root, _dirs, files in os.walk(self.restore_tournament_folder):
+            for name in files:
+                full = os.path.join(root, name)
+                self.assertTrue(
+                    os.path.commonpath([full, self.restore_tournament_folder])
+                    == os.path.normpath(self.restore_tournament_folder)
+                )
+
+    # -- 5. Collision avec un dossier EXISTANT sans rapport -----------------
+
+    def test_ne_fusionne_pas_avec_un_dossier_existant_sans_rapport(self):
+        """Demande explicite du 2026-10-13, point 1. Avant la
+        restauration, "mardi (2)" existe déjà à la destination, avec un
+        fichier SANS rapport avec cette sauvegarde. Les deux groupes
+        sources "mardi" de la sauvegarde ne doivent jamais s'y fondre —
+        le second doit sauter à "mardi (3)", et le contenu déjà présent
+        dans "mardi (2)" doit rester intact."""
+        unrelated = os.path.join(self.restore_tournament_folder, "mardi (2)", "ToInconnu.tournoi")
+        _write(unrelated, "contenu sans rapport, ne doit jamais bouger")
+
+        folder_a = os.path.join(self._tmp.name, "posteA", "mardi")
+        folder_b = os.path.join(self._tmp.name, "posteB", "mardi")
+        p_a = os.path.join(folder_a, "To1.tournoi")
+        p_b = os.path.join(folder_b, "To1.tournoi")
+        _write(p_a, "contenu A")
+        _write(p_b, "contenu B")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p_a, p_b], tournament_source_folders=[folder_a, folder_b],
+        )["backup_dir"]
+
+        self._restore()
+
+        # Le fichier sans rapport est TOUJOURS là, inchangé.
+        with open(unrelated) as f:
+            self.assertEqual(f.read(), "contenu sans rapport, ne doit jamais bouger")
+        # Les deux groupes de la sauvegarde sont allés ailleurs.
+        self.assertTrue(os.path.isfile(os.path.join(self.restore_tournament_folder, "mardi", "To1.tournoi")))
+        self.assertTrue(os.path.isfile(os.path.join(self.restore_tournament_folder, "mardi (3)", "To1.tournoi")))
+
+    # -- 6. Fusion intentionnelle avec un dossier existant du même usage ----
+
+    def test_fusionne_avec_le_dossier_existant_du_meme_nom_simple(self):
+        """Cas normal et voulu : "mardi" existe déjà (usage hebdomadaire
+        habituel du club) — la restauration y AJOUTE les fichiers de la
+        sauvegarde, sans toucher à ce qui y était déjà (noms différents).
+        Deux dossiers sources distincts ("mardi" et "jeudi") pour que
+        cette sauvegarde soit bien une sauvegarde MULTI-dossiers (sinon
+        un seul groupe retombe sur le schéma historique à un seul
+        dossier, sans le moindre sous-dossier — voir create_backup,
+        len(groups) <= 1) et exerce réellement resolve_multi_folder_
+        destination_labels, pas seulement le chemin de compatibilité."""
+        existing = os.path.join(self.restore_tournament_folder, "mardi", "ToDejaLa.tournoi")
+        _write(existing, "déjà présent avant la restauration")
+
+        folder_mardi = os.path.join(self._tmp.name, "club", "mardi")
+        folder_jeudi = os.path.join(self._tmp.name, "club", "jeudi")
+        p1 = os.path.join(folder_mardi, "ToNouveau.tournoi")
+        p2 = os.path.join(folder_jeudi, "ToAutre.tournoi")
+        _write(p1, "nouveau, depuis la sauvegarde")
+        _write(p2, "autre dossier, sans rapport avec mardi")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p1, p2], tournament_source_folders=[folder_mardi, folder_jeudi],
+        )["backup_dir"]
+
+        self._restore()
+
+        with open(existing) as f:
+            self.assertEqual(f.read(), "déjà présent avant la restauration")
+        restored = os.path.join(self.restore_tournament_folder, "mardi", "ToNouveau.tournoi")
+        with open(restored) as f:
+            self.assertEqual(f.read(), "nouveau, depuis la sauvegarde")
+
+    # -- 7. Écrasement protégé par la sauvegarde de sécurité -----------------
+
+    def test_ecrasement_dun_tournoi_existant_protege_par_sauvegarde_de_securite(self):
+        """"Aucun tournoi existant ne doit être écrasé SILENCIEUSEMENT" :
+        un .tournoi de même nom dans le dossier final EST remplacé (
+        comportement de restauration intentionnel, inchangé), mais son
+        contenu AVANT remplacement doit être retrouvable dans la
+        sauvegarde de sécurité automatique. Deux dossiers sources
+        distincts, même raison que le test précédent (exercer réellement
+        la résolution multi-dossiers, pas le repli historique)."""
+        existing = os.path.join(self.restore_tournament_folder, "mardi", "To1.tournoi")
+        _write(existing, "ANCIEN CONTENU AVANT RESTAURATION")
+
+        folder_mardi = os.path.join(self._tmp.name, "club", "mardi")
+        folder_jeudi = os.path.join(self._tmp.name, "club", "jeudi")
+        p1 = os.path.join(folder_mardi, "To1.tournoi")
+        p2 = os.path.join(folder_jeudi, "ToAutre.tournoi")
+        _write(p1, "NOUVEAU CONTENU DE LA SAUVEGARDE")
+        _write(p2, "autre dossier, sans rapport")
+        self._backup_dir = backup_restore.create_backup(
+            self.usb, tournament_files=[p1, p2], tournament_source_folders=[folder_mardi, folder_jeudi],
+        )["backup_dir"]
+
+        result = self._restore()
+
+        # Remplacement bien effectué (comportement voulu, inchangé).
+        with open(existing) as f:
+            self.assertEqual(f.read(), "NOUVEAU CONTENU DE LA SAUVEGARDE")
+        # L'ancien contenu reste récupérable dans la sauvegarde de sécurité.
+        safety_dir = result["safety_backup_dir"]
+        found_old_content = False
+        for root, _dirs, files in os.walk(safety_dir):
+            for name in files:
+                if name == "To1.tournoi":
+                    with open(os.path.join(root, name)) as f:
+                        if f.read() == "ANCIEN CONTENU AVANT RESTAURATION":
+                            found_old_content = True
+        self.assertTrue(
+            found_old_content,
+            "L'ancien contenu écrasé doit être retrouvable dans la sauvegarde de sécurité.",
+        )
 
 
 class ValidateBackupFolderTest(unittest.TestCase):
@@ -1393,17 +1731,23 @@ class NoOpOnCancellationTest(unittest.TestCase):
 
 
 class RestoreMultiFolderTransparencyTest(unittest.TestCase):
-    """Transparence EXPLICITE sur l'arborescence technique d'une
-    sauvegarde multi-dossiers AVANT confirmation de restauration
-    (demande explicite du 2026-10-08, point 3 : "la restauration ne
-    doit pas créer silencieusement une organisation différente de
-    celle attendue") — restore_now() est une closure imbriquée dans
-    _choose_tournament_file, difficile à invoquer isolément (construit
-    une vraie fenêtre Toplevel) : vérification STRUCTURELLE du code
-    source, même convention déjà établie par NoOpOnCancellationTest
-    ci-dessus pour cette même fonction."""
+    """Transparence EXPLICITE sur l'arborescence d'une sauvegarde multi-
+    dossiers AVANT confirmation de restauration (demande explicite du
+    2026-10-08, point 3 : "la restauration ne doit pas créer
+    silencieusement une organisation différente de celle attendue") —
+    restore_now() est une closure imbriquée dans _choose_tournament_file,
+    difficile à invoquer isolément (construit une vraie fenêtre
+    Toplevel) : vérification STRUCTURELLE du code source, même
+    convention déjà établie par NoOpOnCancellationTest ci-dessus pour
+    cette même fonction.
 
-    def test_le_mapping_index_vers_dossier_dorigine_est_annonce_avant_confirmation(self):
+    Mis à jour le 2026-10-13 (correctif "dossiers techniques 4_mardi
+    après restauration") : le mapping annoncé utilise désormais
+    resolve_multi_folder_destination_labels (noms lisibles), plus
+    sanitize_folder_label seule (qui ne gérait pas les collisions avec
+    le dossier de destination réel)."""
+
+    def test_le_mapping_libelle_vers_dossier_dorigine_est_annonce_avant_confirmation(self):
         with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
                    encoding="utf-8") as f:
             source = f.read()
@@ -1412,7 +1756,7 @@ class RestoreMultiFolderTransparencyTest(unittest.TestCase):
         restore_body = source[restore_start:restore_end]
 
         self.assertIn('manifest.get("tournament_source_folders")', restore_body)
-        self.assertIn("backup_restore.sanitize_folder_label(folder)", restore_body)
+        self.assertIn("backup_restore.resolve_multi_folder_destination_labels(", restore_body)
         # Le mapping (multi_note) doit être calculé et inclus dans le
         # message AVANT l'appel à askyesno — jamais une restauration
         # déjà lancée puis expliquée après coup.
@@ -1421,6 +1765,32 @@ class RestoreMultiFolderTransparencyTest(unittest.TestCase):
             restore_body.index("messagebox.askyesno("),
         )
         self.assertIn("multi_note", restore_body[restore_body.index("messagebox.askyesno("):])
+
+    def test_explication_mentionne_des_noms_lisibles(self):
+        """Demande explicite du 2026-10-13, point 2 : courte explication
+        indiquant que les dossiers seront restaurés sous des noms
+        lisibles."""
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        restore_start = source.index("def restore_now():")
+        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_body = source[restore_start:restore_end]
+        self.assertIn("noms de dossiers lisibles", restore_body)
+
+    def test_aucun_prefixe_technique_indexe_dans_le_message(self):
+        """Non-régression explicite : le message ne doit plus jamais
+        afficher le préfixe technique "<index>_<nom>" de l'ARCHIVE — la
+        confirmation doit annoncer le résultat final sur le disque,
+        jamais un détail d'implémentation interne."""
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        restore_start = source.index("def restore_now():")
+        restore_end = source.index("btn_frame = tk.Frame(win", restore_start)
+        restore_body = source[restore_start:restore_end]
+        self.assertNotIn('f"  {index}_{backup_restore', restore_body)
+        self.assertNotIn("sous-dossiers techniques", restore_body)
 
 
 class RestoreOverwriteWarningTest(unittest.TestCase):
