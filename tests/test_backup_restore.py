@@ -1959,5 +1959,409 @@ class SauvegardeZonePresentationTest(unittest.TestCase):
         self.assertIn('text="♻️  Restaurer depuis une clé USB"', source)
 
 
+# =======================================================================
+# Correctif du 2026-10-14 (quater) : "C:\poker\senaco\senaco" après
+# restauration d'une sauvegarde faite sur Mac, sur un poste Windows (HP)
+# — voir backup_restore.detect_redundant_source_folder_prefix pour le
+# diagnostic complet et les conditions STRICTES (toutes nécessaires,
+# aucune suffisante seule) sous lesquelles un premier segment de chemin
+# est jugé redondant et retiré.
+# =======================================================================
+class DetectRedundantSourceFolderPrefixUnitTest(unittest.TestCase):
+    """Tests unitaires directs de la fonction de détection — manifestes
+    synthétiques minimaux (seuls "tournament_files" est lu), jamais de
+    vraie sauvegarde sur disque ici (voir RestoreRedundantFolderPrefixTest
+    plus bas pour l'intégration complète via restore_backup)."""
+
+    def _manifest(self, tournament_files):
+        return {"tournament_files": tournament_files}
+
+    def test_detecte_le_segment_redondant_quand_tout_concorde(self):
+        manifest = self._manifest([
+            "senaco/samedi/To1.tournoi", "senaco/mardi/To2.tournoi",
+        ])
+        self.assertEqual(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco"),
+            "senaco",
+        )
+
+    def test_aucune_detection_si_premier_segment_est_deja_un_jour(self):
+        """Structure déjà normale (le cas très majoritaire) : rien à
+        faire, comportement actuel strictement préservé."""
+        manifest = self._manifest(["samedi/To1.tournoi"])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_aucune_detection_si_le_nom_ne_correspond_pas_a_la_destination(self):
+        """Signal structurel présent (jour au second niveau) mais AUCUNE
+        coïncidence de nom avec la destination — jamais assez pour
+        conclure à une redondance (demande explicite : privilégier les
+        métadonnées/la structure, jamais une simple supposition)."""
+        manifest = self._manifest(["dossier_sans_rapport/samedi/To1.tournoi"])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_aucune_detection_si_tous_les_fichiers_ne_partagent_pas_le_meme_segment(self):
+        """Incohérence partielle : jamais une supposition sur certains
+        fichiers seulement — voir test_chemin_ambigu_un_seul_fichier_non_
+        concluant_reste_inchange pour la version intégrée via restore_
+        backup."""
+        manifest = self._manifest([
+            "senaco/samedi/To1.tournoi", "autre_dossier/mardi/To2.tournoi",
+        ])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_aucune_detection_si_un_fichier_est_directement_sous_le_segment_sans_jour(self):
+        manifest = self._manifest(["senaco/To1.tournoi"])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_aucune_detection_si_le_segment_suivant_nest_pas_un_jour(self):
+        manifest = self._manifest(["senaco/archives/To1.tournoi"])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_sauvegarde_sans_tournois_renvoie_none(self):
+        manifest = self._manifest([])
+        self.assertIsNone(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco")
+        )
+
+    def test_insensible_a_la_casse(self):
+        """Nom de dossier destination et/ou jour avec une casse
+        différente (ex. Windows, ou "Vendredi" comme dans _SyntheticEnv
+        ci-dessus) : toujours reconnu. Chemin de destination au format
+        POSIX (séparateur "/") : un séparateur Windows ("\\") n'est de
+        toute façon reconnu comme tel que SOUS Windows — os.path.
+        basename/normpath traiteraient sinon tout le chemin "C:\\poker\\
+        SENACO" comme un seul composant sur ce poste de développement
+        Mac, hors du périmètre réellement testé ici (la casse, pas le
+        séparateur)."""
+        manifest = self._manifest(["Senaco/Samedi/To1.tournoi"])
+        self.assertEqual(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/SENACO"),
+            "Senaco",
+        )
+
+    def test_sous_dossiers_profonds_toujours_detectes(self):
+        """Seuls les DEUX premiers segments comptent pour la détection —
+        peu importe la profondeur au-delà (ex. "samedi/soir/...")."""
+        manifest = self._manifest(["senaco/samedi/soir/To1.tournoi"])
+        self.assertEqual(
+            backup_restore.detect_redundant_source_folder_prefix(manifest, "/C/poker/senaco"),
+            "senaco",
+        )
+
+
+class RestoreRedundantFolderPrefixTest(unittest.TestCase):
+    """Intégration complète via restore_backup — reproduction du scénario
+    exact signalé sur le HP (Mac -> Windows), sous-dossiers multiples,
+    restaurations répétées, sauvegardes anciennes/sans redondance,
+    chemins ambigus, et non-interférence avec les sauvegardes multi-
+    dossiers et la sauvegarde de sécurité."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="poker_backup_redundant_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.usb = os.path.join(self._tmp.name, "usb_stick")
+        os.makedirs(self.usb)
+        self.pre_restore_root = os.path.join(self._tmp.name, "pre_restore")
+
+    def test_scenario_exact_reproduit_mac_vers_windows(self):
+        """Mac (source) : "Dossier par défaut" configuré UN NIVEAU AU-
+        DESSUS d'un sous-dossier nommé "senaco" contenant les jours de
+        tournoi. Windows (destination) : "Dossier par défaut" = .../
+        senaco, DÉJÀ PEUPLÉ (mardi, mercredi) — reproduit exactement
+        l'arborescence de la photographie fournie par l'utilisateur."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "senaco", "samedi", "To131026-2.tournoi"), "DB samedi")
+        _write(os.path.join(mac_root, "senaco", "mardi", "ToMac.tournoi"), "DB mardi mac")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None, computer_name="MAC-RAJ",
+        )["backup_dir"]
+        manifest = backup_restore.validate_backup_folder(backup)
+        self.assertEqual(
+            sorted(manifest["tournament_files"]),
+            ["senaco/mardi/ToMac.tournoi", "senaco/samedi/To131026-2.tournoi"],
+        )
+
+        windows_senaco = os.path.join(self._tmp.name, "poker", "senaco")
+        _write(os.path.join(windows_senaco, "mardi", "existant.tournoi"), "deja la avant")
+        _write(os.path.join(windows_senaco, "mercredi", "autre.tournoi"), "deja la aussi")
+
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=windows_senaco, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertEqual(result["restored_tournament_files"], 2)
+        # Jamais de dossier "senaco" imbriqué une seconde fois.
+        self.assertFalse(os.path.isdir(os.path.join(windows_senaco, "senaco")))
+        self.assertTrue(os.path.isfile(
+            os.path.join(windows_senaco, "samedi", "To131026-2.tournoi")
+        ))
+        self.assertTrue(os.path.isfile(os.path.join(windows_senaco, "mardi", "ToMac.tournoi")))
+        # Les fichiers déjà présents (mardi, mercredi) restent intacts.
+        with open(os.path.join(windows_senaco, "mardi", "existant.tournoi")) as f:
+            self.assertEqual(f.read(), "deja la avant")
+        with open(os.path.join(windows_senaco, "mercredi", "autre.tournoi")) as f:
+            self.assertEqual(f.read(), "deja la aussi")
+
+    def test_sous_dossiers_multiples_au_dela_du_jour(self):
+        """Un niveau supplémentaire APRÈS le jour (ex. "samedi/soir/...")
+        doit être préservé à l'identique — seul le premier segment
+        redondant est retiré, jamais plus."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "club", "samedi", "soir", "To1.tournoi"), "DB")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "club")
+        os.makedirs(destination)
+
+        backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertTrue(os.path.isfile(os.path.join(destination, "samedi", "soir", "To1.tournoi")))
+        self.assertFalse(os.path.isdir(os.path.join(destination, "club")))
+
+    def test_restaurations_repetees_restent_idempotentes(self):
+        """Restaurer deux fois la MÊME sauvegarde sur la MÊME destination
+        ne doit jamais aggraver ni modifier l'emplacement final."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "club", "samedi", "To1.tournoi"), "v1")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "club")
+        os.makedirs(destination)
+
+        for _ in range(2):
+            result = backup_restore.restore_backup(
+                backup, tournament_folder=destination, poker_data_dir=None,
+                pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+            )
+            self.assertEqual(result["restored_tournament_files"], 1)
+            self.assertTrue(os.path.isfile(os.path.join(destination, "samedi", "To1.tournoi")))
+            self.assertFalse(os.path.isdir(os.path.join(destination, "club")))
+        # Toujours UN SEUL fichier à cet emplacement (écrasé, pas dupliqué).
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(destination, "samedi"))), ["To1.tournoi"],
+        )
+
+    def test_sauvegarde_sans_redondance_comportement_strictement_inchange(self):
+        """Le cas NORMAL/majoritaire (aucun niveau redondant, structure
+        déjà conforme) — y compris quand le dossier source ne porte pas
+        du tout le même nom que la destination : comportement identique
+        à avant ce correctif, aucune détection ne doit se déclencher."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau_normal")
+        _write(os.path.join(mac_root, "samedi", "To1.tournoi"), "v1")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        os.makedirs(destination)
+
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertEqual(result["restored_tournament_files"], 1)
+        self.assertTrue(os.path.isfile(os.path.join(destination, "samedi", "To1.tournoi")))
+
+    def test_sauvegarde_ancienne_sans_le_nouveau_champ_reste_compatible(self):
+        """Simule une sauvegarde créée AVANT ce correctif : son manifeste
+        ne contient jamais que les champs déjà existants — la détection
+        ne repose sur AUCUN champ nouveau, donc fonctionne (ou s'abstient
+        correctement) de façon identique sur une telle sauvegarde."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "senaco", "samedi", "To1.tournoi"), "v1")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        manifest_path = os.path.join(backup, backup_restore.MANIFEST_FILENAME)
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertNotIn("tournament_source_folders", manifest)  # sauvegarde à un seul dossier
+        self.assertIn("tournament_files", manifest)  # seul champ dont dépend la détection
+
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        os.makedirs(destination)
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+        self.assertTrue(os.path.isfile(os.path.join(destination, "samedi", "To1.tournoi")))
+
+    def test_chemin_ambigu_un_seul_fichier_non_concluant_reste_inchange(self):
+        """Un seul fichier NE partage PAS le segment "senaco" des autres
+        (incohérence) : la détection doit s'abstenir ENTIÈREMENT, pour
+        TOUS les fichiers de cette sauvegarde — jamais une correction
+        partielle devinée au cas par cas."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "senaco", "samedi", "To1.tournoi"), "v1")
+        _write(os.path.join(mac_root, "autre_ligne", "mardi", "To2.tournoi"), "v2")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        os.makedirs(destination)
+
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertEqual(result["restored_tournament_files"], 2)
+        # Chemins restaurés TELS QUELS (jamais de retrait partiel/deviné).
+        self.assertTrue(os.path.isfile(
+            os.path.join(destination, "senaco", "samedi", "To1.tournoi")
+        ))
+        self.assertTrue(os.path.isfile(
+            os.path.join(destination, "autre_ligne", "mardi", "To2.tournoi")
+        ))
+
+    def test_sauvegarde_multi_dossiers_jamais_affectee_par_ce_mecanisme(self):
+        """Une sauvegarde multi-dossiers (tournament_source_folders)
+        dont un des dossiers porte, par coïncidence, le même nom que la
+        destination : son propre mécanisme (resolve_multi_folder_
+        destination_labels) reste seul responsable, jamais interféré par
+        detect_redundant_source_folder_prefix (jamais appelée dans ce
+        cas, voir restore_backup)."""
+        folder_a = os.path.join(self._tmp.name, "mac_un", "senaco")
+        folder_b = os.path.join(self._tmp.name, "mac_deux", "autre_club")
+        _write(os.path.join(folder_a, "samedi", "To1.tournoi"), "A")
+        _write(os.path.join(folder_b, "mardi", "To2.tournoi"), "B")
+        backup = backup_restore.create_backup(
+            self.usb,
+            tournament_files=[
+                os.path.join(folder_a, "samedi", "To1.tournoi"),
+                os.path.join(folder_b, "mardi", "To2.tournoi"),
+            ],
+            tournament_source_folders=[folder_a, folder_b],
+            poker_data_dir=None,
+        )["backup_dir"]
+        manifest = backup_restore.validate_backup_folder(backup)
+        self.assertIn("tournament_source_folders", manifest)
+
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        os.makedirs(destination)
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertEqual(result["restored_tournament_files"], 2)
+        # Comportement EXISTANT du mécanisme multi-dossiers, entièrement
+        # inchangé ici : chaque dossier source garde son propre sous-
+        # dossier à la destination (resolve_multi_folder_destination_
+        # labels) — y compris "senaco", qui coïncide avec le nom de la
+        # destination elle-même, sans qu'aucune fusion ne soit tentée
+        # (ce serait précisément le comportement risqué que detect_
+        # redundant_source_folder_prefix évite, mais qui ne s'applique
+        # jamais ici puisque ce n'est pas elle qui est à l'œuvre pour
+        # une sauvegarde multi-dossiers).
+        self.assertTrue(os.path.isfile(os.path.join(destination, "senaco", "samedi", "To1.tournoi")))
+        self.assertTrue(os.path.isfile(os.path.join(destination, "autre_club", "mardi", "To2.tournoi")))
+
+    def test_securite_pre_restauration_toujours_creee(self):
+        """Le mécanisme de sauvegarde de sécurité pré-restauration
+        (étape 1, AVANT tout écrasement) reste entièrement inchangé et
+        actif dans ce scénario."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "senaco", "samedi", "To1.tournoi"), "v1")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        _write(os.path.join(destination, "samedi", "To1.tournoi"), "ancien contenu local")
+
+        result = backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        self.assertTrue(os.path.isdir(result["safety_backup_dir"]))
+        safety_manifest = backup_restore.validate_backup_folder(result["safety_backup_dir"])
+        self.assertEqual(safety_manifest["tournament_files"], ["samedi/To1.tournoi"])
+        # Le contenu LOCAL d'avant restauration (jamais celui de la
+        # sauvegarde Mac) a bien été sauvegardé avant écrasement.
+        with open(os.path.join(result["safety_backup_dir"], "tournois", "samedi", "To1.tournoi")) as f:
+            self.assertEqual(f.read(), "ancien contenu local")
+
+    def test_ne_deplace_ni_ne_supprime_un_fichier_deja_imbrique_dune_restauration_passee(self):
+        """Demande explicite : la correction ne concerne QUE les
+        restaurations FUTURES — un dossier déjà imbriqué par une
+        restauration PASSÉE (avant ce correctif) ne doit jamais être
+        déplacé ni supprimé automatiquement."""
+        mac_root = os.path.join(self._tmp.name, "mac_bureau")
+        _write(os.path.join(mac_root, "senaco", "samedi", "To1.tournoi"), "v1")
+        backup = backup_restore.create_backup(
+            self.usb, tournament_folder=mac_root, poker_data_dir=None,
+        )["backup_dir"]
+        destination = os.path.join(self._tmp.name, "poker", "senaco")
+        # Simule le résultat d'une restauration PASSÉE, déjà imbriquée
+        # (bug non corrigé à l'époque) — ne doit jamais être touché.
+        _write(os.path.join(destination, "senaco", "samedi", "ancien_imbrique.tournoi"), "ne pas toucher")
+
+        backup_restore.restore_backup(
+            backup, tournament_folder=destination, poker_data_dir=None,
+            pre_restore_root=self.pre_restore_root, open_tournament_paths=[],
+        )
+
+        # L'ancien fichier imbriqué est resté EXACTEMENT où il était.
+        with open(os.path.join(destination, "senaco", "samedi", "ancien_imbrique.tournoi")) as f:
+            self.assertEqual(f.read(), "ne pas toucher")
+        # La NOUVELLE restauration, elle, atterrit bien au bon endroit.
+        self.assertTrue(os.path.isfile(os.path.join(destination, "samedi", "To1.tournoi")))
+
+
+class RestoreRedundantFolderPrefixTransparencyTest(unittest.TestCase):
+    """Demande explicite : jamais une correction silencieuse — toute
+    détection doit être annoncée avant confirmation. Vérification
+    STRUCTURELLE (même convention que RestoreMultiFolderTransparencyTest
+    ci-dessus) : _run_restore_flow construit une vraie fenêtre Toplevel,
+    difficile à invoquer isolément."""
+
+    def _restore_flow_body(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "main.py"),
+                   encoding="utf-8") as f:
+            source = f.read()
+        restore_start = source.index("def _run_restore_flow(self, parent):")
+        restore_end = source.index("def _open_data_purge_dialog(self, parent):", restore_start)
+        return source[restore_start:restore_end]
+
+    def test_detection_calculee_et_incluse_avant_confirmation(self):
+        restore_body = self._restore_flow_body()
+        self.assertIn(
+            "backup_restore.detect_redundant_source_folder_prefix(", restore_body,
+        )
+        self.assertLess(
+            restore_body.index("redundant_note = "),
+            restore_body.index("messagebox.askyesno("),
+        )
+        self.assertIn("redundant_note", restore_body[restore_body.index("messagebox.askyesno("):])
+
+    def test_jamais_declenchee_pour_une_sauvegarde_multi_dossiers(self):
+        """Les deux mécanismes (multi_note / redundant_note) restent
+        mutuellement exclusifs — jamais les deux calculés pour la même
+        sauvegarde."""
+        restore_body = self._restore_flow_body()
+        idx_redundant_block = restore_body.index("redundant_prefix = None")
+        idx_multi_folders_check = restore_body.index(
+            "if count and not multi_folders:", idx_redundant_block,
+        )
+        self.assertGreater(idx_multi_folders_check, idx_redundant_block)
+
+
 if __name__ == "__main__":
     unittest.main()

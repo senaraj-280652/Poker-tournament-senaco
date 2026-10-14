@@ -354,6 +354,110 @@ def resolve_multi_folder_destination_labels(tournament_source_folders, tournamen
     return resolved
 
 
+# Noms de sous-dossiers "jour de tournoi" — DUPLIQUÉS tels quels depuis
+# main.py: WEEKDAY_NAMES_FR (seule source de vérité, main.py:
+# tournament_day_folder_proposal) pour la MÊME raison que _LAST_
+# SETTINGS_FILENAME plus bas dans ce fichier : backup_restore.py ne doit
+# jamais importer main.py (main.py importe déjà backup_restore.py —
+# import circulaire). Convention FIXE et INCONDITIONNELLE de
+# l'application : "Nouveau tournoi"/"Sit & Go rapide" créent TOUJOURS le
+# fichier directement sous <Dossier par défaut>/<jour de la semaine> —
+# jamais un niveau de plus. Utilisé UNIQUEMENT comme signal structurel
+# par detect_redundant_source_folder_prefix ci-dessous — jamais pour
+# créer ni organiser quoi que ce soit ici. Comparaisons toujours faites
+# via str.casefold() (jamais une égalité stricte) : un nom de dossier
+# "Vendredi"/"VENDREDI" reste reconnu comme tel (voir aussi tests/
+# test_backup_restore.py:_SyntheticEnv, qui utilise déjà "Vendredi").
+_WEEKDAY_NAMES_FR = frozenset({
+    "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche",
+})
+
+
+def detect_redundant_source_folder_prefix(manifest, tournament_folder):
+    """Détecte un niveau de dossier redondant au tout début des chemins
+    relatifs .tournoi d'une sauvegarde à UN SEUL dossier (jamais appelée
+    pour une sauvegarde multi-dossiers — "tournament_source_folders" —,
+    qui a déjà son propre mécanisme de résolution, voir resolve_multi_
+    folder_destination_labels, entièrement indépendant et inchangé).
+
+    Incident réel ayant motivé cette fonction (2026-10-14, quater) : une
+    sauvegarde faite sur Mac, restaurée sur un poste Windows (HP) dont
+    le « Dossier par défaut » configuré est `C:\\poker\\senaco`, a
+    produit `C:\\poker\\senaco\\senaco\\samedi\\...` — le « Dossier par
+    défaut » configuré SUR LA MACHINE SOURCE au moment de la sauvegarde
+    était en réalité le PARENT d'un sous-dossier nommé "senaco" (plutôt
+    que "senaco" lui-même), si bien que chaque chemin relatif enregistré
+    dans l'archive commençait par "senaco/" — jamais compensé par
+    restore_backup, qui se contentait de joindre ce chemin relatif tel
+    quel au dossier de destination actuel.
+
+    AVERTISSEMENT IMPORTANT (demande explicite de l'utilisateur, suite à
+    la proposition initiale jugée trop permissive) : AUCUN champ du
+    manifeste — ancien ou actuel — n'enregistre de façon CERTAINE si un
+    premier segment de chemin est un niveau de dossier INTENTIONNEL (un
+    club pourrait en théorie organiser délibérément plusieurs lignes de
+    tournois dans des sous-dossiers) ou un simple ARTEFACT d'un
+    « Dossier par défaut » mal aligné sur la machine source. Cette
+    fonction ne PRÉTEND donc PAS lever cette ambiguïté dans l'absolu —
+    voir la liste de conditions ci-dessous, TOUTES nécessaires, aucune
+    suffisante seule, pensées pour réduire le risque de faux positif
+    autant que raisonnablement possible plutôt que pour l'éliminer : le
+    signal structurel (1-5) repose sur la convention FIXE de
+    l'application elle-même (jamais une simple coïncidence de nom), et
+    la coïncidence de nom (6) n'est JAMAIS utilisée seule.
+
+    Renvoie le segment jugé redondant (str, à retirer par l'appelant du
+    DÉBUT de chaque chemin relatif avant de le joindre au dossier de
+    destination) SEULEMENT si TOUTES les conditions suivantes sont
+    réunies :
+    1. La sauvegarde contient au moins un fichier .tournoi ;
+    2. TOUS les chemins relatifs de manifest["tournament_files"]
+       partagent EXACTEMENT le même premier segment (jamais un sous-
+       ensemble — une incohérence partielle est non concluante, jamais
+       une supposition sur certains fichiers seulement) ;
+    3. CHACUN de ces chemins comporte au moins deux segments (un .tournoi
+       placé directement à la racine de ce premier segment, sans sous-
+       dossier "jour", rend le signal non concluant) ;
+    4. Ce premier segment commun N'EST PAS lui-même un jour de la semaine
+       reconnu (sinon : structure déjà normale, rien à faire) ;
+    5. Le SECOND segment de CHAQUE chemin EST un jour de la semaine
+       reconnu (la structure "jour" attendue par l'application apparaît
+       bien, mais décalée d'un niveau) ;
+    6. Ce premier segment correspond EXACTEMENT (comparaison insensible à
+       la casse, utile sous Windows) au nom du dossier de destination
+       actuellement configuré (os.path.basename(tournament_folder)).
+
+    `None` dans tous les autres cas — y compris une sauvegarde ANCIENNE
+    (créée avant cette fonction : son manifeste ne contient jamais que
+    les champs déjà existants, suffisants pour CE calcul SI et seulement
+    si la structure s'y prête, mais rien n'est jamais supposé au-delà de
+    ce qui est structurellement observable). L'appelant (restore_backup)
+    doit alors restaurer le chemin EXACTEMENT comme avant cette fonction,
+    sans y toucher : jamais de modification silencieuse d'une situation
+    non concluante (demande explicite de l'utilisateur) — compatibilité
+    totale avec toutes les sauvegardes existantes, Mac comme Windows."""
+    tournament_files = manifest.get("tournament_files") or []
+    if not tournament_files:
+        return None
+    destination_basename = os.path.basename(os.path.normpath(tournament_folder)).casefold()
+    if not destination_basename:
+        return None
+    split_paths = [rel.split("/") for rel in tournament_files]
+    if any(len(parts) < 2 for parts in split_paths):
+        return None
+    first_segments = {parts[0] for parts in split_paths}
+    if len(first_segments) != 1:
+        return None
+    candidate = next(iter(first_segments))
+    if candidate.casefold() in _WEEKDAY_NAMES_FR:
+        return None
+    if candidate.casefold() != destination_basename:
+        return None
+    if any(parts[1].casefold() not in _WEEKDAY_NAMES_FR for parts in split_paths):
+        return None
+    return candidate
+
+
 def _group_tournament_files_by_source(tournament_files, candidate_folders):
     """Regroupe `tournament_files` (chemins ABSOLUS, déjà dédoublonnés
     par l'appelant) par le dossier de `candidate_folders` qui les
@@ -790,6 +894,14 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
        même nom si pertinent, jamais entre deux dossiers sources
        DIFFÉRENTS de cette même restauration). Sauvegarde ANCIENNE ou à
        un seul dossier : comportement STRICTEMENT inchangé.
+       Pour une sauvegarde à UN SEUL dossier (correctif du 2026-10-14,
+       quater, "C:\\poker\\senaco\\senaco" après restauration Mac ->
+       Windows) : voir detect_redundant_source_folder_prefix pour les
+       conditions STRICTES, toutes nécessaires, sous lesquelles un
+       premier segment de chemin jugé redondant est retiré avant
+       restauration — jamais une sauvegarde multi-dossiers (traitée
+       séparément ci-dessus), jamais une structure non concluante (voir
+       sa docstring pour le détail complet et ses limites assumées).
        open_windows.json et phone_selected_pid.json ne sont
        volontairement JAMAIS restaurés (voir RESTORE_EXCLUDED_DATA_
        FILENAMES) ; license.json, lui, est restauré normalement, sans
@@ -917,6 +1029,21 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
                 resolve_multi_folder_destination_labels(multi_source_folders, tournament_folder)
                 if multi_source_folders else None
             )
+            # Correctif du 2026-10-14 (quater, "C:\poker\senaco\senaco"
+            # après restauration Mac -> Windows) : UNIQUEMENT pour une
+            # sauvegarde à UN SEUL dossier (resolved_labels is None —
+            # jamais pour une sauvegarde multi-dossiers, déjà traitée
+            # ci-dessus) — voir detect_redundant_source_folder_prefix
+            # pour les conditions STRICTES (toutes nécessaires) sous
+            # lesquelles un premier segment de chemin est retiré. `None`
+            # dans tous les autres cas (y compris toute sauvegarde
+            # ancienne ou dont la structure ne s'y prête pas) : le bloc
+            # ci-dessous retombe alors sur `rel` tel quel — comportement
+            # STRICTEMENT INCHANGÉ.
+            redundant_prefix = (
+                detect_redundant_source_folder_prefix(manifest, tournament_folder)
+                if resolved_labels is None else None
+            )
             for rel in manifest["tournament_files"]:
                 src_path = os.path.join(tournaments_src, rel)
                 if not os.path.isfile(src_path):
@@ -928,6 +1055,12 @@ def restore_backup(backup_dir, tournament_folder=None, poker_data_dir=None,
                     old_label, rest_within_group = rel.split("/", 1)
                     index = int(old_label.split("_", 1)[0])
                     rel_for_destination = f"{resolved_labels[index]}/{rest_within_group}"
+                elif redundant_prefix is not None:
+                    # rel == "<segment redondant>/<reste>" — toujours au
+                    # moins un "/" ici (condition 3 de detect_redundant_
+                    # source_folder_prefix, déjà vérifiée pour TOUS les
+                    # fichiers avant que redundant_prefix ne soit renseigné).
+                    rel_for_destination = rel.split("/", 1)[1]
                 else:
                     rel_for_destination = rel
                 dst_path = os.path.join(tournament_folder, *rel_for_destination.split("/"))

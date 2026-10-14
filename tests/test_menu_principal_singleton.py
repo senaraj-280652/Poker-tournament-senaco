@@ -197,6 +197,20 @@ class AcquireMenuPrincipalLockTest(unittest.TestCase):
         registry_lock_patcher.start()
         self.addCleanup(registry_lock_patcher.stop)
 
+        # Correctif du 2026-10-14 (bis) : _acquire_menu_principal_lock_
+        # if_needed appelle désormais open_windows.acquire_standalone_
+        # screen, qui lit/écrit un SECOND fichier (registre multi-entrées
+        # des écrans "sans tournoi") — jamais ~/.poker_tournament pendant
+        # les tests, même précaution que pour les deux fichiers ci-dessus.
+        def _fake_standalone_screens_path(key):
+            return os.path.join(self._tmp.name, f"menu_principal_screens_{key}.json")
+
+        standalone_patcher = patch.object(
+            open_windows, "_standalone_screens_path", side_effect=_fake_standalone_screens_path,
+        )
+        standalone_patcher.start()
+        self.addCleanup(standalone_patcher.stop)
+
         # POKER_TOURNAMENT_INTERNAL_LAUNCH ne doit jamais fuiter d'un test
         # à l'autre (ni depuis l'environnement réel de la machine).
         env_patcher = patch.dict(os.environ, {}, clear=False)
@@ -387,9 +401,13 @@ class ForceCheckOverridesExemptionTest(unittest.TestCase):
         def _fake_registry_lock_path(key):
             return os.path.join(self._tmp.name, f"menu_principal_{key}.lock")
 
+        def _fake_standalone_screens_path(key):
+            return os.path.join(self._tmp.name, f"menu_principal_screens_{key}.json")
+
         for target in (
             patch.object(open_windows, "_menu_principal_lock_path", side_effect=_fake_lock_path),
             patch.object(open_windows, "_menu_principal_registry_lock_path", side_effect=_fake_registry_lock_path),
+            patch.object(open_windows, "_standalone_screens_path", side_effect=_fake_standalone_screens_path),
         ):
             target.start()
             self.addCleanup(target.stop)

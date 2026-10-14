@@ -319,6 +319,32 @@ def _install_crash_logging():
             _log_exception(args.exc_type, args.exc_value, args.exc_traceback)
         threading.excepthook = _thread_hook
 
+
+def _log_theme_fallback(actual_theme):
+    """Journalisation DISCRÈTE (jamais une fenêtre d'erreur affichée à
+    l'utilisateur — demande explicite du 2026-10-14, diagnostic des
+    ascenseurs blancs sous Windows) dans le MÊME fichier que _log_
+    exception (_crash_log_path) : si "clam" n'a pas pu être activé (ou
+    si un AUTRE thème est actif pour une raison quelconque, voir
+    App._apply_theme, seul appelant), la personnalisation de style de
+    Senaco (couleurs, ascenseurs...) ne s'applique alors pas pleinement
+    — "vista"/"winnative"/"xpnative" (Windows) et "aqua" (Mac) redessinent
+    plusieurs éléments nativement et ignorent largement les couleurs
+    configurées via ttk.Style.configure(). Jamais appelée si "clam" est
+    bien actif (cas normal, immense majorité des postes)."""
+    try:
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 70 + "\n")
+            f.write(datetime.now().isoformat(timespec="seconds") + "\n")
+            f.write(
+                "Thème ttk \"clam\" indisponible ou non actif — thème "
+                f"réellement utilisé : \"{actual_theme}\". La personnalisation "
+                "de style de Senaco (couleurs, ascenseurs...) peut ne pas "
+                "s'appliquer pleinement sur ce poste.\n"
+            )
+    except OSError:
+        pass
+
 # Photos de joueurs (aperçu + capture caméra) : dépendances optionnelles.
 # La copie/suppression des fichiers photo (player_photos.py) ne nécessite
 # rien de plus que la bibliothèque standard ; seuls l'AFFICHAGE d'un
@@ -8360,6 +8386,16 @@ class App(tk.Tk):
         # la section reflètent le bon état dès la toute première image,
         # jamais l'ancien état affiché puis corrigé au tick suivant.
         if self.db is not None:
+            # Ce lancement a finalement une vraie base de données
+            # (tournoi choisi via "Bienvenue", ou ouvert directement via
+            # open_path) : ce n'est plus un écran "sans tournoi" —
+            # retire l'inscription provisoire posée plus haut dans
+            # _acquire_menu_principal_lock_if_needed (AVANT que ce choix
+            # ne soit connu) du registre multi-entrées (voir open_
+            # windows.acquire_standalone_screen) — sans effet (no-op) si
+            # ce process ne s'y était jamais inscrit (branche open_path,
+            # qui ne passe jamais par cette inscription).
+            open_windows.unregister_standalone_screen(os.getpid(), _menu_principal_key())
             _align_primes_enabled_on_open(self.db)
         # Détection SEULE (aucune réparation automatique, demande
         # explicite du 2026-09-10) d'une incohérence de capacité déjà
@@ -8405,6 +8441,23 @@ class App(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
+        # Vérification explicite (demande du 2026-10-14, diagnostic des
+        # ascenseurs restés blancs sous Windows dans "LOG > Purger les
+        # données" et le Répertoire) : "clam" est le seul thème ttk qui
+        # respecte intégralement une coloration personnalisée sur les
+        # deux plateformes — "vista"/"winnative" (Windows) et "aqua"
+        # (Mac) redessinent plusieurs éléments nativement (dont
+        # l'ascenseur) et ignorent largement les couleurs ci-dessous.
+        # theme_use() SANS argument renvoie le thème RÉELLEMENT actif,
+        # qu'il ait été accepté ci-dessus ou non (ex. si l'exception
+        # ci-dessus a été levée, ou si "clam" était accepté par Tk sans
+        # réellement s'appliquer) — jamais supposé actif seulement parce
+        # qu'aucune exception n'a été levée. Journalisation DISCRÈTE
+        # uniquement (_log_theme_fallback écrit dans crash.log, jamais
+        # de messagebox) : un thème de repli ne doit jamais interrompre
+        # le démarrage ni être signalé par une fenêtre à l'utilisateur.
+        if style.theme_use() != "clam":
+            _log_theme_fallback(style.theme_use())
 
         base_font = ("Helvetica", 11)
         bold_font = ("Helvetica", 11, "bold")
@@ -8523,9 +8576,32 @@ class App(tk.Tk):
             font=("Helvetica", 24, "bold"), relief="flat",
         )
         style.map("MovesBig.Treeview.Heading", background=[("active", FELT)])
+        # Règle UNIQUE, partagée par les 19 ttk.Scrollbar de ce fichier
+        # (aucun ne précise de style= particulier — "LOG > Purger les
+        # données" et le Répertoire ne font ici RIEN de différent des
+        # autres) : diagnostic du 2026-10-14, ascenseurs restés blancs
+        # sous Windows — darkcolor/lightcolor/gripcount, absents
+        # jusqu'ici, manquaient pour que le thème "clam" calcule
+        # correctement le relief 3D du curseur (thumb) sur TOUTES les
+        # plateformes ; sans eux, Tk retombe sur une valeur par défaut
+        # propre à chaque plateforme, restée claire/blanche sous Windows
+        # alors qu'elle passait inaperçue sous macOS. background/
+        # troughcolor/arrowcolor/bordercolor INCHANGÉS (demande
+        # explicite : préserver les couleurs existantes, bordercolor en
+        # particulier, sauf justification technique précise — aucune
+        # ici) ; darkcolor/lightcolor repris de la même palette Senaco
+        # déjà utilisée pour ce dégradé (FELT_DARK/FELT_LIGHT, les mêmes
+        # que background/troughcolor) ; gripcount=0 retire les petites
+        # rainures du curseur (accentuaient le rendu par défaut) ;
+        # relief="flat" cohérent avec le reste du thème (TButton,
+        # Treeview.Heading...), déjà tous en relief plat. Aucun widget
+        # ni aucune dimension/disposition d'ascenseur touché par ce
+        # changement, uniquement cette définition de style.
         style.configure(
             "Vertical.TScrollbar", background=FELT_LIGHT, troughcolor=FELT_DARK,
             arrowcolor=GOLD, bordercolor=FELT_DARK,
+            darkcolor=FELT_DARK, lightcolor=FELT_LIGHT,
+            gripcount=0, relief="flat",
         )
 
     def _build_header(self):
@@ -8780,21 +8856,44 @@ class App(tk.Tk):
         tournoi est choisi : sans ça, un second double-clic sur le
         raccourci PENDANT qu'un tournoi est déjà affiché ouvrirait quand
         même un second écran Bienvenue, exactement le cas que cette
-        demande doit empêcher."""
-        if open_path is not None or (not force_check and os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH)):
-            return True
+        demande doit empêcher.
+
+        Correctif du 2026-10-14 (bis) — anomalie distincte, reproduite
+        sur le même poste HP : un Menu principal volontaire ("🏠 Menu
+        principal" cliqué DEPUIS un vrai tournoi, marqueur présent, donc
+        exempté ci-dessous) laissé ouvert SANS qu'aucun tournoi n'y soit
+        choisi, pendant que le tournoi d'origine se ferme — ce dernier,
+        qui détenait seul le verrou exclusif, le libère à sa fermeture,
+        puis le retrouve VIDE en retombant à son tour sur "sans tournoi"
+        (force_check=True) et l'acquiert : DEUX fenêtres "Bienvenue"
+        affichées en même temps, la volontaire étant restée invisible à
+        ce verrou à PID unique pendant toute sa vie. open_windows.
+        acquire_standalone_screen ajoute un second registre MULTI-
+        entrées (voir sa docstring) dans lequel la branche exemptée
+        ci-dessous s'enregistre désormais elle aussi (exclusive=False,
+        jamais bloquée) — rendant cette fenêtre visible pour la branche
+        exclusive=True ci-dessous, qui la détecte et s'efface devant
+        elle au lieu d'en construire une seconde."""
         menu_key = _menu_principal_key()
+        if open_path is not None:
+            return True
+        if not force_check and os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH):
+            open_windows.acquire_standalone_screen(os.getpid(), menu_key, exclusive=False)
+            return True
         # Correctif du 2026-10-12 (essai réel, poste Windows HP : "deux
         # lancements successifs de Senaco ont ouvert deux fenêtres
-        # identiques") : lecture (menu_principal_pid) ET écriture
-        # (register_menu_principal) regroupées en UNE SEULE opération
-        # atomique (open_windows.acquire_menu_principal, voir sa
-        # docstring pour le diagnostic complet de la course qu'elle
-        # ferme) — jamais plus deux appels séparés sans verrou commun.
-        existing_pid = open_windows.acquire_menu_principal(os.getpid(), menu_key)
+        # identiques") puis du 2026-10-14 bis (Menu principal volontaire
+        # invisible, voir ci-dessus) : lecture ET écriture des DEUX
+        # registres (exclusif historique + multi-entrées) regroupées en
+        # UNE SEULE opération atomique (open_windows.acquire_standalone_
+        # screen, voir sa docstring) — jamais plus d'appels séparés sans
+        # verrou commun.
+        existing_pid = open_windows.acquire_standalone_screen(os.getpid(), menu_key, exclusive=True)
         if existing_pid is not None:
-            # Une autre instance du Menu principal (de la MÊME ligne
-            # prod/test) tourne déjà sur ce poste : on la ramène au
+            # Une autre instance "sans tournoi" (de la MÊME ligne
+            # prod/test — verrou exclusif historique OU Menu principal
+            # volontaire désormais visible via le registre multi-
+            # entrées) tourne déjà sur ce poste : on la ramène au
             # premier plan (fonctionne qu'elle affiche encore
             # "Bienvenue" ou déjà un tournoi, bring_pid_to_front visant
             # le PID, pas une fenêtre précise) et on quitte
@@ -8991,6 +9090,31 @@ class App(tk.Tk):
                     "distincts. Les fichiers seront restaurés sous des "
                     "noms de dossiers lisibles."
                 )
+        # Transparence EXPLICITE sur un niveau de dossier redondant
+        # détecté (correctif du 2026-10-14, quater, "C:\poker\senaco\
+        # senaco" après restauration Mac -> Windows) — UNIQUEMENT pour
+        # une sauvegarde à UN SEUL dossier (jamais si multi_folders,
+        # déjà couvert séparément ci-dessus par multi_note) : voir
+        # backup_restore.detect_redundant_source_folder_prefix pour les
+        # conditions STRICTES sous lesquelles ce retrait a lieu — jamais
+        # silencieux, toujours annoncé ici AVANT confirmation.
+        redundant_prefix = None
+        if count and not multi_folders:
+            configured_folder = (
+                tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+            ).strip()
+            if configured_folder:
+                redundant_prefix = backup_restore.detect_redundant_source_folder_prefix(
+                    manifest, configured_folder,
+                )
+        redundant_note = (
+            "\n\nCette sauvegarde semble provenir d'un poste où le dossier "
+            f"de tournoi contenait un niveau supplémentaire nommé « {redundant_prefix} », "
+            "identique au nom de votre dossier de destination actuel, avant "
+            "les dossiers de jour habituels (mardi, samedi...). Pour éviter "
+            f"une imbrication (« {redundant_prefix}\\{redundant_prefix}\\... »), ce "
+            "niveau sera automatiquement retiré lors de cette restauration."
+        ) if redundant_prefix else ""
         # Avertissement explicite sur le remplacement (demande du
         # 2026-10-10) : restore_backup() écrase bien un .tournoi de
         # même nom relatif déjà présent à destination (comportement
@@ -9012,7 +9136,7 @@ class App(tk.Tk):
             f"Tournois : {count}\n"
             "Données de l'application (réglages, joueurs, photos...) : "
             f"{'oui' if has_data else 'non'}"
-            f"{multi_note}{overwrite_note}\n\n"
+            f"{multi_note}{redundant_note}{overwrite_note}\n\n"
             "Une sauvegarde de sécurité des données actuelles sera créée "
             "automatiquement avant toute modification.\n\n"
             "Confirmer la restauration ?",
@@ -9683,6 +9807,15 @@ class App(tk.Tk):
         if getattr(self, "_holds_menu_principal_lock", False):
             open_windows.unregister_menu_principal(os.getpid(), _menu_principal_key())
             self._holds_menu_principal_lock = False
+        # Inconditionnel (jamais conditionné par un drapeau, contrairement
+        # au verrou exclusif ci-dessus) : correctif du 2026-10-14 (bis),
+        # voir open_windows.acquire_standalone_screen — retire, si besoin,
+        # l'inscription de CE process au registre multi-entrées des
+        # écrans "sans tournoi" (verrou exclusif historique OU Menu
+        # principal volontaire). No-op silencieux si jamais inscrit
+        # (tournoi ouvert via open_path/Lobby, ou verrou refusé plus
+        # haut).
+        open_windows.unregister_standalone_screen(os.getpid(), _menu_principal_key())
 
     def _on_close(self):
         """Croix rouge de la fenêtre (WM_DELETE_WINDOW) ET "Fin de la

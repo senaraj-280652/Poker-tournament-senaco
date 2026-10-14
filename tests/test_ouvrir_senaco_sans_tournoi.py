@@ -155,12 +155,27 @@ class BienvenueButtonStructuralTest(_SourceHelper, unittest.TestCase):
 # =====================================================================
 class StabilityGuardsStructuralTest(_SourceHelper, unittest.TestCase):
     def test_align_primes_enabled_garde_par_self_db(self):
+        """Correctif du 2026-10-14 (bis, registre multi-entrées des
+        écrans "sans tournoi") : une nouvelle ligne (désinscription de ce
+        registre) s'est intercalée dans ce même bloc `if self.db is not
+        None:`, AVANT l'appel historique — toujours sous la même garde,
+        voir tests/test_menu_principal_singleton.py pour la couverture
+        du nouveau mécanisme lui-même."""
         func = self._find_method("App", "__init__")
         seg = self._source_of(func)
         self.assertIn(
-            "if self.db is not None:\n            _align_primes_enabled_on_open(self.db)",
+            "if self.db is not None:\n"
+            "            # Ce lancement a finalement une vraie base de données",
             seg,
         )
+        idx_guard = seg.index(
+            "if self.db is not None:\n"
+            "            # Ce lancement a finalement une vraie base de données"
+        )
+        idx_unregister = seg.index("open_windows.unregister_standalone_screen(os.getpid(), _menu_principal_key())")
+        idx_align = seg.index("_align_primes_enabled_on_open(self.db)")
+        self.assertLess(idx_guard, idx_unregister)
+        self.assertLess(idx_unregister, idx_align)
 
     def test_remote_control_jamais_demarre_sans_tournoi(self):
         func = self._find_method("App", "__init__")

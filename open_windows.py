@@ -814,6 +814,35 @@ def locked_primes_enabled(default=True):
 # tournois) ni primes_session_started.json ci-dessus : fichier séparé,
 # clé de verrouillage différente.
 #
+# Anomalie signalée le 2026-10-14 (bis), reproduite sur un poste réel
+# (HP, Windows) : (1) tournoi ouvert, (2) "🏠 Menu principal" cliqué
+# DEPUIS ce tournoi (spawn_app_process(internal_menu_child=True) —
+# volontairement exempté du verrou ci-dessus, donc jamais enregistré
+# nulle part), (3) ce Menu principal laissé ouvert sans qu'aucun
+# tournoi n'y soit choisi, (4) le tournoi d'origine fermé par la croix
+# rouge. Ce dernier processus, ayant détenu le verrou depuis son
+# lancement, le libère à sa fermeture (_cleanup_for_close) ; en
+# retombant à son tour sur "sans tournoi" (App(start_standalone=True),
+# voir main.py:App._on_close), il retrouve le verrou VIDE — puisque le
+# Menu principal volontaire de l'étape 2 ne l'a jamais détenu — et
+# l'acquiert à son tour : deux fenêtres "Bienvenue" se retrouvent
+# affichées simultanément, la seconde totalement invisible à ce verrou
+# exclusif à PID unique.
+#
+# Correctif : acquire_standalone_screen ci-dessous ajoute un second
+# registre, MULTI-entrées cette fois (menu_principal_screens_<key>.json,
+# fichier séparé, jamais confondu avec menu_principal_<key>.json)
+# recensant TOUTES les fenêtres actuellement sur l'écran "sans tournoi"
+# — y compris les Menu principal volontaires, désormais rendus visibles
+# sans jamais être eux-mêmes bloqués (voir son paramètre `exclusive`).
+# Le verrou exclusif historique ci-dessus (register_menu_principal/
+# unregister_menu_principal/menu_principal_pid/acquire_menu_principal)
+# reste intégralement INCHANGÉ et continue de fonctionner exactement
+# comme avant pour quiconque l'appelle directement (voir tests/test_
+# acquire_menu_principal_race.py) — acquire_standalone_screen l'appelle
+# seulement en PLUS, dans sa propre section critique, pour les
+# lancements qui doivent rester exclusifs.
+#
 # Une clé par "produit" (`key`, ex. "prod"/"test" — voir main.py: _is_
 # test_build) : Poker Senaco et Poker Senaco TEST doivent pouvoir
 # cohabiter, chacun avec sa PROPRE instance unique de Menu principal,
@@ -960,6 +989,133 @@ def acquire_menu_principal(pid, key):
             return existing_pid
         register_menu_principal(pid, key)
         return None
+
+
+def _standalone_screens_path(key):
+    return os.path.join(
+        os.path.expanduser("~"), ".poker_tournament", f"menu_principal_screens_{key}.json",
+    )
+
+
+def _load_standalone_screens(key):
+    path = _standalone_screens_path(key)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_standalone_screens(key, data):
+    try:
+        _atomic_write_json(_standalone_screens_path(key), data)
+    except OSError:
+        pass
+
+
+def acquire_standalone_screen(pid, key, exclusive):
+    """Correctif du 2026-10-14 (bis) — voir le grand bloc de commentaires
+    ci-dessus pour le diagnostic complet ("Menu principal" volontaire
+    dupliqué quand le tournoi d'origine se ferme). Registre MULTI-
+    entrées (menu_principal_screens_<key>.json, {str(pid): {"pid",
+    "registered_at"}}, un PAR fenêtre actuellement sur l'écran "sans
+    tournoi") — fichier et clé de verrouillage SÉPARÉS du verrou
+    exclusif historique ci-dessus (menu_principal_<key>.json), jamais
+    confondus.
+
+    Section critique UNIQUE protégée par _menu_principal_registry_lock
+    (le MÊME verrou, réutilisé tel quel, que acquire_menu_principal —
+    jamais un second verrou distinct pour une seule et même décision,
+    ce qui rouvrirait exactement la course du 2026-10-12). N'appelle
+    JAMAIS acquire_menu_principal elle-même depuis l'intérieur de cette
+    section (ce verrou n'est pas réentrant — un second appel imbriqué
+    bloquerait indéfiniment, même précaution déjà documentée pour
+    _registry_lock/_remote_control_lock) : appelle directement menu_
+    principal_pid/register_menu_principal, TOUTES DEUX INCHANGÉES,
+    comme le ferait acquire_menu_principal elle-même.
+
+    `exclusive=True` (lancement externe normal, ou retour forcé vers
+    "sans tournoi" après fermeture du dernier tournoi — voir main.py:
+    App._acquire_menu_principal_lock_if_needed) : vérifie D'ABORD
+    qu'aucune entrée vivante (purgée via _prune, même principe que
+    open_windows.json) n'existe déjà dans ce registre — qu'il s'agisse
+    d'un précédent appel exclusif ou d'un Menu principal volontaire
+    (voir exclusive=False ci-dessous) — et renvoie alors son pid SANS
+    RIEN écrire : l'appelant doit la ramener au premier plan et
+    renoncer. AUCUNE exception pour une entrée qui porterait déjà le
+    `pid` appelant lui-même (même principe que l'ancien acquire_menu_
+    principal/menu_principal_pid, qui ne s'excluaient pas non plus eux-
+    mêmes) : en production, ce cas ne se présente normalement jamais
+    (App._cleanup_for_close retire toujours l'inscription d'un process
+    AVANT toute reconstruction ultérieure d'une App() par ce même
+    process) — et le traiter comme "une entrée existe" reste de toute
+    façon le choix le plus sûr. Par compatibilité avec un AUTRE
+    processus qui tournerait encore sur un ancien build (antérieur à ce
+    correctif, qui n'alimente donc jamais ce nouveau registre), vérifie
+    AUSSI le verrou exclusif historique (menu_principal_pid) — défense
+    en profondeur, jamais la seule garantie dans un parc à jour. Sinon :
+    enregistre `pid` dans CE registre ET, dans la MÊME section
+    critique, acquiert en plus le verrou exclusif historique (register_
+    menu_principal) — exactement ce que faisait déjà acquire_menu_
+    principal, désormais dans cette section commune. Renvoie None.
+
+    `exclusive=False` (Menu principal volontaire ouvert depuis un VRAI
+    tournoi, voir main.py: App._open_new_window/spawn_app_process(
+    internal_menu_child=True)) : reste ILLIMITÉ exactement comme avant
+    — ne vérifie JAMAIS la présence d'une autre entrée, s'enregistre
+    toujours, ne touche jamais le verrou exclusif historique. Rend
+    simplement cette fenêtre désormais VISIBLE pour un futur appel
+    exclusive=True — c'est précisément cette visibilité qui manquait et
+    causait la duplication."""
+    with _menu_principal_registry_lock(key):
+        data = _prune(_load_standalone_screens(key))
+        if exclusive:
+            if data:
+                return next(iter(data.values())).get("pid")
+            legacy_pid = menu_principal_pid(key)
+            if legacy_pid is not None:
+                return legacy_pid
+        data[str(pid)] = {"pid": pid, "registered_at": time.time()}
+        _save_standalone_screens(key, data)
+        if exclusive:
+            register_menu_principal(pid, key)
+        return None
+
+
+def unregister_standalone_screen(pid, key):
+    """Retire l'enregistrement de `pid` du registre multi-entrées des
+    écrans "sans tournoi" de la ligne `key` (voir acquire_standalone_
+    screen) — SI cette entrée lui appartient encore (même précaution
+    que unregister_menu_principal : jamais effacer par erreur celle
+    d'un AUTRE processus en cas de course improbable). Sans effet
+    (no-op silencieux) si `pid` n'y figurait pas — voir main.py:
+    App._cleanup_for_close, qui l'appelle INCONDITIONNELLEMENT (qu'une
+    inscription ait eu lieu ou non pour ce process).
+
+    Sous le MÊME verrou que acquire_standalone_screen (jamais une
+    libération ne court contre elle-même, mais reste cohérente avec
+    une acquisition concurrente d'un AUTRE process)."""
+    with _menu_principal_registry_lock(key):
+        data = _load_standalone_screens(key)
+        entry = data.get(str(pid))
+        if entry and entry.get("pid") == pid:
+            del data[str(pid)]
+            _save_standalone_screens(key, data)
+
+
+def list_standalone_screen_pids(key):
+    """Liste (best-effort, instantané SANS verrou — jamais la décision
+    elle-même, voir acquire_standalone_screen pour la section atomique
+    réelle) des pid actuellement enregistrés comme affichant l'écran
+    "sans tournoi" pour la ligne `key`, PID morts déjà purgés. Utilitaire
+    de diagnostic/tests — aucun appelant de production ne doit décider
+    quoi que ce soit à partir de cette fonction (voir acquire_standalone_
+    screen, seule garantie atomique)."""
+    data = _prune(_load_standalone_screens(key))
+    return [entry.get("pid") for entry in data.values()]
 
 
 def bring_pid_to_front(pid):
