@@ -7927,7 +7927,7 @@ class App(tk.Tk):
         terminal visible (contrôle à distance, tests)."""
         _log_exception(exc, val, tb)
 
-    def __init__(self, open_path=None, start_standalone=False):
+    def __init__(self, open_path=None, start_standalone=False, force_menu_principal_check=False):
         super().__init__()
         self.withdraw()
         # Titre initial (Menu principal, avant tout choix de tournoi —
@@ -8295,7 +8295,31 @@ class App(tk.Tk):
                 self.destroy()
                 return
         else:
-            if not self._acquire_menu_principal_lock_if_needed(open_path):
+            # force_check=start_standalone OR force_menu_principal_check
+            # (correctif du 2026-10-14, "Senaco sans tournoi déjà ouvert,
+            # un nouveau lancement externe ouvre quand même un second
+            # Bienvenue") : la véritable vérification du verrou est
+            # désormais FORCÉE dans deux cas précis, même si ce processus
+            # porte le marqueur POKER_TOURNAMENT_INTERNAL_LAUNCH d'un
+            # lancement "🏠 Menu principal" antérieur (qui, sans ce
+            # correctif, l'exempterait sinon pour toute sa durée de vie —
+            # voir la docstring de _acquire_menu_principal_lock_if_needed
+            # pour le diagnostic complet) :
+            # 1. start_standalone=True : ce processus retombe en "sans
+            #    tournoi" (voir App._on_close, seul appelant réel) ;
+            # 2. force_menu_principal_check=True : _new_tournament()
+            #    (voir ci-dessous) rappelle App() alors qu'il était DÉJÀ
+            #    "sans tournoi" (self.db is None à cet instant précis,
+            #    "🏠 Menu principal"/Fichier depuis l'écran "sans
+            #    tournoi" lui-même) — même situation ambiguë que le cas
+            #    1, PAS une action "ouvrir délibérément un AUTRE
+            #    tournoi" (qui, elle, reste exemptée — voir _new_
+            #    tournament, appelée aussi depuis un VRAI tournoi, où ce
+            #    paramètre vaut alors False, comportement entièrement
+            #    inchangé).
+            if not self._acquire_menu_principal_lock_if_needed(
+                open_path, force_check=start_standalone or force_menu_principal_check,
+            ):
                 # Une autre instance (MÊME ligne prod/test) existe déjà
                 # et a été ramenée au premier plan — voir la docstring de
                 # _acquire_menu_principal_lock_if_needed : self.after
@@ -8307,11 +8331,10 @@ class App(tk.Tk):
             # d'un clic sur "🖥️ Ouvrir Senaco" sur l'écran Bienvenue,
             # SANS l'afficher — self.db reste None (déjà initialisé plus
             # haut), _choose_tournament_file() n'est même pas appelée.
-            # Le verrou de Menu principal ci-dessus a néanmoins déjà été
-            # posé/refusé EXACTEMENT comme pour un lancement normal : une
-            # seule fenêtre "sans tournoi/Bienvenue" possible à la fois
-            # sur ce poste, jamais deux en double (voir App._on_close,
-            # seul appelant réel de start_standalone=True).
+            # Le verrou de Menu principal ci-dessus a bien été posé/
+            # refusé pour de vrai juste au-dessus (force_check=True) :
+            # une seule fenêtre "sans tournoi/Bienvenue" possible à la
+            # fois sur ce poste, jamais deux en double.
             if not start_standalone and not self._choose_tournament_file():
                 # _cleanup_for_close (pas juste self.destroy()) : libère
                 # aussi le verrou de Menu principal éventuellement posé
@@ -8684,7 +8707,7 @@ class App(tk.Tk):
         self._menu_principal_proc = proc
         raise_process_when_ready(self, proc.pid)
 
-    def _acquire_menu_principal_lock_if_needed(self, open_path):
+    def _acquire_menu_principal_lock_if_needed(self, open_path, force_check=False):
         """Pose (si nécessaire) le verrou d'unicité du "Menu principal"
         pour CE lancement (demande du 2026-09-14) — extrait d'App.
         __init__ dans sa propre méthode pour rester testable isolément
@@ -8697,10 +8720,42 @@ class App(tk.Tk):
         seul appelant : App.__init__) ET sans le marqueur
         POKER_TOURNAMENT_INTERNAL_LAUNCH (posé UNIQUEMENT par
         spawn_app_process(internal_menu_child=True), voir
-        _open_new_window ci-dessus) : le Lobby (chemin réel) et "🏠 Menu
-        principal" (marqueur présent) sont ainsi TOUJOURS exemptés,
-        quel que soit l'état du verrou — jamais de vérification pour eux
-        du tout.
+        _open_new_window ci-dessus) ET sans `force_check` : le Lobby
+        (chemin réel) et "🏠 Menu principal" (marqueur présent) sont ainsi
+        TOUJOURS exemptés, quel que soit l'état du verrou — jamais de
+        vérification pour eux du tout.
+
+        `force_check=True` (demande explicite du 2026-10-14, suite à
+        l'anomalie "Senaco sans tournoi déjà ouvert, un nouveau
+        lancement ouvre quand même un second Bienvenue") : IGNORE
+        volontairement la SEULE exemption POKER_TOURNAMENT_INTERNAL_
+        LAUNCH — JAMAIS celle d'`open_path` (un chemin réel, Lobby,
+        garde toujours la priorité absolue, quelle que soit la valeur de
+        force_check : ce sont deux justifications d'exemption
+        totalement distinctes, jamais mélangées). Seuls appelants réels
+        de force_check=True : App.__init__ avec start_standalone=True
+        (voir App._on_close) et avec force_menu_principal_check=True
+        (voir App._new_tournament, UNIQUEMENT quand elle est appelée
+        alors que self.db était déjà None). Diagnostic exact :
+        POKER_TOURNAMENT_INTERNAL_LAUNCH est posée UNE SEULE FOIS, à la
+        création du PROCESSUS, par spawn_app_process(internal_menu_
+        child=True) ("🏠 Menu principal") — et reste donc vraie pour
+        TOUTE la durée de vie de ce processus, y compris après que son
+        tournoi se soit fermé et qu'il retombe en "Senaco sans tournoi"
+        (App(start_standalone=True)/App(force_menu_principal_check=
+        True), construite EN MÉMOIRE dans ce même processus, qui hérite
+        donc de ce même environnement). Sans force_check, une fenêtre
+        "Menu principal" devenue "sans tournoi" restait ainsi PERMANEN-
+        MENT exemptée du verrou — remontré concrètement sur un poste
+        réel (menu_principal_prod.json absent malgré une instance "sans
+        tournoi" bel et bien vivante). Une fois "sans tournoi", cette
+        fenêtre n'a plus rien de "volontairement supplémentaire" (sa
+        seule justification pour l'exemption) : elle doit alors être
+        unique comme n'importe quel écran Bienvenue/"sans tournoi" —
+        d'où la vérification RÉELLE forcée ici, sans toucher à
+        l'exemption pour les autres cas (Lobby, tournoi volontaire
+        supplémentaire via "🏠 Menu principal" depuis un VRAI tournoi,
+        qui restent entièrement inchangés).
 
         `_menu_principal_key()` sépare Poker Senaco de Poker Senaco
         TEST : chacun garde sa propre instance unique, sans jamais se
@@ -8708,13 +8763,16 @@ class App(tk.Tk):
 
         Renvoie True si l'appelant doit continuer normalement vers
         _choose_tournament_file() (cas B — open_path fourni ou marqueur
-        interne présent — ou cas A où aucune autre instance n'existait,
-        verrou fraîchement posé par CE process, self.
-        _holds_menu_principal_lock passé à True). Renvoie False si une
-        autre instance de la MÊME ligne existe déjà : elle a été ramenée
-        au premier plan (best-effort, jamais de message d'erreur) et
-        self.after(destroy) déjà programmé — l'appelant ne doit alors
-        RIEN faire de plus, ni construire la moindre fenêtre.
+        interne présent, sans force_check — ou cas A où aucune autre
+        instance n'existait, verrou fraîchement posé par CE process,
+        self._holds_menu_principal_lock passé à True). Renvoie False si
+        une autre instance de la MÊME ligne existe déjà : elle a été
+        ramenée au premier plan (best-effort, jamais de message
+        d'erreur) et self.after(destroy) déjà programmé — l'appelant ne
+        doit alors RIEN faire de plus, ni construire la moindre fenêtre
+        (c'est exactement ce chemin qui, avec force_check=True, ramène
+        au premier plan une fenêtre Bienvenue/"sans tournoi" déjà
+        ouverte plutôt que d'en construire une seconde).
 
         Le verrou est posé AVANT _choose_tournament_file() et gardé
         pendant TOUTE la vie de cette fenêtre (libéré uniquement dans
@@ -8723,7 +8781,7 @@ class App(tk.Tk):
         raccourci PENDANT qu'un tournoi est déjà affiché ouvrirait quand
         même un second écran Bienvenue, exactement le cas que cette
         demande doit empêcher."""
-        if open_path is not None or os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH):
+        if open_path is not None or (not force_check and os.environ.get(POKER_TOURNAMENT_INTERNAL_LAUNCH)):
             return True
         menu_key = _menu_principal_key()
         # Correctif du 2026-10-12 (essai réel, poste Windows HP : "deux
@@ -9839,9 +9897,31 @@ class App(tk.Tk):
         self.notebook.select(self.roster_tab)
 
     def _new_tournament(self):
+        """Appelée depuis un VRAI tournoi ("Fichier > Nouveau tournoi.../
+        Ouvrir...") ou depuis "🏠 Menu principal" en mode "sans tournoi"
+        (self.db is None, voir _build_header/_build_menu) : destroy() +
+        nouvelle App() EN MÉMOIRE, pour revenir à l'écran Bienvenue.
+
+        force_menu_principal_check=(self.db is None) (correctif du
+        2026-10-14, même raison que start_standalone dans App._on_close) :
+        capturé AVANT _cleanup_for_close/destroy — si self.db était déjà
+        None, cette fenêtre était "sans tournoi" (pas une action
+        "ouvrir délibérément un AUTRE tournoi", qui elle reste toujours
+        exemptée du verrou de Menu principal, voir App.__init__) : la
+        nouvelle App() doit alors repasser par la VÉRITABLE vérification
+        du verrou, même si ce processus porte encore le marqueur
+        POKER_TOURNAMENT_INTERNAL_LAUNCH d'un lancement "🏠 Menu
+        principal" antérieur — sans quoi cliquer deux fois sur "🏠 Menu
+        principal" depuis "Senaco sans tournoi" (Bienvenue -> "Ouvrir
+        Senaco" -> "Menu principal" -> "Ouvrir Senaco"...) laisserait
+        cette fenêtre durablement non dédupliquée, exactement le même
+        bug que celui corrigé dans _on_close. Si self.db n'était PAS
+        None (un vrai tournoi se referme pour en rouvrir un autre),
+        comportement entièrement inchangé."""
+        force_menu_principal_check = self.db is None
         self._cleanup_for_close()
         self.destroy()
-        app = App()
+        app = App(force_menu_principal_check=force_menu_principal_check)
         app.mainloop()
 
     def _open_tournament(self):
@@ -10030,6 +10110,30 @@ class App(tk.Tk):
         # surtout sur une fenêtre pas très large.
         stats_row = ttk.Frame(self.players_tab)
         stats_row.pack(fill="x", padx=10, pady=(0, 6))
+        # "Recherche" (demande explicite du 2026-10-14, "retrouver
+        # rapidement un joueur dans une liste de 100+ sans l'ascenseur") :
+        # champ de saisie DÉDIÉ et INDÉPENDANT du champ "Nom du joueur"
+        # ci-dessus (StringVar/Entry/bind séparés) — aucune interférence
+        # possible avec l'ajout de joueur ni avec son auto-complétion
+        # Répertoire (_on_player_name_keyrelease, jamais appelée ici).
+        # Déplace uniquement la SÉLECTION du tableau (self.players_tree.
+        # selection_set/focus/see, voir _on_player_search_keyrelease) :
+        # jamais un filtrage, jamais un changement d'ordre, jamais une
+        # lecture de roster.py (uniquement les noms déjà affichés dans CE
+        # tableau). "Actifs..." (self.stats_lbl) déplacé juste après,
+        # même ligne, inchangé sinon (mise à jour via _update_players_
+        # stats_label, ni la méthode ni ses appelants ne changent).
+        ttk.Label(stats_row, text="Recherche :").pack(side="left")
+        self.player_search_var = tk.StringVar()
+        self.player_search_entry = ttk.Entry(stats_row, textvariable=self.player_search_var, width=18)
+        self.player_search_entry.pack(side="left", padx=(5, 15))
+        self.player_search_entry.bind("<KeyRelease>", self._on_player_search_keyrelease)
+        Tooltip(
+            self.player_search_entry,
+            "Tapez les premières lettres pour positionner la sélection\n"
+            "sur ce joueur dans la liste ci-dessous — ne filtre jamais la\n"
+            "liste, ne modifie aucun joueur.",
+        )
         self.stats_lbl = ttk.Label(stats_row, text="", font=("Helvetica", 10, "bold"))
         self.stats_lbl.pack(side="left")
 
@@ -10866,6 +10970,54 @@ class App(tk.Tk):
 
     def _clear_checked(self):
         self.checked_player_ids.clear()
+
+    def _on_player_search_keyrelease(self, event=None):
+        """Champ "Recherche" de l'onglet Joueurs (demande explicite du
+        2026-10-14) — à chaque lettre tapée (et au Retour arrière, même
+        gestionnaire puisqu'il relit simplement le texte déjà raccourci
+        par l'Entry elle-même) : déplace UNIQUEMENT la sélection du
+        tableau (self.players_tree.selection_set/focus/see) sur le
+        PREMIER joueur, dans l'ORDRE D'AFFICHAGE ACTUEL (self.players_
+        tree.get_children(), celui éventuellement déjà trié par un clic
+        d'en-tête — jamais retrié ici), dont le nom commence par le
+        texte saisi (comparaison insensible à la casse). Ne filtre
+        JAMAIS la liste (aucune ligne masquée/supprimée/réinsérée), ne
+        lit jamais roster.py (uniquement les noms déjà affichés dans CE
+        tableau, via players_tree.set(iid, "name") — jamais une requête
+        self.db supplémentaire), et n'appelle jamais _on_player_name_
+        keyrelease (auto-complétion Répertoire, champ totalement
+        séparé) : aucune interférence possible avec l'ajout de joueur.
+
+        Champ vidé OU aucune correspondance : supprime la sélection
+        (demande explicite, "sécurité" — jamais un joueur incorrect
+        laissé sélectionné). Ne déclenche AUCUNE action sur un joueur
+        par elle-même (ni confirmation, ni élimination, ni suppression)
+        — seules les commandes existantes (Éliminer, Supprimer...),
+        elles-mêmes inchangées avec leurs propres confirmations,
+        peuvent ensuite agir sur la ligne ainsi sélectionnée, exactement
+        comme pour un clic manuel sur cette même ligne (voir
+        _checked_or_selected_ids, qui retombe déjà sur players_tree.
+        selection() en l'absence de case cochée — comportement
+        préexistant, non modifié ici).
+
+        Réappelée automatiquement par _refresh_players_tab() si ce champ
+        n'est pas vide (voir sa fin) : la sélection reste ainsi
+        cohérente avec le joueur recherché même après un rafraîchissement
+        déclenché par une action côté iPhone, qui recrée toutes les
+        lignes du tableau et en perdrait sinon la sélection."""
+        text = self.player_search_var.get().strip().lower()
+        if not text:
+            self.players_tree.selection_set([])
+            self.players_tree.focus("")
+            return
+        for iid in self.players_tree.get_children():
+            if self.players_tree.set(iid, "name").lower().startswith(text):
+                self.players_tree.selection_set(iid)
+                self.players_tree.focus(iid)
+                self.players_tree.see(iid)
+                return
+        self.players_tree.selection_set([])
+        self.players_tree.focus("")
 
     def _on_player_name_keyrelease(self, event):
         """Recalcule, à chaque lettre tapée, les suggestions (joueurs du
@@ -14816,6 +14968,29 @@ class App(tk.Tk):
         self.checked_player_ids &= present_ids
         self._update_checked_count_label()
         self._update_players_stats_label()
+        # Recherche (demande explicite du 2026-10-14) : toutes les lignes
+        # viennent d'être supprimées/recréées ci-dessus (delete + insert),
+        # ce qui efface la sélection Treeview — ré-applique la recherche
+        # EN COURS, si le champ n'est pas vide, pour que la sélection
+        # reste cohérente avec le joueur recherché même après un
+        # rafraîchissement déclenché depuis l'iPhone (ou toute autre
+        # action Mac). Sans effet si le champ est vide (rien à
+        # réappliquer, voir _on_player_search_keyrelease).
+        #
+        # getattr(..., None) plutôt que self.player_search_var direct :
+        # cette méthode est appelée par de très nombreux tests existants
+        # sur des doublures légères de App (self.db réel, mais onglet
+        # jamais réellement CONSTRUIT via _build_players_tab, voir par ex.
+        # tests/test_players_checkbox_header_sort.py) qui n'ont donc
+        # jamais eu ce nouvel attribut — confirmé en pratique (63 échecs
+        # AttributeError à l'exécution de la suite complète avant ce
+        # garde). Une vraie fenêtre App, elle, construit toujours
+        # _build_players_tab() avant le moindre appel à cette méthode
+        # (voir App.__init__/_build_tabs) : cet attribut y existe donc
+        # TOUJOURS réellement, ce `getattr` ne change rien pour elle.
+        search_var = getattr(self, "player_search_var", None)
+        if search_var is not None and search_var.get().strip():
+            self._on_player_search_keyrelease()
 
     def _update_players_stats_label(self):
         """Actualise la ligne "Actifs : X  |  Entrées : Y  |  Z

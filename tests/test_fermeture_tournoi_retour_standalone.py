@@ -79,16 +79,33 @@ class AppInitStandaloneParamTest(_SourceHelper, unittest.TestCase):
         self.assertIn("start_standalone", defaults_by_name)
         self.assertIs(defaults_by_name["start_standalone"].value, False)
 
+    def test_signature_accepte_force_menu_principal_check(self):
+        """Correctif du 2026-10-14 (second point d'entrée vers "sans
+        tournoi", voir App._new_tournament) : paramètre distinct de
+        start_standalone, lui aussi par défaut à False."""
+        func = self._find_method("App", "__init__")
+        arg_names = [a.arg for a in func.args.args]
+        self.assertIn("force_menu_principal_check", arg_names)
+        defaults_by_name = dict(zip(arg_names[-len(func.args.defaults):], func.args.defaults))
+        self.assertIn("force_menu_principal_check", defaults_by_name)
+        self.assertIs(defaults_by_name["force_menu_principal_check"].value, False)
+
     def test_start_standalone_saute_choose_tournament_file(self):
         """Avec start_standalone=True : self.db reste None, _choose_
         tournament_file() n'est PAS appelée — mais le verrou de Menu
         principal (_acquire_menu_principal_lock_if_needed) l'est TOUJOURS,
         exactement comme pour un lancement normal (garantie contre une
-        fenêtre "sans tournoi" dupliquée)."""
+        fenêtre "sans tournoi" dupliquée). Depuis le correctif du
+        2026-10-14 (force_check), cet appel transmet explicitement
+        force_check=start_standalone or force_menu_principal_check —
+        voir tests/test_menu_principal_singleton.py::
+        ForceCheckOverridesExemptionTest pour la couverture complète de
+        ce paramètre."""
         func = self._find_method("App", "__init__")
         seg = self._source_of(func)
         self.assertIn("if not start_standalone and not self._choose_tournament_file():", seg)
-        idx_lock = seg.index("self._acquire_menu_principal_lock_if_needed(open_path)")
+        idx_lock = seg.index("self._acquire_menu_principal_lock_if_needed(")
+        self.assertIn("force_check=start_standalone or force_menu_principal_check", seg)
         idx_standalone_check = seg.index("if not start_standalone and not self._choose_tournament_file():")
         self.assertLess(idx_lock, idx_standalone_check)
 

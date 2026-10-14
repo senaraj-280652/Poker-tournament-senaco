@@ -357,6 +357,204 @@ class AcquireMenuPrincipalLockTest(unittest.TestCase):
         self.assertEqual(open_windows.menu_principal_pid("prod"), os.getpid())
 
 
+class ForceCheckOverridesExemptionTest(unittest.TestCase):
+    """Correction du 2026-10-14 : "Senaco sans tournoi déjà ouvert, un
+    nouveau lancement externe ouvre quand même un second Bienvenue".
+
+    Cause exacte (confirmée sur un poste réel : menu_principal_prod.json
+    absent malgré une instance "sans tournoi" bel et bien vivante) :
+    POKER_TOURNAMENT_INTERNAL_LAUNCH est posée UNE SEULE FOIS, à la
+    création du PROCESSUS, par spawn_app_process(internal_menu_child=
+    True) ("🏠 Menu principal") — et reste donc vraie pour TOUTE la
+    durée de vie de ce processus, y compris après la fermeture de son
+    tournoi, quand il retombe en "Senaco sans tournoi" (App(start_
+    standalone=True) ou App(force_menu_principal_check=True),
+    construite EN MÉMOIRE dans ce même processus, héritant du même
+    environnement). force_check=True (App._acquire_menu_principal_
+    lock_if_needed) force la VÉRITABLE vérification du verrou dans ce
+    cas précis, en ignorant l'exemption — sans jamais toucher à
+    l'exemption pour les autres cas (Lobby, "🏠 Menu principal" ouvrant
+    délibérément un AUTRE tournoi), couverts par AcquireMenuPrincipal
+    LockTest ci-dessus, entièrement inchangés."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="force_check_test_")
+        self.addCleanup(self._tmp.cleanup)
+
+        def _fake_lock_path(key):
+            return os.path.join(self._tmp.name, f"menu_principal_{key}.json")
+
+        def _fake_registry_lock_path(key):
+            return os.path.join(self._tmp.name, f"menu_principal_{key}.lock")
+
+        for target in (
+            patch.object(open_windows, "_menu_principal_lock_path", side_effect=_fake_lock_path),
+            patch.object(open_windows, "_menu_principal_registry_lock_path", side_effect=_fake_registry_lock_path),
+        ):
+            target.start()
+            self.addCleanup(target.stop)
+
+        env_patcher = patch.dict(os.environ, {}, clear=False)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+        os.environ.pop(main.POKER_TOURNAMENT_INTERNAL_LAUNCH, None)
+
+    def _make_window(self):
+        win = _StubWindow()
+        win._acquire_menu_principal_lock_if_needed = types.MethodType(
+            main.App._acquire_menu_principal_lock_if_needed, win
+        )
+        return win
+
+    # -- 1. Transition depuis un lancement interne : force_check ignore
+    #    l'exemption POKER_TOURNAMENT_INTERNAL_LAUNCH ------------------
+
+    def test_transition_depuis_lancement_interne_pose_reellement_le_verrou(self):
+        """LE scénario exact diagnostiqué : un processus "🏠 Menu
+        principal" (marqueur présent) qui retombe "sans tournoi" doit
+        RÉELLEMENT poser le verrou avec force_check=True, pas seulement
+        se déclarer "True" sans rien vérifier (comme le ferait l'ancien
+        comportement, voir test_lancement_interne_menu_principal_jamais_
+        bloque pour le contraste exact)."""
+        os.environ[main.POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+        win = self._make_window()
+        with patch.object(main, "_is_test_build", return_value=False):
+            result = win._acquire_menu_principal_lock_if_needed(None, force_check=True)
+        self.assertTrue(result)
+        self.assertTrue(win._holds_menu_principal_lock)
+        self.assertEqual(open_windows.menu_principal_pid("prod"), os.getpid())
+
+    def test_sans_force_check_le_meme_processus_reste_exempte(self):
+        """Non-régression explicite : SANS force_check, le comportement
+        historique (exemption totale, jamais de verrou posé) reste
+        inchangé pour ce même processus/marqueur."""
+        os.environ[main.POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+        win = self._make_window()
+        with patch.object(open_windows, "menu_principal_pid") as mock_check:
+            result = win._acquire_menu_principal_lock_if_needed(None)
+        self.assertTrue(result)
+        mock_check.assert_not_called()
+        self.assertFalse(win._holds_menu_principal_lock)
+
+    # -- 2. Fenêtre "sans tournoi" déjà ouverte : la seconde transition
+    #    est bloquée et ramenée au premier plan, jamais de doublon -----
+
+    def test_fenetre_sans_tournoi_deja_ouverte_bloque_la_seconde(self):
+        """Première fenêtre déjà "sans tournoi" (verrou détenu, peu
+        importe comment elle y est arrivée) : une SECONDE transition
+        vers "sans tournoi" (ex. un lancement externe répété pendant
+        que la première est déjà affichée) doit être bloquée et ramenée
+        au premier plan — jamais un second processus "sans tournoi" en
+        double."""
+        first = self._make_window()
+        with patch.object(main, "_is_test_build", return_value=False):
+            self.assertTrue(first._acquire_menu_principal_lock_if_needed(None, force_check=True))
+        self.assertTrue(first._holds_menu_principal_lock)
+
+        # Deuxième fenêtre, marquée "lancement interne" (reproduit le
+        # processus exact à l'origine du bug) tentant elle aussi de
+        # retomber "sans tournoi" au même instant.
+        os.environ[main.POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+        second = self._make_window()
+        with patch.object(main, "_is_test_build", return_value=False), \
+             patch.object(main, "raise_process_when_ready") as mock_raise:
+            result = second._acquire_menu_principal_lock_if_needed(None, force_check=True)
+        self.assertFalse(result)
+        mock_raise.assert_called_once_with(second, os.getpid())
+        self.assertEqual(second.after_calls, [(3500, second.destroy)])
+        self.assertFalse(second._holds_menu_principal_lock)
+        # La première fenêtre n'est JAMAIS perturbée : son verrou reste
+        # intact, rien ne l'a fermée ni modifiée.
+        self.assertFalse(first.destroyed)
+        self.assertEqual(open_windows.menu_principal_pid("prod"), os.getpid())
+
+    # -- 3. Lancements externes répétés : chaque nouvelle tentative,
+    #    tant que la première "sans tournoi" reste ouverte, échoue -----
+
+    def test_lancements_externes_repetes_toujours_bloques(self):
+        first = self._make_window()
+        with patch.object(main, "_is_test_build", return_value=False):
+            self.assertTrue(first._acquire_menu_principal_lock_if_needed(None, force_check=True))
+
+        for _ in range(3):
+            repeated = self._make_window()
+            with patch.object(main, "_is_test_build", return_value=False), \
+                 patch.object(main, "raise_process_when_ready") as mock_raise:
+                result = repeated._acquire_menu_principal_lock_if_needed(None)
+            self.assertFalse(result, "un lancement externe répété doit toujours être bloqué")
+            mock_raise.assert_called_once_with(repeated, os.getpid())
+
+    # -- 4. Jamais d'impact sur les cas déjà exemptés légitimement -----
+
+    def test_force_check_naffecte_jamais_le_lobby(self):
+        """force_check n'est jamais passé par le Lobby (open_path
+        fourni) — vérifié ici que même si on le passait, un open_path
+        réel garde la priorité (jamais de vérification)."""
+        win = self._make_window()
+        with patch.object(open_windows, "menu_principal_pid") as mock_check:
+            result = win._acquire_menu_principal_lock_if_needed(
+                "/tmp/un_tournoi.tournoi", force_check=True,
+            )
+        self.assertTrue(result)
+        mock_check.assert_not_called()
+
+
+class NewTournamentForceMenuPrincipalCheckTest(unittest.TestCase):
+    """App._new_tournament (Fichier > "Nouveau tournoi.../Ouvrir..." ou
+    "🏠 Menu principal" depuis "Senaco sans tournoi") — doit calculer
+    force_menu_principal_check=(self.db is None) AVANT de nettoyer/
+    détruire, et le transmettre à la nouvelle App()."""
+
+    def _make_app(self, db):
+        app = _StubWindow()
+        app.db = db
+        app._new_tournament = types.MethodType(main.App._new_tournament, app)
+        app._cleanup_for_close = types.MethodType(main.App._cleanup_for_close, app)
+        return app
+
+    def test_depuis_un_vrai_tournoi_force_check_false(self):
+        """Fichier > "Nouveau tournoi.../Ouvrir..." depuis un VRAI
+        tournoi (self.db not None) : comportement historique inchangé,
+        jamais de vérification forcée (préserve l'ouverture déliberée
+        d'un AUTRE tournoi, même depuis une fenêtre "Menu principal"
+        interne)."""
+        fake_db = types.SimpleNamespace(path="/tmp/un_vrai_tournoi.tournoi", close=lambda: None)
+        app = self._make_app(db=fake_db)
+        # open_windows.unregister mocké (jamais le vrai registre
+        # ~/.poker_tournament : ce test porte sur l'appel à App(...),
+        # pas sur l'état réel du registre, déjà couvert ailleurs).
+        with patch.object(open_windows, "unregister", return_value=False), \
+             patch.object(main, "App") as mock_app_cls:
+            app._new_tournament()
+        mock_app_cls.assert_called_once_with(force_menu_principal_check=False)
+        mock_app_cls.return_value.mainloop.assert_called_once()
+
+    def test_depuis_senaco_sans_tournoi_force_check_true(self):
+        """"🏠 Menu principal" cliqué DEPUIS "Senaco sans tournoi"
+        (self.db is None) : force_menu_principal_check=True — même
+        situation ambiguë que App._on_close avec start_standalone,
+        jamais une action "ouvrir délibérément un autre tournoi"."""
+        app = self._make_app(db=None)
+        with patch.object(main, "App") as mock_app_cls:
+            app._new_tournament()
+        mock_app_cls.assert_called_once_with(force_menu_principal_check=True)
+        mock_app_cls.return_value.mainloop.assert_called_once()
+
+    def test_nettoyage_termine_avant_toute_destruction(self):
+        """Précaution explicite de l'utilisateur : le nettoyage
+        (_cleanup_for_close, donc la fermeture réelle des ressources du
+        tournoi) doit être ENTIÈREMENT terminé avant self.destroy() et
+        avant la construction de la nouvelle App()."""
+        app = self._make_app(db=None)
+        call_order = []
+        app._cleanup_for_close = lambda: call_order.append("cleanup")
+        app.destroy = lambda: call_order.append("destroy")
+        with patch.object(main, "App") as mock_app_cls:
+            mock_app_cls.side_effect = lambda **kw: call_order.append("new_app") or mock_app_cls.return_value
+            app._new_tournament()
+        self.assertEqual(call_order[:3], ["cleanup", "destroy", "new_app"])
+
+
 class SpawnAppProcessInternalMarkerTest(unittest.TestCase):
     """spawn_app_process(internal_menu_child=True) pose bien le
     marqueur d'environnement, jamais sinon (Lobby, appel par défaut)."""
