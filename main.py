@@ -5311,12 +5311,6 @@ class ResultsExportDialog(tk.Toplevel):
         open_file_with_default_app(path)
 
 
-# Colonnes fixes de l'onglet Classement (Nom, Rang, Éliminé le, Round,
-# Éliminé par) — un sous-ensemble de PLAYERS_TAB_COLUMNS, réutilisé tel
-# quel pour l'export (voir ClassementExportDialog).
-CLASSEMENT_EXPORT_COLUMNS = ["name", "rang", "elim_time", "elim_round", "eliminated_by"]
-
-
 def _compute_tournament_export_title(db, tab_name):
     """Titre standard "<Onglet> du SitnGo du <club> <tournoi> du <date>"
     (Sit & Go) ou "<Onglet> du Tournoi du <club> <tournoi> du <date>"
@@ -5336,8 +5330,11 @@ class ClassementExportDialog(tk.Toplevel):
     """Choix du format (CSV / Excel / PDF) pour l'export de l'onglet
     Classement (Nom, Rang, Éliminé le, Round, Éliminé par) — colonnes
     fixes, pas de sélection possible (contrairement aux autres exports).
-    Réutilise les fonctions d'export de l'onglet Joueurs (mêmes colonnes,
-    voir CLASSEMENT_EXPORT_COLUMNS), triées par Rang."""
+    Export DÉDIÉ (demande du 2026-10-15, groupe TMP — voir Database.
+    export_classement_csv/xlsx/pdf/classement_rows/CLASSEMENT_ROWS_
+    COLUMNS) : réguliers en premier avec leur rang officiel, TMP ensuite
+    avec "Hors classement", jamais mélangés — INDÉPENDANT des exports de
+    l'onglet Joueurs (export_players_csv/xlsx/pdf), jamais touchés."""
 
     def __init__(self, master, db):
         super().__init__(master)
@@ -5421,19 +5418,23 @@ class ClassementExportDialog(tk.Toplevel):
             return
 
         title = _compute_tournament_export_title(self.db, "Classement")
+        # Export DÉDIÉ au Classement OFFICIEL (demande du 2026-10-15,
+        # groupe TMP) — Database.export_classement_csv/xlsx/pdf, jamais
+        # export_players_csv/xlsx/pdf (onglet Joueurs, "sans modifier le
+        # comportement des exports génériques de l'onglet Joueurs",
+        # demande explicite) : réguliers EN PREMIER avec leur rang
+        # officiel, TMP ENSUITE avec "Hors classement", jamais mélangés
+        # (voir Database.classement_rows, seule source de cet ordre —
+        # aucun sort_column/ascending ici, l'ordre est déjà fixé par
+        # cette fonction, comme documenté par cette fenêtre : "colonnes
+        # fixes, pas de sélection possible").
         try:
             if fmt == "xlsx":
-                self.db.export_players_xlsx(
-                    path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True,
-                    title=title, show_prize_pool=False,
-                )
+                self.db.export_classement_xlsx(path, title=title)
             elif fmt == "pdf":
-                self.db.export_players_pdf(
-                    path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True,
-                    title=title, show_prize_pool=False,
-                )
+                self.db.export_classement_pdf(path, title=title)
             else:
-                self.db.export_players_csv(path, columns=CLASSEMENT_EXPORT_COLUMNS, sort_column="rang", ascending=True)
+                self.db.export_classement_csv(path)
         except ImportError:
             show_missing_export_module(fmt)
             return
@@ -8755,7 +8756,40 @@ class App(tk.Tk):
         ouverte) — les deux mécanismes sont indépendants, jamais
         redondants : celui-ci évite de spammer des process depuis LA
         MÊME fenêtre, l'autre (global) évite un second lancement
-        EXTERNE accidentel."""
+        EXTERNE accidentel.
+
+        Correctif du 2026-10-15 ("fermeture rapide" -> double Bienvenue,
+        photo HP à l'appui) : le processus volontaire ci-dessus doit lui-
+        même démarrer tout l'interpréteur Python figé (PyInstaller),
+        importer Tkinter/sqlite3/Pillow, construire l'App — AVANT
+        d'atteindre _acquire_menu_principal_lock_if_needed() et de
+        s'inscrire au registre multi-entrées des écrans "sans tournoi"
+        (voir open_windows.acquire_standalone_screen). Sur un poste
+        modeste/antivirus actif, ce démarrage peut prendre bien plus que
+        les 0,3 s attendues ci-dessous. Si le tournoi d'origine (CE
+        process-ci) se ferme PENDANT cette fenêtre, il ne trouve
+        personne encore inscrit et ouvre sa propre fenêtre "sans
+        tournoi" : duplication, indépendante de l'ancienne course déjà
+        corrigée (qui ne fermait que l'écart côté processus volontaire
+        lui-même, jamais celui-ci, bien plus large, côté lancement).
+
+        Corrigé en inscrivant CE PARENT, lui-même, le PID du nouveau
+        process dans ce même registre, dès l'instant où il le connaît ET
+        sait qu'il n'a pas immédiatement planté (ligne ci-dessous,
+        exclusive=False — jamais bloqué, jamais vérifié, exactement le
+        même traitement qu'un lancement volontaire qui se serait inscrit
+        lui-même) — élimine toute dépendance au temps de démarrage du
+        nouveau process : il devient visible AVANT même que son propre
+        interpréteur Python n'ait démarré. Placé APRÈS la vérification
+        anti-plantage immédiat ci-dessous (jamais avant) : un process
+        mort avant même cette vérification ne laisse donc aucune
+        inscription fantôme (voir tests/test_open_new_window_standalone_
+        registration.py) — un process qui planterait PLUS TARD, lui,
+        laisserait une entrée purgée automatiquement au prochain accès
+        (_prune, même mécanisme que partout ailleurs dans open_windows.
+        py, aucun code supplémentaire nécessaire ici). Le process
+        volontaire continue par ailleurs de s'inscrire lui-même une fois
+        démarré (idempotent, sans effet si déjà fait par ce parent)."""
         if self._menu_principal_proc is not None and self._menu_principal_proc.poll() is None:
             open_windows.bring_pid_to_front(self._menu_principal_proc.pid)
             return
@@ -8781,6 +8815,9 @@ class App(tk.Tk):
             return
 
         self._menu_principal_proc = proc
+        # Inscription IMMÉDIATE, par ce parent, voir le correctif du
+        # 2026-10-15 ci-dessus — avant même raise_process_when_ready.
+        open_windows.acquire_standalone_screen(proc.pid, _menu_principal_key(), exclusive=False)
         raise_process_when_ready(self, proc.pid)
 
     def _acquire_menu_principal_lock_if_needed(self, open_path, force_check=False):
@@ -10211,6 +10248,15 @@ class App(tk.Tk):
         # un nom l'inscrit directement au tournoi, sans passer par le
         # bouton "Ajouter".
         self.new_player_entry.bind("<KeyRelease>", self._on_player_name_keyrelease)
+        # Clic droit pour vider ce champ (demande explicite du 2026-10-15)
+        # — Button-3 la plupart des plateformes, Button-2 sur Mac avec
+        # certains trackpads/souris, les deux liés au même gestionnaire
+        # (même convention déjà établie ailleurs dans ce fichier, ex. les
+        # boutons de sons du chronomètre). Purement visuel/local : voir
+        # _on_player_name_right_click, qui ne touche ni la base de
+        # données ni le répertoire, jamais une suppression de joueur.
+        self.new_player_entry.bind("<Button-2>", self._on_player_name_right_click)
+        self.new_player_entry.bind("<Button-3>", self._on_player_name_right_click)
         self._autocomplete_popup = None
         self._autocomplete_listbox = None
 
@@ -10261,11 +10307,20 @@ class App(tk.Tk):
         self.player_search_entry = ttk.Entry(stats_row, textvariable=self.player_search_var, width=18)
         self.player_search_entry.pack(side="left", padx=(5, 15))
         self.player_search_entry.bind("<KeyRelease>", self._on_player_search_keyrelease)
+        # Clic droit pour vider ce champ (demande explicite du 2026-10-15)
+        # — même convention que new_player_entry ci-dessus (Button-2 ET
+        # Button-3). Voir _on_player_search_right_click : ne touche ni la
+        # base de données ni le répertoire, uniquement la sélection
+        # affichée dans ce tableau (même principe que _on_player_search_
+        # keyrelease lui-même, jamais un filtrage/une suppression).
+        self.player_search_entry.bind("<Button-2>", self._on_player_search_right_click)
+        self.player_search_entry.bind("<Button-3>", self._on_player_search_right_click)
         Tooltip(
             self.player_search_entry,
             "Tapez les premières lettres pour positionner la sélection\n"
             "sur ce joueur dans la liste ci-dessous — ne filtre jamais la\n"
-            "liste, ne modifie aucun joueur.",
+            "liste, ne modifie aucun joueur.\n"
+            "Clic droit : vider ce champ.",
         )
         self.stats_lbl = ttk.Label(stats_row, text="", font=("Helvetica", 10, "bold"))
         self.stats_lbl.pack(side="left")
@@ -11152,6 +11207,23 @@ class App(tk.Tk):
         self.players_tree.selection_set([])
         self.players_tree.focus("")
 
+    def _on_player_search_right_click(self, event=None):
+        """Clic droit sur le champ "Recherche" (demande explicite du
+        2026-10-15) : vide IMMÉDIATEMENT ce champ, puis réapplique
+        _on_player_search_keyrelease pour effacer la sélection qui en
+        découlait — exactement le même traitement que si l'utilisateur
+        avait lui-même vidé le champ au clavier (jamais une logique
+        dupliquée). Ne touche JAMAIS self.db ni roster.py, n'appelle
+        aucune commande de suppression/élimination : un simple .set("")
+        sur la StringVar, suivi du nettoyage d'affichage déjà existant
+        et testé (voir _on_player_search_keyrelease ci-dessus). Renvoie
+        "break" pour neutraliser tout comportement de menu contextuel
+        natif résiduel côté OS (à vérifier en particulier sous
+        Windows, voir le compte-rendu de cette demande)."""
+        self.player_search_var.set("")
+        self._on_player_search_keyrelease()
+        return "break"
+
     def _on_player_name_keyrelease(self, event):
         """Recalcule, à chaque lettre tapée, les suggestions (joueurs du
         répertoire dont le nom commence par le texte saisi, déjà inscrits
@@ -11173,6 +11245,22 @@ class App(tk.Tk):
             self._show_autocomplete(matches)
         else:
             self._hide_autocomplete()
+
+    def _on_player_name_right_click(self, event=None):
+        """Clic droit sur le champ "Nom du joueur" (demande explicite du
+        2026-10-15) : vide IMMÉDIATEMENT ce champ et referme le menu
+        d'auto-complétion éventuellement affiché (_hide_autocomplete,
+        même nettoyage que <Escape> ci-dessus). Ne touche JAMAIS self.db
+        ni roster.py (ni ajout ni suppression), ne touche pas non plus
+        le champ Club : un simple .set("") sur la StringVar, suivi du
+        nettoyage d'affichage déjà existant — jamais un appel à
+        _add_player ni à aucune commande de suppression/élimination.
+        Renvoie "break" pour neutraliser tout comportement de menu
+        contextuel natif résiduel côté OS (à vérifier en particulier
+        sous Windows, voir le compte-rendu de cette demande)."""
+        self.new_player_var.set("")
+        self._hide_autocomplete()
+        return "break"
 
     def _show_autocomplete(self, matches):
         """Affiche (en la créant si besoin) une petite liste cliquable
@@ -18073,40 +18161,70 @@ class App(tk.Tk):
                 self.payouts_tree.heading(col, text=label)
 
     def _classement_rows(self):
-        """Lignes du Classement : uniquement les joueurs déjà classés (un
-        rang déterminé — vainqueur ou éliminé), pour rester simple. Un
-        joueur encore actif en cours de tournoi n'a pas encore de rang
-        (voir Database.players_rows) et n'apparaît donc jamais ici — le
-        compteur "En cours" du résumé suffit à savoir combien il en
-        reste. Par défaut : du plus récemment classé (rang le plus bas)
-        au plus ancien ; cliquer Nom/Rang trie autrement. Filtré en plus
-        par le club coché dans le filtre "Club" (voir _build_payouts_tab
-        / get_selected_clubs) — aucune coche = tous les clubs. Le club
-        pris en compte est celui, actuel, du répertoire (roster.py), pas
-        l'éventuel club figé dans ce tournoi au moment de l'inscription
-        (souvent resté vide sur d'anciens tournois, avant que le club du
-        joueur ne soit renseigné dans le répertoire) — comme pour le
-        filtre équivalent de l'onglet Statistiques. Un joueur toujours
-        sans club dans le répertoire compte pour le club réglé dans
-        Paramètres, pas pour "aucun club"."""
-        rows = [r for r in self.db.players_rows() if r["rang"] is not None]
+        """Lignes du Classement OFFICIEL (demande du 2026-10-15, groupe
+        TMP — PRÉCISION explicite après une première version qui les
+        rendait à tort invisibles) : voir Database.classement_rows, SEULE
+        source — jamais une formule dupliquée ici. Deux groupes JAMAIS
+        MÉLANGÉS, quel que soit le tri demandé :
+        - RÉGULIERS (rang officiel connu, int) : EN PREMIER, "les TMP
+          exclus" du calcul lui-même (voir is_tmp_club/official_
+          standings) — reçoivent les points de leur rang recalculé.
+        - TMP déjà classés (rang réel connu) : ENSUITE, "rang" affiché
+          vaut la chaîne "Hors classement" (jamais un nombre, jamais
+          vide) — présents uniquement pour conserver une trace de leur
+          participation, ne prennent AUCUNE place officielle.
+        Un joueur encore actif (tournoi pas terminé), TMP ou non, n'a pas
+        encore de rang et n'apparaît donc jamais ici (déjà exclu par
+        classement_rows) — le compteur "En cours" du résumé suffit à
+        savoir combien il en reste.
+
+        Tri : "Nom" trie les DEUX groupes par nom (ordre demandé
+        préservé dans chacun) ; "Rang" (par défaut) trie uniquement le
+        groupe des réguliers par rang officiel (le sens — ascendant/
+        descendant — n'a pas de signification pour "Hors classement",
+        identique pour tous les TMP : leur groupe garde son propre ordre
+        de participation, voir classement_rows). Dans les deux cas, le
+        groupe des TMP reste TOUJOURS après celui des réguliers.
+
+        Filtré en plus par le club coché dans le filtre "Club" (voir
+        _build_payouts_tab / get_selected_clubs) — aucune coche = tous
+        les clubs. Le club pris en compte ici est celui, ACTUEL, du
+        répertoire (roster.py), pas l'éventuel club FIGÉ dans ce tournoi
+        au moment de l'inscription (souvent resté vide sur d'anciens
+        tournois) — comme pour le filtre équivalent de l'onglet
+        Statistiques. Un joueur toujours sans club dans le répertoire
+        compte pour le club réglé dans Paramètres, pas pour "aucun
+        club". Ce filtre « Club » (affichage, Répertoire actuel) est
+        ENTIÈREMENT INDÉPENDANT du groupe TMP (club FIGÉ dans CE
+        tournoi, jamais le Répertoire) — s'applique indifféremment aux
+        deux groupes, sans jamais les mélanger pour autant."""
+        base_rows = self.db.classement_rows()
         selected_clubs = get_selected_clubs(self.classement_club_listbox)
         if selected_clubs:
             home_club = export_prefs.load_value("club_name", "").strip()
-            rows = [
-                r for r in rows
+            base_rows = [
+                r for r in base_rows
                 if (roster.get_club(r["name"]) or home_club) in selected_clubs
             ]
+        regulars = [r for r in base_rows if r["rang"] != "Hors classement"]
+        tmps = [r for r in base_rows if r["rang"] == "Hors classement"]
+
         column = self.classement_sort["column"]
         ascending = self.classement_sort["ascending"]
-
         if column == "name":
-            rows.sort(key=lambda r: r["name"].lower())
+            regulars.sort(key=lambda r: r["name"].lower())
+            tmps.sort(key=lambda r: r["name"].lower())
+            if not ascending:
+                regulars.reverse()
+                tmps.reverse()
         else:
-            rows.sort(key=lambda r: r["rang"])
-        if not ascending:
-            rows.reverse()
-        return rows
+            regulars.sort(key=lambda r: r["rang"])
+            if not ascending:
+                regulars.reverse()
+            # tmps : garde l'ordre de participation donné par classement_
+            # rows (place brute croissante) — "Hors classement" n'a pas
+            # de sens à inverser, voir docstring ci-dessus.
+        return regulars + tmps
 
     def _refresh_payouts_tab(self):
         players = self.db.list_players()
@@ -18121,10 +18239,15 @@ class App(tk.Tk):
         for row in self.payouts_tree.get_children():
             self.payouts_tree.delete(row)
         for r in self._classement_rows():
+            # r["rang"] (demande du 2026-10-15, groupe TMP) : déjà résolu
+            # par Database.classement_rows — un entier (rang officiel)
+            # pour un régulier, ou la chaîne littérale "Hors classement"
+            # pour un TMP (jamais vide, jamais un nombre) — jamais
+            # recalculé ici.
             self.payouts_tree.insert(
                 "", "end",
                 values=(
-                    r["name"], r["rang"] or "-", format_datetime_fr(r["elim_time"]) or "-",
+                    r["name"], r["rang"], format_datetime_fr(r["elim_time"]) or "-",
                     r["elim_round"] or "-", r["eliminated_by"] or "-",
                 ),
             )

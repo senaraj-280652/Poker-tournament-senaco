@@ -654,7 +654,7 @@ class ClassementExportDialogWhatsAppTest(unittest.TestCase):
         dlg = self._open_dialog()
         out_path = os.path.join(self._tmp.name, "classement.pdf")
         dlg.format_var.set("pdf")
-        with patch.object(self.db, "export_players_pdf", side_effect=self._fake_write), \
+        with patch.object(self.db, "export_classement_pdf", side_effect=self._fake_write), \
              patch.object(main.filedialog, "asksaveasfilename", return_value=out_path), \
              patch.object(main, "open_file_with_default_app") as mock_open:
             dlg._do_export()
@@ -673,7 +673,7 @@ class ClassementExportDialogWhatsAppTest(unittest.TestCase):
             dlg = self._open_dialog()
             out_path = os.path.join(self._tmp.name, "classement.pdf")
             dlg.format_var.set("pdf")
-            with patch.object(self.db, "export_players_pdf", side_effect=self._fake_write), \
+            with patch.object(self.db, "export_classement_pdf", side_effect=self._fake_write), \
                  patch.object(main.filedialog, "asksaveasfilename", return_value=out_path), \
                  patch.object(main, "open_file_with_default_app"):
                 dlg._do_export()
@@ -684,7 +684,7 @@ class ClassementExportDialogWhatsAppTest(unittest.TestCase):
         dlg = self._open_dialog()
         out_path = os.path.join(self._tmp.name, "classement.csv")
         dlg.format_var.set("csv")
-        with patch.object(self.db, "export_players_csv", side_effect=self._fake_write) as mock_csv, \
+        with patch.object(self.db, "export_classement_csv", side_effect=self._fake_write) as mock_csv, \
              patch.object(main.filedialog, "asksaveasfilename", return_value=out_path), \
              patch.object(main, "open_file_with_default_app") as mock_open:
             dlg._do_export()
@@ -696,7 +696,7 @@ class ClassementExportDialogWhatsAppTest(unittest.TestCase):
         dlg = self._open_dialog()
         out_path = os.path.join(self._tmp.name, "classement.xlsx")
         dlg.format_var.set("xlsx")
-        with patch.object(self.db, "export_players_xlsx", side_effect=self._fake_write) as mock_xlsx, \
+        with patch.object(self.db, "export_classement_xlsx", side_effect=self._fake_write) as mock_xlsx, \
              patch.object(main.filedialog, "asksaveasfilename", return_value=out_path), \
              patch.object(main, "open_file_with_default_app") as mock_open:
             dlg._do_export()
@@ -723,7 +723,7 @@ class ClassementExportDialogWhatsAppTest(unittest.TestCase):
         dlg = self._open_dialog()
         out_path = os.path.join(self._tmp.name, "classement.pdf")
         dlg.format_var.set("pdf")
-        with patch.object(self.db, "export_players_pdf", side_effect=self._fake_write) as mock_pdf, \
+        with patch.object(self.db, "export_classement_pdf", side_effect=self._fake_write) as mock_pdf, \
              patch.object(main.filedialog, "asksaveasfilename", return_value=out_path), \
              patch.object(main, "open_file_with_default_app"):
             dlg._do_export()

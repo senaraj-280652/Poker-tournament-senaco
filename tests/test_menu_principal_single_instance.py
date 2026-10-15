@@ -58,12 +58,17 @@ class MenuPrincipalSingleInstanceTest(unittest.TestCase):
         with patch.object(main, "spawn_app_process", return_value=proc) as mock_spawn, \
              patch.object(main, "raise_process_when_ready") as mock_raise, \
              patch.object(main.open_windows, "bring_pid_to_front") as mock_bring, \
+             patch.object(main.open_windows, "acquire_standalone_screen") as mock_register, \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)
         mock_spawn.assert_called_once()
         mock_raise.assert_called_once_with(fake, 111)
         mock_bring.assert_not_called()
         self.assertIs(fake._menu_principal_proc, proc)
+        # Correctif du 2026-10-15 ("fermeture rapide" -> double Bienvenue) :
+        # le parent inscrit lui-même le PID du nouveau process, volontaire
+        # (exclusive=False, jamais bloqué), AVANT raise_process_when_ready.
+        mock_register.assert_called_once_with(111, main._menu_principal_key(), exclusive=False)
 
     def test_second_appel_avant_fermeture_ne_relance_pas_un_process(self):
         """Coeur de la demande : tant que le précédent est encore vivant
@@ -104,6 +109,7 @@ class MenuPrincipalSingleInstanceTest(unittest.TestCase):
         with patch.object(main, "spawn_app_process", return_value=proc) as mock_spawn, \
              patch.object(main, "raise_process_when_ready"), \
              patch.object(main.open_windows, "bring_pid_to_front") as mock_bring, \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)  # 1er clic : lance réellement
             main.App._open_new_window(fake)  # 2e clic : déjà vivant
@@ -124,6 +130,7 @@ class MenuPrincipalSingleInstanceTest(unittest.TestCase):
         with patch.object(main, "spawn_app_process", return_value=new_proc) as mock_spawn, \
              patch.object(main, "raise_process_when_ready") as mock_raise, \
              patch.object(main.open_windows, "bring_pid_to_front") as mock_bring, \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)
 
@@ -138,26 +145,37 @@ class MenuPrincipalSingleInstanceTest(unittest.TestCase):
         — un nouveau clic doit pouvoir retenter normalement."""
         fake = _FakeApp()
         with patch.object(main, "spawn_app_process", side_effect=OSError("échec simulé")), \
-             patch.object(main.messagebox, "showerror") as mock_error:
+             patch.object(main.messagebox, "showerror") as mock_error, \
+             patch.object(main.open_windows, "acquire_standalone_screen") as mock_register:
             main.App._open_new_window(fake)
         mock_error.assert_called_once()
         self.assertIsNone(fake._menu_principal_proc)
+        # Correctif du 2026-10-15 : jamais d'inscription fantôme pour un
+        # process qui n'a même pas pu être lancé (voir "Qu'un lancement
+        # échoué ne laisse pas d'enregistrement fantôme").
+        mock_register.assert_not_called()
 
     def test_process_mort_immediatement_ne_memorise_rien(self):
         """Le process se termine tout de suite après son lancement (voir
         le check existant returncode is not None) : ne doit pas non plus
         être mémorisé comme "vivant" — sans quoi un nouveau clic resterait
-        bloqué à tort sur un process déjà mort."""
+        bloqué à tort sur un process déjà mort. Correctif du 2026-10-15 :
+        ne doit pas non plus laisser d'inscription fantôme dans le
+        registre multi-entrées des écrans "sans tournoi" — l'inscription
+        est placée APRÈS cette vérification anti-plantage immédiat,
+        jamais avant (voir _open_new_window)."""
         fake = _FakeApp()
         dead_proc = _FakeProc(pid=666, alive=False)
         with patch.object(main, "spawn_app_process", return_value=dead_proc), \
              patch.object(main.messagebox, "showerror") as mock_error, \
+             patch.object(main.open_windows, "acquire_standalone_screen") as mock_register, \
              patch.object(main.time, "sleep"), \
              patch.object(main, "raise_process_when_ready") as mock_raise:
             main.App._open_new_window(fake)
         mock_error.assert_called_once()
         mock_raise.assert_not_called()
         self.assertIsNone(fake._menu_principal_proc)
+        mock_register.assert_not_called()
 
 
 class NoModalityClaimedTest(unittest.TestCase):
@@ -216,6 +234,7 @@ class PreferenceUnaffectedTest(unittest.TestCase):
              patch.object(main.open_windows, "list_open_paths", return_value=["/tmp/moi.tournoi"]), \
              patch.object(main, "spawn_app_process", return_value=proc) as mock_spawn, \
              patch.object(main, "raise_process_when_ready"), \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)
         mock_block.assert_not_called()

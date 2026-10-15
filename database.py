@@ -595,6 +595,89 @@ def ranking_points_table(n_players, formula=RANKING_FORMULA_NONE):
     return table
 
 
+# =======================================================================
+# Groupe TMP (invités temporaires, demande du 2026-10-15) : participent
+# normalement au tournoi (table, équilibrages, éliminations) mais sont
+# exclus du classement OFFICIEL, des points (classement/présence/
+# assiduité), des bounties et des statistiques officielles de
+# participation du club. AUCUNE nouvelle colonne : le champ `players.
+# club` (déjà existant, déjà figé PAR TOURNOI dès l'inscription — voir
+# add_player, jamais resynchronisé avec le Répertoire ensuite) sert de
+# seul signal, confirmé explicitement par l'utilisateur comme seul
+# nécessaire ("effectif réel" du tournoi = tout le monde, TMP compris ;
+# "effectif officiel" = classement/points/récompenses = régulier
+# uniquement). Voir is_tmp_club/official_standings ci-dessous, seuls
+# points d'entrée de cette logique — jamais dupliquée ailleurs.
+def is_tmp_club(club):
+    """True si `club` correspond EXACTEMENT (espaces et casse ignorés)
+    à "TMP" — jamais une sous-chaîne ("TMP Poker Club" n'est PAS TMP).
+    Confirmé explicitement par l'utilisateur (demande du 2026-10-15)
+    qu'aucun club nommé littéralement "TMP" n'existe dans l'historique
+    des tournois déjà enregistrés — ce correctif est donc totalement
+    rétro-compatible : aucun ancien tournoi n'est affecté tant qu'aucun
+    de ses joueurs ne porte déjà ce club exact."""
+    return (club or "").strip().casefold() == "tmp"
+
+
+def official_standings(rows):
+    """Reclasse `rows` (liste de dicts, CHACUN avec au moins "id", "club"
+    et "place" — "place" étant déjà résolue par l'appelant, y compris la
+    place=1 synthétique du vainqueur le cas échéant, EXACTEMENT comme
+    c'était déjà fait avant ce correctif — "place" vaut None pour un
+    joueur pas encore classé, un forfait, ou tout joueur encore actif
+    tant que le tournoi n'est pas terminé) en calculant un rang OFFICIEL :
+
+    1. Les joueurs TMP (is_tmp_club) sont retirés de la séquence.
+    2. Chaque joueur RÉGULIER garde la MÊME position relative que sa
+       place brute, simplement DÉCALÉE du nombre de TMP dont la place
+       brute est STRICTEMENT inférieure à la sienne (jamais un simple
+       "renumérotage 1..M du sous-ensemble filtré", voir le piège
+       documenté ci-dessous) — la colonne `players.place` elle-même
+       n'est JAMAIS modifiée en base par cette fonction, uniquement ce
+       calcul dérivé à la lecture (voir Database.eliminate_player,
+       inchangée).
+    3. Les TMP reçoivent official_rank=None (hors classement) — jamais
+       replacés dans la liste ici (voir l'appelant pour l'affichage "en
+       fin de liste", ex. Database.players_rows : official_rank=None
+       suffit à les reconnaître et les trier en dernier).
+
+    PIÈGE ÉVITÉ (bug réel détecté en test, voir tests/test_tmp_group.py
+    et tests/test_period_summary_stats_tab.py::
+    ForfaitNeCompteJamaisCommeTournoiJoueTest) : un "renumérotage 1..M
+    du sous-ensemble classé" (première version de cette fonction) est
+    FAUX dès que `rows` contient des trous pour une raison AUTRE qu'un
+    TMP (ex. un forfait n'ayant jamais reçu de place, ou un tournoi pas
+    encore terminé) — un seul joueur éliminé avec une place brute de 2,
+    sans personne à la place 1 (le seul autre joueur ayant abandonné
+    avant la fin), se retrouverait à tort "rang officiel 1" (donc
+    déclaré vainqueur) par un simple renumérotage, alors qu'il n'a
+    jamais été le dernier survivant. Le décalage PAR SOUSTRACTION ci-
+    dessus ne reclasse jamais personne dont la place brute n'était pas
+    DÉJÀ la meilleure parmi les classés — seuls les TMP, explicitement
+    retirés, peuvent faire "remonter" un régulier.
+
+    RÉSOUT AUTOMATIQUEMENT le cas "un TMP termine réellement premier"
+    (demande explicite de l'utilisateur, "le joueur régulier le mieux
+    classé devient le vainqueur officiel du club") : si la place=1
+    appartient à un TMP, il est simplement retiré comme n'importe quel
+    autre TMP à l'étape 1 — le régulier à la place brute la plus basse
+    parmi les survivants devient alors naturellement official_rank=1,
+    sans le moindre cas particulier à coder séparément.
+
+    Renvoie un dict {id du joueur: official_rank (int) ou None} — jamais
+    une liste reconstruite (laisse chaque appelant combiner ce résultat
+    avec ses propres lignes existantes, par simple `.get(id)`)."""
+    with_place = [r for r in rows if r.get("place") is not None]
+    tmp_places = sorted(r["place"] for r in with_place if is_tmp_club(r.get("club")))
+    result = {r["id"]: None for r in rows}
+    for r in with_place:
+        if is_tmp_club(r.get("club")):
+            continue
+        shift = sum(1 for tmp_place in tmp_places if tmp_place < r["place"])
+        result[r["id"]] = r["place"] - shift
+    return result
+
+
 def bounty_unit_value(n_players, flat_value=0):
     """Valeur en points d'un bounty (un joueur éliminé) dans un tournoi de
     `n_players` joueurs au total. Si `flat_value` (réglage manuel, non nul)
@@ -1241,11 +1324,21 @@ class Database:
         ce tournoi garde la photo de ces champs telle qu'elle était à
         l'inscription (demande du 2026-10-03, "ajouter la colonne Pseudo
         au Répertoire" — `pseudo` suit exactement le même principe que
-        `club`, déjà en place)."""
+        `club`, déjà en place).
+
+        Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : "aucune
+        prime bounty n'est placée sur la tête d'un TMP" — `bounty_amount`
+        forcé à 0 si `club` vaut exactement "TMP", quel que soit le
+        réglage `bounty_amount` du tournoi (même principe déjà en place
+        pour les primes désactivées juste en dessous)."""
         starting_chips = self.get_setting_int("starting_chips", 10000)
-        # Primes désactivées (_primes_enabled) : jamais de bounty stampée
-        # à l'inscription, quel que soit le réglage `bounty_amount`.
-        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
+        # Primes désactivées (_primes_enabled) OU joueur TMP (demande du
+        # 2026-10-15) : jamais de bounty stampée à l'inscription, quel
+        # que soit le réglage `bounty_amount`.
+        bounty_amount = (
+            self.get_setting_int("bounty_amount", 0)
+            if self._primes_enabled() and not is_tmp_club(club) else 0
+        )
         cur = self.conn.execute(
             "INSERT INTO players(name, buyin_count, rebuy_count, addon_count, "
             "chips, status, bounty, club, pseudo) VALUES (?, 1, 0, 0, ?, 'active', ?, ?, ?)",
@@ -1431,8 +1524,14 @@ class Database:
     def rebuy_player(self, player_id):
         chips = self.get_setting_int("rebuy_chips", 10000)
         # Voir add_player : jamais de bounty ajoutée si les primes sont
-        # désactivées pour ce tournoi.
-        bounty_amount = self.get_setting_int("bounty_amount", 0) if self._primes_enabled() else 0
+        # désactivées pour ce tournoi, ni pour un joueur TMP (demande du
+        # 2026-10-15, voir is_tmp_club) — même règle qu'à l'inscription.
+        player = self.get_player(player_id)
+        player_is_tmp = bool(player) and is_tmp_club(player["club"])
+        bounty_amount = (
+            self.get_setting_int("bounty_amount", 0)
+            if self._primes_enabled() and not player_is_tmp else 0
+        )
         self.conn.execute(
             "UPDATE players SET rebuy_count = rebuy_count + 1, "
             "chips = chips + ?, bounty = bounty + ? WHERE id=?",
@@ -1460,10 +1559,24 @@ class Database:
 
     def set_player_club(self, player_id, club):
         """Corrige le club (POUR CE TOURNOI, voir add_player) d'un joueur
-        déjà inscrit — ex. club mal renseigné/absent à l'ajout."""
-        self.conn.execute(
-            "UPDATE players SET club=? WHERE id=?", ((club or "").strip(), player_id)
-        )
+        déjà inscrit — ex. club mal renseigné/absent à l'ajout.
+
+        Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : si le
+        NOUVEAU club corrigé vaut exactement "TMP", la bounty déjà
+        éventuellement portée par ce joueur (assignée avant cette
+        correction, alors qu'il était encore considéré régulier) est
+        remise à 0 — maintient l'invariant "aucune prime bounty sur la
+        tête d'un TMP" à tout moment, pas seulement à l'inscription
+        (voir add_player/rebuy_player, même règle)."""
+        club = (club or "").strip()
+        if is_tmp_club(club):
+            self.conn.execute(
+                "UPDATE players SET club=?, bounty=0 WHERE id=?", (club, player_id)
+            )
+        else:
+            self.conn.execute(
+                "UPDATE players SET club=? WHERE id=?", (club, player_id)
+            )
         self.conn.commit()
 
     def set_purchase_counts(self, player_id, buyin_count, rebuy_count, addon_count):
@@ -1551,6 +1664,16 @@ class Database:
         current_round = self.get_current_round_number()
         eliminator_row = self.get_player(eliminated_by_id) if eliminated_by_id else None
         eliminator_name = eliminator_row["name"] if eliminator_row else None
+        # Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : "aucun
+        # bounty attribué lorsqu'un TMP élimine un joueur ou lorsqu'un
+        # joueur élimine un TMP" — vérifié des DEUX côtés, jamais un
+        # seul (voir les deux blocs plus bas, kills et transfert de
+        # bounty). eliminated_is_tmp vérifiée explicitement malgré
+        # l'invariant "un TMP ne porte jamais de bounty non nulle"
+        # (add_player/rebuy_player/set_player_club) : défense en
+        # profondeur, jamais une simple supposition ici.
+        eliminator_is_tmp = eliminator_row is not None and is_tmp_club(eliminator_row["club"])
+        eliminated_is_tmp = eliminated is not None and is_tmp_club(eliminated["club"])
 
         primes_enabled = self._primes_enabled()
         pko_mode = primes_enabled and self.get_setting_int("pko_mode", 0) == 1
@@ -1598,34 +1721,55 @@ class Database:
             # ligne bounty_events, aucun partage PKO).
             self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
 
-        if primes_enabled and eliminated_by_id:
+        # Groupe TMP : "nombre" (kills, voir get_bounty_bonuses) ne doit
+        # JAMAIS augmenter pour une élimination impliquant un TMP, d'un
+        # côté comme de l'autre — en mode CLASSIQUE (valeur FIXE par
+        # bounty × nombre de kills), laisser kills s'incrémenter ici
+        # aurait sinon récompensé en points un régulier éliminant un TMP
+        # (dont la bounty est pourtant déjà à 0) : le nombre à lui seul
+        # suffirait à générer des points, indépendamment de la bounty
+        # réellement portée.
+        if primes_enabled and eliminated_by_id and not eliminator_is_tmp and not eliminated_is_tmp:
             self.conn.execute(
                 "UPDATE players SET kills = kills + 1 WHERE id=?", (eliminated_by_id,)
             )
 
         if primes_enabled and eliminated_by_id and eliminated and eliminated["bounty"] > 0:
-            bounty = eliminated["bounty"]
-            eliminator = self.get_player(eliminated_by_id)
-            if pko_mode:
-                cash_pct = self.get_setting_int("pko_cash_percent", 50)
-                cash_part = round(bounty * cash_pct / 100)
-                grow_part = bounty - cash_part
-            else:
-                cash_part = bounty
-                grow_part = 0
-            self.conn.execute(
-                "UPDATE players SET bounty_won = bounty_won + ?, bounty = bounty + ? "
-                "WHERE id=?",
-                (cash_part, grow_part, eliminated_by_id),
-            )
-            self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
-            self.conn.execute(
-                "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
-                "amount_won, added_to_eliminator_bounty, event_time, event_type) "
-                "VALUES (?,?,?,?,?,'elimination')",
-                (eliminated["name"], eliminator["name"] if eliminator else "?",
-                 cash_part, grow_part, now),
-            )
+            if eliminator_is_tmp:
+                # "Un TMP éliminant un joueur régulier ne reçoit aucun
+                # bounty" : la bounty du joueur éliminé est ABANDONNÉE
+                # (même traitement que orphan_bounty_ok plus haut),
+                # jamais transférée à un TMP — aucune ligne bounty_events
+                # (aucun transfert n'a réellement eu lieu).
+                self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
+            elif not eliminated_is_tmp:
+                # eliminated_is_tmp : jamais atteint en pratique (bounty
+                # toujours à 0 pour un TMP, voir add_player/
+                # rebuy_player/set_player_club) — gardé explicitement
+                # par cohérence avec eliminator_is_tmp ci-dessus, jamais
+                # supposé silencieusement.
+                bounty = eliminated["bounty"]
+                eliminator = self.get_player(eliminated_by_id)
+                if pko_mode:
+                    cash_pct = self.get_setting_int("pko_cash_percent", 50)
+                    cash_part = round(bounty * cash_pct / 100)
+                    grow_part = bounty - cash_part
+                else:
+                    cash_part = bounty
+                    grow_part = 0
+                self.conn.execute(
+                    "UPDATE players SET bounty_won = bounty_won + ?, bounty = bounty + ? "
+                    "WHERE id=?",
+                    (cash_part, grow_part, eliminated_by_id),
+                )
+                self.conn.execute("UPDATE players SET bounty=0 WHERE id=?", (player_id,))
+                self.conn.execute(
+                    "INSERT INTO bounty_events(eliminated_name, eliminator_name, "
+                    "amount_won, added_to_eliminator_bounty, event_time, event_type) "
+                    "VALUES (?,?,?,?,?,'elimination')",
+                    (eliminated["name"], eliminator["name"] if eliminator else "?",
+                     cash_part, grow_part, now),
+                )
 
         self.conn.commit()
 
@@ -3591,12 +3735,17 @@ class Database:
 
         Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
         aucun calcul, {} inconditionnellement — court-circuit à la
-        source, pas un simple masquage à l'affichage."""
+        source, pas un simple masquage à l'affichage.
+
+        Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : "aucun
+        point de présence pour les TMP" — exclus ici au même titre que
+        les forfaits, jamais une exception ajoutée côté affichage."""
         if not self._primes_enabled():
             return {}
         points = self.get_setting_int("attendance_bonus_points", 0)
         return {
-            p["name"]: points for p in self.list_players() if p["status"] != "withdrawn"
+            p["name"]: points for p in self.list_players()
+            if p["status"] != "withdrawn" and not is_tmp_club(p["club"])
         }
 
     def get_assiduity_bonuses(self):
@@ -3661,11 +3810,20 @@ class Database:
                 name_sets = [_read_present_player_names_from_file(fp) for fp in prev_files]
                 eligible_names = present_now.intersection(*name_sets)
 
+        # Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : "aucun
+        # point d'assiduité pour les TMP" — jamais de points pour eux,
+        # quelle que soit leur série de présence par ailleurs (affichée
+        # telle quelle dans "present_previous", purement informatif, ne
+        # conditionne que les points ci-dessous).
         result = [
             {
                 "name": p["name"],
                 "present_previous": p["name"].strip().lower() in eligible_names,
-                "points": points if p["name"].strip().lower() in eligible_names else 0,
+                "points": (
+                    points
+                    if p["name"].strip().lower() in eligible_names and not is_tmp_club(p["club"])
+                    else 0
+                ),
             }
             for p in self.list_players()
         ]
@@ -3716,14 +3874,31 @@ class Database:
 
     def get_ranking_bonuses(self):
         """Calcule la prime de classement (en points) de chaque joueur dont
-        le rang est déjà connu : un joueur éliminé (place déjà attribuée),
-        ou le vainqueur une fois le tournoi terminé (même convention que le
-        rang affiché dans l'onglet Joueurs / les exports). Les joueurs
-        encore actifs en cours de tournoi (rang pas encore connu) n'ont pas
-        de ligne. Renvoie une liste de dicts {name, place, nombre, valeur,
-        montant} (montant = nombre × valeur), triée par rang croissant ;
-        liste vide si `_primes_enabled` est faux (interrupteur général,
-        demande du 2026-09-09 — court-circuit à la source).
+        le rang OFFICIEL est déjà connu : un joueur éliminé (place déjà
+        attribuée), ou le vainqueur une fois le tournoi terminé — JAMAIS
+        un TMP (voir is_tmp_club/official_standings, demande du
+        2026-10-15 : "aucun point de classement pour les TMP", retirés de
+        la séquence, les réguliers remontant d'un rang chacun). Les
+        joueurs encore actifs en cours de tournoi (rang pas encore connu)
+        n'ont pas de ligne. Renvoie une liste de dicts {name, place,
+        nombre, valeur, montant} (montant = nombre × valeur, "place" ici
+        = le rang OFFICIEL, pas la place brute d'élimination — même
+        convention que players_rows/"official_rang"), triée par rang
+        croissant ; liste vide si `_primes_enabled` est faux (interrupteur
+        général, demande du 2026-09-09 — court-circuit à la source).
+
+        `n_players` (effectif pour la formule) = effectif OFFICIEL
+        (réguliers uniquement, demande explicite : "les TMP sont exclus
+        du nombre de participants utilisé dans les formules de points")
+        — distinct de self.get_stats()["total_players_ever"] (effectif
+        RÉEL du tournoi, TMP compris, jamais modifié par ce correctif :
+        reste utilisé tel quel partout ailleurs, ex. Lobby/tapis moyen).
+
+        Si la place=1 (vainqueur réel) appartient à un TMP, official_
+        standings le retire comme n'importe quel autre TMP : le régulier
+        à la place brute la plus basse devient alors rang officiel 1,
+        sans cas particulier ("le joueur régulier le mieux classé devient
+        le vainqueur officiel du club", demande explicite).
 
         Utilise resolve_ranking_formula() (voir sa docstring pour la
         règle de compatibilité complète avec l'ancien ranking_bonus_points)
@@ -3734,10 +3909,22 @@ class Database:
         if not self._primes_enabled():
             return []
         formula, legacy_flat_value = self.resolve_ranking_formula()
-        n_players = self.get_stats()["total_players_ever"]
         all_players = self.list_players()
         active = [p for p in all_players if p["status"] == "active"]
         finished = len(active) == 1
+
+        raw_places = []
+        for p in all_players:
+            place = None
+            if p["status"] == "eliminated":
+                place = p["place"]
+            elif p["status"] == "active" and finished:
+                place = 1
+            if place is not None:
+                raw_places.append({"id": p["id"], "club": p["club"], "place": place})
+        official_ranks = official_standings(raw_places)
+
+        n_players = sum(1 for p in all_players if not is_tmp_club(p["club"]))
         # Barème calculé UNE SEULE FOIS pour tout le tournoi (voir
         # ranking_points_table), jamais un appel par joueur : nécessaire
         # pour "tournois_cpc" (plus grands restes, exige la répartition
@@ -3749,24 +3936,20 @@ class Database:
 
         result = []
         for p in all_players:
-            place = None
-            if p["status"] == "eliminated":
-                place = p["place"]
-            elif p["status"] == "active" and finished:
-                place = 1
-            if place is None:
-                continue
+            official_rank = official_ranks.get(p["id"])
+            if official_rank is None:
+                continue  # pas encore classé, OU TMP (hors classement officiel)
             # legacy_flat_value (ancien réglage "valeur fixe") prime
             # absolument sur la formule si présent — voir
             # resolve_ranking_formula, cas 2.
             if legacy_flat_value is not None:
                 valeur = legacy_flat_value
-            elif 0 < place <= len(points_table):
-                valeur = points_table[place - 1]
+            elif 0 < official_rank <= len(points_table):
+                valeur = points_table[official_rank - 1]
             else:
                 valeur = 0
             result.append({
-                "name": p["name"], "place": place,
+                "name": p["name"], "place": official_rank,
                 "nombre": 1, "valeur": valeur, "montant": valeur,
             })
         result.sort(key=lambda r: r["place"])
@@ -3803,24 +3986,36 @@ class Database:
         Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
         liste vide inconditionnellement — court-circuit à la source (de
         toute façon `kills`/`bounty_won` ne sont jamais alimentés dans ce
-        cas, voir eliminate_player, mais on ne dépend pas de cela ici)."""
+        cas, voir eliminate_player, mais on ne dépend pas de cela ici).
+
+        Groupe TMP (demande du 2026-10-15, voir is_tmp_club) : "aucune
+        prime bounty sur la tête des TMP" — EXCLUS entièrement de cette
+        liste (jamais une ligne à 0, par cohérence avec get_ranking_
+        bonuses ci-dessus). `n_players` (mode CLASSIQUE, formule 10×√N)
+        = effectif OFFICIEL (réguliers uniquement, même raison que get_
+        ranking_bonuses) — distinct de total_players_ever. `kills`/
+        `bounty_won` ne sont de toute façon jamais incrémentés pour une
+        élimination impliquant un TMP, des deux côtés (voir
+        eliminate_player) — cette exclusion ici est donc une garantie
+        supplémentaire, jamais la seule."""
         if not self._primes_enabled():
             return []
         pko_mode = self.get_setting_int("pko_mode", 0) == 1
+        regular_players = [p for p in self.list_players() if not is_tmp_club(p["club"])]
         if not pko_mode:
             flat_value = self.get_setting_int("bounty_amount", 0)
-            n_players = self.get_stats()["total_players_ever"]
+            n_players = len(regular_players)
             valeur = bounty_unit_value(n_players, flat_value)
             result = [
                 {
                     "name": p["name"], "nombre": p["kills"],
                     "valeur": valeur, "montant": p["kills"] * valeur,
                 }
-                for p in self.list_players()
+                for p in regular_players
             ]
         else:
             result = []
-            for p in self.list_players():
+            for p in regular_players:
                 nombre = p["kills"]
                 montant = self._pko_effective_bounty_won(p)
                 valeur = round(montant / nombre) if nombre else 0
@@ -3858,6 +4053,17 @@ class Database:
         (ex : rang d'un joueur encore actif) sont toujours reléguées en
         fin de liste, quel que soit le sens du tri.
 
+        Groupe TMP (demande du 2026-10-15, uniquement pour le TRI PAR
+        DÉFAUT — `sort_column` None/inconnu — demande explicite de
+        préserver les AUTRES tris existants sans régression, voir plus
+        bas) : les joueurs TMP (toujours à 0 partout, voir is_tmp_club)
+        apparaissent TOUJOURS après TOUS les réguliers, même si un
+        régulier a lui aussi 0 point — jamais mélangés dans ce tri-là.
+        Les tris explicites ('rang'/'bo_nombre'/'total') restent
+        INCHANGÉS : 'rang' reléguait déjà les TMP en fin de liste (leur
+        rang officiel vaut toujours None, voir get_ranking_bonuses),
+        'bo_nombre'/'total' ne sont volontairement pas touchés ici.
+
         Primes désactivées (`_primes_enabled`, demande du 2026-09-09) :
         liste vide inconditionnellement — l'onglet Primes reste
         simplement vide, aucun message de remplacement (les quatre
@@ -3885,6 +4091,7 @@ class Database:
                 "rang": rang, "cl_montant": cl_montant,
                 "bo_nombre": bt["nombre"], "bo_valeur": bt["valeur"], "bo_montant": bt["montant"],
                 "total": total,
+                "_is_tmp": is_tmp_club(p["club"]),  # jamais exporté (PRIMES_COLUMNS ne la référence pas)
             })
 
         if sort_column in ("rang", "bo_nombre", "total"):
@@ -3895,7 +4102,9 @@ class Database:
                 return (0, v if ascending else -v, r["name"].casefold())
             rows.sort(key=sort_key)
         else:
-            rows.sort(key=lambda r: (-r["total"], r["name"].casefold()))
+            rows.sort(key=lambda r: (r["_is_tmp"], -r["total"], r["name"].casefold()))
+        for r in rows:
+            del r["_is_tmp"]
         return rows
 
     def export_primes_csv(self, path, columns=None, sort_column=None, ascending=True):
@@ -4475,11 +4684,33 @@ class Database:
         `sort_column`/`ascending` reproduisent exactement le tri appliqué
         dans l'onglet (voir App._sort_players_by côté interface) : sans
         eux, l'ordre d'affichage à l'écran (par ex. trié par Rang) et
-        l'ordre du fichier exporté pouvaient diverger."""
+        l'ordre du fichier exporté pouvaient diverger.
+
+        "rang" (INCHANGÉ par le groupe TMP, demande du 2026-10-15) :
+        l'ordre RÉEL d'élimination — "l'effectif réel du tournoi, qui
+        inclut les TMP" (demande explicite de l'utilisateur), toujours
+        affiché tel quel dans l'onglet Joueurs, jamais retiré ni décalé.
+        "official_rang" (NOUVEAU champ, additif) : le rang OFFICIEL —
+        "l'effectif officiel utilisé pour les classements et les
+        récompenses" — TMP exclus, régulier remontant d'un cran chacun
+        (voir is_tmp_club/official_standings). None pour un TMP (hors
+        classement officiel) ou un joueur pas encore classé — jamais
+        utilisé par l'onglet Joueurs lui-même, uniquement par
+        App._classement_rows (onglet Classement) et les synthèses/
+        exports qui doivent refléter le classement OFFICIEL."""
         status_labels = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
         tables = {t["id"]: t["name"] for t in self.list_tables(active_only=False)}
         players = [dict(p) for p in self.list_players()]
         n_active = sum(1 for p in players if p["status"] == "active")
+
+        raw_places = [
+            {"id": p["id"], "club": p["club"], "place": (
+                1 if p["status"] == "active" and n_active == 1
+                else p["place"] if p["status"] == "eliminated" else None
+            )}
+            for p in players
+        ]
+        official_ranks = official_standings(raw_places)
 
         rows = []
         for p in players:
@@ -4501,6 +4732,7 @@ class Database:
                 "bounty": p["bounty"],
                 "status": status_labels.get(p["status"], p["status"]),
                 "rang": rang,
+                "official_rang": official_ranks.get(p["id"]),
                 "elim_time": p["elim_time"] or "",
                 "elim_round": p["elim_round"],
                 "eliminated_by": p["eliminated_by_name"] or "",
@@ -4521,6 +4753,132 @@ class Database:
         if sort_column and not ascending:
             rows.reverse()
         return rows
+
+    def classement_rows(self):
+        """Lignes du CLASSEMENT OFFICIEL — pour l'onglet Classement et SES
+        TROIS exports dédiés UNIQUEMENT (export_classement_csv/xlsx/pdf
+        ci-dessous), demande du 2026-10-15 (groupe TMP) : JAMAIS pour
+        l'onglet Joueurs ni ses propres exports (export_players_csv/
+        xlsx/pdf, totalement INCHANGÉS, toujours basés sur players_rows
+        ci-dessus, "rang" réel, TMP compris à leur vraie position —
+        demande explicite : "ne pas modifier le comportement des exports
+        génériques de l'onglet Joueurs").
+
+        Réutilise players_rows() (jamais une seconde formule de rang —
+        "official_rang" y est déjà calculé) : sépare les lignes déjà
+        classées (rang réel connu) en deux groupes, JAMAIS mélangés
+        ensuite, quel que soit l'appelant :
+        - RÉGULIERS (official_rang connu) : triés par rang officiel
+          croissant — "rang" ci-dessous est directement ce rang officiel
+          (int), jamais la place brute.
+        - TMP (rang réel connu mais official_rang=None) : triés par leur
+          place BRUTE croissante (ordre réel d'élimination — "conserver
+          une trace de leur participation" dans l'ordre où ils ont
+          joué) — "rang" ci-dessous vaut la chaîne littérale "Hors
+          classement", jamais un nombre, jamais mélangé avec un
+          régulier : TOUJOURS après le dernier régulier dans la liste
+          renvoyée.
+
+        Un joueur sans rang réel (encore actif, tournoi pas terminé) est
+        exclu ici, TMP ou non — exactement comme players_rows/
+        _classement_rows le faisaient déjà avant ce correctif.
+
+        Renvoie une liste de dicts {name, club, rang (int ou "Hors
+        classement"), elim_time, elim_round, eliminated_by} — jamais les
+        autres clés de players_rows (table/siège/chips/statut...), sans
+        rapport avec le Classement."""
+        regulars = []
+        tmps = []
+        for r in self.players_rows():
+            if r["rang"] is None:
+                continue  # encore actif / tournoi pas terminé : jamais ici
+            row = {
+                "name": r["name"], "club": r["club"],
+                "elim_time": r["elim_time"], "elim_round": r["elim_round"],
+                "eliminated_by": r["eliminated_by"],
+            }
+            if r["official_rang"] is not None:
+                row["rang"] = r["official_rang"]
+                regulars.append(row)
+            else:
+                row["rang"] = "Hors classement"
+                row["_raw_rang"] = r["rang"]
+                tmps.append(row)
+        regulars.sort(key=lambda r: r["rang"])
+        tmps.sort(key=lambda r: r["_raw_rang"])
+        for row in tmps:
+            del row["_raw_rang"]
+        return regulars + tmps
+
+    def export_classement_csv(self, path, columns=None):
+        """Exporte l'onglet Classement OFFICIEL (voir classement_rows)
+        en CSV — DÉDIÉ, jamais export_players_csv (onglet Joueurs,
+        inchangée). `columns` : sous-ensemble de clés de CLASSEMENT_ROWS_
+        COLUMNS (None = toutes — en pratique toujours toutes, voir
+        ClassementExportDialog : "colonnes fixes, pas de sélection
+        possible", INCHANGÉ par ce correctif)."""
+        import csv
+
+        cols = _selected_period_columns(CLASSEMENT_ROWS_COLUMNS, columns)
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow([h for _, h, _ in cols])
+            for r in self.classement_rows():
+                writer.writerow([fn(r) for _, _, fn in cols])
+        return path
+
+    def export_classement_xlsx(self, path, columns=None, title=None):
+        """Exporte l'onglet Classement OFFICIEL en Excel (.xlsx) — voir
+        export_classement_csv. `title` : remplace le titre par défaut
+        (nom du tournoi) si fourni. Nécessite 'openpyxl'."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill
+        from openpyxl.utils import get_column_letter
+
+        cols = _selected_period_columns(CLASSEMENT_ROWS_COLUMNS, columns)
+        rows = self.classement_rows()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Classement"
+
+        name = title or self.get_setting("tournament_name", "Tournoi")
+        ws.append([name])
+        ws["A1"].font = Font(bold=True, size=14)
+        ws.append([])
+
+        headers = [h for _, h, _ in cols]
+        header_row = ws.max_row + 1
+        ws.append(headers)
+        header_fill = PatternFill(start_color="1F4E24", end_color="1F4E24", fill_type="solid")
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=header_row, column=col)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for r in rows:
+            ws.append([fn(r) for _, _, fn in cols])
+
+        widths = {"name": 22, "rang": 16, "elim_time": 18, "elim_round": 10, "eliminated_by": 18}
+        for i, (key, _, _) in enumerate(cols, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = widths.get(key, 14)
+
+        wb.save(path)
+        return path
+
+    def export_classement_pdf(self, path, columns=None, title=None):
+        """Exporte l'onglet Classement OFFICIEL en PDF — voir export_
+        classement_csv/xlsx. Nécessite le paquet 'fpdf2'."""
+        cols = _selected_period_columns(CLASSEMENT_ROWS_COLUMNS, columns)
+        rows = self.classement_rows()
+        name = title or self.get_setting("tournament_name", "Tournoi")
+        return _write_pdf_table(
+            path, name,
+            [],
+            [h for _, h, _ in cols],
+            [[fn(r) for _, _, fn in cols] for r in rows],
+        )
 
     def _bounty_in_use(self):
         if self.get_setting_int("bounty_amount", 0) > 0:
@@ -5363,8 +5721,45 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
             # être "Terminé" au sens ci-dessus sans qu'il ne reste
             # personne pour être désigné vainqueur (0 actif) — dans ce
             # cas précis, "-" (comme "En cours") plutôt qu'une IndexError
-            # sur `active[0]`.
-            winner = active[0]["name"] if len(active) == 1 else "-"
+            # sur `active[0]`. INCHANGÉ par le groupe TMP : cette
+            # condition ("exactement 1 survivant") reste la SEULE source
+            # de vérité pour "y a-t-il un vainqueur du tout" — jamais
+            # déduite d'un rang officiel, qui PEUT légitimement valoir 1
+            # pour un joueur déjà ÉLIMINÉ sans rapport avec un TMP (ex. un
+            # forfait renumérote les places des joueurs déjà éliminés,
+            # voir withdraw_player — piège réel détecté en test, voir
+            # tests/test_period_summary_stats_tab.py::
+            # ForfaitNeCompteJamaisCommeTournoiJoueTest : un rang officiel
+            # 1 n'implique PAS "a réellement gagné").
+            #
+            # Groupe TMP (demande du 2026-10-15, voir is_tmp_club/
+            # official_standings) : "si un TMP termine réellement
+            # premier, le joueur régulier le mieux classé devient le
+            # vainqueur officiel du club" — appliqué UNIQUEMENT dans le
+            # cas où un vainqueur réel existe déjà (ci-dessus), jamais
+            # pour en inventer un là où il n'y en avait pas.
+            raw_places_for_standings = [
+                {
+                    "id": p["id"], "club": p["club"],
+                    "place": (
+                        1 if p["status"] == "active" and len(active) == 1
+                        else p["place"] if p["status"] == "eliminated" else None
+                    ),
+                }
+                for p in all_players
+            ]
+            official_ranks_by_id = official_standings(raw_places_for_standings)
+            if len(active) == 1:
+                sole_survivor = active[0]
+                if is_tmp_club(sole_survivor["club"]):
+                    winner = next(
+                        (p["name"] for p in all_players if official_ranks_by_id.get(p["id"]) == 1),
+                        "-",
+                    )
+                else:
+                    winner = sole_survivor["name"]
+            else:
+                winner = "-"
             # Même source que l'onglet Primes de ce tournoi (voir
             # get_primes_summary) : "bo_montant" = bounty en points, "total"
             # = Présence + Assiduité + Classement + Bounty pour ce tournoi.
@@ -5386,11 +5781,13 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
 
             player_updates = []
             for p in all_players:
-                place = None
-                if p["status"] == "eliminated":
-                    place = p["place"]
-                elif p["status"] == "active" and finished:
-                    place = 1
+                # Groupe TMP (demande du 2026-10-15) : "wins"/"best_place"
+                # (ci-dessous, voir agg["wins"]/agg["best_place"]) doivent
+                # refléter le rang OFFICIEL, jamais la place brute — sans
+                # quoi un TMP resté seul en jeu compterait à tort une
+                # "victoire" dans ses propres statistiques, et le régulier
+                # devenu vainqueur officiel n'en recevrait pas le crédit.
+                place = official_ranks_by_id.get(p["id"])
 
                 # EXCLUSIVEMENT get_primes_summary() (source unique déjà
                 # utilisée pour bounty_won/points ci-dessous, voir la
@@ -5398,7 +5795,9 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 # dupliquée pour presence/assiduite/cl_montant — ces
                 # valeurs sont déjà correctes pour les 5 formules de
                 # classement (Aucun/Classique/Progressive/Tournois CPC/
-                # Sit & Go CPC)
+                # Sit & Go CPC), déjà TMP-exclues (voir get_primes_summary
+                # -> get_ranking_bonuses/get_presence_bonuses/get_
+                # assiduity_bonuses/get_bounty_bonuses)
                 # et pour un tournoi "primes désactivées" (prime_row is
                 # None -> 0 partout, comme bounty_won/points).
                 prime_row = primes_by_name.get(p["name"])
@@ -5413,7 +5812,13 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 # participation ADMINISTRATIVE, jamais comme un tournoi
                 # JOUÉ — seul "played" distingue les deux ci-dessous, rien
                 # d'autre n'est modifié pour ce joueur (primes...).
-                played = p["status"] != "withdrawn"
+                # Groupe TMP (demande du 2026-10-15) : "aucune contribution
+                # des TMP aux statistiques de participation officielle du
+                # club" — un TMP ne compte jamais comme un tournoi JOUÉ ici
+                # (effectif OFFICIEL des statistiques), même s'il a
+                # réellement participé (effectif RÉEL, voir "entries"
+                # ci-dessus, jamais touché par cette exclusion).
+                played = p["status"] != "withdrawn" and not is_tmp_club(p["club"])
                 player_updates.append((
                     p["name"], place, bounty_won, points,
                     presence_assiduity, ranking_pts, played,
@@ -5561,6 +5966,23 @@ PLAYERS_TAB_COLUMNS = [
     ("elim_time", "Éliminé le", lambda p: format_datetime_fr(p["elim_time"])),
     ("elim_round", "Round", lambda p: p["elim_round"]),
     ("eliminated_by", "Éliminé par", lambda p: p["eliminated_by"]),
+]
+
+# Colonnes disponibles pour l'export DÉDIÉ du Classement OFFICIEL (voir
+# Database.classement_rows/export_classement_csv/xlsx/pdf, demande du
+# 2026-10-15, groupe TMP) — SÉPARÉES de PLAYERS_TAB_COLUMNS ci-dessus
+# (demande explicite : "sans modifier le comportement des exports
+# génériques de l'onglet Joueurs", jamais touchées par ce correctif).
+# Même 5 colonnes que l'ancien CLASSEMENT_EXPORT_COLUMNS (main.py) —
+# "rang" vaut ici soit un entier (rang officiel), soit la chaîne
+# littérale "Hors classement" pour un TMP (déjà résolue par classement_
+# rows, jamais recalculée ici).
+CLASSEMENT_ROWS_COLUMNS = [
+    ("name", "Nom", lambda r: r["name"]),
+    ("rang", "Rang", lambda r: r["rang"]),
+    ("elim_time", "Éliminé le", lambda r: format_datetime_fr(r["elim_time"])),
+    ("elim_round", "Round", lambda r: r["elim_round"]),
+    ("eliminated_by", "Éliminé par", lambda r: r["eliminated_by"]),
 ]
 
 # Colonnes disponibles pour l'export de l'onglet Primes, dans le même ordre

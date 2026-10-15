@@ -248,6 +248,7 @@ class OpenNewWindowAlwaysOpensTest(unittest.TestCase):
              patch.object(main.open_windows, "list_open_paths", return_value=["/tmp/moi.tournoi"]), \
              patch.object(main, "spawn_app_process", return_value=_FakeProc()) as mock_spawn, \
              patch.object(main, "raise_process_when_ready") as mock_raise, \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)
         mock_block.assert_not_called()
@@ -259,6 +260,7 @@ class OpenNewWindowAlwaysOpensTest(unittest.TestCase):
         with patch.object(main.export_prefs, "load_value", return_value=False), \
              patch.object(main, "spawn_app_process", return_value=_FakeProc()) as mock_spawn, \
              patch.object(main, "raise_process_when_ready") as mock_raise, \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(fake)
         mock_spawn.assert_called_once()
@@ -790,6 +792,7 @@ class PreferenceSyncAcrossProcessesTest(unittest.TestCase):
         # même préférence cochée et un tournoi (A lui-même) ouvert.
         with patch.object(main, "spawn_app_process", return_value=_FakeProc()) as mock_spawn, \
              patch.object(main, "raise_process_when_ready") as mock_raise, \
+             patch.object(main.open_windows, "acquire_standalone_screen"), \
              patch.object(main.time, "sleep"):
             main.App._open_new_window(app_a)
         mock_spawn.assert_called_once()
