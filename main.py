@@ -38,7 +38,7 @@ from database import (
     RANKING_FORMULA_TOURNOIS_CPC, RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
     REMOTE_PERMISSION_LABELS,
     STATS_TOURNAMENT_TYPE_TOURNOIS, STATS_TOURNAMENT_TYPE_SITNGO, STATS_TOURNAMENT_TYPE_ALL,
-    STATS_WEEKDAY_FOLDER_NAMES,
+    STATS_WEEKDAY_FOLDER_NAMES, is_tmp_club,
 )
 from structures import (
     default_blind_structure, standard_payout_structure, generate_blind_structure,
@@ -1555,6 +1555,47 @@ def get_selected_clubs(listbox):
     if CLUB_FILTER_ALL_LABEL in selected:
         return []
     return selected
+
+
+# Pseudo-club "TMP" (demande du 2026-10-15, statistiques de fréquentation
+# des visiteurs temporaires) : UNIQUEMENT ajouté/retiré dynamiquement du
+# filtre "Club" de l'onglet STATISTIQUES (voir PeriodSummaryDialog._
+# sync_stats_tmp_club_option ci-dessous) — jamais du filtre équivalent de
+# l'onglet Classement (classement_club_listbox), ni de build_club_filter_
+# widget/_populate_club_filter_listbox ci-dessus (tous deux INCHANGÉS,
+# toujours uniquement nourris par roster.list_clubs()).
+STATS_TMP_CLUB_LABEL = "TMP"
+
+
+def _is_tmp_visitor_still_relevant(name):
+    """Un joueur historiquement TMP (voir Database.build_period_summary,
+    champ "is_tmp" d'un agrégat) ne doit plus être compté comme VISITEUR
+    TMP dans les statistiques de fréquentation dès que le Répertoire
+    (roster.py) lui attribue AUJOURD'HUI un club réel — "devenu membre du
+    CPC en payant sa cotisation" (demande explicite du 2026-10-15) : il
+    est alors un joueur comme un autre, ses anciennes participations TMP
+    restent comptées nulle part ici, SANS qu'aucun ancien tournoi ni
+    aucun point/classement/prime historique ne soit jamais recalculé ou
+    modifié (voir Database.build_period_summary, "is_tmp" reste un FAIT
+    HISTORIQUE brut, jamais réécrit) — seule la visibilité dans CETTE
+    liste de fréquentation change, ici, à la lecture.
+
+    Un nom jamais inscrit au Répertoire, inscrit sans club renseigné, ou
+    inscrit avec le club exact "TMP" (roster.get_club vide ou lui-même
+    TMP, voir is_tmp_club), reste compté comme visiteur TMP."""
+    current_club = roster.get_club(name)
+    return not current_club or is_tmp_club(current_club)
+
+
+def _tmp_visitor_rows(players):
+    """Sous-ensemble de `players` (summary["players"], voir Database.
+    build_period_summary) à compter comme VISITEURS TMP dans les
+    statistiques de fréquentation de l'onglet Statistiques : au moins
+    une participation réelle tamponnée TMP sur la période (agg["is_tmp"])
+    ET toujours considéré TMP aujourd'hui (voir _is_tmp_visitor_still_
+    relevant ci-dessus) — un ancien TMP devenu membre régulier du club
+    n'y figure plus."""
+    return [a for a in players if a.get("is_tmp") and _is_tmp_visitor_still_relevant(a["name"])]
 
 
 class TreeHeadingTooltip:
@@ -4249,8 +4290,11 @@ STATS_TOURNAMENTS_SORT_HEADERS = {
 STATS_PLAYERS_SORT_KEYS = {
     # "rang" (demande du 2026-09-18) : trie l'AFFICHAGE selon le rang déjà
     # figé par _stats_players_with_rank (appelée AVANT ce tri, voir
-    # _refresh_display) — ne recalcule jamais rien, un entier simple comme
-    # les autres colonnes numériques ci-dessous, jamais None.
+    # _refresh_display) — un entier simple, SAUF pour une ligne visiteur
+    # TMP (demande du 2026-10-15), dont "rang" vaut la chaîne littérale
+    # "Hors classement" (voir _apply_tmp_hors_classement) : ce cas est
+    # traité à part par _sort_stats_players ci-dessous (jamais par cette
+    # clé générique, qui comparerait un entier à une chaîne — TypeError).
     "rang": lambda a: a["rang"],
     "name": lambda a: a["name"].lower(),
     "played": lambda a: a["tournaments_played"],
@@ -4266,22 +4310,42 @@ STATS_PLAYERS_SORT_HEADERS = {
 
 
 def _sort_stats_players(players, sort_state):
-    """Comme _sorted_rows, mais gère en plus "best" (Meilleur Rang) —
-    cas particulier demandé le 2026-09-18 : un joueur sans classement
-    (best_place=None, affiché "-") doit TOUJOURS rester en DERNIÈRE
-    position, aussi bien en tri croissant qu'en tri décroissant (il
-    représente une absence de classement, jamais un rang numérique à
-    inverser comme les autres). Implémenté via une clé à deux niveaux —
-    (a_un_classement, valeur signée) — le premier niveau (False < True)
-    sépare définitivement les deux groupes sans jamais dépendre du sens,
-    le second n'inverse QUE l'ordre à l'intérieur du groupe classé."""
-    if sort_state.get("column") != "best":
-        return _sorted_rows(players, sort_state, STATS_PLAYERS_SORT_KEYS)
-    sign = 1 if sort_state.get("ascending", True) else -1
-    return sorted(
-        players,
-        key=lambda a: (a["best_place"] is None, sign * (a["best_place"] or 0)),
-    )
+    """Comme _sorted_rows, mais gère en plus "best" (Meilleur Rang) et
+    "rang" (Rang) — deux cas particuliers où la valeur BRUTE n'est pas
+    directement comparable pour tous les joueurs :
+    - "best" (demande du 2026-09-18) : un joueur sans classement
+      (best_place=None, affiché "-") doit TOUJOURS rester en DERNIÈRE
+      position, aussi bien en tri croissant qu'en tri décroissant (il
+      représente une absence de classement, jamais un rang numérique à
+      inverser comme les autres).
+    - "rang" (demande du 2026-10-15, visiteurs TMP) : une ligne TMP
+      affiche la chaîne littérale "Hors classement" au lieu d'un entier
+      (voir _apply_tmp_hors_classement) — comparer directement un entier
+      à cette chaîne lèverait une TypeError dès que le filtre "Club"
+      mélange TMP et un club réel en même temps ; une ligne "Hors
+      classement" doit de toute façon TOUJOURS rester en dernière
+      position, exactement comme "best" ci-dessus.
+    Les deux cas réutilisent le MÊME principe : une clé à deux niveaux —
+    (a_un_rang_numérique, valeur signée) — le premier niveau (False <
+    True) sépare définitivement les deux groupes sans jamais dépendre du
+    sens, le second n'inverse QUE l'ordre à l'intérieur du groupe classé."""
+    column = sort_state.get("column")
+    if column == "best":
+        sign = 1 if sort_state.get("ascending", True) else -1
+        return sorted(
+            players,
+            key=lambda a: (a["best_place"] is None, sign * (a["best_place"] or 0)),
+        )
+    if column == "rang":
+        sign = 1 if sort_state.get("ascending", True) else -1
+        return sorted(
+            players,
+            key=lambda a: (
+                not isinstance(a["rang"], int),
+                sign * (a["rang"] if isinstance(a["rang"], int) else 0),
+            ),
+        )
+    return _sorted_rows(players, sort_state, STATS_PLAYERS_SORT_KEYS)
 
 
 def _stats_players_with_rank(players):
@@ -4320,6 +4384,23 @@ def _stats_players_with_rank(players):
             prev_points = a["total_points"]
         rank_by_name[a["name"]] = rank
     return [dict(a, rang=rank_by_name[a["name"]]) for a in players]
+
+
+def _apply_tmp_hors_classement(players):
+    """Remplace, pour chaque ligne marquée "_tmp_view" (visiteur TMP,
+    voir PeriodSummaryDialog._club_filtered_players, demande du
+    2026-10-15), le "rang" numérique que _stats_players_with_rank vient
+    de calculer par la chaîne littérale "Hors classement" — un visiteur
+    TMP n'occupe jamais de rang officiel (même convention que l'onglet
+    Classement). Appelée TOUJOURS après _stats_players_with_rank (jamais
+    avant : ce "rang" numérique serait sinon écrasé par ce calcul),
+    mute `players` EN PLACE (déjà une liste de NOUVEAUX dicts fournie par
+    _stats_players_with_rank, jamais self.summary) et la renvoie
+    inchangée par ailleurs — pour chaîner directement les appels."""
+    for a in players:
+        if a.get("_tmp_view"):
+            a["rang"] = "Hors classement"
+    return players
 
 
 def _apply_stats_sort_arrows(tree, sort_state, base_headers):
@@ -4813,7 +4894,31 @@ class PeriodSummaryDialog(ttk.Frame):
             tournament_type=tournament_type,
             selected_days=selected_days,
         )
+        self._sync_stats_tmp_club_option()
         self._refresh_display()
+
+    def _sync_stats_tmp_club_option(self):
+        """Ajoute/retire STATS_TMP_CLUB_LABEL ("TMP") dans self.stats_
+        club_listbox selon qu'il existe, ou non, au moins un visiteur TMP
+        à comptabiliser dans la synthèse qui vient d'être générée (voir
+        _tmp_visitor_rows, demande du 2026-10-15) — TOUJOURS en fin de
+        liste (listbox.insert("end", ...)), jamais en réinitialisant les
+        autres entrées ni la sélection en cours (contrairement à
+        _populate_club_filter_listbox, jamais appelée ici) : les clubs du
+        Répertoire et le club actuellement coché restent donc intacts à
+        chaque "Générer la synthèse". N'affecte QUE self.stats_club_
+        listbox — jamais classement_club_listbox (onglet Classement, non
+        concerné par cette demande) ni le widget/la fonction partagés
+        (build_club_filter_widget/_populate_club_filter_listbox,
+        inchangés)."""
+        listbox = self.stats_club_listbox
+        items = listbox.get(0, "end")
+        has_tmp_visitors = bool(_tmp_visitor_rows(self.summary["players"]))
+        has_tmp_entry = STATS_TMP_CLUB_LABEL in items
+        if has_tmp_visitors and not has_tmp_entry:
+            listbox.insert("end", STATS_TMP_CLUB_LABEL)
+        elif not has_tmp_visitors and has_tmp_entry:
+            listbox.delete(items.index(STATS_TMP_CLUB_LABEL))
 
     def _club_filtered_players(self, players):
         """Sous-ensemble de `players` (une liste comme summary["players"])
@@ -4832,15 +4937,43 @@ class PeriodSummaryDialog(ttk.Frame):
         clubs (voir get_selected_clubs). Un joueur sans club renseigné
         dans le répertoire (le cas le plus courant pour les joueurs du
         club organisateur, jamais explicitement tagués) compte pour le
-        club réglé dans Paramètres, pas pour "aucun club"."""
+        club réglé dans Paramètres, pas pour "aucun club".
+
+        STATS_TMP_CLUB_LABEL ("TMP" coché, demande du 2026-10-15) : cas à
+        part, AVANT le repli roster/home_club ci-dessus — un visiteur TMP
+        n'a le plus souvent aucun club dans le Répertoire (voir
+        _tmp_visitor_rows) et ne doit JAMAIS être compté pour le club
+        organisateur par ce repli. Une ligne retenue par ce chemin est
+        une COPIE (jamais self.summary lui-même, jamais muté) dont
+        "club"/"tournaments_played" sont réécrits pour l'affichage —
+        "club" vaut la chaîne "TMP" (jamais une recherche Répertoire, qui
+        pourrait être vide ou trompeuse), "tournaments_played" devient le
+        nombre RÉEL de participations TMP (tmp_tournaments_played, voir
+        Database.build_period_summary — jamais le compteur officiel, qui
+        exclut structurellement les TMP). Tous les autres champs (points,
+        bounty, victoires...) restent les 0/None déjà corrects, inchangés
+        par cette copie. "_tmp_view" : simple marqueur interne pour
+        _apply_tmp_hors_classement ci-dessous, jamais lu ailleurs."""
         home_club = export_prefs.load_value("club_name", "").strip()
         selected_clubs = get_selected_clubs(self.stats_club_listbox)
         if not selected_clubs:
             return players
-        return [
-            a for a in players
-            if (roster.get_club(a["name"]) or home_club) in selected_clubs
-        ]
+        tmp_names = (
+            {a["name"] for a in _tmp_visitor_rows(players)}
+            if STATS_TMP_CLUB_LABEL in selected_clubs else set()
+        )
+        result = []
+        for a in players:
+            if a["name"] in tmp_names:
+                view = dict(a)
+                view["club"] = STATS_TMP_CLUB_LABEL
+                view["tournaments_played"] = a["tmp_tournaments_played"]
+                view["_tmp_view"] = True
+                result.append(view)
+                continue
+            if (roster.get_club(a["name"]) or home_club) in selected_clubs:
+                result.append(a)
+        return result
 
     def _on_stats_sort_click(self, sort_state, column):
         """Clic sur un en-tête triable de l'un des deux tableaux de
@@ -4883,7 +5016,9 @@ class PeriodSummaryDialog(ttk.Frame):
         # _stats_players_with_rank, jamais recalculé par _sort_stats_
         # players, qui ne fait que réordonner l'affichage.
         players = _sort_stats_players(
-            _stats_players_with_rank(self._club_filtered_players(self.summary["players"])),
+            _apply_tmp_hors_classement(
+                _stats_players_with_rank(self._club_filtered_players(self.summary["players"]))
+            ),
             self.stats_players_sort,
         )
         _apply_stats_sort_arrows(
@@ -4953,7 +5088,13 @@ class PeriodSummaryDialog(ttk.Frame):
             self.players_tree.insert(
                 "", "end",
                 values=(
-                    roster.get_club(a["name"]) or home_club or "-",
+                    # a.get("club") : UNIQUEMENT présent sur une ligne
+                    # visiteur TMP (voir _club_filtered_players, demande
+                    # du 2026-10-15) — vaut alors "TMP", jamais une
+                    # recherche Répertoire qui pourrait être vide ou
+                    # trompeuse (voir le home_club ci-dessous). Absent
+                    # pour toute ligne régulière, comportement INCHANGÉ.
+                    a.get("club") or roster.get_club(a["name"]) or home_club or "-",
                     a["rang"],
                     a["name"], a["tournaments_played"],
                     f"{a['total_presence_assiduity']:,}".replace(",", " "),
@@ -5004,7 +5145,9 @@ class PeriodSummaryDialog(ttk.Frame):
         # volontairement non consulté ici).
         export_summary = {
             "tournaments": self.summary["tournaments"],
-            "players": _stats_players_with_rank(self._club_filtered_players(self.summary["players"])),
+            "players": _apply_tmp_hors_classement(
+                _stats_players_with_rank(self._club_filtered_players(self.summary["players"]))
+            ),
         }
         PeriodExportDialog(self, export_summary, date_from=date_from, date_to=date_to)
 

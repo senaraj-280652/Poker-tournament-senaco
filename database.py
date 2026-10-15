@@ -5603,8 +5603,27 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                            winner, bounty_distributed}, ... ],  # triés par date
         "players": [ {name, tournaments_played, wins, best_place,
                        total_presence_assiduity, total_ranking_points,
-                       total_bounty_won, total_points}, ... ],  # triés par total_points décroissant
+                       total_bounty_won, total_points,
+                       is_tmp, tmp_tournaments_played}, ... ],  # triés par total_points décroissant
       }
+
+    "is_tmp"/"tmp_tournaments_played" (demande du 2026-10-15, statistiques
+    de FRÉQUENTATION des visiteurs TMP, distinctes des 8 champs OFFICIELS
+    ci-dessus, jamais mélangées avec eux) : "is_tmp" vaut Vrai dès que ce
+    nom a eu au moins une participation RÉELLE (voir is_tmp_club, status
+    != 'withdrawn' — même règle que "played" ci-dessous, appliquée ici à
+    un TMP plutôt que de l'exclure) tamponnée TMP sur la période ;
+    "tmp_tournaments_played" compte ces participations réelles — JAMAIS
+    "tournaments_played", qui exclut structurellement les TMP (voir plus
+    bas) et ne doit donc jamais servir à mesurer leur fréquentation. Un
+    joueur jamais tamponné TMP garde is_tmp=False/tmp_tournaments_
+    played=0, sans aucun effet sur le reste de cet agrégat. Qu'un ancien
+    TMP soit aujourd'hui redevenu un membre régulier du club (plus de
+    club "TMP" dans le Répertoire actuel) est une décision d'AFFICHAGE,
+    prise en aval par l'appelant (main.py, voir PeriodSummaryDialog) —
+    cette fonction, agnostique du Répertoire, continue de renvoyer le
+    FAIT HISTORIQUE brut, sans jamais recalculer ni altérer les anciens
+    tournois.
 
     "total_bounty_won" (par joueur) et "bounty_distributed" (par tournoi)
     viennent de la MÊME source que l'onglet Primes de chaque tournoi (voir
@@ -5819,9 +5838,19 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 # réellement participé (effectif RÉEL, voir "entries"
                 # ci-dessus, jamais touché par cette exclusion).
                 played = p["status"] != "withdrawn" and not is_tmp_club(p["club"])
+                # Statistiques de FRÉQUENTATION des TMP (demande du
+                # 2026-10-15, distincte des statistiques OFFICIELLES
+                # ci-dessus, jamais mélangée avec elles) : "tmp_real_
+                # participation" utilise la MÊME règle que "played"
+                # (un forfait, status='withdrawn', n'est jamais une
+                # venue réelle — même principe, appliqué ici à un TMP
+                # au lieu de l'exclure) — jamais le compteur officiel
+                # "tournaments_played", qui exclut structurellement les
+                # TMP (voir agg ci-dessous).
+                tmp_real_participation = is_tmp_club(p["club"]) and p["status"] != "withdrawn"
                 player_updates.append((
                     p["name"], place, bounty_won, points,
-                    presence_assiduity, ranking_pts, played,
+                    presence_assiduity, ranking_pts, played, tmp_real_participation,
                 ))
         except Exception as e:
             _log_skipped_tournament_file(path, e)
@@ -5830,7 +5859,8 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
             db.close()
 
         tournaments.append(tournament_entry)
-        for p_name, place, bounty_won, points, presence_assiduity, ranking_pts, played in player_updates:
+        for (p_name, place, bounty_won, points, presence_assiduity, ranking_pts, played,
+             tmp_real_participation) in player_updates:
             agg = players.setdefault(p_name, {
                 "name": p_name,
                 "tournaments_played": 0,
@@ -5840,6 +5870,12 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 "total_ranking_points": 0,
                 "total_bounty_won": 0,
                 "total_points": 0,
+                # Fréquentation TMP (demande du 2026-10-15, voir plus haut
+                # et la docstring de cette fonction) : purement additifs,
+                # jamais lus par les 8 champs ci-dessus ni par aucune
+                # règle de classement/points/bounty déjà validée.
+                "is_tmp": False,
+                "tmp_tournaments_played": 0,
             })
             if played:
                 agg["tournaments_played"] += 1
@@ -5851,6 +5887,9 @@ def build_period_summary(folder, date_from=None, date_to=None, recursive=True,
                 agg["wins"] += 1
             if place is not None and (agg["best_place"] is None or place < agg["best_place"]):
                 agg["best_place"] = place
+            if tmp_real_participation:
+                agg["is_tmp"] = True
+                agg["tmp_tournaments_played"] += 1
 
     tournaments.sort(key=lambda t: t["date"])
     players_list = sorted(players.values(), key=lambda a: a["total_points"], reverse=True)
