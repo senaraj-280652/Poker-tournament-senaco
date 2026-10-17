@@ -681,6 +681,32 @@ def selected_log_export_columns(keys):
     return [c for c in LOG_EXPORT_COLUMNS if c[0] in keys]
 
 
+# Colonnes exportables du second mode d'affichage "Participation" (demande
+# du 2026-10-16) — SÉPARÉES de LOG_EXPORT_COLUMNS ci-dessus (demande
+# explicite : "les préférences d'export des deux modes doivent être
+# indépendantes", jamais mélangées, jamais la même liste). Ordre et
+# intitulés IDENTIQUES à ceux déjà affichés dans self.log_participation_
+# tree (voir main.py: App._build_log_participation_tab) — "ce que je vois
+# dans le tableau = ce qui peut être exporté", même principe que LOG_
+# EXPORT_COLUMNS.
+LOG_PARTICIPATION_EXPORT_COLUMNS = [
+    ("date", "Date"),
+    ("tournament", "Tournoi"),
+    ("type", "Type"),
+    ("status", "Statut"),
+    ("classement", "Classement"),
+]
+
+
+def selected_log_participation_export_columns(keys):
+    """Même principe que selected_log_export_columns ci-dessus, pour
+    LOG_PARTICIPATION_EXPORT_COLUMNS — jamais mélangées entre elles."""
+    if keys is None:
+        return list(LOG_PARTICIPATION_EXPORT_COLUMNS)
+    keys = set(keys)
+    return [c for c in LOG_PARTICIPATION_EXPORT_COLUMNS if c[0] in keys]
+
+
 # Substitutions LISIBLES pour quelques caractères de "typographie
 # intelligente" courants (tiret cadratin/demi-cadratin, points de
 # suspension, guillemets/apostrophes courbes, symbole euro) — hors
@@ -754,7 +780,7 @@ def _pdf_text(value):
     return "".join(out_chars)
 
 
-def export_csv(path, columns, rows, title=None, criteria_line=None):
+def export_csv(path, columns, rows, title=None, criteria_line=None, count_label=None):
     """CSV — séparateur ";", encodage "utf-8-sig" (Excel français), une
     colonne par entrée de `columns` (voir selected_log_export_columns),
     dans cet ordre. `rows` : voir la docstring de section ci-dessus.
@@ -763,23 +789,29 @@ def export_csv(path, columns, rows, title=None, criteria_line=None):
     seule cellule — le titre ("Journal des actions" par défaut), la
     ligne de critères SEULEMENT si `criteria_line` est non vide (jamais
     une ligne par défaut inventée), puis "Nombre d'opérations : N" —
-    TOUJOURS présente, N = len(rows) (calculé ici, jamais transmis)."""
+    TOUJOURS présente, N = len(rows) (calculé ici, jamais transmis).
+
+    `count_label` (demande du 2026-10-16, mode "Participation" de
+    l'onglet LOG) : remplace "Nombre d'opérations" par ce texte si
+    fourni (ex. "Nombre de participations") — AUCUN appelant existant
+    ne le passe, comportement par défaut strictement inchangé."""
     import csv
 
     keys = [k for k, _ in columns]
+    count_label = count_label or "Nombre d'opérations"
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f, delimiter=";")
         writer.writerow([title or "Journal des actions"])
         if criteria_line:
             writer.writerow([criteria_line])
-        writer.writerow([f"Nombre d'opérations : {len(rows)}"])
+        writer.writerow([f"{count_label} : {len(rows)}"])
         writer.writerow([h for _, h in columns])
         for row in rows:
             writer.writerow([row.get(k, "") for k in keys])
     return path
 
 
-def export_xlsx(path, columns, rows, title=None, criteria_line=None):
+def export_xlsx(path, columns, rows, title=None, criteria_line=None, count_label=None, sheet_title=None):
     """Excel (.xlsx) — même style que database.export_primes_xlsx (titre
     en gras, ligne d'en-tête verte/blanche, largeurs de colonnes
     ajustées) : reprend le mécanisme existant plutôt que d'en inventer un
@@ -793,23 +825,30 @@ def export_xlsx(path, columns, rows, title=None, criteria_line=None):
     inventée), puis "Nombre d'opérations : N" — TOUJOURS présente, N =
     len(rows). `header_row` reste calculé dynamiquement (ws.max_row + 1,
     inchangé) : ces lignes en plus n'imposent aucun numéro de ligne fixe
-    ailleurs dans cette fonction."""
+    ailleurs dans cette fonction.
+
+    `count_label`/`sheet_title` (demande du 2026-10-16, mode
+    "Participation" de l'onglet LOG) : remplacent respectivement "Nombre
+    d'opérations" et le nom d'onglet Excel "LOG" si fournis — AUCUN
+    appelant existant ne les passe, comportement par défaut strictement
+    inchangé."""
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 
     keys = [k for k, _ in columns]
     headers = [h for _, h in columns]
+    count_label = count_label or "Nombre d'opérations"
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "LOG"
+    ws.title = sheet_title or "LOG"
 
     ws.append([title or "Journal des actions"])
     ws["A1"].font = Font(bold=True, size=14)
     if criteria_line:
         ws.append([criteria_line])
-    ws.append([f"Nombre d'opérations : {len(rows)}"])
+    ws.append([f"{count_label} : {len(rows)}"])
     ws.append([])
 
     header_row = ws.max_row + 1
@@ -916,7 +955,7 @@ def format_log_export_criteria(date_from=None, date_to=None, tournament_label="T
     return "Critères : " + " — ".join(segments)
 
 
-def export_pdf(path, columns, rows, title=None, criteria_line=None):
+def export_pdf(path, columns, rows, title=None, criteria_line=None, count_label=None):
     """PDF — même esprit que database._write_pdf_table (titre en gras,
     en-tête vert/blanc, lignes alternées, paysage automatique au-delà
     d'un certain nombre de colonnes, taille de police adaptée) mais avec
@@ -944,11 +983,17 @@ def export_pdf(path, columns, rows, title=None, criteria_line=None):
     absente), même style gris — TOUJOURS présente, contrairement à
     `criteria_line`, et elle aussi protégée par _pdf_text (un nombre
     reste toujours latin-1, mais le principe "tout texte dessiné passe
-    par _pdf_text" reste appliqué sans exception). Nécessite 'fpdf2'."""
+    par _pdf_text" reste appliqué sans exception). Nécessite 'fpdf2'.
+
+    `count_label` (demande du 2026-10-16, mode "Participation" de
+    l'onglet LOG) : remplace "Nombre d'opérations" si fourni — AUCUN
+    appelant existant ne le passe, comportement par défaut strictement
+    inchangé."""
     from fpdf import FPDF
 
     keys = [k for k, _ in columns]
     headers = [h for _, h in columns]
+    count_label = count_label or "Nombre d'opérations"
     orientation = "L" if len(columns) > 4 else "P"
     pdf = FPDF(orientation=orientation, unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -960,7 +1005,7 @@ def export_pdf(path, columns, rows, title=None, criteria_line=None):
     pdf.set_text_color(90, 90, 90)
     if criteria_line:
         pdf.cell(0, 6, _pdf_text(criteria_line), new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(0, 6, _pdf_text(f"Nombre d'opérations : {len(rows)}"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 6, _pdf_text(f"{count_label} : {len(rows)}"), new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
     pdf.ln(4)
 

@@ -583,6 +583,23 @@ class DataPurgeDialogTest(unittest.TestCase):
         picker_au.destroy()
         self.assertEqual(_toplevel_children(dlg), [])
 
+    def test_jamais_de_bouton_aujourdhui_dans_purger_donnees(self):
+        """Non-régression explicite (demande du 2026-10-17, bouton
+        "Aujourd'hui" ajouté UNIQUEMENT pour Journal des actions et
+        Participation — voir tests/test_log_purge.py::LogDatePickerTest
+        et tests/test_log_participation_tab.py::TodayButtonTest) :
+        "Purger Données" garde son calendrier STRICTEMENT inchangé —
+        DataPurgeDialog._show_log_date_picker passe explicitement
+        show_today_button=False à App._show_log_date_picker."""
+        dlg = self._make_dialog()
+        picker_du = self._open_calendar(dlg, which=0)
+        self.assertIsNone(next((b for b in _all_buttons(picker_du) if b.cget("text") == "Aujourd'hui"), None))
+        picker_du.destroy()
+
+        picker_au = self._open_calendar(dlg, which=1)
+        self.assertIsNone(next((b for b in _all_buttons(picker_au) if b.cget("text") == "Aujourd'hui"), None))
+        picker_au.destroy()
+
     # ------------------------------------------------------------------
     # Fermeture de DataPurgeDialog / calendrier — SIGSEGV réel rapporté
     # le 2026-10-07 (postérieur au correctif de transfert de grab

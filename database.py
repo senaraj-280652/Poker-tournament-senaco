@@ -5529,6 +5529,127 @@ def _tournament_type_matches(path, tournament_type):
     return True
 
 
+def _tournament_type_label(path):
+    """Libellé affiché (demande du 2026-10-16, onglet LOG > Fonction >
+    "Participation", colonne "Type") pour le fichier .tournoi `path` —
+    MÊME convention de nommage que _tournament_type_matches ci-dessus
+    ("To"/"Sn", jamais dupliquée différemment), mais sous forme de
+    libellé plutôt que de filtre booléen. "Inconnu" (jamais une
+    supposition) pour tout nom hors convention (ex. un ancien repli
+    "tournoi.tournoi", ou un renommage manuel) — jamais classé à tort
+    comme Tournoi ou Sit & Go."""
+    name = os.path.basename(path)
+    if name.startswith("To"):
+        return "Tournoi"
+    if name.startswith("Sn"):
+        return "Sit & Go"
+    return "Inconnu"
+
+
+def find_player_participations(paths, name, date_from=None, date_to=None, cancel_event=None):
+    """Historique de participation d'un joueur (membre régulier OU TMP,
+    identifié par son NOM — voir is_tmp_club/players.club, demande du
+    2026-10-16, onglet LOG > Fonction > "Participation") à travers les
+    fichiers .tournoi déjà trouvés dans `paths`. La RECHERCHE de ces
+    fichiers (bornée et annulable) vit dans data_purge.scan_folder_for_
+    tournaments — JAMAIS ici, jamais find_tournament_files/glob sans
+    limite (voir l'incident documenté dans data_purge.py) : cette
+    fonction se contente de LIRE les fichiers déjà trouvés.
+
+    Correspondance de nom : EXACTE (espaces/casse ignorés), aucune
+    tentative de rapprochement de variantes/fautes de frappe — même
+    limite déjà acceptée par Database.build_period_summary (agrégation
+    par nom, aucun identifiant ne traverse les fichiers .tournoi).
+
+    `date_from`/`date_to` (demande du 2026-10-17, filtres "Du"/"Au" du
+    mode "Participation") : chaînes 'AAAA-MM-JJ' (bornes INCLUSES), ou
+    None pour ne pas borner — EXACTEMENT le même principe que Database.
+    build_period_summary (comparaison de dates ISO, jamais une formule
+    dupliquée) : un tournoi est retenu si sa date (get_tournament_date)
+    tombe dans l'intervalle, comparé avant même de chercher le joueur
+    dans ce fichier (évite une lecture complète de players_rows pour un
+    fichier déjà hors période).
+
+    `cancel_event` (threading.Event, optionnel) : vérifié avant chaque
+    fichier — permet d'interrompre PROPREMENT une recherche encore en
+    cours de LECTURE (après la découverte des fichiers elle-même, déjà
+    annulable séparément), jamais en plein milieu de la lecture d'un
+    fichier. Aucun appel Tkinter ici, directement ou indirectement — à
+    exécuter hors du thread Tk (voir main.py, orchestration du
+    threading).
+
+    Pour chaque fichier contenant une ligne "players" dont le nom
+    correspond, renvoie un dict :
+      {date, tournament_name, path,
+       type ("Tournoi"/"Sit & Go"/"Inconnu", voir _tournament_type_label),
+       status ("Actif"/"Forfait"/"Éliminé", voir players_rows),
+       classement (int, ou "Hors classement" pour un TMP, ou "-" si pas
+       encore classé — forfait ou tournoi encore en cours)}.
+    Triée par date croissante.
+
+    "classement" réutilise EXCLUSIVEMENT players_rows()/official_rang
+    (TMP-compatible, is_tmp_club) — jamais une formule dupliquée ici :
+    un TMP (is_tmp_club(club)) est toujours "Hors classement", quel que
+    soit son official_rang (déjà None pour lui) ; un régulier déjà
+    classé affiche son official_rang (entier) ; tout le reste (pas
+    encore classé : encore actif sans être seul survivant, ou forfait,
+    qui n'a jamais de rang officiel) affiche "-".
+
+    Un fichier illisible/corrompu, ou dont le schéma manque une colonne
+    nécessaire (très vieux fichier jamais rouvert en écriture depuis
+    avant l'ajout de cette colonne — voir Database._migrate, limite déjà
+    acceptée ailleurs), est silencieusement ignoré (voir _log_skipped_
+    tournament_file) — jamais une exception remontée à l'appelant, sur
+    le MÊME principe que build_period_summary. AUCUNE écriture : chaque
+    fichier est ouvert en lecture seule (read_only=True) et refermé
+    aussitôt lu."""
+    name_key = (name or "").strip().casefold()
+    results = []
+    for path in paths:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        try:
+            db = Database(path, read_only=True)
+        except Exception as e:
+            _log_skipped_tournament_file(path, e)
+            continue
+        try:
+            date = db.get_tournament_date()
+            if date_from and date < date_from:
+                continue
+            if date_to and date > date_to:
+                continue
+            row = next(
+                (r for r in db.players_rows() if r["name"].strip().casefold() == name_key),
+                None,
+            )
+            if row is None:
+                continue
+            if is_tmp_club(row["club"]):
+                classement = "Hors classement"
+            elif row["official_rang"] is not None:
+                classement = row["official_rang"]
+            else:
+                classement = "-"
+            tournament_name = db.get_setting(
+                "tournament_name", os.path.splitext(os.path.basename(path))[0]
+            )
+            results.append({
+                "date": date,
+                "tournament_name": tournament_name,
+                "path": path,
+                "type": _tournament_type_label(path),
+                "status": row["status"],
+                "classement": classement,
+            })
+        except Exception as e:
+            _log_skipped_tournament_file(path, e)
+        finally:
+            db.close()
+    results.sort(key=lambda r: r["date"] or "")
+    return results
+
+
 # Sous-dossiers "jour" (demande du 2026-09-18, onglet Statistiques,
 # 7 cases à cocher Lundi...Dimanche) — mêmes noms que WEEKDAY_NAMES_FR
 # (main.py: tournament_day_folder_proposal), qui les CRÉE ; ce module ne

@@ -481,8 +481,20 @@ _LOG_METHODS = (
     # _on_log_purge lui-même reste strictement inchangé et intégralement
     # couvert par le reste de ce fichier.
     "_on_purge_choice",
+    # "Participation" (demande du 2026-10-16, second mode d'affichage) :
+    # voir la même note dans tests/test_log_tab_functional.py.
+    "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+    "_browse_log_participation_folder", "_start_log_participation_search",
+    "_poll_log_participation_queue", "_on_log_participation_search_finished",
+    "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+    "_on_log_participation_export",
+    "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+    "_apply_log_participation_tournament_filter",
 )
-_LOG_STATIC_METHODS = ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text")
+_LOG_STATIC_METHODS = (
+    "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+    "_run_log_participation_search_worker",
+)
 
 
 @unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible dans cet environnement")
@@ -582,6 +594,66 @@ class LogDatePickerTest(LogPurgeGuiTestCase):
         month_lbl = _find_widget(picker, lambda w: isinstance(w, ttk.Label) and expected_year in w.cget("text"))
         self.assertIsNotNone(month_lbl)
         picker.destroy()
+
+    def test_bouton_aujourdhui_present_pour_du(self):
+        """Demande du 2026-10-17 : le calendrier du Journal des actions
+        (mode normal) propose un bouton "Aujourd'hui" (show_today_button
+        =True par défaut, voir App._show_log_date_picker)."""
+        self.win._build_log_tab()
+        self.win._show_log_date_picker(self.win.log_date_from_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        self.assertIsNotNone(_find_button(picker, "Aujourd'hui"))
+        picker.destroy()
+
+    def test_bouton_aujourdhui_present_pour_au(self):
+        self.win._build_log_tab()
+        self.win._show_log_date_picker(self.win.log_date_to_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        self.assertIsNotNone(_find_button(picker, "Aujourd'hui"))
+        picker.destroy()
+
+    def test_bouton_aujourdhui_remplit_du_au_format_jj_mm_aaaa_et_ferme_le_popup(self):
+        self.win._build_log_tab()
+        self.win.log_date_from_var.set("01/01/2020")  # mois/année arbitrairement différents
+        self.win._show_log_date_picker(self.win.log_date_from_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        _find_button(picker, "Aujourd'hui").invoke()
+        value = self.win.log_date_from_var.get()
+        self.assertEqual(value, datetime.now().strftime("%d/%m/%Y"))
+        self.assertEqual([w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel)], [])
+
+    def test_bouton_aujourdhui_remplit_au(self):
+        self.win._build_log_tab()
+        self.win._show_log_date_picker(self.win.log_date_to_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        _find_button(picker, "Aujourd'hui").invoke()
+        self.assertEqual(self.win.log_date_to_var.get(), datetime.now().strftime("%d/%m/%Y"))
+
+    def test_bouton_aujourdhui_najamais_lie_a_un_jour_navigue_differemment(self):
+        """Contrairement à un clic sur un jour de la grille (qui dépend
+        du mois/année NAVIGUÉ), "Aujourd'hui" doit toujours renvoyer la
+        date RÉELLE, même après avoir changé de mois dans le popup."""
+        self.win._build_log_tab()
+        self.win._show_log_date_picker(self.win.log_date_from_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        _find_button(picker, "▶").invoke()  # navigue vers le mois suivant
+        _find_button(picker, "Aujourd'hui").invoke()
+        self.assertEqual(self.win.log_date_from_var.get(), datetime.now().strftime("%d/%m/%Y"))
+
+    def test_selection_normale_dun_jour_toujours_possible_avec_le_bouton_present(self):
+        """Non-régression explicite (exigence 5) : la sélection d'un jour
+        dans la grille reste possible normalement, bouton "Aujourd'hui"
+        ou pas."""
+        self.win._build_log_tab()
+        self.win.log_date_from_var.set("")
+        self.win._show_log_date_picker(self.win.log_date_from_var, self.win.log_reset_btn)
+        picker = next(w for w in self.win.winfo_children() if isinstance(w, tk.Toplevel))
+        btn = _find_button(picker, "15")
+        self.assertIsNotNone(btn)
+        btn.invoke()
+        value = self.win.log_date_from_var.get()
+        datetime.strptime(value, "%d/%m/%Y")
+        self.assertTrue(value.startswith("15/"))
 
 
 # -----------------------------------------------------------------------

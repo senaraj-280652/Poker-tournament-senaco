@@ -411,9 +411,25 @@ class LogTabRealBuildTest(unittest.TestCase):
             # pour que log_purge_btn continue de se construire sans
             # AttributeError ; le câblage LOG lui-même reste inchangé.
             "_on_purge_choice",
+            # "Participation" (demande du 2026-10-16, second mode
+            # d'affichage) : voir la même note dans tests/test_log_tab_
+            # functional.py — nécessaires pour que _build_log_tab
+            # continue de se construire sans AttributeError.
+            "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+            "_browse_log_participation_folder", "_start_log_participation_search",
+            "_poll_log_participation_queue", "_on_log_participation_search_finished",
+            "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+            "_on_log_participation_export",
+            # Filtres Du/Au/Tournoi + bouton "Retour" (demande du 2026-10-17) :
+            # idem, nécessaire à la construction sans AttributeError.
+            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+            "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
-        for name in ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text"):
+        for name in (
+            "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+            "_run_log_participation_search_worker",
+        ):
             setattr(self.win, name, getattr(main.App, name))
         self.win._LOG_CALENDAR_MONTH_NAMES_FR = main.App._LOG_CALENDAR_MONTH_NAMES_FR
 
@@ -445,38 +461,55 @@ class LogTabRealBuildTest(unittest.TestCase):
         self.assertEqual(self.win.log_function_var.get(), "Toutes")
         self.assertEqual(self.win.log_player_var.get(), "Tous")
 
-    def test_reinitialiser_rechercher_exporter_purger_sur_la_meme_ligne_dans_cet_ordre(self):
-        """Précision du 2026-09-24 : les 4 boutons doivent être sur la
-        MÊME ligne, dans l'ordre Réinitialiser -> Rechercher -> Exporter
-        -> Purger (Purger ajouté par la correction du même jour, séparé
-        visuellement des 3 premiers par un séparateur vertical)."""
+    def test_reinitialiser_rechercher_purger_sur_la_meme_ligne_dans_cet_ordre(self):
+        """Précision du 2026-09-24 : Réinitialiser/Rechercher/Purger
+        restent sur la MÊME ligne, dans cet ordre (Purger ajouté par la
+        correction du même jour, séparé visuellement des 2 premiers par
+        un séparateur vertical). "Exporter" a rejoint "Fonction" dans la
+        bande TOUJOURS visible le 2026-10-16 (voir le test dédié ci-
+        dessous) — il n'est donc plus sur cette ligne, demande explicite
+        ("doit rester accessible dans les deux modes")."""
         self.win._build_log_tab()
         self.assertIs(
             self.win.log_reset_btn.master, self.win.log_search_btn.master,
             "Réinitialiser et Rechercher doivent être sur la même ligne",
         )
         self.assertIs(
-            self.win.log_search_btn.master, self.win.log_export_btn.master,
-            "Exporter doit être sur la même ligne que Rechercher",
-        )
-        self.assertIs(
-            self.win.log_export_btn.master, self.win.log_purge_btn.master,
-            "Purger doit être sur la même ligne que les 3 autres boutons",
+            self.win.log_search_btn.master, self.win.log_purge_btn.master,
+            "Purger doit être sur la même ligne que les 2 autres boutons",
         )
         siblings = self.win.log_reset_btn.master.pack_slaves()
         positions = {
             "reset": siblings.index(self.win.log_reset_btn),
             "search": siblings.index(self.win.log_search_btn),
-            "export": siblings.index(self.win.log_export_btn),
             "purge": siblings.index(self.win.log_purge_btn),
         }
         self.assertLess(positions["reset"], positions["search"])
-        self.assertLess(positions["search"], positions["export"])
-        self.assertLess(positions["export"], positions["purge"])
+        self.assertLess(positions["search"], positions["purge"])
+
+    def test_fonction_et_exporter_toujours_visibles_hors_de_cette_ligne(self):
+        """Demande du 2026-10-16 : "Fonction" et "Exporter" doivent
+        rester accessibles dans les deux modes d'affichage — construits
+        par _build_log_persistent_bar, JAMAIS dans la même frame que
+        Réinitialiser/Rechercher/Purger (qui restent masqués en mode
+        Participation, voir App._apply_log_view_mode), et toujours
+        ENFANTS DIRECTS de self.log_tab lui-même (jamais de _log_normal_
+        criteria_frame, qui est masquée dans ce mode)."""
+        self.win._build_log_tab()
+        self.assertIsNot(self.win.log_export_btn.master, self.win.log_reset_btn.master)
+        self.assertIs(self.win.log_export_btn.master, self.win.log_function_combo.master)
+        self.assertIs(self.win.log_export_btn.master.master, self.log_tab)
+        self.assertIsNot(self.win.log_export_btn.master, self.win._log_normal_criteria_frame)
 
     def test_boutons_calendrier_du_et_au_existent(self):
         """Correction du 2026-09-24 : un bouton 📅 accompagne chacun des
-        champs Du/Au (voir _show_log_date_picker)."""
+        champs Du/Au du Journal des actions (voir _show_log_date_picker).
+        Portée volontairement limitée à _log_normal_criteria_frame (mode
+        normal) : depuis l'ajout des filtres Du/Au du mode "Participation"
+        (demande du 2026-10-17), self.log_tab contient aussi les 2 boutons
+        📅 de ce second mode — voir test_boutons_calendrier_du_et_au_
+        existent_en_mode_participation ci-dessous pour leur couverture
+        dédiée, qui ne doit pas être confondue avec celle-ci."""
         self.win._build_log_tab()
 
         def _count_calendar_buttons(widget):
@@ -487,7 +520,30 @@ class LogTabRealBuildTest(unittest.TestCase):
                 count += _count_calendar_buttons(c)
             return count
 
-        self.assertEqual(_count_calendar_buttons(self.log_tab), 2, "un bouton 📅 pour Du et un pour Au")
+        self.assertEqual(
+            _count_calendar_buttons(self.win._log_normal_criteria_frame), 2,
+            "un bouton 📅 pour Du et un pour Au",
+        )
+
+    def test_boutons_calendrier_du_et_au_existent_en_mode_participation(self):
+        """Ajout du 2026-10-17 : le mode "Participation" reçoit lui aussi
+        ses propres champs Du/Au avec bouton 📅 (voir _build_log_
+        participation_tab), indépendants de ceux du mode normal couverts
+        par le test ci-dessus."""
+        self.win._build_log_tab()
+
+        def _count_calendar_buttons(widget):
+            count = 0
+            for c in widget.winfo_children():
+                if isinstance(c, ttk.Button) and c.cget("text") == "📅":
+                    count += 1
+                count += _count_calendar_buttons(c)
+            return count
+
+        self.assertEqual(
+            _count_calendar_buttons(self.win._log_participation_frame), 2,
+            "un bouton 📅 pour Du et un pour Au en mode Participation",
+        )
 
     def test_criteres_log_enfants_de_log_tab_jamais_de_ca_tab(self):
         self.win._build_log_tab()

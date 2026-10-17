@@ -52,8 +52,28 @@ _LOG_METHODS = (
     # log_purge_btn continue de se construire sans AttributeError ; le
     # câblage LOG lui-même reste inchangé.
     "_on_purge_choice",
+    # "Participation" (demande du 2026-10-16, second mode d'affichage) :
+    # ajoutées pour que _build_log_tab (qui construit désormais aussi ce
+    # second mode, voir _build_log_participation_tab) continue de
+    # fonctionner sans AttributeError dans ce harnais — comportement des
+    # 8 fonctions ci-dessus INCHANGÉ par cet ajout (voir tests/test_log_
+    # participation_tab.py pour la couverture dédiée de ce nouveau mode).
+    "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+    "_browse_log_participation_folder", "_start_log_participation_search",
+    "_poll_log_participation_queue", "_on_log_participation_search_finished",
+    "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+    # "Exporter" (demande du 2026-10-16, export du mode "Participation") :
+    # idem, nécessaire à la construction sans AttributeError.
+    "_on_log_participation_export",
+    # Filtres Du/Au/Tournoi + bouton "Retour" (demande du 2026-10-17) :
+    # idem, nécessaire à la construction sans AttributeError.
+    "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+    "_apply_log_participation_tournament_filter",
 )
-_LOG_STATIC_METHODS = ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text")
+_LOG_STATIC_METHODS = (
+    "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+    "_run_log_participation_search_worker",
+)
 
 
 @unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible dans cet environnement")
@@ -224,7 +244,13 @@ class FiltresTest(LogTabFunctionalTestCase):
     def test_combobox_alimentees_depuis_les_donnees_reelles(self):
         self.assertEqual(set(self.win.log_user_combo["values"]), {"Tous", "Marie", "Raj"})
         self.assertEqual(set(self.win.log_player_combo["values"]), {"Tous", "Alice", "Bob"})
-        self.assertEqual(set(self.win.log_function_combo["values"]), {"Toutes", "Éliminations", "Chronomètre"})
+        # "Participation" (demande du 2026-10-16) : TOUJOURS proposée en
+        # plus des catégories réellement présentes dans le journal — voir
+        # tests/test_log_participation_tab.py pour sa couverture dédiée.
+        self.assertEqual(
+            set(self.win.log_function_combo["values"]),
+            {"Toutes", "Éliminations", "Chronomètre", main.LOG_PARTICIPATION_LABEL},
+        )
         self.assertEqual(
             set(self.win.log_tournament_combo["values"]), {"Tous", "Tournoi A", "Tournoi B"},
         )

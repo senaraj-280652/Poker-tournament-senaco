@@ -287,10 +287,11 @@ class WhatsAppPhoneGuardStructuralTest(_SourceHelper, unittest.TestCase):
 # 5. _build_tabs : branche standalone
 # =====================================================================
 class BuildTabsStandaloneStructuralTest(_SourceHelper, unittest.TestCase):
-    def test_branche_standalone_seulement_4_onglets(self):
+    def test_branche_standalone_seulement_5_onglets(self):
         """Blindes/Répertoire/Statistiques (depuis le 2026-10-13) +
-        Paramètres (ajouté le 2026-10-14) — tous les autres onglets
-        tournoi-spécifiques restent absents."""
+        Paramètres (ajouté le 2026-10-14) + LOG (ajouté le 2026-10-16,
+        "le LOG fait partie des outils de suivi et de statistiques") —
+        tous les autres onglets tournoi-spécifiques restent absents."""
         func = self._find_method("App", "_build_tabs")
         seg = self._source_of(func)
         start = seg.index("if self.db is None:")
@@ -299,8 +300,9 @@ class BuildTabsStandaloneStructuralTest(_SourceHelper, unittest.TestCase):
         self.assertIn('self.notebook.add(self.blinds_tab, text="Blindes")', standalone_branch)
         self.assertIn('self.notebook.add(self.roster_tab, text="Répertoire")', standalone_branch)
         self.assertIn('self.notebook.add(self.stats_tab, text="Statistiques")', standalone_branch)
+        self.assertIn('self.notebook.add(self.log_tab, text="LOG")', standalone_branch)
         self.assertIn('self.notebook.add(self.settings_tab, text="Paramètres")', standalone_branch)
-        for forbidden in ("Joueurs", "Tables", "Mouvements", "Primes", "Chronomètre", "Classement", "CA", "LOG"):
+        for forbidden in ("Joueurs", "Tables", "Mouvements", "Primes", "Chronomètre", "Classement", "CA"):
             self.assertNotIn(f'text="{forbidden}"', standalone_branch)
         self.assertIn("return", standalone_branch)
 

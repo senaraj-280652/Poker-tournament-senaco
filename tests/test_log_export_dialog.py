@@ -73,6 +73,7 @@ from tkinter import ttk
 import action_log  # noqa: E402
 import export_prefs  # noqa: E402
 import main  # noqa: E402
+import tournament_prefs  # noqa: E402
 from _tk_cleanup import cleanup_tk  # noqa: E402
 
 try:
@@ -555,6 +556,166 @@ class ChoixDuFormatTest(LogExportDialogGuiTestCase):
         self.assertEqual(kwargs["defaultextension"], ".xlsx")
 
 
+class InitialDirJamaisLaRacineDuDisqueTest(LogExportDialogGuiTestCase):
+    """Demande du 2026-10-16 : un export "Participation" avait échoué
+    avec "Read-only file system" sur un Mac — asksaveasfilename sans
+    `initialdir` s'était ouvert sur "/" (racine protégée en écriture).
+    Le Journal des actions partage EXACTEMENT le même appel
+    (asksaveasfilename sans initialdir avant ce correctif) — vérifié
+    ici pour les 3 formats qu'il passe désormais toujours un dossier
+    RÉEL, accessible en écriture, jamais "/". setUp() (LogExportDialog
+    GuiTestCase) ne redirige PAS tournament_prefs — ces tests utilisent
+    donc le repli "non renseigné" (voir DefaultExportDirTest ci-dessous
+    pour les 3 cas détaillés et isolés)."""
+
+    def setUp(self):
+        super().setUp()
+        tp_patcher = patch.object(
+            tournament_prefs, "_prefs_path",
+            return_value=os.path.join(self._tmp.name, "last_settings.json"),
+        )
+        self.addCleanup(tp_patcher.stop)
+        tp_patcher.start()
+
+    def test_initialdir_toujours_fourni_et_jamais_la_racine(self):
+        for fmt in ("csv", "xlsx", "pdf"):
+            with self.subTest(fmt=fmt):
+                dlg = self._open()
+                dlg.format_var.set(fmt)
+                export_fn = {"csv": "export_csv", "xlsx": "export_xlsx", "pdf": "export_pdf"}[fmt]
+                with patch("main.filedialog.asksaveasfilename", return_value="") as mock_save, \
+                     patch(f"action_log.{export_fn}"):
+                    dlg._do_export()
+                kwargs = mock_save.call_args[1]
+                self.assertIn("initialdir", kwargs)
+                self.assertNotEqual(kwargs["initialdir"], "/")
+                self.assertTrue(os.path.isdir(kwargs["initialdir"]))
+                self.assertTrue(os.access(kwargs["initialdir"], os.W_OK))
+
+    def test_utilisateur_reste_libre_de_choisir_un_autre_dossier(self):
+        """initialdir n'est qu'un point de départ — le chemin RENVOYÉ
+        par le sélecteur (celui que l'utilisateur a réellement choisi)
+        est bien celui utilisé pour écrire le fichier, jamais ignoré ni
+        remplacé par ce correctif."""
+        dlg = self._open()
+        dlg.format_var.set("csv")
+        chosen_path = os.path.join(self._tmp.name, "ailleurs", "mon_export.csv")
+        os.makedirs(os.path.dirname(chosen_path), exist_ok=True)
+        with patch("main.filedialog.asksaveasfilename", return_value=chosen_path), \
+             patch("action_log.export_csv") as mock_export:
+            dlg._do_export()
+        self.assertEqual(mock_export.call_args[0][0], chosen_path)
+
+    def test_dossier_par_defaut_configure_et_valide_est_utilise(self):
+        """Demande du 2026-10-16 ("pourquoi les fenêtres d'export ne
+        tiennent-elles pas compte du Dossier par défaut ?") : s'il est
+        renseigné et accessible, il devient le dossier de départ."""
+        configured = os.path.join(self._tmp.name, "dossier_du_jour")
+        os.makedirs(configured, exist_ok=True)
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        dlg = self._open()
+        dlg.format_var.set("csv")
+        with patch("main.filedialog.asksaveasfilename", return_value="") as mock_save, \
+             patch("action_log.export_csv"):
+            dlg._do_export()
+        self.assertEqual(mock_save.call_args[1]["initialdir"], configured)
+
+    def test_dossier_par_defaut_introuvable_avertit_puis_replie_sur_le_personnel(self):
+        """Renseigné mais introuvable (clé USB débranchée...) : message
+        explicite affiché, PUIS repli sur le dossier personnel — jamais
+        un repli silencieux, jamais une recréation automatique, jamais
+        un blocage de l'export (option validée explicitement)."""
+        configured = os.path.join(self._tmp.name, "disparu")
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        dlg = self._open()
+        dlg.format_var.set("csv")
+        with patch("main.filedialog.asksaveasfilename", return_value="") as mock_save, \
+             patch("action_log.export_csv"), \
+             patch.object(main.messagebox, "showwarning") as mock_warn:
+            dlg._do_export()
+        mock_warn.assert_called_once()
+        self.assertIn(configured, mock_warn.call_args[0][1])
+        self.assertEqual(mock_save.call_args[1]["initialdir"], os.path.expanduser("~"))
+
+
+class DefaultExportDirTest(unittest.TestCase):
+    """main.default_export_dir — isolé de tournament_prefs (fichier
+    temporaire dédié, jamais le vrai ~/.poker_tournament/last_settings.
+    json de ce poste)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="default_export_dir_test_")
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(
+            tournament_prefs, "_prefs_path",
+            return_value=os.path.join(self._tmp.name, "last_settings.json"),
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_non_renseigne_replie_silencieusement_sur_le_dossier_personnel(self):
+        with patch.object(main.messagebox, "showwarning") as mock_warn:
+            result = main.default_export_dir()
+        self.assertEqual(result, os.path.expanduser("~"))
+        mock_warn.assert_not_called()
+
+    def test_renseigne_et_valide_est_utilise_tel_quel(self):
+        configured = os.path.join(self._tmp.name, "dossier_du_jour")
+        os.makedirs(configured, exist_ok=True)
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        with patch.object(main.messagebox, "showwarning") as mock_warn:
+            result = main.default_export_dir()
+        self.assertEqual(result, configured)
+        mock_warn.assert_not_called()
+
+    def test_renseigne_mais_introuvable_avertit_et_replie_sur_le_personnel(self):
+        configured = os.path.join(self._tmp.name, "disparu")
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        with patch.object(main.messagebox, "showwarning") as mock_warn:
+            result = main.default_export_dir()
+        self.assertEqual(result, os.path.expanduser("~"))
+        mock_warn.assert_called_once()
+        self.assertIn(configured, mock_warn.call_args[0][1])
+
+    def test_renseigne_mais_non_accessible_en_ecriture_avertit(self):
+        configured = os.path.join(self._tmp.name, "lecture_seule")
+        os.makedirs(configured, exist_ok=True)
+        home = os.path.expanduser("~")
+        real_access = os.access
+
+        def _fake_access(path, mode):
+            if path == configured:
+                return False
+            return real_access(path, mode)
+
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        with patch("main.os.access", side_effect=_fake_access), \
+             patch.object(main.messagebox, "showwarning") as mock_warn:
+            result = main.default_export_dir()
+        mock_warn.assert_called_once()
+        self.assertEqual(result, home)
+
+    def test_jamais_la_racine_du_disque_dans_aucun_cas(self):
+        self.assertNotEqual(main.default_export_dir(), "/")
+        tournament_prefs.save_last_settings({"tournament_day_folder": "/"})
+        with patch.object(main.messagebox, "showwarning"):
+            # "/" existe mais n'est pas accessible en écriture pour un
+            # utilisateur normal -> jamais renvoyé tel quel.
+            self.assertNotEqual(main.default_export_dir(), "/")
+
+    def test_repli_sur_un_dossier_temporaire_si_le_dossier_personnel_est_inaccessible(self):
+        with patch("main.os.path.isdir", return_value=False):
+            self.assertEqual(main.default_export_dir(), tempfile.gettempdir())
+
+    def test_avertissement_associe_a_la_fenetre_parent_fournie(self):
+        configured = os.path.join(self._tmp.name, "disparu")
+        tournament_prefs.save_last_settings({"tournament_day_folder": configured})
+        sentinel = object()
+        with patch.object(main.messagebox, "showwarning") as mock_warn:
+            main.default_export_dir(parent=sentinel)
+        self.assertIs(mock_warn.call_args[1]["parent"], sentinel)
+
+
 class ColonnesCocheesEtOrdreTest(LogExportDialogGuiTestCase):
     def test_seules_les_colonnes_cochees_sont_transmises_dans_lordre(self):
         dlg = self._open()
@@ -742,9 +903,22 @@ class LogExportEndToEndTest(unittest.TestCase):
             # pour que log_purge_btn continue de se construire sans
             # AttributeError ; le câblage LOG lui-même reste inchangé.
             "_on_purge_choice",
+            # "Participation" (demande du 2026-10-16, second mode
+            # d'affichage) : voir la même note dans tests/test_log_tab_
+            # functional.py.
+            "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+            "_browse_log_participation_folder", "_start_log_participation_search",
+            "_poll_log_participation_queue", "_on_log_participation_search_finished",
+            "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+            "_on_log_participation_export",
+            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+            "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
-        for name in ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text"):
+        for name in (
+            "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+            "_run_log_participation_search_worker",
+        ):
             setattr(self.win, name, getattr(main.App, name))
         self.win._LOG_CALENDAR_MONTH_NAMES_FR = main.App._LOG_CALENDAR_MONTH_NAMES_FR
 
@@ -877,9 +1051,22 @@ class VolumeImportantTest(unittest.TestCase):
             # pour que log_purge_btn continue de se construire sans
             # AttributeError ; le câblage LOG lui-même reste inchangé.
             "_on_purge_choice",
+            # "Participation" (demande du 2026-10-16, second mode
+            # d'affichage) : voir la même note dans tests/test_log_tab_
+            # functional.py.
+            "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+            "_browse_log_participation_folder", "_start_log_participation_search",
+            "_poll_log_participation_queue", "_on_log_participation_search_finished",
+            "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+            "_on_log_participation_export",
+            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+            "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
-        for name in ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text"):
+        for name in (
+            "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+            "_run_log_participation_search_worker",
+        ):
             setattr(self.win, name, getattr(main.App, name))
         self.win._LOG_CALENDAR_MONTH_NAMES_FR = main.App._LOG_CALENDAR_MONTH_NAMES_FR
 
@@ -1458,9 +1645,22 @@ class OnLogExportBuildsCriteriaLineTest(unittest.TestCase):
             # pour que log_purge_btn continue de se construire sans
             # AttributeError ; le câblage LOG lui-même reste inchangé.
             "_on_purge_choice",
+            # "Participation" (demande du 2026-10-16, second mode
+            # d'affichage) : voir la même note dans tests/test_log_tab_
+            # functional.py.
+            "_apply_log_view_mode", "_build_log_participation_tab", "_build_log_persistent_bar",
+            "_browse_log_participation_folder", "_start_log_participation_search",
+            "_poll_log_participation_queue", "_on_log_participation_search_finished",
+            "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
+            "_on_log_participation_export",
+            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
+            "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
-        for name in ("_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text"):
+        for name in (
+            "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
+            "_run_log_participation_search_worker",
+        ):
             setattr(self.win, name, getattr(main.App, name))
         self.win._LOG_CALENDAR_MONTH_NAMES_FR = main.App._LOG_CALENDAR_MONTH_NAMES_FR
 

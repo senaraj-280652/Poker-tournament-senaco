@@ -38,7 +38,7 @@ from database import (
     RANKING_FORMULA_TOURNOIS_CPC, RANKING_FORMULA_SITNGO_CPC, RANKING_FORMULA_LABELS,
     REMOTE_PERMISSION_LABELS,
     STATS_TOURNAMENT_TYPE_TOURNOIS, STATS_TOURNAMENT_TYPE_SITNGO, STATS_TOURNAMENT_TYPE_ALL,
-    STATS_WEEKDAY_FOLDER_NAMES, is_tmp_club,
+    STATS_WEEKDAY_FOLDER_NAMES, is_tmp_club, find_player_participations,
 )
 from structures import (
     default_blind_structure, standard_payout_structure, generate_blind_structure,
@@ -978,6 +978,65 @@ def default_tournament_dir():
     return os.path.expanduser("~")
 
 
+def default_export_dir(parent=None):
+    """Dossier de départ pour les sélecteurs "Exporter..." (demande du
+    2026-10-16, suite à un export "Participation" ayant réellement
+    échoué avec "Read-only file system" sur un Mac : asksaveasfilename
+    sans `initialdir` s'était ouvert sur la racine du disque "/",
+    protégée en écriture).
+
+    Règle validée le 2026-10-16 ("pourquoi les fenêtres d'export ne
+    tiennent-elles pas compte du Dossier par défaut de Senaco ?") :
+    1. "Dossier par défaut" (réglage tournament_day_folder, voir
+       Paramètres) renseigné ET réellement accessible en écriture ->
+       utilisé tel quel. tournament_prefs.load_last_settings() reste
+       TOUJOURS à jour, qu'un tournoi soit ouvert ou non (voir App.
+       _save_day_folder, qui y écrit en plus de self.db à chaque
+       sauvegarde) — jamais besoin de distinguer les deux contextes ici.
+    2. Renseigné mais introuvable/inaccessible (clé USB débranchée,
+       dossier supprimé/renommé...) -> message D'AVERTISSEMENT EXPLICITE
+       le nommant, JAMAIS recréé automatiquement — PUIS repli sur le
+       dossier personnel (option validée explicitement par
+       l'utilisateur : avertir plutôt que bloquer purement et
+       simplement l'export en pleine soirée de tournoi). Jamais un
+       repli SILENCIEUX dans ce cas précis : l'avertissement est
+       TOUJOURS affiché avant.
+    3. Pas renseigné du tout (jamais réglé) -> repli silencieux sur le
+       dossier personnel, aucune règle explicite ne couvrant ce cas (ce
+       n'est pas une erreur en soi, juste l'absence de préférence).
+
+    Jamais la racine du disque dans aucun cas (même principe que
+    default_tournament_dir ci-dessus, déjà validé pour la création de
+    tournoi) — le dossier personnel de l'utilisateur existe et est
+    accessible en écriture sur tout compte normal ; le repli vers un
+    dossier temporaire ne sert qu'aux cas extrêmes où même lui serait
+    inaccessible (jamais observé en pratique, défense en profondeur
+    uniquement).
+
+    Dans tous les cas, ce n'est qu'un POINT DE DÉPART : le sélecteur
+    natif qui s'ouvre ensuite reste entièrement libre, l'utilisateur
+    peut toujours choisir un autre dossier et un autre nom de fichier.
+
+    `parent` : fenêtre Tk à associer au message d'avertissement éventuel
+    (messagebox.showwarning) — None accepté (repli sur le comportement
+    par défaut de Tkinter)."""
+    configured = tournament_prefs.load_last_settings().get("tournament_day_folder", "").strip()
+    if configured:
+        if os.path.isdir(configured) and os.access(configured, os.W_OK):
+            return configured
+        messagebox.showwarning(
+            "Dossier par défaut introuvable",
+            "Le « Dossier par défaut » réglé dans Paramètres n'est plus "
+            f"accessible :\n{configured}\n\n"
+            "Choisissez un autre dossier pour cet export.",
+            parent=parent,
+        )
+    home = os.path.expanduser("~")
+    if os.path.isdir(home) and os.access(home, os.W_OK):
+        return home
+    return tempfile.gettempdir()
+
+
 # Noms de sous-dossiers "jour de tournoi" (voir tournament_day_folder_proposal) :
 # l'index correspond à datetime.weekday() (lundi=0 ... dimanche=6).
 WEEKDAY_NAMES_FR = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]
@@ -1137,6 +1196,15 @@ SINGLE_TOURNAMENT_PREF_KEY = "single_tournament_at_a_time"
 # 1-3 chiffres ("01/01/26" serait alors interprété comme l'an 26), ce
 # que cette regex exclut d'abord.
 _LOG_DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+
+# "Participation" (demande du 2026-10-16) : pseudo-valeur de "Fonction"
+# qui bascule l'onglet LOG vers un SECOND mode d'affichage (recherche de
+# l'historique de participation d'un joueur à travers les fichiers
+# .tournoi) — JAMAIS une vraie catégorie du journal actions_log.py (voir
+# App._apply_log_view_mode/_refresh_log_filter_choices/_refresh_log_tab)
+# : les 8 fonctions existantes (filtrage du journal, inchangées) ne
+# connaissent jamais cette valeur.
+LOG_PARTICIPATION_LABEL = "Participation"
 
 # Ancien plafond de 500 lignes affichées/exportées par une recherche LOG
 # (décision du 2026-09-24) — ABANDONNÉ le 2026-09-25 ("CE QUI CORRESPOND
@@ -6039,6 +6107,7 @@ class LogExportDialog(tk.Toplevel):
             defaultextension=ext,
             filetypes=filetypes,
             initialfile=f"journal_actions_{datetime.now():%Y%m%d_%H%M%S}{ext}",
+            initialdir=default_export_dir(parent=self),
         )
         if not path:
             return
@@ -6077,6 +6146,144 @@ class LogExportDialog(tk.Toplevel):
             # OUVERTE (pas de self.destroy()) et fichier JAMAIS ouvert
             # (pas d'open_file_with_default_app) : l'export a échoué,
             # rien ne doit laisser croire le contraire.
+            _log_exception(type(e), e, e.__traceback__)
+            messagebox.showerror(
+                "Erreur d'export",
+                f"L'export {fmt.upper()} a échoué :\n{e}",
+            )
+            return
+        self.destroy()
+        open_file_with_default_app(path)
+
+
+class LogParticipationExportDialog(tk.Toplevel):
+    """Export du second mode d'affichage "Participation" de l'onglet LOG
+    (demande du 2026-10-16) — MÊME présentation que LogExportDialog
+    ci-dessus (Format + Colonnes à exporter + Exporter.../Annuler,
+    "présentation homogène avec les autres modules de Senaco", demande
+    explicite), mais ENTIÈREMENT SÉPARÉE : colonnes (action_log.LOG_
+    PARTICIPATION_EXPORT_COLUMNS, jamais LOG_EXPORT_COLUMNS), préférences
+    (export_prefs sous la clé "log_participation", jamais "log" — "les
+    préférences d'export des deux modes doivent être indépendantes"),
+    titre/texte de comptage ("Historique de participation"/"Nombre de
+    participations", jamais "Journal des actions"/"Nombre d'opérations").
+
+    `rows` : instantané FIGÉ des lignes actuellement affichées dans
+    self.log_participation_tree, construit par App._on_log_participation_
+    export AVANT l'ouverture de cette fenêtre — jamais une nouvelle
+    recherche relancée ici, même principe que LogExportDialog. `player_
+    name` : nom actuellement recherché, utilisé uniquement pour le titre
+    affiché et le nom de fichier par défaut — jamais relu dans la base ni
+    dans un fichier .tournoi depuis cette fenêtre."""
+
+    def __init__(self, master, rows, player_name=""):
+        super().__init__(master)
+        self.rows = rows
+        self.player_name = player_name
+        self.title("Exporter l'historique de participation")
+        self.configure(bg=FELT_DARK)
+        self.geometry("420x360")
+        self.transient(master)
+        self.grab_set()
+
+        self.format_var = tk.StringVar(value=export_prefs.load_format("log_participation"))
+
+        saved_cols = export_prefs.load_columns(
+            "log_participation", [k for k, _ in action_log.LOG_PARTICIPATION_EXPORT_COLUMNS],
+        )
+        self.col_vars = {
+            key: tk.BooleanVar(value=key in saved_cols)
+            for key, _ in action_log.LOG_PARTICIPATION_EXPORT_COLUMNS
+        }
+
+        btns = ttk.Frame(self)
+        btns.pack(side="top", fill="x", padx=14, pady=(14, 8))
+        ttk.Button(btns, text="Exporter...", command=self._do_export).pack(side="left")
+        ttk.Button(btns, text="Annuler", command=self.destroy).pack(side="right")
+
+        fmt_frame = ttk.LabelFrame(self, text="Format")
+        fmt_frame.pack(fill="x", padx=14, pady=(0, 8))
+        ttk.Radiobutton(fmt_frame, text="CSV", variable=self.format_var, value="csv").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="Excel (.xlsx)", variable=self.format_var, value="xlsx").pack(
+            side="left", padx=10, pady=6
+        )
+        ttk.Radiobutton(fmt_frame, text="PDF", variable=self.format_var, value="pdf").pack(
+            side="left", padx=10, pady=6
+        )
+
+        cols_frame = ttk.LabelFrame(self, text="Colonnes à exporter")
+        cols_frame.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = ttk.Frame(cols_frame)
+        bar.pack(fill="x", padx=8, pady=(4, 2))
+        ttk.Button(
+            bar, text="Tout cocher",
+            command=lambda: [v.set(True) for v in self.col_vars.values()],
+        ).pack(side="left", padx=(0, 6))
+        ttk.Button(
+            bar, text="Tout décocher",
+            command=lambda: [v.set(False) for v in self.col_vars.values()],
+        ).pack(side="left")
+        grid = ttk.Frame(cols_frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=(2, 8))
+        for idx, (key, header) in enumerate(action_log.LOG_PARTICIPATION_EXPORT_COLUMNS):
+            ttk.Checkbutton(grid, text=header, variable=self.col_vars[key]).grid(
+                row=idx // 2, column=idx % 2, sticky="w", padx=6, pady=2
+            )
+
+    def _do_export(self):
+        keys = [k for k, v in self.col_vars.items() if v.get()]
+        if not keys:
+            messagebox.showerror("Erreur", "Sélectionnez au moins une colonne à exporter.")
+            return
+
+        export_prefs.save_columns("log_participation", keys)
+        export_prefs.save_format("log_participation", self.format_var.get())
+
+        columns = action_log.selected_log_participation_export_columns(keys)
+        fmt = self.format_var.get()
+        ext = {"csv": ".csv", "xlsx": ".xlsx", "pdf": ".pdf"}[fmt]
+        filetypes = {
+            "csv": [("Fichier CSV", "*.csv")],
+            "xlsx": [("Fichier Excel", "*.xlsx")],
+            "pdf": [("Fichier PDF", "*.pdf")],
+        }[fmt]
+        safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in self.player_name).strip() or "joueur"
+        path = filedialog.asksaveasfilename(
+            title="Exporter l'historique de participation",
+            defaultextension=ext,
+            filetypes=filetypes,
+            initialfile=f"participation_{safe_name}_{datetime.now():%Y%m%d_%H%M%S}{ext}",
+            initialdir=default_export_dir(parent=self),
+        )
+        if not path:
+            return
+
+        title = f"Historique de participation — {self.player_name}" if self.player_name else "Historique de participation"
+        try:
+            if fmt == "xlsx":
+                action_log.export_xlsx(
+                    path, columns, self.rows, title=title,
+                    count_label="Nombre de participations", sheet_title="Participation",
+                )
+            elif fmt == "pdf":
+                action_log.export_pdf(
+                    path, columns, self.rows, title=title,
+                    count_label="Nombre de participations",
+                )
+            else:
+                action_log.export_csv(
+                    path, columns, self.rows, title=title,
+                    count_label="Nombre de participations",
+                )
+        except ImportError:
+            show_missing_export_module(fmt)
+            return
+        except Exception as e:
+            # Même défense qu'à LogExportDialog._do_export ci-dessus :
+            # jamais une exception d'export avalée silencieusement par
+            # Tkinter, fenêtre gardée ouverte, aucun fichier ouvert.
             _log_exception(type(e), e, e.__traceback__)
             messagebox.showerror(
                 "Erreur d'export",
@@ -7167,7 +7374,12 @@ class DataPurgeDialog(tk.Toplevel):
         être dupliquée ni modifiée pour le LOG."""
         self._LOG_CALENDAR_MONTH_NAMES_FR = App._LOG_CALENDAR_MONTH_NAMES_FR
         before = {w for w in self.winfo_children() if isinstance(w, tk.Toplevel)}
-        App._show_log_date_picker(self, target_var, anchor_widget)
+        # show_today_button=False (demande du 2026-10-17) : le bouton
+        # "Aujourd'hui" n'a été demandé que pour Journal des actions et
+        # Participation — "Purger Données" garde son calendrier
+        # STRICTEMENT inchangé (voir tout l'historique de correctifs
+        # grab/focus/SIGSEGV ci-dessus, jamais à rouvrir sans raison).
+        App._show_log_date_picker(self, target_var, anchor_widget, show_today_button=False)
         created = [w for w in self.winfo_children() if isinstance(w, tk.Toplevel) and w not in before]
         if not created:
             return
@@ -10096,6 +10308,13 @@ class App(tk.Tk):
             statsmenu.add_command(label="Synthèse par période...", command=self._open_period_summary)
             menubar.add_cascade(label="Statistiques", menu=statsmenu)
 
+            # LOG (demande du 2026-10-16) : même principe que Statistiques
+            # ci-dessus — un simple raccourci vers l'onglet déjà construit
+            # (voir _build_tabs), jamais une seconde implémentation.
+            logmenu = tk.Menu(menubar, tearoff=0)
+            logmenu.add_command(label="Consulter le LOG...", command=self._open_log_tab)
+            menubar.add_cascade(label="LOG", menu=logmenu)
+
             datamenu = tk.Menu(menubar, tearoff=0)
             datamenu.add_command(label="💾 Sauvegarder sur clé USB...", command=lambda: self._run_backup_flow(self))
             datamenu.add_command(label="♻️ Restaurer depuis une clé USB...", command=lambda: self._run_restore_flow(self))
@@ -10203,6 +10422,13 @@ class App(tk.Tk):
         # (PeriodSummaryDialog). Le menu reste, en simple raccourci.
         self.notebook.select(self.stats_tab)
 
+    def _open_log_tab(self):
+        # Bascule vers l'onglet "LOG" (voir App._build_tabs, demande du
+        # 2026-10-16, menu réduit "Ouvrir Senaco") — même principe que
+        # _open_period_summary ci-dessus pour "Statistiques" : un simple
+        # raccourci, jamais une seconde implémentation.
+        self.notebook.select(self.log_tab)
+
     def _manage_roster(self):
         # Bascule vers l'onglet "Répertoire" (voir App._build_tabs) —
         # avant cette réorganisation, ouvrait une fenêtre séparée
@@ -10264,24 +10490,36 @@ class App(tk.Tk):
 
         if self.db is None:
             # "🖥️ Ouvrir Senaco" sans tournoi (demande du 2026-10-13,
-            # Paramètres ajouté le 2026-10-14) : SEULS Blindes/Répertoire/
-            # Statistiques/Paramètres ont un sens sans self.db — tous les
-            # autres onglets (Joueurs, Tables, Mouvements, Primes,
-            # Chronomètre, Classement, CA, LOG) ne sont même pas créés,
-            # jamais juste masqués : ils dépendent tous directement d'un
-            # tournoi ouvert. self.notebook reste néanmoins créé
-            # INCONDITIONNELLEMENT juste au-dessus, avant toute autre
-            # chose — _tick()/_refresh_all() y accèdent sans jamais
-            # supposer un nombre précis d'onglets.
+            # Paramètres ajouté le 2026-10-14, LOG ajouté le 2026-10-16) :
+            # SEULS Blindes/Répertoire/Statistiques/LOG/Paramètres ont un
+            # sens sans self.db — tous les autres onglets (Joueurs,
+            # Tables, Mouvements, Primes, Chronomètre, Classement, CA) ne
+            # sont même pas créés, jamais juste masqués : ils dépendent
+            # tous directement d'un tournoi ouvert. self.notebook reste
+            # néanmoins créé INCONDITIONNELLEMENT juste au-dessus, avant
+            # toute autre chose — _tick()/_refresh_all() y accèdent sans
+            # jamais supposer un nombre précis d'onglets.
+            #
+            # LOG (demande du 2026-10-16, "le LOG fait partie des outils
+            # de suivi et de statistiques") : _build_log_tab (ci-dessous)
+            # est RÉUTILISÉE telle quelle, jamais dupliquée — confirmé
+            # qu'elle ne référence jamais self.db (uniquement le journal
+            # global action_log.py, indépendant de tout tournoi), donc
+            # consultation/export/purge fonctionnent ici à l'identique,
+            # avec exactement les mêmes garde-fous qu'avec un tournoi
+            # ouvert (voir _on_log_purge, jamais modifiée).
             self.blinds_tab = ttk.Frame(self.notebook)
             self.roster_tab = RosterManagerDialog(self.notebook, self)
             self.stats_tab = PeriodSummaryDialog(self.notebook, self)
+            self.log_tab = ttk.Frame(self.notebook)
             self.settings_tab = ttk.Frame(self.notebook)
             self.notebook.add(self.blinds_tab, text="Blindes")
             self.notebook.add(self.roster_tab, text="Répertoire")
             self.notebook.add(self.stats_tab, text="Statistiques")
+            self.notebook.add(self.log_tab, text="LOG")
             self.notebook.add(self.settings_tab, text="Paramètres")
             self._build_blinds_tab()
+            self._build_log_tab()
             self._build_settings_tab_standalone()
             self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
             return
@@ -20243,16 +20481,36 @@ class App(tk.Tk):
         truncated_lbl tant qu'il ne servait qu'à signaler un dépassement
         du plafond de 500 lignes, désormais supprimé) : affiche en
         permanence "N opération(s) affichée(s)", voir _log_count_label_
-        text/_refresh_log_tab."""
+        text/_refresh_log_tab.
+
+        self._log_normal_criteria_frame/self._log_normal_results_frame
+        (demande du 2026-10-16, second mode d'affichage "Participation")
+        : les 3 widgets "normaux" (critères, compteur, tableau 9
+        colonnes) sont gardés sous ces noms pour pouvoir être masqués/
+        réaffichés par _apply_log_view_mode SANS jamais toucher à leur
+        construction ni à leur contenu — voir _build_log_participation_
+        tab, construite juste après, cachée par défaut.
+
+        _build_log_persistent_bar (demande du 2026-10-16, AVANT `top`,
+        donc affichée tout en haut de l'onglet) : "Fonction" et
+        "Exporter" doivent rester accessibles dans LES DEUX modes — ni
+        l'un ni l'autre n'est donc plus construit par _build_log_search_
+        criteria_placeholder ci-dessous (qui garde tout le reste
+        strictement à l'identique), ni jamais masquée par _apply_log_
+        view_mode, contrairement à `top`/`results`/self.log_count_lbl."""
+        self._build_log_persistent_bar()
+
         top = ttk.Frame(self.log_tab)
         top.pack(padx=20, pady=(20, 8), anchor="nw", fill="x")
         self._build_log_search_criteria_placeholder(top, row=0)
+        self._log_normal_criteria_frame = top
 
         self.log_count_lbl = ttk.Label(self.log_tab, foreground=MUTED)
         self.log_count_lbl.pack(padx=20, anchor="w")
 
         results = ttk.Frame(self.log_tab)
         results.pack(fill="both", expand=True, padx=20, pady=(6, 20))
+        self._log_normal_results_frame = results
 
         cols = ("ts", "tournament", "user", "role", "category", "action", "player", "result", "message")
         headers = [
@@ -20286,6 +20544,11 @@ class App(tk.Tk):
         self._log_tournament_label_to_path = {}
         self._log_category_label_to_key = {}
 
+        # "Participation" (demande du 2026-10-16) : construite ICI,
+        # cachée par défaut (jamais pack()ée) — voir _apply_log_view_
+        # mode, seule méthode qui l'affiche/la masque.
+        self._build_log_participation_tab()
+
         # Chargement initial (§11 de l'analyse validée) : opérations
         # récentes affichées dès la construction de l'onglet, sans
         # attendre un clic sur Rechercher — une seule requête indexée
@@ -20293,15 +20556,62 @@ class App(tk.Tk):
         # plusieurs années.
         self._refresh_log_tab()
 
+    def _build_log_persistent_bar(self):
+        """Bande TOUJOURS visible en haut de l'onglet LOG (demande du
+        2026-10-16, export du mode "Participation") : "Fonction" (la
+        liste déroulante elle-même) et "Exporter" — ni l'un ni l'autre
+        n'est plus jamais masqué par _apply_log_view_mode, contrairement
+        à tout le reste (critères/compteur/tableau des 2 modes). Sans
+        cette bande, choisir "Participation" rendait la liste "Fonction"
+        elle-même inaccessible (tout le conteneur self._log_normal_
+        criteria_frame qui la contenait disparaissait avec elle) — aucun
+        moyen de revenir en arrière à l'écran ; corrigé en même temps que
+        cette demande d'export, qui a le même besoin.
+
+        self.log_function_combo/self.log_export_btn : MÊMES attributs,
+        MÊME widget, MÊME command= qu'avant le 2026-10-16 — seul
+        l'ENDROIT où ils sont construits change (ici, plutôt que dans
+        _build_log_search_criteria_placeholder/log_actions_row). Les 3
+        autres boutons (Réinitialiser/Rechercher/Purger) et tous les
+        autres critères restent exactement là où ils étaient, sans le
+        moindre changement de présentation — voir _build_log_search_
+        criteria_placeholder ci-dessous."""
+        bar = ttk.Frame(self.log_tab)
+        bar.pack(padx=20, pady=(20, 0), anchor="nw", fill="x")
+        ttk.Label(bar, text="Fonction :").pack(side="left", padx=(0, 4))
+        self.log_function_var = tk.StringVar(value="Toutes")
+        self.log_function_combo = ttk.Combobox(
+            bar, textvariable=self.log_function_var, state="readonly", width=14,
+            values=("Toutes",),
+        )
+        self.log_function_combo.pack(side="left")
+        # "Participation" (demande du 2026-10-16) : SEUL endroit qui
+        # réagit à un changement de "Fonction" — bascule immédiatement
+        # l'affichage (voir _apply_log_view_mode), sans attendre un clic
+        # sur "Rechercher". <<ComboboxSelected>> ne se déclenche QUE sur
+        # une sélection faite par l'utilisateur (jamais sur un .set()
+        # programmatique, ex. _refresh_log_filter_choices/_on_log_reset
+        # — ce dernier appelle donc _apply_log_view_mode lui-même, voir
+        # sa docstring).
+        self.log_function_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_log_view_mode())
+        self.log_export_btn = ttk.Button(bar, text="Exporter", command=self._on_log_export)
+        self.log_export_btn.pack(side="left", padx=(16, 0))
+
     def _build_log_search_criteria_placeholder(self, parent, row):
         """Critères de recherche du Journal des actions — RÉELLEMENT
         câblés depuis le chantier "LOG", Phase 2 (2026-09-24) : Du/Au/
-        Tournoi/Utilisateur/Fonction/Joueur alimentent action_log.
-        search_actions (voir _refresh_log_tab). 4 boutons : Réinitialiser/
-        Rechercher/Exporter (_on_log_reset/_on_log_search/_on_log_export)
-        et, ajouté par la correction du même jour, Purger (_on_log_purge)
-        — Du/Au portent aussi un petit bouton calendrier 📅 (voir
-        _show_log_date_picker), sans dépendance externe.
+        Tournoi/Utilisateur/Joueur alimentent action_log.search_actions
+        (voir _refresh_log_tab ; "Fonction" alimente aussi ce filtre,
+        mais vit désormais dans la bande TOUJOURS visible construite par
+        _build_log_tab, voir plus bas — self.log_function_var/_combo
+        existent déjà quand cette méthode s'exécute). 2 boutons ici :
+        Réinitialiser/Rechercher (_on_log_reset/_on_log_search), plus
+        Purger (_on_log_purge, ajouté par la correction du même jour) —
+        "Exporter" a rejoint "Fonction" dans la bande toujours visible le
+        2026-10-16 (mode "Participation", qui a besoin des deux dans les
+        deux modes d'affichage). Du/Au portent aussi un petit bouton
+        calendrier 📅 (voir _show_log_date_picker), sans dépendance
+        externe.
 
         Purger réutilise désormais EXACTEMENT les mêmes 6 filtres que
         Rechercher, avec EXACTEMENT la même interprétation (revu le
@@ -20313,11 +20623,11 @@ class App(tk.Tk):
         dernier, Tournoi/Utilisateur/Fonction/Joueur sur "Tous"/"Toutes"
         = aucune restriction sur ce critère.
 
-        Une seule grille PARTAGÉE par les 4 lignes (jamais une grille
+        Une seule grille PARTAGÉE par les 3 lignes (jamais une grille
         par ligne) : "Du"/"Utilisateur"/"Joueur" tombent tous en
-        colonne 0, "Au"/"Fonction" en colonne 2 — même mécanisme
-        d'alignement par colonne que "Permissions DIRTO" juste à droite
-        (voir _build_remote_dirto_permissions_widgets)."""
+        colonne 0, "Au" en colonne 2 — même mécanisme d'alignement par
+        colonne que "Permissions DIRTO" juste à droite (voir
+        _build_remote_dirto_permissions_widgets)."""
         criteria = ttk.Frame(parent)
         criteria.grid(row=row, column=0, columnspan=2, sticky="w")
 
@@ -20365,19 +20675,18 @@ class App(tk.Tk):
             values=("Tous",),
         )
         self.log_user_combo.grid(row=1, column=1, sticky="w", padx=(0, 16), pady=(0, 6))
-        ttk.Label(criteria, text="Fonction :").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(0, 6))
-        self.log_function_var = tk.StringVar(value="Toutes")
-        self.log_function_combo = ttk.Combobox(
-            criteria, textvariable=self.log_function_var, state="readonly", width=14,
-            values=("Toutes",),
-        )
-        self.log_function_combo.grid(row=1, column=3, sticky="w", pady=(0, 6))
+        # "Fonction" (déplacée le 2026-10-16 dans une bande TOUJOURS
+        # visible, voir _build_log_tab/_build_log_persistent_bar) :
+        # colonnes 2-3 de cette ligne restent simplement vides — jamais
+        # reconstruite ici, self.log_function_var/self.log_function_combo
+        # existent déjà au moment où cette méthode s'exécute.
 
-        # Ligne 3 : Joueur, puis Réinitialiser / Rechercher / Exporter
+        # Ligne 3 : Joueur, puis Réinitialiser / Rechercher
         # SUR LA MÊME LIGNE (demande du 2026-09-24, précision apportée
-        # le même jour) — sous-frame packée (jamais une grille dédiée)
-        # pour aligner les 3 boutons côte à côte sans avoir à gérer
-        # 3 colonnes de grille supplémentaires.
+        # le même jour ; "Exporter" déplacé le 2026-10-16 dans la bande
+        # TOUJOURS visible, voir ci-dessus) — sous-frame packée (jamais
+        # une grille dédiée) pour aligner les boutons côte à côte sans
+        # avoir à gérer de colonnes de grille supplémentaires.
         ttk.Label(criteria, text="Joueur :").grid(row=2, column=0, sticky="w", padx=(0, 4), pady=(0, 10))
         self.log_player_var = tk.StringVar(value="Tous")
         self.log_player_combo = ttk.Combobox(
@@ -20389,17 +20698,15 @@ class App(tk.Tk):
         log_actions_row = ttk.Frame(criteria)
         log_actions_row.grid(row=2, column=2, columnspan=4, sticky="w", pady=(0, 10))
         # Réellement câblés depuis le chantier "LOG", Phase 2
-        # (2026-09-24) — voir _on_log_reset/_on_log_search/_on_log_export.
-        # "Purger" (revu le 2026-09-25) : utilise désormais les 6 mêmes
-        # filtres que Rechercher — voir _on_log_purge. Placé à droite
-        # d'un petit séparateur vertical pour le distinguer visuellement
-        # des 3 actions non destructives qui précèdent.
+        # (2026-09-24) — voir _on_log_reset/_on_log_search. "Purger"
+        # (revu le 2026-09-25) : utilise désormais les 6 mêmes filtres
+        # que Rechercher — voir _on_log_purge. Placé à droite d'un petit
+        # séparateur vertical pour le distinguer visuellement de
+        # Réinitialiser/Rechercher, action non destructive.
         self.log_reset_btn = ttk.Button(log_actions_row, text="Réinitialiser", command=self._on_log_reset)
         self.log_reset_btn.pack(side="left")
         self.log_search_btn = ttk.Button(log_actions_row, text="🔍 Rechercher", command=self._on_log_search)
         self.log_search_btn.pack(side="left", padx=(8, 0))
-        self.log_export_btn = ttk.Button(log_actions_row, text="Exporter", command=self._on_log_export)
-        self.log_export_btn.pack(side="left", padx=(8, 0))
         ttk.Separator(log_actions_row, orient="vertical").pack(side="left", fill="y", padx=(12, 12))
         self.log_purge_btn = ttk.Button(log_actions_row, text="🗑 Purger", command=self._on_purge_choice)
         self.log_purge_btn.pack(side="left")
@@ -20482,7 +20789,17 @@ class App(tk.Tk):
         self._log_category_label_to_key = {
             action_log.category_label(c): c for c in categories
         }
-        function_values = ("Toutes",) + tuple(action_log.category_label(c) for c in categories)
+        # LOG_PARTICIPATION_LABEL (demande du 2026-10-16) : TOUJOURS
+        # proposée, en dernière position, contrairement aux catégories
+        # ci-dessus qui ne listent que celles réellement présentes dans
+        # le journal — "Participation" ne filtre pas ce journal, voir
+        # App._apply_log_view_mode, jamais ajoutée à _log_category_
+        # label_to_key (donc jamais transmise comme category= à
+        # action_log.search_actions, voir _current_log_filter_values).
+        function_values = (
+            ("Toutes",) + tuple(action_log.category_label(c) for c in categories)
+            + (LOG_PARTICIPATION_LABEL,)
+        )
         self.log_function_combo["values"] = function_values
         if self.log_function_var.get() not in function_values:
             self.log_function_var.set("Toutes")
@@ -20591,7 +20908,17 @@ class App(tk.Tk):
         désormais en permanence le nombre EXACT de lignes du tableau
         (voir _log_count_label_text), calculé sur `rows` lui-même —
         jamais un compte séparé qui pourrait diverger de ce qui est
-        réellement affiché."""
+        réellement affiché.
+
+        LOG_PARTICIPATION_LABEL (demande du 2026-10-16) : retour
+        immédiat si c'est la "Fonction" actuellement sélectionnée — ce
+        mode n'interroge JAMAIS action_log.search_actions (données
+        complètement différentes, voir App._apply_log_view_mode/
+        _start_log_participation_search), et son propre tableau
+        (self.log_participation_tree) reste de toute façon caché,
+        jamais rafraîchi par cette méthode-ci."""
+        if self.log_function_var.get() == LOG_PARTICIPATION_LABEL:
+            return
         self._refresh_log_filter_choices()
 
         date_from, date_to, ok, tournament_path, category, user_name, player_name = (
@@ -20646,14 +20973,513 @@ class App(tk.Tk):
         """Réinitialiser (option B validée le 2026-09-24) : vide Du/Au,
         remet les 4 combobox sur "Tous"/"Toutes", PUIS relance
         immédiatement une recherche sans filtre — jamais un tableau vidé
-        en attente d'un second clic sur Rechercher."""
+        en attente d'un second clic sur Rechercher.
+
+        self._apply_log_view_mode() (demande du 2026-10-16, ajoutée par
+        défense en profondeur) : ce bouton vit dans self._log_normal_
+        criteria_frame, donc caché tant que "Fonction" vaut LOG_
+        PARTICIPATION_LABEL — inatteignable par un clic réel dans ce
+        cas. Un .set() programmatique (ligne ci-dessus) ne déclenche
+        jamais <<ComboboxSelected>> (voir _build_log_search_criteria_
+        placeholder) : cet appel explicite garantit que l'affichage
+        bascule bien vers le tableau normal si jamais ce bouton était
+        atteint autrement."""
         self.log_date_from_var.set("")
         self.log_date_to_var.set("")
         self.log_tournament_var.set("Tous")
         self.log_user_var.set("Tous")
         self.log_function_var.set("Toutes")
         self.log_player_var.set("Tous")
+        self._apply_log_view_mode()
         self._refresh_log_tab()
+
+    # -----------------------------------------------------------------
+    # Onglet LOG — second mode d'affichage "Participation" (demande du
+    # 2026-10-16) : historique de participation d'un joueur (membre
+    # régulier OU TMP) à travers les fichiers .tournoi d'un dossier —
+    # données COMPLÈTEMENT DIFFÉRENTES du journal actions_log.py utilisé
+    # par les 8 fonctions ci-dessus (jamais mélangées, jamais la même
+    # requête). Toute la logique de LECTURE vit dans database.
+    # find_player_participations (jamais un SQL direct ici) ; la
+    # RECHERCHE de fichiers (bornée, annulable) réutilise data_purge.
+    # scan_folder_for_tournaments, déjà validée pour "Purger les
+    # données" — même mécanisme de threading/file d'attente/sondage que
+    # DataPurgeDialog._start_scan et consorts, jamais une seconde
+    # implémentation parallèle.
+    # -----------------------------------------------------------------
+
+    def _apply_log_view_mode(self):
+        """Bascule l'affichage de l'onglet LOG selon que "Fonction" vaut
+        LOG_PARTICIPATION_LABEL ou non — masque/affiche simplement les 3
+        widgets "normaux" (self._log_normal_criteria_frame/self.
+        log_count_lbl/self._log_normal_results_frame) en échange du
+        second mode (self._log_participation_frame), JAMAIS une
+        fenêtre séparée, JAMAIS une modification des 8 fonctions
+        existantes (ni leur construction, ni action_log.py, ni self.
+        log_tree) — jamais les deux groupes empaquetés à la fois.
+
+        Appelée au changement RÉEL de sélection de la combobox (voir
+        _build_log_search_criteria_placeholder, <<ComboboxSelected>>)
+        ET explicitement par _on_log_reset (qui réinitialise "Fonction"
+        par le code, sans jamais déclencher cet événement)."""
+        is_participation = self.log_function_var.get() == LOG_PARTICIPATION_LABEL
+        if is_participation:
+            self._log_normal_criteria_frame.pack_forget()
+            self.log_count_lbl.pack_forget()
+            self._log_normal_results_frame.pack_forget()
+            self._log_participation_frame.pack(fill="both", expand=True)
+        else:
+            self._log_participation_frame.pack_forget()
+            self._log_normal_criteria_frame.pack(padx=20, pady=(20, 8), anchor="nw", fill="x")
+            self.log_count_lbl.pack(padx=20, anchor="w")
+            self._log_normal_results_frame.pack(fill="both", expand=True, padx=20, pady=(6, 20))
+
+    def _return_to_normal_log_view(self):
+        """Bouton "◀ Retour au Journal des actions" (demande du
+        2026-10-17) — appelle EXACTEMENT le même mécanisme qu'un choix
+        "Toutes" (ou toute autre fonction normale) dans la liste
+        "Fonction" : jamais une seconde implémentation. N'efface AUCUN
+        champ, ni du mode Participation (Dossier/Joueur/Du/Au/Tournoi,
+        voir _build_log_participation_tab) ni du mode normal — seul
+        l'AFFICHAGE change (voir _apply_log_view_mode), les deux
+        ensembles de critères restent tels que l'utilisateur les a
+        laissés pour un futur aller-retour."""
+        self.log_function_var.set("Toutes")
+        self._apply_log_view_mode()
+
+    def _build_log_participation_tab(self):
+        """Construit self._log_participation_frame (enfant direct de
+        self.log_tab, comme self._log_normal_criteria_frame/_log_normal_
+        results_frame) — JAMAIS empaqueté ici, uniquement par _apply_
+        log_view_mode. Dossier pré-rempli avec le dossier par défaut des
+        paramètres généraux (même mécanisme déjà utilisé par l'onglet
+        Statistiques, voir PeriodSummaryDialog.__init__/tournament_
+        prefs.load_last_settings) — "Parcourir..." reste entièrement
+        fonctionnel, indépendant de ce pré-remplissage.
+
+        "Joueur" : Combobox ÉDITABLE (jamais state="readonly") dont les
+        valeurs ne sont que des SUGGESTIONS du Répertoire — un visiteur
+        TMP n'y figure pas forcément, la recherche reste possible avec
+        n'importe quel texte libre (voir database.find_player_
+        participations, correspondance exacte espaces/casse ignorés).
+
+        "Retour" (demande du 2026-10-17) : bouton EN PREMIER, clairement
+        visible dès l'arrivée sur ce mode — appelle EXACTEMENT le même
+        mécanisme qu'un changement de "Fonction" vers une valeur normale
+        (self.log_function_var.set("Toutes") puis _apply_log_view_mode),
+        jamais une seconde implémentation, jamais un champ effacé ici
+        (Dossier/Joueur/Du/Au/Tournoi restent tels que l'utilisateur les
+        a laissés — voir _return_to_normal_log_view).
+
+        "Du"/"Au" (demande du 2026-10-17) : RÉUTILISENT tel quel
+        _show_log_date_picker/_parse_log_date_field (déjà génériques,
+        voir le mode normal) — validés et appliqués au clic sur
+        "Rechercher" (voir _start_log_participation_search), jamais en
+        continu : Database.find_player_participations filtre désormais
+        par date (mêmes bornes ISO incluses que build_period_summary).
+
+        "Tournoi" (demande du 2026-10-17, choix validé explicitement :
+        filtrage INSTANTANÉ plutôt que via "Rechercher") : contrairement
+        à Du/Au, ne nécessite JAMAIS un nouveau balayage de dossier — sa
+        liste de valeurs se reconstruit après chaque recherche à partir
+        des tournois RÉELLEMENT trouvés (self._log_participation_last_
+        rows, voir _on_log_participation_search_finished), et son
+        changement ne fait que ré-filtrer CE résultat déjà en mémoire
+        (voir _apply_log_participation_tournament_filter) — jamais relu
+        depuis le disque pour ce seul filtre."""
+        frame = ttk.Frame(self.log_tab)
+        self._log_participation_frame = frame
+
+        criteria = ttk.Frame(frame)
+        criteria.pack(padx=20, pady=(20, 8), anchor="nw", fill="x")
+
+        retour_row = ttk.Frame(criteria)
+        retour_row.pack(fill="x", pady=(0, 10), anchor="w")
+        self.log_participation_back_btn = ttk.Button(
+            retour_row, text="◀ Retour au Journal des actions",
+            command=self._return_to_normal_log_view,
+        )
+        self.log_participation_back_btn.pack(side="left")
+
+        row1 = ttk.Frame(criteria)
+        row1.pack(fill="x", pady=(0, 6), anchor="w")
+        ttk.Label(row1, text="Dossier des tournois :").pack(side="left")
+        default_folder = (
+            tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+        ).strip()
+        self.log_participation_folder_var = tk.StringVar(value=default_folder)
+        ttk.Entry(row1, textvariable=self.log_participation_folder_var, width=35).pack(
+            side="left", padx=6
+        )
+        ttk.Button(
+            row1, text="Parcourir...", command=self._browse_log_participation_folder,
+        ).pack(side="left")
+        self.log_participation_recursive_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            row1, text="Inclure les sous-dossiers", variable=self.log_participation_recursive_var,
+        ).pack(side="left", padx=(16, 0))
+
+        dates_row = ttk.Frame(criteria)
+        dates_row.pack(fill="x", pady=(0, 6), anchor="w")
+        ttk.Label(dates_row, text="Du :").pack(side="left")
+        self.log_participation_date_from_var = tk.StringVar(value="")
+        ttk.Entry(dates_row, textvariable=self.log_participation_date_from_var, width=12).pack(
+            side="left", padx=(4, 2)
+        )
+        date_from_cal_btn = ttk.Button(dates_row, text="📅", width=3)
+        date_from_cal_btn.pack(side="left", padx=(0, 16))
+        date_from_cal_btn.config(
+            command=lambda: self._show_log_date_picker(
+                self.log_participation_date_from_var, date_from_cal_btn,
+            )
+        )
+        ttk.Label(dates_row, text="Au :").pack(side="left")
+        self.log_participation_date_to_var = tk.StringVar(value="")
+        ttk.Entry(dates_row, textvariable=self.log_participation_date_to_var, width=12).pack(
+            side="left", padx=(4, 2)
+        )
+        date_to_cal_btn = ttk.Button(dates_row, text="📅", width=3)
+        date_to_cal_btn.pack(side="left", padx=(0, 16))
+        date_to_cal_btn.config(
+            command=lambda: self._show_log_date_picker(
+                self.log_participation_date_to_var, date_to_cal_btn,
+            )
+        )
+        ttk.Label(dates_row, text="Tournoi :").pack(side="left")
+        self.log_participation_tournament_var = tk.StringVar(value="Tous")
+        self.log_participation_tournament_combo = ttk.Combobox(
+            dates_row, textvariable=self.log_participation_tournament_var, state="readonly",
+            width=18, values=("Tous",),
+        )
+        self.log_participation_tournament_combo.pack(side="left", padx=(4, 0))
+        self.log_participation_tournament_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self._apply_log_participation_tournament_filter()
+        )
+
+        row2 = ttk.Frame(criteria)
+        row2.pack(fill="x", pady=(0, 6), anchor="w")
+        ttk.Label(row2, text="Joueur :").pack(side="left")
+        self.log_participation_player_var = tk.StringVar(value="")
+        self.log_participation_player_combo = ttk.Combobox(
+            row2, textvariable=self.log_participation_player_var, width=25,
+            values=tuple(roster.load_roster()),
+        )
+        self.log_participation_player_combo.pack(side="left", padx=6)
+        self.log_participation_player_combo.bind(
+            "<Return>", lambda e: self._start_log_participation_search()
+        )
+        Tooltip(
+            self.log_participation_player_combo,
+            "Nom exact du joueur (espaces/casse ignorés) — les\n"
+            "suggestions viennent du Répertoire à titre indicatif\n"
+            "seulement : un visiteur TMP n'y figure pas forcément,\n"
+            "tapez son nom librement.",
+        )
+
+        actions_row = ttk.Frame(row2)
+        actions_row.pack(side="left", padx=(16, 0))
+        self.log_participation_search_btn = ttk.Button(
+            actions_row, text="🔍 Rechercher", command=self._start_log_participation_search,
+        )
+        self.log_participation_search_btn.pack(side="left")
+        self.log_participation_cancel_btn = ttk.Button(
+            actions_row, text="Annuler la recherche", command=self._on_cancel_log_participation_search,
+        )
+        # Jamais empaqueté ici — voir _update_log_participation_scan_ui,
+        # seule méthode qui le pack()/pack_forget() selon self._log_
+        # participation_scan_in_progress (même principe que DataPurge
+        # Dialog.cancel_scan_btn, jamais dupliqué différemment).
+
+        self.log_participation_status_lbl = ttk.Label(criteria, foreground=MUTED)
+        self.log_participation_status_lbl.pack(anchor="w", pady=(4, 0))
+
+        results = ttk.Frame(frame)
+        results.pack(fill="both", expand=True, padx=20, pady=(6, 20))
+        cols = ("date", "tournament", "type", "status", "classement")
+        headers = ["Date", "Tournoi", "Type", "Statut", "Classement"]
+        self.log_participation_tree = ttk.Treeview(results, columns=cols, show="headings")
+        widths = {"date": 110, "tournament": 220, "type": 90, "status": 100, "classement": 110}
+        for c, h in zip(cols, headers):
+            self.log_participation_tree.heading(c, text=h)
+            anchor = "w" if c == "tournament" else "center"
+            self.log_participation_tree.column(c, width=widths[c], anchor=anchor, stretch=(c == "tournament"))
+        participation_scrollbar = ttk.Scrollbar(
+            results, orient="vertical", command=self.log_participation_tree.yview
+        )
+        self.log_participation_tree.configure(yscrollcommand=participation_scrollbar.set)
+        self.log_participation_tree.pack(side="left", fill="both", expand=True)
+        participation_scrollbar.pack(side="right", fill="y")
+
+        # État du balayage en arrière-plan (voir _start_log_
+        # participation_search et consorts, même principe que
+        # DataPurgeDialog._scan_cancel_event/_scan_generation/_scan_
+        # queue/_scan_in_progress/_poll_after_id)."""
+        self._log_participation_scan_cancel_event = None
+        self._log_participation_scan_generation = 0
+        self._log_participation_scan_queue = queue.Queue()
+        self._log_participation_scan_in_progress = False
+        self._log_participation_poll_after_id = None
+        # Dernier résultat COMPLET d'une recherche réussie (déjà filtré
+        # par Du/Au, voir _start_log_participation_search — demande du
+        # 2026-10-17) : jamais encore réduit par "Tournoi", qui ne fait
+        # que ré-afficher un SOUS-ENSEMBLE de cette liste (voir _apply_
+        # log_participation_tournament_filter), sans jamais relire le
+        # disque pour ce seul filtre.
+        self._log_participation_last_rows = []
+        # Avertissement de la DERNIÈRE recherche (annulée/tronquée, ou
+        # ("", MUTED) si complète) — réappliqué après chaque changement
+        # du filtre "Tournoi" sans jamais relire le disque, voir _apply_
+        # log_participation_tournament_filter.
+        self._log_participation_last_warning = ("", MUTED)
+
+    def _browse_log_participation_folder(self):
+        path = filedialog.askdirectory(
+            title="Choisir le dossier contenant les fichiers .tournoi",
+            initialdir=self.log_participation_folder_var.get() or os.path.expanduser("~"),
+        )
+        if path:
+            self.log_participation_folder_var.set(path)
+
+    def _start_log_participation_search(self):
+        """Lance une recherche BORNÉE ET ANNULABLE (data_purge.
+        scan_folder_for_tournaments, puis database.find_player_
+        participations) sur un THREAD SÉPARÉ, jamais sur le thread
+        principal — même discipline que DataPurgeDialog._start_scan :
+        annule d'abord toute recherche précédente encore active
+        (self._log_participation_scan_cancel_event) et incrémente la
+        génération (un résultat tardif d'un ANCIEN appel est ignoré par
+        _poll_log_participation_queue, jamais appliqué après le
+        lancement d'une nouvelle recherche).
+
+        AUCUNE écriture nulle part : find_player_participations
+        n'ouvre chaque fichier .tournoi qu'en lecture seule (read_
+        only=True, voir sa docstring).
+
+        "Du"/"Au" (demande du 2026-10-17) : validés ICI (même _parse_
+        log_date_field que le mode normal, jamais une validation
+        dupliquée) — une date invalide annule le lancement, exactement
+        comme pour Rechercher/Purger en mode normal. "Tournoi" n'est
+        volontairement PAS relu ici : il sera réinitialisé à "Tous" dès
+        que ce nouveau résultat arrivera (voir _on_log_participation_
+        search_finished), un choix antérieur n'ayant plus de sens pour
+        une recherche dont les tournois trouvés peuvent différer."""
+        folder = self.log_participation_folder_var.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Erreur", "Choisissez d'abord un dossier valide.", parent=self)
+            return
+        name = self.log_participation_player_var.get().strip()
+        if not name:
+            messagebox.showerror("Erreur", "Entrez d'abord le nom d'un joueur.", parent=self)
+            return
+        date_from_dt, ok_from = self._parse_log_date_field(self.log_participation_date_from_var.get(), "Du")
+        if not ok_from:
+            return
+        date_to_dt, ok_to = self._parse_log_date_field(self.log_participation_date_to_var.get(), "Au")
+        if not ok_to:
+            return
+        if date_from_dt is not None and date_to_dt is not None and date_from_dt > date_to_dt:
+            messagebox.showerror("Dates invalides", "« Du » doit être antérieur ou égal à « Au ».", parent=self)
+            return
+        date_from = date_from_dt.strftime("%Y-%m-%d") if date_from_dt is not None else None
+        date_to = date_to_dt.strftime("%Y-%m-%d") if date_to_dt is not None else None
+
+        if self._log_participation_scan_cancel_event is not None:
+            self._log_participation_scan_cancel_event.set()
+        self._log_participation_scan_generation += 1
+        generation = self._log_participation_scan_generation
+        cancel_event = threading.Event()
+        self._log_participation_scan_cancel_event = cancel_event
+        self._log_participation_scan_in_progress = True
+        self._update_log_participation_scan_ui()
+
+        for row in self.log_participation_tree.get_children():
+            self.log_participation_tree.delete(row)
+
+        recursive = self.log_participation_recursive_var.get()
+        thread = threading.Thread(
+            target=App._run_log_participation_search_worker,
+            args=(
+                self._log_participation_scan_queue, generation, folder, recursive, name,
+                date_from, date_to, cancel_event,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self._log_participation_poll_after_id = self.after(100, self._poll_log_participation_queue)
+
+    @staticmethod
+    def _run_log_participation_search_worker(
+        result_queue, generation, folder, recursive, name, date_from, date_to, cancel_event,
+    ):
+        """MÉTHODE STATIQUE délibérément (même principe que DataPurge
+        Dialog._run_scan_worker, "aucun appel Tkinter depuis le thread
+        de recherche") : exécutée sur un thread séparé, ne reçoit JAMAIS
+        `self` (l'instance Tk) — seulement `result_queue` (une queue.
+        Queue, thread-safe par construction) et des valeurs Python
+        simples. Impossible, PAR CONSTRUCTION, d'appeler accidentellement
+        une méthode Tk d'ici : aucune référence à un widget n'existe
+        dans sa portée.
+
+        Toute exception IMPRÉVUE est interceptée ICI (jamais ailleurs)
+        et transformée en résultat {"error": str(e)} déposé dans la même
+        file — même défense que DataPurgeDialog : un thread mort sans
+        jamais déposer de résultat bloquerait sinon indéfiniment
+        _poll_log_participation_queue sur "Recherche en cours..."."""
+        try:
+            scan = data_purge.scan_folder_for_tournaments(
+                folder, recursive=recursive, cancel_event=cancel_event,
+            )
+            participations = find_player_participations(
+                scan["files"], name, date_from=date_from, date_to=date_to, cancel_event=cancel_event,
+            )
+            result = {
+                "participations": participations,
+                "truncated": scan["truncated"],
+                "cancelled": cancel_event.is_set(),
+            }
+        except Exception as e:  # noqa: BLE001 - voir docstring : jamais un thread mort sans résultat
+            result = {"error": str(e)}
+        result_queue.put((generation, result))
+
+    def _poll_log_participation_queue(self):
+        """Appelée UNIQUEMENT via self.after (jamais directement depuis
+        un thread de fond) — seul endroit, avec _on_log_participation_
+        search_finished qu'elle appelle, qui lit self._log_
+        participation_scan_queue et touche les widgets. Se reprogramme
+        elle-même tant qu'aucun résultat n'est encore disponible ;
+        ignore silencieusement tout résultat d'une génération périmée
+        (une recherche plus récente a déjà démarré, voir _start_log_
+        participation_search) en continuant de surveiller la file pour
+        le résultat ACTUEL."""
+        self._log_participation_poll_after_id = None
+        if not self.winfo_exists():
+            return
+        try:
+            generation, result = self._log_participation_scan_queue.get_nowait()
+        except queue.Empty:
+            self._log_participation_poll_after_id = self.after(100, self._poll_log_participation_queue)
+            return
+        if generation != self._log_participation_scan_generation:
+            self._log_participation_poll_after_id = self.after(100, self._poll_log_participation_queue)
+            return
+        self._on_log_participation_search_finished(result)
+
+    def _on_log_participation_search_finished(self, result):
+        """Reçoit le résultat d'une recherche RÉELLEMENT terminée pour
+        les critères ACTUELS (jamais périmée, voir _poll_log_
+        participation_queue) — seul endroit qui reçoit un nouveau
+        résultat de RECHERCHE (jamais mélangé avec "Recherche en
+        cours..." — voir _update_log_participation_scan_ui, même
+        séparation que DataPurgeDialog._update_scan_ui/_on_scan_
+        finished).
+
+        Demande du 2026-10-17 : stocke le résultat COMPLET (déjà filtré
+        par Du/Au) dans self._log_participation_last_rows, reconstruit
+        la liste "Tournoi" à partir de ces résultats, PUIS délègue
+        l'affichage réel à _apply_log_participation_tournament_filter —
+        jamais une seconde logique de remplissage du tableau dupliquée
+        ici (cette dernière est aussi appelée seule, sans nouvelle
+        recherche, quand "Tournoi" change)."""
+        self._log_participation_scan_in_progress = False
+        if "error" in result:
+            self._update_log_participation_scan_ui()
+            self.log_participation_status_lbl.config(
+                text=f"⚠ La recherche a échoué de façon inattendue ({result['error']}).",
+                foreground=DANGER_RED,
+            )
+            return
+
+        self._log_participation_last_rows = result["participations"]
+        if result["cancelled"]:
+            self._log_participation_last_warning = (" ⚠ Recherche annulée — résultat partiel.", DANGER_RED)
+        elif result["truncated"]:
+            self._log_participation_last_warning = (
+                " ⚠ Dossier trop volumineux, recherche tronquée — résultat partiel.", DANGER_RED,
+            )
+        else:
+            self._log_participation_last_warning = ("", MUTED)
+
+        self._refresh_log_participation_tournament_choices()
+        self._apply_log_participation_tournament_filter()
+        self._update_log_participation_scan_ui()
+
+    def _refresh_log_participation_tournament_choices(self):
+        """Reconstruit les valeurs de "Tournoi" (demande du 2026-10-17)
+        à partir des tournois RÉELLEMENT présents dans self._log_
+        participation_last_rows — même principe que _refresh_log_
+        filter_choices pour le mode normal (jamais une liste figée à la
+        construction) : conserve la sélection courante si elle existe
+        encore parmi les nouvelles valeurs, repli sur "Tous" sinon."""
+        names = sorted(
+            {r["tournament_name"] for r in self._log_participation_last_rows}, key=str.casefold,
+        )
+        values = ("Tous",) + tuple(names)
+        self.log_participation_tournament_combo["values"] = values
+        if self.log_participation_tournament_var.get() not in values:
+            self.log_participation_tournament_var.set("Tous")
+
+    def _apply_log_participation_tournament_filter(self):
+        """Ré-affiche self.log_participation_tree à partir de self.
+        _log_participation_last_rows, restreint au tournoi choisi (ou
+        "Tous") — demande du 2026-10-17, choix explicitement validé :
+        JAMAIS une nouvelle recherche sur le disque pour ce seul filtre,
+        contrairement à Du/Au (voir _start_log_participation_search).
+        Également la SEULE méthode qui repeuple ce tableau, y compris
+        juste après une recherche (voir _on_log_participation_search_
+        finished, qui l'appelle en dernier) — jamais une logique de
+        remplissage dupliquée.
+
+        Le compteur affiché reflète les lignes RÉELLEMENT affichées
+        (donc déjà filtrées par Tournoi), suivi de l'avertissement
+        éventuel de la DERNIÈRE recherche (self._log_participation_
+        last_warning — annulation/troncature, qui reste vrai quel que
+        soit le filtre Tournoi choisi ensuite, puisqu'aucune nouvelle
+        lecture n'a lieu ici)."""
+        selected = self.log_participation_tournament_var.get()
+        rows = (
+            self._log_participation_last_rows if selected == "Tous"
+            else [r for r in self._log_participation_last_rows if r["tournament_name"] == selected]
+        )
+        for row in self.log_participation_tree.get_children():
+            self.log_participation_tree.delete(row)
+        for p in rows:
+            self.log_participation_tree.insert(
+                "", "end",
+                values=(
+                    format_date_fr(p["date"]) if p["date"] else "-",
+                    p["tournament_name"], p["type"], p["status"], p["classement"],
+                ),
+            )
+
+        n = len(rows)
+        mot = "participation" if n <= 1 else "participations"
+        participe = "trouvée" if n <= 1 else "trouvées"
+        suffix, foreground = self._log_participation_last_warning
+        self.log_participation_status_lbl.config(text=f"{n} {mot} {participe}.{suffix}", foreground=foreground)
+
+    def _on_cancel_log_participation_search(self):
+        """"Annuler la recherche" — ne fait que poser le drapeau partagé ;
+        c'est le thread de recherche lui-même (data_purge.scan_folder_
+        for_tournaments, puis database.find_player_participations) qui
+        s'arrête PROPREMENT à la prochaine vérification, jamais ici de
+        façon forcée. Le résultat (marqué "cancelled") arrive ensuite
+        normalement par la même file — voir _on_log_participation_
+        search_finished."""
+        if self._log_participation_scan_cancel_event is not None:
+            self._log_participation_scan_cancel_event.set()
+
+    def _update_log_participation_scan_ui(self):
+        """Affiche "Recherche en cours..." + le bouton "Annuler la
+        recherche" pendant une recherche ; les états finaux (succès,
+        erreur, annulation, troncature) sont écrits par _on_log_
+        participation_search_finished — jamais mélangés, même principe
+        que DataPurgeDialog._update_scan_ui/_on_scan_finished."""
+        if self._log_participation_scan_in_progress:
+            self.log_participation_status_lbl.config(text="Recherche en cours...", foreground=MUTED)
+            if not self.log_participation_cancel_btn.winfo_manager():
+                self.log_participation_cancel_btn.pack(side="left", padx=(8, 0))
+            return
+        self.log_participation_cancel_btn.pack_forget()
 
     def _on_log_row_double_click(self, event):
         item_id = self.log_tree.identify_row(event.y)
@@ -20713,14 +21539,23 @@ class App(tk.Tk):
         )
 
     def _on_log_export(self):
-        """Ouvre "Exporter le LOG" (LogExportDialog — correction du
-        2026-09-24, remplace l'export CSV direct) — construit d'abord un
-        instantané FIGÉ des lignes actuellement affichées dans
-        self.log_tree (colonnes/ordre/libellés EXACTEMENT ceux de
-        _populate_log_tree), avant même d'ouvrir la fenêtre : "ce que je
-        vois dans le tableau LOG = ce qui peut être exporté", jamais une
-        nouvelle recherche relancée en coulisses. Aucun résultat affiché
-        -> refusé ici, la fenêtre ne s'ouvre même pas.
+        """Point d'entrée UNIQUE du bouton "Exporter" (voir self.
+        log_export_btn, construit par _build_log_persistent_bar,
+        toujours le MÊME bouton quel que soit le mode affiché, demande
+        explicite du 2026-10-16 : "il faut le réutiliser, sans ajouter
+        de nouveau bouton"). Mode "Participation" -> _on_log_participation_
+        export ci-dessous (données complètement différentes, jamais
+        mélangées) ; sinon, comportement STRICTEMENT inchangé depuis la
+        correction du 2026-09-24 (voir le reste de cette méthode).
+
+        Ouvre "Exporter le LOG" (LogExportDialog, remplace l'export CSV
+        direct) — construit d'abord un instantané FIGÉ des lignes
+        actuellement affichées dans self.log_tree (colonnes/ordre/
+        libellés EXACTEMENT ceux de _populate_log_tree), avant même
+        d'ouvrir la fenêtre : "ce que je vois dans le tableau LOG = ce
+        qui peut être exporté", jamais une nouvelle recherche relancée
+        en coulisses. Aucun résultat affiché -> refusé ici, la fenêtre
+        ne s'ouvre même pas.
 
         La ligne "Critères : ..." (ajoutée le 2026-09-24, uniquement
         utilisée par l'export PDF — voir action_log.format_log_export_
@@ -20728,6 +21563,9 @@ class App(tk.Tk):
         filtre actuellement affichés que ceux ayant produit `rows` —
         jamais recalculée après coup, donc forcément cohérente avec le
         tableau exporté."""
+        if self.log_function_var.get() == LOG_PARTICIPATION_LABEL:
+            self._on_log_participation_export()
+            return
         items = self.log_tree.get_children()
         if not items:
             messagebox.showinfo("Info", "Aucun résultat à exporter.", parent=self)
@@ -20744,6 +21582,24 @@ class App(tk.Tk):
         )
         LogExportDialog(self, rows, criteria_line)
 
+    def _on_log_participation_export(self):
+        """Export du second mode d'affichage "Participation" (demande du
+        2026-10-16) — même principe que _on_log_export ci-dessus : un
+        instantané FIGÉ des lignes ACTUELLEMENT affichées dans self.
+        log_participation_tree (jamais une nouvelle recherche relancée),
+        dans leur ordre d'affichage, avec les 5 colonnes Date/Tournoi/
+        Type/Statut/Classement. Ouvre LogParticipationExportDialog —
+        JAMAIS LogExportDialog/action_log.LOG_EXPORT_COLUMNS (données et
+        préférences d'export ENTIÈREMENT séparées, demande explicite)."""
+        items = self.log_participation_tree.get_children()
+        if not items:
+            messagebox.showinfo("Info", "Aucun résultat à exporter.", parent=self)
+            return
+        cols = ("date", "tournament", "type", "status", "classement")
+        rows = [dict(zip(cols, self.log_participation_tree.item(item_id, "values"))) for item_id in items]
+        player_name = self.log_participation_player_var.get().strip()
+        LogParticipationExportDialog(self, rows, player_name)
+
     # Noms de mois FRANÇAIS pour l'en-tête du calendrier — jamais les
     # locale.setlocale() du système (source classique de plantages
     # inter-plateforme quand la locale n'est pas installée) : une liste
@@ -20755,7 +21611,7 @@ class App(tk.Tk):
         "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre",
     ]
 
-    def _show_log_date_picker(self, target_var, anchor_widget):
+    def _show_log_date_picker(self, target_var, anchor_widget, show_today_button=True):
         """Petit calendrier POPUP (chantier "LOG", correction "Purger" du
         2026-09-24) — pur Tkinter + module `calendar` de la bibliothèque
         standard (déjà importé en tête de fichier), AUCUNE dépendance
@@ -20764,7 +21620,17 @@ class App(tk.Tk):
         manuelle reste par ailleurs toujours possible (ce popup ne
         remplace rien, il complète). Ouvre sur la date déjà saisie si
         elle est valide, sinon sur aujourd'hui — jamais sur une date par
-        défaut arbitraire."""
+        défaut arbitraire.
+
+        `show_today_button` (demande du 2026-10-17, bouton "Aujourd'hui")
+        : True par défaut pour les 2 modes explicitement demandés
+        (Journal des actions et Participation, qui appellent cette
+        méthode directement sans le préciser). DataPurgeDialog
+        ("Purger Données", non demandé ici, voir son propre _show_log_
+        date_picker qui délègue ici) passe explicitement False pour
+        rester identique à avant — un seul calendrier partagé, jamais
+        dupliqué, dont cette option contrôle juste la présence du
+        bouton."""
         raw = (target_var.get() or "").strip()
         try:
             start = datetime.strptime(raw, "%d/%m/%Y") if raw else datetime.now()
@@ -20796,6 +21662,20 @@ class App(tk.Tk):
         def _select(day):
             target_var.set(f"{day:02d}/{state['month']:02d}/{state['year']:04d}")
             picker.destroy()
+
+        def _select_today():
+            """Bouton "Aujourd'hui" (demande du 2026-10-17) — TOUJOURS la
+            date locale réelle du jour, indépendamment du mois/année
+            actuellement affiché/navigué dans le calendrier (state),
+            contrairement à _select ci-dessus qui dépend de state."""
+            now = datetime.now()
+            target_var.set(f"{now.day:02d}/{now.month:02d}/{now.year:04d}")
+            picker.destroy()
+
+        if show_today_button:
+            footer = ttk.Frame(picker)
+            footer.pack(fill="x", padx=6, pady=(0, 6))
+            ttk.Button(footer, text="Aujourd'hui", command=_select_today).pack()
 
         def _render():
             for w in grid_frame.winfo_children():
