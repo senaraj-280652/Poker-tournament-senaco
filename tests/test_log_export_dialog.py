@@ -911,8 +911,7 @@ class LogExportEndToEndTest(unittest.TestCase):
             "_poll_log_participation_queue", "_on_log_participation_search_finished",
             "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
             "_on_log_participation_export",
-            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-            "_apply_log_participation_tournament_filter",
+            "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
         for name in (
@@ -1059,8 +1058,7 @@ class VolumeImportantTest(unittest.TestCase):
             "_poll_log_participation_queue", "_on_log_participation_search_finished",
             "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
             "_on_log_participation_export",
-            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-            "_apply_log_participation_tournament_filter",
+            "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
         for name in (
@@ -1653,8 +1651,7 @@ class OnLogExportBuildsCriteriaLineTest(unittest.TestCase):
             "_poll_log_participation_queue", "_on_log_participation_search_finished",
             "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
             "_on_log_participation_export",
-            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-            "_apply_log_participation_tournament_filter",
+            "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
         for name in (

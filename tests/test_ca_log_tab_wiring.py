@@ -422,8 +422,7 @@ class LogTabRealBuildTest(unittest.TestCase):
             "_on_log_participation_export",
             # Filtres Du/Au/Tournoi + bouton "Retour" (demande du 2026-10-17) :
             # idem, nécessaire à la construction sans AttributeError.
-            "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-            "_apply_log_participation_tournament_filter",
+            "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
         ):
             setattr(self.win, name, types.MethodType(getattr(main.App, name), self.win))
         for name in (

@@ -88,15 +88,62 @@ def _find_button(root, text):
 # 1. database.py — _tournament_type_label / find_player_participations
 # =======================================================================
 class TournamentTypeLabelTest(unittest.TestCase):
-    def test_prefixe_to(self):
-        self.assertEqual(database._tournament_type_label("/a/To270826.tournoi"), "Tournoi")
+    """Revu le 2026-10-18 : "is_sng" (réglage en base, écrit UNE SEULE
+    fois à la création par "Sit & Go rapide", jamais modifié ensuite —
+    voir main.App._apply_sng_defaults) est désormais la source PRIORITAIRE
+    et la plus fiable, devant le nom de fichier — qui reste un repli
+    nécessaire pour les tournois créés avant l'introduction de ce
+    réglage (jamais en base chez eux, mais déjà conformes à la convention
+    de nom "To"/"Sn")."""
 
-    def test_prefixe_sn(self):
-        self.assertEqual(database._tournament_type_label("/a/Sn270826.tournoi"), "Sit & Go")
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="tournament_type_label_")
+        self.addCleanup(self._tmp.cleanup)
+
+    def _db(self, filename, is_sng=None):
+        db = database.Database(os.path.join(self._tmp.name, filename))
+        self.addCleanup(db.close)
+        if is_sng is not None:
+            db.set_settings({"is_sng": is_sng})
+        return db
+
+    def test_prefixe_to_sans_is_sng(self):
+        db = self._db("To270826.tournoi")
+        self.assertEqual(database._tournament_type_label(db, db.path), "Tournoi")
+
+    def test_prefixe_sn_sans_is_sng(self):
+        """Repli sur le nom de fichier : cas d'un Sit & Go créé AVANT
+        l'introduction du réglage "is_sng" en base — ne doit pas être
+        mal classé "Tournoi" pour autant."""
+        db = self._db("Sn270826.tournoi")
+        self.assertEqual(database._tournament_type_label(db, db.path), "Sit & Go")
 
     def test_hors_convention_inconnu(self):
-        self.assertEqual(database._tournament_type_label("/a/tournoi.tournoi"), "Inconnu")
-        self.assertEqual(database._tournament_type_label("/a/mon_tournoi_special.tournoi"), "Inconnu")
+        db = self._db("tournoi.tournoi")
+        self.assertEqual(database._tournament_type_label(db, db.path), "Inconnu")
+        db2 = self._db("mon_tournoi_special.tournoi")
+        self.assertEqual(database._tournament_type_label(db2, db2.path), "Inconnu")
+
+    def test_is_sng_prioritaire_meme_si_le_fichier_est_renomme(self):
+        """Cœur de la demande du 2026-10-18 : un Sit & Go renommé "à la
+        main" sans le préfixe "Sn" reste correctement identifié grâce au
+        réglage "is_sng", jamais mal classé "Inconnu" ou "Tournoi" par
+        la seule faute du nom de fichier."""
+        db = self._db("MaSoireeDuJeudi.tournoi", is_sng=1)
+        self.assertEqual(database._tournament_type_label(db, db.path), "Sit & Go")
+
+    def test_is_sng_prioritaire_meme_si_le_nom_suit_la_convention_tournoi(self):
+        db = self._db("To270826.tournoi", is_sng=1)
+        self.assertEqual(database._tournament_type_label(db, db.path), "Sit & Go")
+
+    def test_is_sng_absent_reste_tournoi_normal(self):
+        """Non-régression : un réglage "is_sng" absent (cas de l'immense
+        majorité des tournois normaux, jamais écrit par "Nouveau
+        tournoi") ne doit jamais faire basculer un tournoi normal vers
+        "Sit & Go"."""
+        db = self._db("To1.tournoi")
+        self.assertEqual(db.get_setting_int("is_sng", 0), 0)
+        self.assertEqual(database._tournament_type_label(db, db.path), "Tournoi")
 
 
 class FindPlayerParticipationsTest(unittest.TestCase):
@@ -370,8 +417,7 @@ _LOG_METHODS = (
     "_poll_log_participation_queue", "_on_log_participation_search_finished",
     "_on_cancel_log_participation_search", "_update_log_participation_scan_ui",
     "_on_log_participation_export",
-    "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-    "_apply_log_participation_tournament_filter",
+    "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
 )
 _LOG_STATIC_METHODS = (
     "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
@@ -1213,13 +1259,20 @@ class TodayButtonTest(LogParticipationTestCase):
 
 
 class TournamentFilterTest(LogParticipationTestCase):
-    """"Tournoi" (demande du 2026-10-17, choix validé explicitement :
-    filtrage INSTANTANÉ) : jamais une nouvelle lecture disque pour ce
-    seul filtre, contrairement à Du/Au ci-dessus."""
+    """"Tournoi" (demande du 2026-10-17 : filtrage INSTANTANÉ, jamais une
+    nouvelle lecture disque pour ce seul filtre, contrairement à Du/Au
+    ci-dessus ; demande du 2026-10-18 : 3 valeurs FIXES "Tous"/"Tournoi"/
+    "Sit & Go", filtrant sur le TYPE réellement identifié — voir
+    database._tournament_type_label, réglage "is_sng" en priorité sur le
+    nom de fichier — remplaçant l'ancien filtre par nom de tournoi
+    trouvé)."""
 
-    def _make_tournament(self, filename, name):
+    def _make_tournament(self, filename, name, is_sng=None):
         db = database.Database(os.path.join(self.tournaments_dir, filename))
-        db.set_settings({"tournament_name": name})
+        settings = {"tournament_name": name}
+        if is_sng is not None:
+            settings["is_sng"] = is_sng
+        db.set_settings(settings)
         db.add_player("Pierre", "CPC")
         db.close()
 
@@ -1231,22 +1284,78 @@ class TournamentFilterTest(LogParticipationTestCase):
         self.win._start_log_participation_search()
         self._wait_for_search()
 
-    def test_combo_rempli_avec_les_tournois_reellement_trouves(self):
-        self._make_tournament("A.tournoi", "Tournoi Alpha")
-        self._make_tournament("B.tournoi", "Tournoi Beta")
-        self._search()
+    def test_valeurs_fixes_des_la_construction_avant_toute_recherche(self):
         self.assertEqual(
-            set(self.win.log_participation_tournament_combo["values"]),
-            {"Tous", "Tournoi Alpha", "Tournoi Beta"},
+            tuple(self.win.log_participation_tournament_combo["values"]),
+            ("Tous", "Tournoi", "Sit & Go"),
         )
 
+    def test_valeurs_ne_changent_jamais_apres_une_recherche(self):
+        """Contrairement à l'ancien comportement (liste reconstruite
+        depuis les tournois trouvés), ces 3 valeurs restent EXACTEMENT
+        les mêmes après une recherche, quels que soient les tournois
+        réellement trouvés."""
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
+        self._search()
+        self.assertEqual(
+            tuple(self.win.log_participation_tournament_combo["values"]),
+            ("Tous", "Tournoi", "Sit & Go"),
+        )
+
+    def test_filtre_tournoi_ne_garde_que_les_tournois_classiques(self):
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
+        self._make_tournament("Sn1.tournoi", "Sit & Go Beta")
+        self._search()
+        self.win.log_participation_tournament_var.set("Tournoi")
+        self.win._apply_log_participation_tournament_filter()
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "Tournoi Alpha")
+        self.assertEqual(rows[0][2], "Tournoi")
+
+    def test_filtre_sit_and_go_ne_garde_que_les_sit_and_go(self):
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
+        self._make_tournament("Sn1.tournoi", "Sit & Go Beta")
+        self._search()
+        self.win.log_participation_tournament_var.set("Sit & Go")
+        self.win._apply_log_participation_tournament_filter()
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "Sit & Go Beta")
+        self.assertEqual(rows[0][2], "Sit & Go")
+
+    def test_filtre_sit_and_go_reconnait_is_sng_meme_sans_prefixe_sn(self):
+        """Cœur de la demande du 2026-10-18 : un Sit & Go dont le fichier
+        ne suit pas la convention "Sn" doit quand même apparaître sous
+        "Sit & Go", grâce au réglage "is_sng" en base."""
+        self._make_tournament("MaSoiree.tournoi", "Soirée spéciale", is_sng=1)
+        self._search()
+        self.win.log_participation_tournament_var.set("Sit & Go")
+        self.win._apply_log_participation_tournament_filter()
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "Soirée spéciale")
+
+    def test_ligne_inconnu_najamais_affichee_sous_tournoi_ou_sit_and_go(self):
+        self._make_tournament("hors_convention.tournoi", "Mystère")
+        self._search()
+        self.assertEqual(len(self._rows()), 1)  # visible sous "Tous"
+
+        self.win.log_participation_tournament_var.set("Tournoi")
+        self.win._apply_log_participation_tournament_filter()
+        self.assertEqual(self._rows(), [])
+
+        self.win.log_participation_tournament_var.set("Sit & Go")
+        self.win._apply_log_participation_tournament_filter()
+        self.assertEqual(self._rows(), [])
+
     def test_selection_filtre_instantanement_sans_nouveau_balayage(self):
-        self._make_tournament("A.tournoi", "Tournoi Alpha")
-        self._make_tournament("B.tournoi", "Tournoi Beta")
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
+        self._make_tournament("Sn1.tournoi", "Sit & Go Beta")
         self._search()
 
         with patch.object(data_purge, "scan_folder_for_tournaments") as mock_scan:
-            self.win.log_participation_tournament_var.set("Tournoi Alpha")
+            self.win.log_participation_tournament_var.set("Tournoi")
             self.win._apply_log_participation_tournament_filter()
         mock_scan.assert_not_called()
         rows = self._rows()
@@ -1254,50 +1363,50 @@ class TournamentFilterTest(LogParticipationTestCase):
         self.assertEqual(rows[0][1], "Tournoi Alpha")
 
     def test_tous_reaffiche_lensemble_apres_un_filtre(self):
-        self._make_tournament("A.tournoi", "Tournoi Alpha")
-        self._make_tournament("B.tournoi", "Tournoi Beta")
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
+        self._make_tournament("Sn1.tournoi", "Sit & Go Beta")
         self._search()
-        self.win.log_participation_tournament_var.set("Tournoi Alpha")
+        self.win.log_participation_tournament_var.set("Tournoi")
         self.win._apply_log_participation_tournament_filter()
         self.win.log_participation_tournament_var.set("Tous")
         self.win._apply_log_participation_tournament_filter()
         self.assertEqual(len(self._rows()), 2)
 
-    def test_selection_conservee_si_toujours_presente_apres_une_nouvelle_recherche(self):
-        self._make_tournament("A.tournoi", "Tournoi Alpha")
-        self._make_tournament("B.tournoi", "Tournoi Beta")
+    def test_selection_persiste_et_sapplique_a_une_nouvelle_recherche(self):
+        """Plus de réinitialisation automatique à "Tous" (demande du
+        2026-10-18, valeurs désormais fixes, toujours valides) : la
+        sélection "Sit & Go" reste active et filtre déjà le résultat
+        d'une recherche ultérieure, sans action supplémentaire."""
+        self._make_tournament("To1.tournoi", "Tournoi Alpha")
         self._search()
-        self.win.log_participation_tournament_var.set("Tournoi Alpha")
+        self.win.log_participation_tournament_var.set("Sit & Go")
         self.win._apply_log_participation_tournament_filter()
-        self._search()  # même dossier, mêmes tournois trouvés
-        self.assertEqual(self.win.log_participation_tournament_var.get(), "Tournoi Alpha")
-
-    def test_selection_reinitialisee_a_tous_si_absente_du_nouveau_resultat(self):
-        self._make_tournament("A.tournoi", "Tournoi Alpha")
-        self._search()
-        self.win.log_participation_tournament_var.set("Tournoi Alpha")
-        self.win._apply_log_participation_tournament_filter()
+        self.assertEqual(self._rows(), [])
 
         other_dir = tempfile.mkdtemp(prefix="log_participation_other_", dir=self._tmp.name)
-        other_db = database.Database(os.path.join(other_dir, "C.tournoi"))
-        other_db.set_settings({"tournament_name": "Tournoi Gamma"})
+        other_db = database.Database(os.path.join(other_dir, "Sn1.tournoi"))
+        other_db.set_settings({"tournament_name": "Sit & Go Gamma"})
         other_db.add_player("Pierre", "CPC")
         other_db.close()
         self._search(folder=other_dir)
-        self.assertEqual(self.win.log_participation_tournament_var.get(), "Tous")
+
+        self.assertEqual(self.win.log_participation_tournament_var.get(), "Sit & Go")
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], "Sit & Go Gamma")
 
 
 class ParticipationFiltersExportIntegrationTest(LogParticipationTestCase):
     """Vérification de bout en bout demandée explicitement ("Vérifier
     leur fonctionnement combiné") : une recherche filtrée par Du/Au puis
-    par Tournoi, exportée, ne contient QUE les lignes réellement
-    affichées à l'écran — jamais l'ensemble complet du dernier résultat
-    de recherche."""
+    par Tournoi (type, depuis le 2026-10-18), exportée, ne contient QUE
+    les lignes réellement affichées à l'écran — jamais l'ensemble
+    complet du dernier résultat de recherche."""
 
-    def test_export_ne_contient_que_les_lignes_filtrees_par_tournoi(self):
+    def test_export_ne_contient_que_les_lignes_filtrees_par_type(self):
         for filename, date, name in (
-            ("A.tournoi", "2026-01-15", "Tournoi Alpha"),
-            ("B.tournoi", "2026-01-20", "Tournoi Beta"),
+            ("To1.tournoi", "2026-01-15", "Tournoi Alpha"),
+            ("Sn1.tournoi", "2026-01-20", "Sit & Go Beta"),
         ):
             db = database.Database(os.path.join(self.tournaments_dir, filename))
             db.set_settings({"tournament_date": date, "tournament_name": name})
@@ -1312,7 +1421,7 @@ class ParticipationFiltersExportIntegrationTest(LogParticipationTestCase):
         self._wait_for_search()
         self.assertEqual(len(self._rows()), 2)
 
-        self.win.log_participation_tournament_var.set("Tournoi Beta")
+        self.win.log_participation_tournament_var.set("Sit & Go")
         self.win._apply_log_participation_tournament_filter()
 
         with patch.object(main, "LogParticipationExportDialog") as mock_dialog:
@@ -1320,7 +1429,8 @@ class ParticipationFiltersExportIntegrationTest(LogParticipationTestCase):
         mock_dialog.assert_called_once()
         rows = mock_dialog.call_args[0][1]
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["tournament"], "Tournoi Beta")
+        self.assertEqual(rows[0]["tournament"], "Sit & Go Beta")
+        self.assertEqual(rows[0]["type"], "Sit & Go")
 
 
 class ReturnButtonTest(LogParticipationTestCase):

@@ -21151,15 +21151,17 @@ class App(tk.Tk):
         continu : Database.find_player_participations filtre désormais
         par date (mêmes bornes ISO incluses que build_period_summary).
 
-        "Tournoi" (demande du 2026-10-17, choix validé explicitement :
-        filtrage INSTANTANÉ plutôt que via "Rechercher") : contrairement
-        à Du/Au, ne nécessite JAMAIS un nouveau balayage de dossier — sa
-        liste de valeurs se reconstruit après chaque recherche à partir
-        des tournois RÉELLEMENT trouvés (self._log_participation_last_
-        rows, voir _on_log_participation_search_finished), et son
-        changement ne fait que ré-filtrer CE résultat déjà en mémoire
-        (voir _apply_log_participation_tournament_filter) — jamais relu
-        depuis le disque pour ce seul filtre."""
+        "Tournoi" (demande du 2026-10-17 : filtrage INSTANTANÉ plutôt que
+        via "Rechercher" ; demande du 2026-10-18 : 3 valeurs FIXES "Tous"/
+        "Tournoi"/"Sit & Go", jamais reconstruites depuis les résultats —
+        contrairement à l'ancienne liste de noms de tournois qu'elle
+        remplace) : contrairement à Du/Au, ne nécessite JAMAIS un nouveau
+        balayage de dossier — sa valeur ne fait que ré-filtrer le
+        résultat déjà en mémoire (self._log_participation_last_rows, sur
+        le champ "type" — voir _apply_log_participation_tournament_
+        filter et database._tournament_type_label pour sa détermination
+        fiable, réglage "is_sng" en priorité sur le nom de fichier),
+        jamais relu depuis le disque pour ce seul filtre."""
         frame = ttk.Frame(self.log_tab)
         self._log_participation_frame = frame
 
@@ -21222,7 +21224,7 @@ class App(tk.Tk):
         self.log_participation_tournament_var = tk.StringVar(value="Tous")
         self.log_participation_tournament_combo = ttk.Combobox(
             dates_row, textvariable=self.log_participation_tournament_var, state="readonly",
-            width=18, values=("Tous",),
+            width=12, values=("Tous", "Tournoi", "Sit & Go"),
         )
         self.log_participation_tournament_combo.pack(side="left", padx=(4, 0))
         self.log_participation_tournament_combo.bind(
@@ -21447,12 +21449,14 @@ class App(tk.Tk):
         finished).
 
         Demande du 2026-10-17 : stocke le résultat COMPLET (déjà filtré
-        par Du/Au) dans self._log_participation_last_rows, reconstruit
-        la liste "Tournoi" à partir de ces résultats, PUIS délègue
+        par Du/Au) dans self._log_participation_last_rows, PUIS délègue
         l'affichage réel à _apply_log_participation_tournament_filter —
         jamais une seconde logique de remplissage du tableau dupliquée
         ici (cette dernière est aussi appelée seule, sans nouvelle
-        recherche, quand "Tournoi" change)."""
+        recherche, quand "Tournoi" change). "Tournoi" ayant désormais 3
+        valeurs FIXES (demande du 2026-10-18, voir _build_log_
+        participation_tab), il n'y a plus de liste à reconstruire ici
+        contrairement à avant ce changement."""
         self._log_participation_scan_in_progress = False
         if "error" in result:
             self._update_log_participation_scan_ui()
@@ -21472,35 +21476,28 @@ class App(tk.Tk):
         else:
             self._log_participation_last_warning = ("", MUTED)
 
-        self._refresh_log_participation_tournament_choices()
         self._apply_log_participation_tournament_filter()
         self._update_log_participation_scan_ui()
 
-    def _refresh_log_participation_tournament_choices(self):
-        """Reconstruit les valeurs de "Tournoi" (demande du 2026-10-17)
-        à partir des tournois RÉELLEMENT présents dans self._log_
-        participation_last_rows — même principe que _refresh_log_
-        filter_choices pour le mode normal (jamais une liste figée à la
-        construction) : conserve la sélection courante si elle existe
-        encore parmi les nouvelles valeurs, repli sur "Tous" sinon."""
-        names = sorted(
-            {r["tournament_name"] for r in self._log_participation_last_rows}, key=str.casefold,
-        )
-        values = ("Tous",) + tuple(names)
-        self.log_participation_tournament_combo["values"] = values
-        if self.log_participation_tournament_var.get() not in values:
-            self.log_participation_tournament_var.set("Tous")
-
     def _apply_log_participation_tournament_filter(self):
         """Ré-affiche self.log_participation_tree à partir de self.
-        _log_participation_last_rows, restreint au tournoi choisi (ou
-        "Tous") — demande du 2026-10-17, choix explicitement validé :
-        JAMAIS une nouvelle recherche sur le disque pour ce seul filtre,
+        _log_participation_last_rows, restreint au TYPE choisi ("Tous" /
+        "Tournoi" / "Sit & Go", demande du 2026-10-17, revue le
+        2026-10-18 — 3 valeurs FIXES, voir _build_log_participation_tab,
+        remplaçant l'ancien filtre par nom de tournoi trouvé) : JAMAIS
+        une nouvelle recherche sur le disque pour ce seul filtre,
         contrairement à Du/Au (voir _start_log_participation_search).
         Également la SEULE méthode qui repeuple ce tableau, y compris
         juste après une recherche (voir _on_log_participation_search_
         finished, qui l'appelle en dernier) — jamais une logique de
         remplissage dupliquée.
+
+        Filtre sur r["type"] (voir database.find_player_participations/
+        _tournament_type_label pour sa détermination fiable — réglage
+        "is_sng" en base en priorité, repli sur le nom de fichier) —
+        jamais recalculé ici, jamais une seconde formule dupliquée. Une
+        ligne "Inconnu" n'apparaît que sous "Tous", jamais sous "Tournoi"
+        ni "Sit & Go" — jamais une supposition pour la classer.
 
         Le compteur affiché reflète les lignes RÉELLEMENT affichées
         (donc déjà filtrées par Tournoi), suivi de l'avertissement
@@ -21511,7 +21508,7 @@ class App(tk.Tk):
         selected = self.log_participation_tournament_var.get()
         rows = (
             self._log_participation_last_rows if selected == "Tous"
-            else [r for r in self._log_participation_last_rows if r["tournament_name"] == selected]
+            else [r for r in self._log_participation_last_rows if r["type"] == selected]
         )
         for row in self.log_participation_tree.get_children():
             self.log_participation_tree.delete(row)

@@ -5529,15 +5529,31 @@ def _tournament_type_matches(path, tournament_type):
     return True
 
 
-def _tournament_type_label(path):
+def _tournament_type_label(db, path):
     """Libellé affiché (demande du 2026-10-16, onglet LOG > Fonction >
-    "Participation", colonne "Type") pour le fichier .tournoi `path` —
-    MÊME convention de nommage que _tournament_type_matches ci-dessus
-    ("To"/"Sn", jamais dupliquée différemment), mais sous forme de
-    libellé plutôt que de filtre booléen. "Inconnu" (jamais une
-    supposition) pour tout nom hors convention (ex. un ancien repli
-    "tournoi.tournoi", ou un renommage manuel) — jamais classé à tort
-    comme Tournoi ou Sit & Go."""
+    "Participation", colonne "Type", et filtre "Tournoi"/"Sit & Go" du
+    même mode — demande du 2026-10-18) pour le fichier .tournoi `path`,
+    déjà ouvert dans `db`.
+
+    Revu le 2026-10-18 ("vérifier comment les types de tournois sont
+    réellement enregistrés... utiliser cette information fiable plutôt
+    que de se baser uniquement sur le nom des fichiers") : le réglage
+    "is_sng" (main.py: App._apply_sng_defaults, écrit une seule fois à la
+    création par le bouton "Sit & Go rapide", JAMAIS modifié ensuite) est
+    la source la plus fiable — contrairement au nom de fichier, il ne
+    change pas si le fichier est renommé par la suite. Priorité :
+    1. "is_sng" = 1 en base -> "Sit & Go", quel que soit le nom du
+       fichier (cas le plus fiable).
+    2. Sinon, repli sur la convention de nommage déjà établie ("To"/"Sn",
+       même convention que _tournament_type_matches ci-dessus) :
+       nécessaire pour les tournois créés AVANT l'introduction du réglage
+       "is_sng", qui ne l'ont donc jamais en base mais suivent déjà cette
+       convention de nom.
+    3. "Inconnu" (jamais une supposition) si ni l'un ni l'autre ne
+       permet de conclure — jamais classé à tort comme Tournoi ou
+       Sit & Go."""
+    if db.get_setting_int("is_sng", 0):
+        return "Sit & Go"
     name = os.path.basename(path)
     if name.startswith("To"):
         return "Tournoi"
@@ -5581,7 +5597,8 @@ def find_player_participations(paths, name, date_from=None, date_to=None, cancel
     Pour chaque fichier contenant une ligne "players" dont le nom
     correspond, renvoie un dict :
       {date, tournament_name, path,
-       type ("Tournoi"/"Sit & Go"/"Inconnu", voir _tournament_type_label),
+       type ("Tournoi"/"Sit & Go"/"Inconnu", voir _tournament_type_label
+       — réglage "is_sng" en priorité, repli sur le nom de fichier),
        status ("Actif"/"Forfait"/"Éliminé", voir players_rows),
        classement (int, ou "Hors classement" pour un TMP, ou "-" si pas
        encore classé — forfait ou tournoi encore en cours)}.
@@ -5638,7 +5655,7 @@ def find_player_participations(paths, name, date_from=None, date_to=None, cancel
                 "date": date,
                 "tournament_name": tournament_name,
                 "path": path,
-                "type": _tournament_type_label(path),
+                "type": _tournament_type_label(db, path),
                 "status": row["status"],
                 "classement": classement,
             })

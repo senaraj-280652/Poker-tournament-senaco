@@ -67,8 +67,7 @@ _LOG_METHODS = (
     "_on_log_participation_export",
     # Filtres Du/Au/Tournoi + bouton "Retour" (demande du 2026-10-17) :
     # idem, nécessaire à la construction sans AttributeError.
-    "_return_to_normal_log_view", "_refresh_log_participation_tournament_choices",
-    "_apply_log_participation_tournament_filter",
+    "_return_to_normal_log_view", "_apply_log_participation_tournament_filter",
 )
 _LOG_STATIC_METHODS = (
     "_build_log_tournament_label_maps", "_format_log_ts", "_log_count_label_text",
