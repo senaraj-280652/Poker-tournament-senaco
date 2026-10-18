@@ -40,9 +40,14 @@ except tk.TclError:
 
 class _FakeRosterDialog:
     """Doublure minimale de RosterManagerDialog pour _edit_group/_edit_
-    phone/_edit_mail : seuls _selected_name() et _refresh() sont lus/
-    appelés par ces méthodes — même style que _FakeRosterDialog dans
-    tests/test_roster_add_club_prompt.py."""
+    phone/_edit_mail : seuls _selected_name()/_require_single_selection()
+    et _refresh() sont lus/appelés par ces méthodes — même style que
+    _FakeRosterDialog dans tests/test_roster_add_club_prompt.py.
+    _require_single_selection (demande du 2026-10-15, passage du
+    Répertoire en sélection multiple) : cette doublure ne représente
+    jamais qu'une sélection unique ou vide (jamais plusieurs), donc
+    reproduit fidèlement ce sous-ensemble du comportement réel (voir
+    main.RosterManagerDialog._require_single_selection)."""
 
     def __init__(self, selected_name=None):
         self._selected = selected_name
@@ -50,6 +55,13 @@ class _FakeRosterDialog:
 
     def _selected_name(self):
         return self._selected
+
+    def _require_single_selection(self, empty_message=None):
+        if self._selected is not None:
+            return self._selected
+        if empty_message:
+            main.messagebox.showinfo("Info", empty_message, parent=self)
+        return None
 
     def _refresh(self):
         self.refresh_calls += 1

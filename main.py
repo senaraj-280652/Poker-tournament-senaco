@@ -2689,6 +2689,12 @@ class RosterManagerDialog(ttk.Frame):
             add_frame, text="Importer les joueurs d'un tournoi existant...",
             command=self._import_from_tournament,
         ).pack(side="left", padx=(8, 0))
+        # Bouton "Supprimer" (demande du 2026-10-15), immédiatement à
+        # côté d'"Importer..." pour un accès rapide — APPELLE la MÊME
+        # méthode _delete que le bouton déjà existant plus bas (voir
+        # btns, jamais dupliquée) : les deux restent strictement
+        # équivalents, peu importe lequel est cliqué.
+        ttk.Button(add_frame, text="Supprimer", command=self._delete).pack(side="left", padx=(8, 0))
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=12, pady=(0, 4))
@@ -2762,7 +2768,18 @@ class RosterManagerDialog(ttk.Frame):
         # "" par défaut) s'affiche simplement avec ces 3 colonnes vides.
         self.roster_tree = ttk.Treeview(
             list_frame, columns=("name", "club", "group", "phone", "mail", "pseudo"),
-            show="tree headings", selectmode="browse",
+            # "extended" (demande du 2026-10-15, bouton "Supprimer" à
+            # sélection multiple — AVANT "browse" seul ici) : Ctrl/Shift
+            # + clic pour cocher plusieurs lignes, même principe que le
+            # filtre "Club" ailleurs dans l'app (voir build_club_filter_
+            # widget). _selected_name() (singulier, INCHANGÉE) continue
+            # de renvoyer la PREMIÈRE ligne sélectionnée pour les actions
+            # à cible unique (Renommer/Modifier...) — désormais gardées
+            # par _require_single_selection ci-dessous plutôt que d'agir
+            # silencieusement sur cette première ligne si plusieurs sont
+            # cochées. _selected_names() (pluriel, nouvelle) renvoie
+            # TOUTES les lignes cochées, utilisée uniquement par _delete.
+            show="tree headings", selectmode="extended",
         )
         self.roster_tree.heading("#0", text="Photo")
         # +32 (pas +16) : le libellé "Photo" de l'en-tête ne tenait pas
@@ -2918,6 +2935,34 @@ class RosterManagerDialog(ttk.Frame):
             return None
         return sel[0]
 
+    def _selected_names(self):
+        """TOUS les noms actuellement cochés (voir selectmode="extended",
+        demande du 2026-10-15) — UNIQUEMENT pour _delete ci-dessous, seule
+        action à cible multiple de cet onglet. Tuple possiblement vide,
+        jamais None (contrairement à _selected_name)."""
+        return self.roster_tree.selection()
+
+    def _require_single_selection(self, empty_message=None):
+        """Nom du joueur sélectionné pour une action à CIBLE UNIQUE
+        (Renommer/Modifier le club/groupe/téléphone/mail/pseudo) : None
+        si aucune sélection (silencieux si `empty_message` est omis, sinon
+        affiché — préserve EXACTEMENT le comportement de chacun de ces
+        boutons avant le passage de ce Répertoire en sélection multiple),
+        OU si PLUSIEURS joueurs sont cochés à la fois (message dédié,
+        toujours affiché dans ce cas précis — jamais d'action silencieuse
+        sur le premier seulement, ambiguë pour l'utilisateur)."""
+        sel = self.roster_tree.selection()
+        if len(sel) > 1:
+            messagebox.showinfo(
+                "Info", "Sélectionnez un seul joueur pour cette action.", parent=self,
+            )
+            return None
+        if not sel:
+            if empty_message:
+                messagebox.showinfo("Info", empty_message, parent=self)
+            return None
+        return sel[0]
+
     def _add(self):
         name = self.new_name_var.get().strip()
         if not name:
@@ -2965,7 +3010,7 @@ class RosterManagerDialog(ttk.Frame):
             self.roster_tree.see(name)
 
     def _rename(self):
-        name = self._selected_name()
+        name = self._require_single_selection()
         if not name:
             return
         new_name = simpledialog.askstring("Renommer", "Nouveau nom :", initialvalue=name)
@@ -2975,9 +3020,8 @@ class RosterManagerDialog(ttk.Frame):
             self._refresh()
 
     def _edit_club(self):
-        name = self._selected_name()
+        name = self._require_single_selection("Sélectionnez d'abord un joueur dans la liste.")
         if not name:
-            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
             return
         club = ask_club_dialog(self, title=f"Club de {name}", current_club=roster.get_club(name))
         if club is not None:
@@ -2985,9 +3029,8 @@ class RosterManagerDialog(ttk.Frame):
             self._refresh()
 
     def _edit_group(self):
-        name = self._selected_name()
+        name = self._require_single_selection("Sélectionnez d'abord un joueur dans la liste.")
         if not name:
-            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
             return
         group = ask_group_dialog(self, title=f"Groupe de {name}", current_group=roster.get_group(name))
         if group is not None:
@@ -2995,9 +3038,8 @@ class RosterManagerDialog(ttk.Frame):
             self._refresh()
 
     def _edit_phone(self):
-        name = self._selected_name()
+        name = self._require_single_selection("Sélectionnez d'abord un joueur dans la liste.")
         if not name:
-            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
             return
         phone = simpledialog.askstring(
             "Téléphone", f"Téléphone de {name} :", initialvalue=roster.get_phone(name),
@@ -3007,9 +3049,8 @@ class RosterManagerDialog(ttk.Frame):
             self._refresh()
 
     def _edit_mail(self):
-        name = self._selected_name()
+        name = self._require_single_selection("Sélectionnez d'abord un joueur dans la liste.")
         if not name:
-            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
             return
         mail = simpledialog.askstring(
             "Mail", f"Mail de {name} :", initialvalue=roster.get_mail(name),
@@ -3022,9 +3063,8 @@ class RosterManagerDialog(ttk.Frame):
         """Même principe que _edit_mail ci-dessus (demande du 2026-10-03,
         "ajouter la colonne Pseudo au Répertoire") — un bouton dédié,
         purement informatif, n'affecte aucune permission."""
-        name = self._selected_name()
+        name = self._require_single_selection("Sélectionnez d'abord un joueur dans la liste.")
         if not name:
-            messagebox.showinfo("Info", "Sélectionnez d'abord un joueur dans la liste.")
             return
         pseudo = simpledialog.askstring(
             "Pseudo", f"Pseudo de {name} :", initialvalue=roster.get_pseudo(name),
@@ -3068,13 +3108,31 @@ class RosterManagerDialog(ttk.Frame):
         )
 
     def _delete(self):
-        name = self._selected_name()
-        if not name:
+        """Supprime du Répertoire le ou les joueurs actuellement cochés
+        (demande du 2026-10-15, sélection multiple — voir selectmode=
+        "extended" ci-dessus) : AUCUNE suppression sans sélection (liste
+        vide -> retour immédiat, avant même toute confirmation), une
+        SEULE confirmation nommant TOUS les joueurs concernés, puis un
+        SEUL rafraîchissement une fois tous supprimés. Ne touche jamais
+        à self.db/aucun fichier .tournoi (roster.py et player_photos.py
+        sont entièrement indépendants des tournois déjà créés — voir
+        leurs propres docstrings) : aucun résultat, classement,
+        participation ni historique de tournoi n'est jamais affecté."""
+        names = self._selected_names()
+        if not names:
             return
-        if messagebox.askyesno("Confirmer", f"Retirer {name} du répertoire ?\n"
-                                "(Cela ne touche à aucun tournoi déjà créé.)"):
-            roster.remove_from_roster(name)
-            player_photos.delete_photo(name)
+        if len(names) == 1:
+            question = f"Retirer {names[0]} du répertoire ?\n(Cela ne touche à aucun tournoi déjà créé.)"
+        else:
+            listed = "\n".join(f"  • {n}" for n in names)
+            question = (
+                f"Retirer ces {len(names)} joueurs du répertoire ?\n\n{listed}\n\n"
+                "(Cela ne touche à aucun tournoi déjà créé.)"
+            )
+        if messagebox.askyesno("Confirmer", question, parent=self):
+            for name in names:
+                roster.remove_from_roster(name)
+                player_photos.delete_photo(name)
             self._refresh()
 
     def _delete_all(self):
@@ -4648,6 +4706,21 @@ class PeriodSummaryDialog(ttk.Frame):
             default_folder = (app.db.get_setting("tournament_day_folder", "") or "").strip()
             if not default_folder:
                 default_folder = os.path.dirname(os.path.abspath(app.db.path))
+        if not default_folder:
+            # Aucun tournoi ouvert (écran « Menu principal », voir
+            # App._build_tabs) — ou, par défense, son propre réglage ET
+            # son dossier étaient tous deux vides : repli sur le dossier
+            # par défaut des PARAMÈTRES GÉNÉRAUX (demande du 2026-10-15),
+            # mémorisé indépendamment de tout tournoi dans ~/.poker_
+            # tournament/last_settings.json (voir tournament_prefs.py,
+            # même fichier déjà utilisé pour proposer ce même dossier à la
+            # création d'un tournoi — voir sa docstring/_build_settings_
+            # tab_standalone). Ne change RIEN quand un tournoi est ouvert
+            # (default_folder déjà non vide dans ce cas, bloc ci-dessus
+            # inchangé) : purement additif.
+            default_folder = (
+                tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+            ).strip()
         self.folder_var = tk.StringVar(value=default_folder)
         self.recursive_var = tk.BooleanVar(value=True)
         # Filtre "jours" (demande du 2026-09-18, 7 cases Lundi...Dimanche
