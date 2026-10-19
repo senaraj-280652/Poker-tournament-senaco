@@ -2446,11 +2446,27 @@ setInterval(tickAbsentBlink, 600);
 // touchmove a appelé preventDefault(), ce qui est déjà le cas pour tout
 // glissement engagé, voir onTouchMove). Purement local à cette page :
 // aucune écriture BDD, aucun appel serveur.
-document.getElementById('btn-abs-des').addEventListener('click', function() {{
-  absFirstSortActive = !absFirstSortActive;
-  document.getElementById('btn-abs-des').classList.toggle('sort-active', absFirstSortActive);
-  renderLists();
-}});
+//
+// "btn-abs-des" n'existe dans le HTML que si "Gestion de l'accueil" est
+// activée pour ce tournoi (voir {{abs_des_button}} ci-dessus, réservé aux
+// tournois Open, désactivé par défaut) — getElementById renvoie alors
+// null, et getElementById(...).addEventListener(...) levait une
+// exception JS à l'exécution de CETTE ligne, AVANT même le premier
+// appel à loadPlayers() (plus bas dans ce script) : la page restait
+// alors figée, deux colonnes vides, sans le moindre message visible
+// (régression du 2026-10-12, corrigée le 2026-10-19 — bug réel constaté
+// sur Mac + iPhone). Garde-fou IDENTIQUE à celui déjà utilisé plus haut
+// pour ce même bouton (onTouchMove, onTouchEnd) : ce bloc ne s'exécute
+// simplement plus quand le bouton est absent, chargement des joueurs et
+// reste de la page inchangés dans les deux cas.
+var absDesSortBtn = document.getElementById('btn-abs-des');
+if (absDesSortBtn) {{
+  absDesSortBtn.addEventListener('click', function() {{
+    absFirstSortActive = !absFirstSortActive;
+    absDesSortBtn.classList.toggle('sort-active', absFirstSortActive);
+    renderLists();
+  }});
+}}
 
 // Recherche Nom/Table/Siège (demande du 2026-10-07) : dynamique, sans
 // bouton "Rechercher" — chaque frappe redessine directement la colonne

@@ -27,11 +27,15 @@ reste à confirmer par le test manuel."""
 import os
 import re
 import sys
+import tempfile
+import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import database  # noqa: E402
+import main  # noqa: E402
 import remote_control  # noqa: E402
 
 
@@ -99,9 +103,18 @@ class AbsFirstSortStateTest(_JsSourceTestCase):
 #    redessin — jamais d'écriture BDD ni d'appel serveur
 # =========================================================================
 class AbsDesClickListenerTest(_JsSourceTestCase):
+    """Revu le 2026-10-19 (régression réelle corrigée, voir
+    AbsDesButtonMissingGuardTest ci-dessous) : le listener n'est plus
+    posé par un appel chaîné direct sur getElementById(...), mais via la
+    variable `absDesSortBtn`, déjà testée nulle avant d'appeler
+    addEventListener — _listener_body() et les vérifications suivent ce
+    nouveau point d'ancrage, le CONTENU du listener lui-même (bascule du
+    drapeau, classe visuelle, redessin, aucun réseau/BDD) reste
+    EXACTEMENT le même qu'avant ce correctif."""
+
     def _listener_body(self):
         m = re.search(
-            r"getElementById\('btn-abs-des'\)\.addEventListener\('click',\s*function\(\)\s*\{\{",
+            r"absDesSortBtn\.addEventListener\('click',\s*function\(\)\s*\{\{",
             self.page,
         )
         self.assertIsNotNone(m, "listener click sur btn-abs-des introuvable")
@@ -138,8 +151,123 @@ class AbsDesClickListenerTest(_JsSourceTestCase):
         self.assertNotIn("sendAction(", body)
 
     def test_un_seul_listener_click_pose_sur_ce_bouton(self):
-        occurrences = self.page.count("getElementById('btn-abs-des').addEventListener('click'")
+        occurrences = self.page.count("absDesSortBtn.addEventListener('click'")
         self.assertEqual(occurrences, 1)
+
+
+# =========================================================================
+# 1bis. Régression réelle (2026-10-19) : page Éliminations totalement
+#    vide (Mac + iPhone) quand "Gestion de l'accueil" est désactivée —
+#    cas par défaut pour un tournoi normal du club, et pour TOUT nouveau
+#    tournoi. Cause : getElementById('btn-abs-des').addEventListener(...)
+#    posé SANS vérifier que l'élément existe ; #btn-abs-des n'est
+#    construit dans le HTML QUE si "Gestion de l'accueil" est activée
+#    (voir main.py, abs_des_button). Sans garde, cette ligne levait une
+#    exception JS AVANT le premier appel à loadPlayers() plus bas dans
+#    le même <script> — aucun joueur n'était donc jamais chargé ni
+#    affiché, sans le moindre message visible.
+#
+#    AVERTISSEMENT (comme pour tout ce fichier) : aucun moteur
+#    JavaScript n'est disponible dans cet environnement (ni Node, ni
+#    js2py/PyMiniRacer) — ces tests vérifient uniquement, par inspection
+#    du SOURCE, que la ligne fautive est bien gardée et que les deux
+#    configurations ("Gestion de l'accueil" activée ou non) restent
+#    cohérentes textuellement. Ils NE PEUVENT PAS exécuter le script et
+#    donc ne prouvent pas, par eux-mêmes, l'absence d'exception à
+#    l'exécution réelle dans un navigateur — seul un essai manuel réel
+#    (déjà effectué pour ce correctif, cause confirmée puis corrigée)
+#    le garantit.
+# =========================================================================
+class AbsDesButtonMissingGuardTest(_JsSourceTestCase):
+    def test_getelementbyid_najamais_chaine_directement_sur_addeventlistener(self):
+        """Cœur du correctif : plus aucun appel direct
+        getElementById('btn-abs-des').addEventListener(...) — la seule
+        façon sûre de poser ce listener passe désormais par une
+        variable explicitement testée avant l'appel."""
+        self.assertNotIn(
+            "getElementById('btn-abs-des').addEventListener", self.page,
+        )
+
+    def test_la_variable_est_bien_testee_avant_addeventlistener(self):
+        m = re.search(
+            r"var absDesSortBtn = document\.getElementById\('btn-abs-des'\);\s*"
+            r"if \(absDesSortBtn\) \{\{",
+            self.page,
+        )
+        self.assertIsNotNone(
+            m, "absDesSortBtn doit être vérifiée (if) avant tout usage pour le listener click",
+        )
+
+    def test_la_classe_sort_active_bascule_aussi_via_la_variable_gardee(self):
+        """classList.toggle('sort-active', ...) doit rester À L'INTÉRIEUR
+        du bloc protégé (sur absDesSortBtn, jamais un nouvel appel
+        getElementById('btn-abs-des') non gardé qui réintroduirait le
+        même risque)."""
+        body = self._listener_body_for_test()
+        self.assertIn("absDesSortBtn.classList.toggle", body)
+
+    def _listener_body_for_test(self):
+        m = re.search(
+            r"absDesSortBtn\.addEventListener\('click',\s*function\(\)\s*\{\{",
+            self.page,
+        )
+        self.assertIsNotNone(m)
+        start = m.end()
+        depth = 1
+        i = start
+        while depth > 0:
+            if self.page[i:i + 2] == "{{":
+                depth += 1
+                i += 2
+            elif self.page[i:i + 2] == "}}":
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+        return self.page[start:i - 2]
+
+    def test_les_deux_autres_acces_a_ce_bouton_restent_deja_gardes(self):
+        """Vérifie qu'aucun autre accès à "btn-abs-des" dans le JS n'a été
+        rendu, par erreur, non gardé en corrigeant celui-ci — les deux
+        autres usages existants (détection du dépôt pendant un glisser,
+        comparaison d'id en fin de glisser) étaient déjà protégés avant
+        ce correctif et le restent, INCHANGÉS."""
+        self.assertIn(
+            "if (absDesBtn && pointInRect(", self.page,
+        )
+        self.assertIn(
+            "if (wasEngaged && target && target.id === 'btn-abs-des')", self.page,
+        )
+
+    def test_abs_des_button_vide_najamais_le_tag_bouton_dans_la_page(self):
+        """Non-régression de la construction HTML elle-même (main.py,
+        inchangée par ce correctif) : {{abs_des_button}} vide (Gestion de
+        l'accueil désactivée) ne doit jamais laisser le tag <button
+        id="btn-abs-des"> dans la page rendue — sinon le scénario qui a
+        produit le bug ne serait plus jamais exercé par ces tests."""
+        rendered = self.page.format(
+            tournament_name="Test", reload_script="", rebalance_widget="",
+            auth_redirect_script="", abs_des_button="",
+        )
+        self.assertNotIn('id="btn-abs-des"', rendered)
+        # Le script, lui, reste toujours présent et syntaxiquement entier
+        # (le bloc "if (absDesSortBtn) {" n'est jamais retiré selon ce
+        # réglage — seul le HTML du bouton lui-même change).
+        self.assertIn("var absDesSortBtn = document.getElementById('btn-abs-des');", rendered)
+
+    def test_abs_des_button_present_garde_le_tag_bouton_dans_la_page(self):
+        """Configuration inverse (Gestion de l'accueil activée) : le tag
+        <button> doit bien apparaître, pour que absDesSortBtn ne soit
+        JAMAIS null dans ce cas et que le tri "absents en premier" reste
+        pleinement fonctionnel — voir AbsFirstSortStateTest/
+        AbsDesClickListenerTest ci-dessus pour le comportement du
+        listener lui-même, inchangé."""
+        rendered = self.page.format(
+            tournament_name="Test", reload_script="", rebalance_widget="",
+            auth_redirect_script="",
+            abs_des_button='<button id="btn-abs-des" data-target="true">🚩 Abs/Dés</button>',
+        )
+        self.assertIn('id="btn-abs-des"', rendered)
 
 
 # =========================================================================
@@ -310,6 +438,45 @@ class DragAndDropFunctionsUntouchedTest(_JsSourceTestCase):
         idx_engaged = move_body.index("pending.engaged = true;")
         idx_prevent = move_body.index("e.preventDefault();")
         self.assertLess(idx_engaged, idx_prevent)
+
+
+# =========================================================================
+# 7. Complément côté serveur (pas du JS) : le scénario exact rapporté
+#    (8 inscrits, 7 actifs, 1 déjà éliminé) renvoie bien 7 entrées —
+#    confirme que App._refresh_remote_players_cache (donc /players) n'a
+#    jamais été la cause de la page vide : la régression est isolée au
+#    seul listener JS non gardé, corrigé ci-dessus.
+# =========================================================================
+class RemotePlayersCacheActiveScenarioTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="remote_players_cache_")
+        self.addCleanup(self._tmp.cleanup)
+        self.db = database.Database(os.path.join(self._tmp.name, "To191026.tournoi"))
+        self.addCleanup(self.db.close)
+
+    def test_8_inscrits_7_actifs_1_elimine_renvoie_7_entrees(self):
+        ids = [self.db.add_player(f"Joueur {i}", "CPC") for i in range(8)]
+        self.db.eliminate_player(ids[0], eliminated_by_id=ids[1])
+
+        app = types.SimpleNamespace(db=self.db)
+        app._refresh_remote_players_cache = types.MethodType(
+            main.App._refresh_remote_players_cache, app,
+        )
+        app._refresh_remote_players_cache()
+
+        self.assertEqual(len(app._remote_players_cache), 7)
+        cached_ids = {p["id"] for p in app._remote_players_cache}
+        self.assertNotIn(ids[0], cached_ids)  # l'éliminé n'apparaît jamais
+        for pid in ids[1:]:
+            self.assertIn(pid, cached_ids)
+
+    def test_aucun_tournoi_ouvert_renvoie_une_liste_vide_jamais_une_exception(self):
+        app = types.SimpleNamespace(db=None)
+        app._refresh_remote_players_cache = types.MethodType(
+            main.App._refresh_remote_players_cache, app,
+        )
+        app._refresh_remote_players_cache()
+        self.assertEqual(app._remote_players_cache, [])
 
 
 if __name__ == "__main__":

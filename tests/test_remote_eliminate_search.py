@@ -365,8 +365,33 @@ class DragDropAndEliminationUntouchedTest(_JsSourceTestCase):
     def test_abs_first_sort_toggle_toujours_independant_de_la_recherche(self):
         """Non-régression du chantier précédent : le listener click sur
         Abs/Dés ne doit toujours référencer QUE absFirstSortActive,
-        jamais les variables de recherche."""
-        body = self._listener_body("btn-abs-des", "click")
+        jamais les variables de recherche.
+
+        Revu le 2026-10-19 (régression réelle corrigée — page vide quand
+        "Gestion de l'accueil" est désactivée, voir tests/test_remote_
+        abs_first_sort.py::AbsDesButtonMissingGuardTest pour le détail
+        complet du correctif) : le listener est désormais posé via la
+        variable `absDesSortBtn` (vérifiée non nulle avant tout appel),
+        jamais par un appel chaîné direct sur getElementById(...) — le
+        contenu du listener lui-même reste inchangé."""
+        m = re.search(
+            r"absDesSortBtn\.addEventListener\('click',\s*function\(\)\s*\{\{",
+            self.page,
+        )
+        self.assertIsNotNone(m, "listener click sur btn-abs-des introuvable")
+        start = m.end()
+        depth = 1
+        i = start
+        while depth > 0:
+            if self.page[i:i + 2] == "{{":
+                depth += 1
+                i += 2
+            elif self.page[i:i + 2] == "}}":
+                depth -= 1
+                i += 2
+            else:
+                i += 1
+        body = self.page[start:i - 2]
         self.assertIn("absFirstSortActive = !absFirstSortActive;", body)
         for var in ("nameFilter", "tableFilter", "seatFilter"):
             self.assertNotIn(var, body)
