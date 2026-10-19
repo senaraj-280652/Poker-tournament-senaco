@@ -50,8 +50,8 @@ TAB_TO_CHAPTER = {
     "Chronomètre": "10. Onglet Chronomètre",
     "Blindes": "9. Onglet Blindes",
     "Classement": "11. Onglet Classement",
-    "Répertoire": "16. Menu Répertoire — joueurs habituels et photos",
-    "Statistiques": "15. Statistiques — Synthèse par période",
+    "Répertoire": "17. Menu Répertoire — joueurs et photos",
+    "Statistiques": "16. Statistiques — Synthèse par période",
     "Paramètres": "12. Onglet Paramètres",
 }
 

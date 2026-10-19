@@ -3657,7 +3657,7 @@ class LobbyDialog(tk.Toplevel):
         self.bind(
             "<F1>",
             lambda e: HelpBrowser.open_at(
-                master, chapter_title="14. Sit & Go et gestion de plusieurs tournois", section_title="Lobby"
+                master, chapter_title="15. Sit & Go et gestion de plusieurs tournois", section_title="Lobby"
             ),
         )
         self._after_id = None
@@ -10458,7 +10458,7 @@ class App(tk.Tk):
             and focused is not None
             and focused.winfo_toplevel() is self.clock_window
         ):
-            HelpBrowser.open_at(self, chapter_title="9. Onglet Chronomètre", section_title="Écran projecteur")
+            HelpBrowser.open_at(self, chapter_title="10. Onglet Chronomètre", section_title="Écran projecteur")
             return
         try:
             current_tab = self.notebook.tab(self.notebook.select(), "text")
