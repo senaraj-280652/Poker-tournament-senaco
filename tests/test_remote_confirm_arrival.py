@@ -311,8 +311,7 @@ class RemoteConfirmArrivalHttpTest(_RemoteControlHttpTestCase):
             self.db.cancel_arrival(player_id)
             return {"ok": True, "message": ""}
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_checkin_players=_checkin_players,
             on_confirm_arrival=_confirm,
@@ -323,8 +322,7 @@ class RemoteConfirmArrivalHttpTest(_RemoteControlHttpTestCase):
             # serveur lorsque ce réglage est désactivé (défaut).
             get_accueil_management_enabled=lambda: True,
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def test_checkin_players_expose_la_liste_reelle(self):
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")

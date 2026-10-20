@@ -618,16 +618,14 @@ class DirectCancelArrivalHttpRequestRefusedTest(_RemoteControlHttpTestCase):
 
         import remote_control
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_checkin_players=lambda: [],
             on_confirm_arrival=self.fake._remote_confirm_arrival_request,
             on_cancel_arrival=self.fake._remote_cancel_arrival_request,
             get_accueil_management_enabled=lambda: True,
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def test_requete_directe_vers_cancel_arrival_refusee_pour_un_joueur_actif(self):
         """Simule un client qui n'affiche plus de bouton "Annuler" mais

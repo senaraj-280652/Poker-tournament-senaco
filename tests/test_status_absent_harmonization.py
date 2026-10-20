@@ -282,8 +282,7 @@ class CheckinPageAbsentHttpTest(_RemoteControlHttpTestCase):
         self.addCleanup(self.db.conn.close)
         self.pid = self.db.add_player("Alice")
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_checkin_players=lambda: [
                 {
@@ -298,8 +297,7 @@ class CheckinPageAbsentHttpTest(_RemoteControlHttpTestCase):
             get_accueil_management_enabled=lambda: True,
             get_absence_deadline_passed=lambda: self.db.absence_deadline_passed(),
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def _jar(self):
         return authenticated_jar(self.base, code=self.code, owner_name="Test Admin")

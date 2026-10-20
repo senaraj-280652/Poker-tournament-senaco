@@ -25,7 +25,6 @@ obligatoire : les connexions sqlite3 ne sont pas partageables entre
 threads)."""
 import json
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -40,13 +39,6 @@ import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 class _DirtoEnforcementTestCase(unittest.TestCase):
@@ -87,11 +79,14 @@ class _DirtoEnforcementTestCase(unittest.TestCase):
         self.on_eliminate_calls = []
         self.on_end_tournament_calls = []
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.server = self._make_server(self.db, self.port)
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
+        self.server = self._make_server(self.db, 0)
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.own_pid = os.getpid()
 
     def _make_server(self, db, port):
@@ -570,14 +565,17 @@ class EtancheiteMultiTournoisEnforcementTest(unittest.TestCase):
         self.db_b = database.Database(os.path.join(self._tmp.name, "B.tournoi"))
         self.addCleanup(self.db_b.conn.close)
 
-        self.port_a = _free_port()
-        self.port_b = _free_port()
-        self.server_a = self._make_server(self.db_a, self.port_a)
-        self.server_b = self._make_server(self.db_b, self.port_b)
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
+        self.server_a = self._make_server(self.db_a, 0)
+        self.server_b = self._make_server(self.db_b, 0)
         self.server_a.start()
         self.addCleanup(self.server_a.stop)
         self.server_b.start()
         self.addCleanup(self.server_b.stop)
+        self.port_a = self.server_a.port
+        self.port_b = self.server_b.port
 
         # Marie autorisée sur A ("tables") UNIQUEMENT — jamais sur B.
         self.db_a.set_dirto_authorization("Marie", "Raj", ["tables"])

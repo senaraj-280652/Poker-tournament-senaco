@@ -243,8 +243,7 @@ class RemoteAbsenceManagementHttpTest(_RemoteControlHttpTestCase):
             self.db.withdraw_player(player_id)
             return {"ok": True, "message": ""}
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_players=_get_players,
             on_declare_absence=_declare,
@@ -257,8 +256,7 @@ class RemoteAbsenceManagementHttpTest(_RemoteControlHttpTestCase):
             # serveur lorsque ce réglage est désactivé (défaut).
             get_accueil_management_enabled=lambda: True,
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def test_declare_absence_confirme_uniquement_le_joueur_vise(self):
         _start_tournament(self.db)

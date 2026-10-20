@@ -343,11 +343,20 @@ class _RemoteControlHttpTestCase(unittest.TestCase):
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=self.port)
+        # port=0 (demande du 2026-10-20) : jamais un port pré-sondé via
+        # _free_port() puis réutilisé en espérant qu'il soit toujours
+        # libre au moment du vrai bind() — cette approche a provoqué un
+        # ConnectionRefusedError intermittent ailleurs (self.base figé
+        # sur un port qui n'était plus celui réellement obtenu après un
+        # repli de RemoteControlServer.start() sur un AUTRE port). port=0
+        # fait choisir le port par l'OS de façon atomique au bind — aucune
+        # fenêtre de course possible. self.port/self.base sont donc
+        # construits APRÈS start(), à partir du port RÉELLEMENT obtenu.
+        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=0)
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.code = open_windows.remote_session_code()
 
         self.log_path = os.path.join(self._tmp.name, "remote_control.log")
@@ -357,6 +366,38 @@ class _RemoteControlHttpTestCase(unittest.TestCase):
         logger_patcher = patch.object(remote_control, "_logger", None)
         self.addCleanup(logger_patcher.stop)
         logger_patcher.start()
+
+    def _replace_server(self, server):
+        """Remplace self.server (déjà démarré par ce setUp(), voir plus
+        haut) par `server` (un RemoteControlServer reconfiguré avec des
+        callbacks différents, construit par l'appelant) — pour toute
+        sous-classe ayant besoin d'un serveur propre à son scénario sans
+        répéter à la main la séquence stop()/réaffectation/start()/
+        addCleanup().
+
+        Historique (demande du 2026-10-20) : cette séquence, écrite à la
+        main dans 8 fichiers de tests, omettait systématiquement le
+        addCleanup(self.server.stop) du serveur DE REMPLACEMENT (seul
+        celui du serveur d'origine, posé par le setUp() ci-dessus, était
+        enregistré) — chaque test laissait donc un thread "serve_forever"
+        tourner pour le reste du process. 14 threads ainsi accumulés ont
+        fini par provoquer un plantage natif Tcl/Tk (voir tests/
+        test_remote_control_server_stop_joins_threads.py pour le
+        mécanisme exact : un thread d'arrière-plan qui traîne peut être
+        choisi par le ramasse-miettes cyclique pour finaliser un objet
+        Tk/Tcl d'un AUTRE thread). Centraliser ici la séquence complète
+        élimine la possibilité même d'oublier ce addCleanup à l'avenir.
+
+        Aucun risque de double-arrêt problématique : RemoteControlServer.
+        stop() est idempotent (no-op si déjà arrêté, voir son code), et le
+        stop() de l'ANCIEN serveur reste déjà programmé par le setUp()
+        d'origine (capturé par valeur à ce moment-là — jamais affecté par
+        la réaffectation de self.server ci-dessous) ; l'appel explicite
+        ici ne fait qu'avancer ce même arrêt, pas le dupliquer."""
+        self.server.stop()
+        self.server = server
+        self.server.start()
+        self.addCleanup(self.server.stop)
 
     def _read_log(self):
         if not os.path.exists(self.log_path):

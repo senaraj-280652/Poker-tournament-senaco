@@ -18,7 +18,6 @@ utilisé (jamais d'accès au vrai registre partagé)."""
 import http.cookiejar
 import json
 import os
-import socket
 import sys
 import tempfile
 import time
@@ -32,14 +31,6 @@ import open_windows  # noqa: E402
 import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
-
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 class _RemoteControlHttpTestCase(unittest.TestCase):
@@ -81,11 +72,14 @@ class _RemoteControlHttpTestCase(unittest.TestCase):
         log_patcher.start()
         logger_patcher.start()
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=self.port)
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
+        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=0)
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.code = open_windows.remote_session_code()
 
     def _req(self, method, path, jar=None, body=None):

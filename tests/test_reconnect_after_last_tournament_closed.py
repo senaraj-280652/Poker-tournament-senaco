@@ -39,7 +39,6 @@ Deux familles de tests :
   le fichier, et la condition exacte qui le protège), pas seulement la
   présence de texte."""
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -52,13 +51,6 @@ import open_windows  # noqa: E402
 import remote_control  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _render_main_page():
@@ -87,11 +79,6 @@ class LobbylistOwnPidHeaderTest(unittest.TestCase):
     requête protégée."""
 
     def setUp(self):
-        self.test_port = _free_port()
-        patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
-        self.addCleanup(patcher.stop)
-        patcher.start()
-
         self._tmp = tempfile.TemporaryDirectory(prefix="reconnect_lobbylist_test_")
         self.addCleanup(self._tmp.cleanup)
         registry_path = os.path.join(self._tmp.name, "open_windows.json")
@@ -117,13 +104,22 @@ class LobbylistOwnPidHeaderTest(unittest.TestCase):
         log_patcher.start()
         logger_patcher.start()
 
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent). DEFAULT_PORT
+        # n'est patché qu'APRÈS avoir le port réellement obtenu, pour que
+        # les deux restent toujours cohérents.
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_tournament_name=lambda: "Tournoi Test",
-            port=self.test_port,
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.test_port = self.server.port
+        patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
+        self.addCleanup(patcher.stop)
+        patcher.start()
         self.jar = authenticated_jar(f"http://127.0.0.1:{self.test_port}")
 
     def test_lobbylist_expose_le_pid_du_process_qui_repond_vraiment(self):

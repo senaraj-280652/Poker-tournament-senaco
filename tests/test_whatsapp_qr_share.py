@@ -67,7 +67,6 @@ except Exception:
 
 import main  # noqa: E402
 from _tk_cleanup import cleanup_tk  # noqa: E402
-from test_remote_control_reliability import _free_port  # noqa: E402
 
 
 def _write_pdf(path, content=b"PDF CONTENT"):
@@ -346,7 +345,11 @@ class WhatsAppShareServerIntegrationTest(unittest.TestCase):
         patcher = patch.object(remote_control, "_whatsapp_share_tokens", {})
         self.addCleanup(patcher.stop)
         patcher.start()
-        self.server = remote_control.WhatsAppShareServer(port=_free_port())
+        # port=0 (demande du 2026-10-20) : ce test lit déjà self.server.port
+        # à la volée (voir test_page_de_confirmation_rechargeable_sans_
+        # consommer ci-dessous), jamais une valeur mise en cache — port=0
+        # élimine simplement le sondage _free_port() devenu inutile.
+        self.server = remote_control.WhatsAppShareServer(port=0)
         self.server.start()
         self.addCleanup(self.server.stop)
         self.own_pid = os.getpid()
@@ -462,10 +465,13 @@ class RemoteControlServerWhatsAppShareNonRegressionTest(unittest.TestCase):
         self.pdf_path = os.path.join(self._tmp.name, "classement.pdf")
         _write_pdf(self.pdf_path, b"CONTENU REEL")
 
-        self.port = _free_port()
-        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=self.port)
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
+        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=0)
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
         self.own_pid = os.getpid()
 
     def test_login_reste_joignable_sans_authentification(self):

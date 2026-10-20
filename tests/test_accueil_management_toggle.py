@@ -52,7 +52,7 @@ import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 from _tk_cleanup import cleanup_tk  # noqa: E402
-from test_remote_control_reliability import _RemoteControlHttpTestCase, _free_port  # noqa: E402,F401
+from test_remote_control_reliability import _RemoteControlHttpTestCase  # noqa: E402
 
 try:
     _root_probe = tk.Tk()
@@ -431,8 +431,7 @@ class RemoteAccueilToggleHttpTest(_RemoteControlHttpTestCase):
         self.pid = self.db.add_player("Alice")
         self._accueil_enabled = False
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_players=lambda: [
                 {"id": p["id"], "name": p["name"], "absent": bool(p["absent_declared_at"])}
@@ -450,8 +449,7 @@ class RemoteAccueilToggleHttpTest(_RemoteControlHttpTestCase):
             get_absence_deadline_passed=lambda: self.db.absence_deadline_passed(),
             get_accueil_management_enabled=lambda: self._accueil_enabled,
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def _jar(self):
         return authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
@@ -611,17 +609,22 @@ class RemoteAccueilToggleDirtoHttpTest(unittest.TestCase):
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
         self._accueil_enabled = False
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent, self.base
+        # jamais resynchronisé avec le port réel après un repli éventuel
+        # de start()).
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_dirto_permissions=lambda name: frozenset({remote_control._PERM_CHECKIN}),
             get_accueil_management_enabled=lambda: self._accueil_enabled,
-            port=self.port,
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.code = open_windows.remote_session_code()
 
     def test_bouton_accueil_absent_pour_dirto_quand_desactive(self):

@@ -37,7 +37,6 @@ import http.cookiejar
 import io
 import json
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -57,13 +56,6 @@ try:
 except ImportError:
     _PIL_AVAILABLE = False
 
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 _TEMPLATES = {
@@ -180,11 +172,14 @@ class _RemoteControlWebAppHttpTestCase(unittest.TestCase):
         log_patcher.start()
         logger_patcher.start()
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
-        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=self.port)
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
+        self.server = remote_control.RemoteControlServer(on_word=lambda w: None, port=0)
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
 
     def _req(self, method, path, jar=None, body=None):
         return http_request(self.base, method, path, jar, body=body)

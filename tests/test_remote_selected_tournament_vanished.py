@@ -130,11 +130,10 @@ class SelectedTournamentVanishedHttpTest(_RemoteControlHttpTestCase):
     def setUp(self):
         super().setUp()
         self.eliminate_calls = []
-        self.server.stop()
         # Recrée le serveur avec un on_eliminate qui enregistre CE qu'il
         # reçoit réellement — pour prouver qu'il n'est JAMAIS appelé
         # dans ce scénario (voir les assertions ci-dessous).
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             on_eliminate=lambda eliminated_id, eliminator_id, client_request_id=None: (
                 self.eliminate_calls.append((eliminated_id, eliminator_id, client_request_id))
@@ -142,8 +141,7 @@ class SelectedTournamentVanishedHttpTest(_RemoteControlHttpTestCase):
             ),
             get_players=lambda: [{"id": 1, "name": "JoueurDeA", "table": None, "seat": None, "has_photo": False}],
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def test_players_repond_409_tournament_gone_jamais_les_donnees_de_a(self):
         """Vérifie précisément les questions 5/6 de la demande : le

@@ -31,7 +31,6 @@ Couvre :
    séparée."""
 import os
 import re
-import socket
 import sys
 import tempfile
 import unittest
@@ -48,13 +47,6 @@ from _remote_control_auth_test_utils import authenticated_jar, http_request  # n
 
 _PAGES_WITH_TOURNAMENT_NAME = ("/", "/eliminate", "/photos", "/moves", "/checkin")
 
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _get_text(url, jar=None):
@@ -94,16 +86,19 @@ class _PhoneIdentifierHttpTestCase(unittest.TestCase):
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
         self.server = remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_tournament_name=lambda: self.TOURNAMENT_NAME,
             get_accueil_management_enabled=lambda: True,
-            port=self.port,
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
 
         self.log_path = os.path.join(self._tmp.name, "remote_control.log")
         log_patcher = patch.object(remote_control, "_LOG_PATH", self.log_path)

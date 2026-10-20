@@ -44,7 +44,6 @@ lui-même AUCUNE action fonctionnelle) :
   serveur ;
 - Cache-Control: no-store ajouté à _send_html/_send_json."""
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -59,13 +58,6 @@ import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 class PermissionSyncTestCase(unittest.TestCase):
@@ -101,17 +93,20 @@ class PermissionSyncTestCase(unittest.TestCase):
         self.on_word_calls = []
         self.on_eliminate_calls = []
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
         self._permission_cache = {}
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
         self.server = remote_control.RemoteControlServer(
             on_word=lambda word: self.on_word_calls.append(word),
             on_eliminate=self._on_eliminate,
             get_dirto_permissions=lambda name: self._permission_cache.get((name or "").strip(), frozenset()),
-            port=self.port,
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
 
         roster.set_group("Raj", roster.ROSTER_GROUP_ADMIN)
         roster.set_group("Marie", roster.ROSTER_GROUP_DIRTO)

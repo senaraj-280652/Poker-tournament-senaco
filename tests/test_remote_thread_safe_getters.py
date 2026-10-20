@@ -217,16 +217,14 @@ class HomePageCrossThreadRegressionTest(_RemoteControlHttpTestCase):
         self.addCleanup(self.db.conn.close)
 
     def test_ancien_cablage_direct_sur_self_db_casse_la_page_accueil(self):
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             # Reproduit EXACTEMENT l'ancien bogue (avant le correctif du
             # 2026-09-29) : lecture directe de self.db depuis le thread
             # HTTP, plutôt qu'un cache.
             get_accueil_management_enabled=lambda: self.db.accueil_management_enabled(),
             port=self.port,
-        )
-        self.server.start()
+        ))
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
 
         with self.assertRaises(Exception):
@@ -238,13 +236,11 @@ class HomePageCrossThreadRegressionTest(_RemoteControlHttpTestCase):
         # fermeture Python — exactement le rôle de self._remote_accueil_
         # management_enabled dans l'application réelle.
         cached_accueil_enabled = self.db.accueil_management_enabled()
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_accueil_management_enabled=lambda: cached_accueil_enabled,
             port=self.port,
-        )
-        self.server.start()
+        ))
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
 
         status, body, _ = http_request(self.base, "GET", "/", jar)
@@ -257,14 +253,12 @@ class HomePageCrossThreadRegressionTest(_RemoteControlHttpTestCase):
         deadline_passed, préexistant avant ce complément) — visible sur
         /eliminate plutôt que "/", puisque c'est la page qui sonde ce
         callback (via _ABSENCE_STATE_PERMISSIONS/{abs_des_button})."""
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_accueil_management_enabled=lambda: True,
             get_absence_deadline_passed=lambda: self.db.absence_deadline_passed(),
             port=self.port,
-        )
-        self.server.start()
+        ))
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
 
         # "/" ne dépend pas de get_absence_deadline_passed : reste
@@ -278,14 +272,12 @@ class HomePageCrossThreadRegressionTest(_RemoteControlHttpTestCase):
 
     def test_nouveau_cablage_absence_deadline_passed_fonctionne(self):
         cached_deadline_passed = self.db.absence_deadline_passed()
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_accueil_management_enabled=lambda: True,
             get_absence_deadline_passed=lambda: cached_deadline_passed,
             port=self.port,
-        )
-        self.server.start()
+        ))
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")
 
         status, body, _ = http_request(self.base, "GET", "/absence_state", jar)

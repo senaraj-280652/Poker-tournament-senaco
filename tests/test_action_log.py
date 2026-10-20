@@ -18,7 +18,6 @@ Deux niveaux :
 import json
 import os
 import sqlite3
-import socket
 import sys
 import tempfile
 import threading
@@ -34,14 +33,6 @@ import open_windows  # noqa: E402
 import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
-
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _read_all_rows(db_path):
@@ -288,8 +279,6 @@ class _ActionLogHttpTestCase(unittest.TestCase):
         self.upload_photo_result = (True, "ok")
         self.delete_photo_result = (True, "ok")
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
         self.server = remote_control.RemoteControlServer(
             on_word=lambda word: None,
             get_tournament_name=lambda: self.tournament_name,
@@ -306,10 +295,20 @@ class _ActionLogHttpTestCase(unittest.TestCase):
             on_rebalance_answer=lambda rid, player_id: None,
             on_end_tournament=lambda: None,
             get_dirto_permissions=lambda name: self._dirto_permissions.get((name or "").strip(), frozenset()),
-            port=self.port,
+            # port=0 (demande du 2026-10-20) : jamais un port pré-sondé via
+            # _free_port() puis réutilisé en espérant qu'il soit toujours
+            # libre au moment du vrai bind() — cette dernière approche a
+            # provoqué un ConnectionRefusedError intermittent (self.base
+            # figé sur un port qui n'était plus celui réellement obtenu
+            # après un repli de RemoteControlServer.start() sur un AUTRE
+            # port). port=0 fait choisir le port par l'OS de façon atomique
+            # au moment même du bind — aucune fenêtre de course possible.
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.own_pid = os.getpid()
 
     def _rows(self):
@@ -686,11 +685,16 @@ class TournoiIdentiteEtEtancheiteTest(unittest.TestCase):
         self.addCleanup(self.server_b.stop)
 
     def _make_server(self, name, path):
+        # port=0 (demande du 2026-10-20) : les appelants lisent déjà
+        # self.server_a.port/self.server_b.port à la volée (voir
+        # test_deux_tournois_ne_se_melangent_jamais ci-dessous), jamais
+        # une valeur mise en cache — port=0 élimine simplement le sondage
+        # _free_port() devenu inutile, sans rien changer au comportement.
         return remote_control.RemoteControlServer(
             on_word=lambda word: None,
             get_tournament_name=lambda: name,
             get_tournament_path=lambda: path,
-            port=_free_port(),
+            port=0,
         )
 
     def test_deux_tournois_ne_se_melangent_jamais(self):

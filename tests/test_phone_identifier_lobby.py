@@ -20,7 +20,6 @@ Couvre :
    jamais celui de l'autre."""
 import json
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -33,14 +32,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import open_windows  # noqa: E402
 import remote_control  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
-
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _get_text(url, jar=None):
@@ -116,11 +107,6 @@ class GetRemoteDeviceShortIdTest(_TmpRemoteControlTest):
 # =====================================================================
 class LobbylistShowsPhoneIdentifierTest(unittest.TestCase):
     def setUp(self):
-        self.test_port = _free_port()
-        patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
-        self.addCleanup(patcher.stop)
-        patcher.start()
-
         self._tmp = tempfile.TemporaryDirectory(prefix="phone_identifier_lobby_http_test_")
         self.addCleanup(self._tmp.cleanup)
         registry_path = os.path.join(self._tmp.name, "open_windows.json")
@@ -144,11 +130,20 @@ class LobbylistShowsPhoneIdentifierTest(unittest.TestCase):
         log_patcher.start()
         logger_patcher.start()
 
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent). DEFAULT_PORT
+        # n'est patché qu'APRÈS avoir le port réellement obtenu, pour que
+        # les deux restent toujours cohérents.
         self.server = remote_control.RemoteControlServer(
-            on_word=lambda w: None, get_tournament_name=lambda: "Tournoi du vendredi", port=self.test_port,
+            on_word=lambda w: None, get_tournament_name=lambda: "Tournoi du vendredi", port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.test_port = self.server.port
+        patcher = patch.object(remote_control, "DEFAULT_PORT", self.test_port)
+        self.addCleanup(patcher.stop)
+        patcher.start()
         self.base = f"http://127.0.0.1:{self.test_port}"
         self.own_pid = os.getpid()
         self.live = [

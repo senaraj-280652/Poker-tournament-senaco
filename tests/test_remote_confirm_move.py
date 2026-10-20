@@ -215,8 +215,7 @@ class RemoteConfirmMoveHttpTest(_RemoteControlHttpTestCase):
         self.id_b = _insert_move(self.db, "B", "Table 2", 2, "Table 4", 5)
         self.confirmed_ids = []
 
-        self.server.stop()
-        self.server = remote_control.RemoteControlServer(
+        self._replace_server(remote_control.RemoteControlServer(
             on_word=lambda w: None,
             get_pending_moves=lambda: [
                 {
@@ -232,8 +231,7 @@ class RemoteConfirmMoveHttpTest(_RemoteControlHttpTestCase):
                 or {"ok": True, "all_done": self.db.count_seat_moves() == 0}
             ),
             port=self.port,
-        )
-        self.server.start()
+        ))
 
     def test_moves_pending_expose_la_liste_reelle(self):
         jar = authenticated_jar(self.base, code=self.code, owner_name="Test Admin")

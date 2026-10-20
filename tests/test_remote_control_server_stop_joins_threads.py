@@ -54,14 +54,6 @@ import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
 
 
-def _free_port():
-    import socket
-
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 class _ServerStopTestCase(unittest.TestCase):
@@ -90,8 +82,11 @@ class _ServerStopTestCase(unittest.TestCase):
         open_windows.register(self._session_path)
         self.addCleanup(open_windows.unregister, self._session_path)
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        # self.port/self.base NE sont PAS fixés ici : chaque sous-classe
+        # démarre son propre serveur (callbacks différents) et les en
+        # déduit APRÈS coup — voir le commentaire détaillé dans
+        # tests/test_remote_control_reliability.py:_RemoteControlHttpTestCase.setUp
+        # (demande du 2026-10-20, ConnectionRefusedError intermittent).
 
 
 class ServerStopJoinsRequestThreadsTest(_ServerStopTestCase):
@@ -104,8 +99,10 @@ class ServerStopJoinsRequestThreadsTest(_ServerStopTestCase):
             self.handler_started.set()
             self.release_handler.wait(timeout=5)
 
-        self.server = remote_control.RemoteControlServer(on_word=slow_on_word, port=self.port)
+        self.server = remote_control.RemoteControlServer(on_word=slow_on_word, port=0)
         self.server.start()
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.jar = authenticated_jar(self.base, owner_name="Test Admin")
 
     def test_stop_attend_la_fin_dune_requete_en_cours_avant_de_rendre_la_main(self):
@@ -187,8 +184,10 @@ class ServerStopNeverBlocksIndefinitelyTest(_ServerStopTestCase):
             self.handler_started.set()
             self.release_handler_never_set.wait()  # bloqué pendant le test, débloqué au cleanup
 
-        self.server = remote_control.RemoteControlServer(on_word=stuck_on_word, port=self.port)
+        self.server = remote_control.RemoteControlServer(on_word=stuck_on_word, port=0)
         self.server.start()
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
         self.jar = authenticated_jar(self.base, owner_name="Test Admin")
 
     def test_stop_rend_la_main_meme_si_une_requete_ne_se_termine_jamais(self):

@@ -20,7 +20,6 @@ Deux volets, comme les autres chantiers de ce module :
    remote_control._REBALANCE_WIDGET (aucun ancien texte "grosse blinde"
    ne doit y rester)."""
 import os
-import socket
 import sys
 import tempfile
 import unittest
@@ -34,14 +33,6 @@ import open_windows  # noqa: E402
 import remote_control  # noqa: E402
 import roster  # noqa: E402
 from _remote_control_auth_test_utils import authenticated_jar, http_request  # noqa: E402
-
-
-def _free_port():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _seat_new_player(db, table_id, seat, name):
@@ -285,8 +276,9 @@ class _RebalanceHttpTestCase(unittest.TestCase):
         self.rebalance_answer_calls = []
         self._dirto_permissions = {}
 
-        self.port = _free_port()
-        self.base = f"http://127.0.0.1:{self.port}"
+        # port=0 (demande du 2026-10-20) : voir tests/test_remote_control_
+        # reliability.py:_RemoteControlHttpTestCase.setUp pour le détail
+        # du correctif (ConnectionRefusedError intermittent).
         self.server = remote_control.RemoteControlServer(
             on_word=lambda word: None,
             get_tournament_name=lambda: "Tournoi",
@@ -295,10 +287,12 @@ class _RebalanceHttpTestCase(unittest.TestCase):
             get_pending_rebalance=lambda: self._pending,
             on_rebalance_answer=lambda rid, pid: self.rebalance_answer_calls.append((rid, pid)),
             get_dirto_permissions=lambda name: self._dirto_permissions.get((name or "").strip(), frozenset()),
-            port=self.port,
+            port=0,
         )
         self.server.start()
         self.addCleanup(self.server.stop)
+        self.port = self.server.port
+        self.base = f"http://127.0.0.1:{self.port}"
 
     def _jar(self, owner_name=None, label="Test"):
         return authenticated_jar(self.base, owner_name=owner_name, label=label)
