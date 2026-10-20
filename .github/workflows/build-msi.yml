@@ -32,6 +32,25 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: "Lecture du numéro de version (source de référence : version.py)"
+        # APP_VERSION dans version.py est la source unique de vérité du
+        # numéro de version (voir sa docstring) — jamais windows/app.wxs,
+        # qui ne fait que la reporter à la main. Nommer le .msi et
+        # l'artifact d'après cette valeur (demande du 2026-10-20, suite à
+        # deux incidents réels où un ancien .msi au nom générique
+        # "PokerTournament-16.msi" a été confondu avec le dernier build)
+        # rend une telle confusion immédiatement visible dans le nom du
+        # fichier, sans toucher au mécanisme de mise à niveau lui-même
+        # (Version dans app.wxs reste indépendamment la source lue par
+        # WiX/Windows Installer). Extraction déportée dans windows/
+        # read_version.py plutôt qu'un -c en ligne : ses guillemets
+        # entraient en conflit avec le découpage de pwsh (vérifié).
+        id: version
+        shell: pwsh
+        run: |
+          $v = python windows/read_version.py
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+
       - name: Installation des dépendances Python
         run: |
           python -m pip install --upgrade pip
@@ -61,19 +80,19 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           wix extension add WixToolset.UI.wixext/5.0.2 --global
 
-      - name: Génération de PokerTournament-16.msi (WiX)
+      - name: Génération de PokerTournament-${{ steps.version.outputs.version }}.msi (WiX)
         run: |
-          wix build windows/app.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-16.msi
+          wix build windows/app.wxs -arch x64 -ext WixToolset.UI.wixext -d Dist=windows/dist -out windows/dist/PokerTournament-${{ steps.version.outputs.version }}.msi
 
       - name: Publication de l'artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PokerTournament-msi
-          path: windows/dist/PokerTournament-16.msi
+          name: PokerTournament-${{ steps.version.outputs.version }}
+          path: windows/dist/PokerTournament-${{ steps.version.outputs.version }}.msi
           if-no-files-found: error
 
       - name: Publication dans la Release (si déclenché par un tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: windows/dist/PokerTournament-16.msi
+          files: windows/dist/PokerTournament-${{ steps.version.outputs.version }}.msi
