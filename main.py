@@ -1205,6 +1205,32 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
     if internal_menu_child:
         env = os.environ.copy()
         env[POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+    # Windows uniquement (demande du 2026-10-31, anomalie du Sony Vaio :
+    # "Menu principal" cliqué depuis un tournoi ouvert faisait disparaître
+    # la fenêtre du tournoi SANS jamais afficher la nouvelle fenêtre
+    # "Bienvenue", trace CMD montrant un KeyboardInterrupt au niveau de
+    # app.mainloop() du process D'ORIGINE, sans que l'utilisateur ait
+    # pressé Ctrl+C) — diagnostiqué : sous Windows, un subprocess.Popen()
+    # sans creationflags hérite du MÊME groupe de processus console que
+    # son parent. Un événement console (Ctrl+C/Ctrl+Break, quelle qu'en
+    # soit l'origine exacte — pas nécessairement une frappe clavier
+    # volontaire) est alors délivré à TOUS les processus de ce groupe
+    # simultanément, ce qui explique à la fois le KeyboardInterrupt du
+    # process d'origine ET la nouvelle fenêtre qui ne s'affiche jamais
+    # (le nouveau process meurt lui aussi, avant même d'avoir eu le temps
+    # de construire sa fenêtre). CREATE_NEW_PROCESS_GROUP place le nouveau
+    # process dans son PROPRE groupe, qui n'hérite plus de ces signaux
+    # console. N'affecte jamais macOS/Linux (où cette constante n'existe
+    # même pas) ni le comportement d'un .exe PyInstaller empaqueté
+    # (console=False, voir windows/poker_tournament.spec) — seulement un
+    # lancement "python main.py" depuis une vraie console, exactement le
+    # cas reproduit sur le Vaio. Observé uniquement depuis que Windows est
+    # testé pour de vrai (10 jours plus tôt, dernier test Windows réel,
+    # aucune de ces corrections n'était encore écrite) — jamais reproduit
+    # sur macOS, où ce groupe de processus console n'existe pas.
+    popen_kwargs = {}
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with open(_spawned_child_log_path(), "a", encoding="utf-8") as log_file:
         # Popen duplique ce descripteur pour le nouveau process (voir la
         # doc standard de subprocess) : ce fichier peut être refermé ici
@@ -1216,11 +1242,13 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
             proc = subprocess.Popen(
                 [sys.executable, *extra_args],
                 stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, env=env,
+                **popen_kwargs,
             )
         else:
             proc = subprocess.Popen(
                 [sys.executable, os.path.abspath(__file__), *extra_args],
                 stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, env=env,
+                **popen_kwargs,
             )
     return proc
 

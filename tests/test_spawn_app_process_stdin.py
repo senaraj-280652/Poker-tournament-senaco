@@ -174,5 +174,56 @@ class SpawnAppProcessStdinTest(unittest.TestCase):
         self.assertTrue(captured["cmd"][1].endswith("main.py"))
 
 
+class SpawnAppProcessWindowsProcessGroupTest(unittest.TestCase):
+    """Correctif du 2026-10-31 (anomalie du Sony Vaio : "Menu principal"
+    cliqué depuis un tournoi ouvert faisait disparaître la fenêtre du
+    tournoi, sans jamais afficher "Bienvenue" — trace CMD montrant un
+    KeyboardInterrupt au niveau de app.mainloop() du process D'ORIGINE,
+    sans frappe Ctrl+C volontaire de l'utilisateur).
+
+    Diagnostic : sous Windows, un subprocess.Popen() sans creationflags
+    hérite du MÊME groupe de processus console que son parent — un
+    événement console (Ctrl+C/Ctrl+Break, quelle qu'en soit l'origine)
+    est alors délivré à TOUS les processus de ce groupe, parent compris.
+    CREATE_NEW_PROCESS_GROUP isole le nouveau process dans son propre
+    groupe. subprocess.CREATE_NEW_PROCESS_GROUP n'existe pas sur cette
+    machine de développement (macOS) : simulé via create=True, comme
+    socket.SO_EXCLUSIVEADDRUSE l'est déjà dans tests/test_remote_control_
+    windows_port_collision.py — même principe établi dans cette suite."""
+
+    def _spawn_and_capture(self, **spawn_kwargs):
+        captured = {}
+
+        class _FakeProcReturn:
+            pid = 99999
+
+            def poll(self):
+                return None
+
+        def fake_popen(cmd, **popen_kwargs):
+            captured["kwargs"] = popen_kwargs
+            return _FakeProcReturn()
+
+        with patch.object(main.subprocess, "Popen", side_effect=fake_popen):
+            main.spawn_app_process(**spawn_kwargs)
+        return captured
+
+    def test_sous_windows_isole_le_nouveau_process_dans_son_propre_groupe(self):
+        fake_flag = 0x200  # valeur réelle de CREATE_NEW_PROCESS_GROUP sous Windows
+        with patch.object(main.sys, "platform", "win32"), \
+             patch.object(main.subprocess, "CREATE_NEW_PROCESS_GROUP", fake_flag, create=True):
+            captured = self._spawn_and_capture()
+        self.assertEqual(captured["kwargs"].get("creationflags"), fake_flag)
+
+    def test_hors_windows_jamais_de_creationflags(self):
+        """Non-régression explicite : macOS/Linux ne doivent jamais voir
+        apparaître ce kwarg (la constante n'existe même pas dans leur
+        module subprocess réel — y accéder sans garde lèverait
+        AttributeError, ce que ce test couvre indirectement en tournant
+        sur la plateforme réelle de cette machine, jamais win32)."""
+        captured = self._spawn_and_capture()
+        self.assertNotIn("creationflags", captured["kwargs"])
+
+
 if __name__ == "__main__":
     unittest.main()
