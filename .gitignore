@@ -5,6 +5,10 @@
 # gains...) — jamais du code source, propres à chaque utilisation.
 *.xlsx
 *.csv
+# Certificats de participation générés par l'application (données
+# personnelles réelles — nom du joueur dans le nom de fichier) — jamais
+# du code source, et ne doivent jamais atterrir sur ce dépôt public.
+participation_*.pdf
 
 # Fichiers système macOS
 .DS_Store
@@ -60,3 +64,7 @@ _license_secret.py
 /synthese_tournois.pdf
 /classement_essaiac2.pdf
 /images-senaco.docx
+# Ancienne copie de sauvegarde du manuel (pas un livrable)
+/MANUEL_UTILISATEUR_TOURNOI_CPC-anc.pdf
+# Lanceur de SenaMail/Senapok — outil séparé, sans rapport avec Senaco
+/Lancer_SenaMail.command
