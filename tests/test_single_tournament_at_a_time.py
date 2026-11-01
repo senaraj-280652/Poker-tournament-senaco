@@ -267,6 +267,57 @@ class OpenNewWindowAlwaysOpensTest(unittest.TestCase):
         mock_raise.assert_called_once()
 
 
+class OpenLobbyWindowAlwaysOpensTest(unittest.TestCase):
+    """App._open_lobby_window (demande du 2026-10-31, Lobby en processus
+    autonome unique pour toute la session) : même statut que _open_new_
+    window ci-dessus — le Lobby n'est pas lui-même un tournoi, jamais
+    bloqué par "Un seul tournoi à la fois", quel que soit son état.
+    Doublure directe de open_windows (pas de vrai fichier/verrou ici,
+    déjà couvert en détail par tests/test_lobby_cross_process_
+    registry.py) : ce test porte uniquement sur l'appel ou non du garde,
+    et sur le choix spawn-vs-premier-plan selon lobby_pid()."""
+
+    def test_jamais_bloque_meme_option_activee_et_tournoi_ouvert(self):
+        fake = _FakeApp()
+        with patch.object(main, "_block_second_tournament_if_needed") as mock_block, \
+             patch.object(main.export_prefs, "load_value", return_value=True), \
+             patch.object(main.open_windows, "list_open_paths", return_value=["/tmp/moi.tournoi"]), \
+             patch.object(main.open_windows, "lobby_registry_lock") as mock_lock, \
+             patch.object(main.open_windows, "lobby_pid", return_value=None), \
+             patch.object(main.open_windows, "register_lobby") as mock_register, \
+             patch.object(main, "spawn_app_process", return_value=_FakeProc(pid=24680)) as mock_spawn:
+            main.App._open_lobby_window(fake, fake)
+        mock_block.assert_not_called()
+        mock_spawn.assert_called_once_with(lobby_standalone=True)
+        mock_register.assert_called_once_with(24680)
+
+    def test_lobby_deja_ouvert_ramene_au_premier_plan_sans_spawn(self):
+        fake = _FakeApp()
+        with patch.object(main.open_windows, "lobby_registry_lock") as mock_lock, \
+             patch.object(main.open_windows, "lobby_pid", return_value=13579), \
+             patch.object(main.open_windows, "bring_pid_to_front") as mock_bring, \
+             patch.object(main, "spawn_app_process") as mock_spawn, \
+             patch.object(main.open_windows, "register_lobby") as mock_register:
+            main.App._open_lobby_window(fake, fake)
+        mock_bring.assert_called_once_with(13579)
+        mock_spawn.assert_not_called()
+        mock_register.assert_not_called()
+
+    def test_echec_de_lancement_naffiche_pas_derreur_fatale(self):
+        """Comportement attendu, comme ailleurs dans ce fichier pour
+        spawn_app_process : un OSError au lancement affiche un message
+        d'erreur, ne lève jamais d'exception non interceptée."""
+        fake = _FakeApp()
+        with patch.object(main.open_windows, "lobby_registry_lock") as mock_lock, \
+             patch.object(main.open_windows, "lobby_pid", return_value=None), \
+             patch.object(main, "spawn_app_process", side_effect=OSError("échec simulé")), \
+             patch.object(main.messagebox, "showerror") as mock_showerror, \
+             patch.object(main.open_windows, "register_lobby") as mock_register:
+            main.App._open_lobby_window(fake, fake)
+        mock_showerror.assert_called_once()
+        mock_register.assert_not_called()
+
+
 # ---------------------------------------------------------------------
 # 7 : clic sur le tournoi déjà ouvert -> jamais bloqué, jamais un
 # second process, juste le premier plan (comportement actuel préservé).
@@ -399,7 +450,8 @@ class NoBypassPathExistsTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and calls_spawn(node)
         }
         self.assertEqual(
-            functions_calling_spawn, {"_open_new_window", "_open_selected"},
+            functions_calling_spawn,
+            {"_open_new_window", "_open_selected", "_open_lobby_window"},
             "Un nouvel appel à spawn_app_process() a été ajouté ailleurs — vérifier "
             "qu'il reste couvert (garde backend et/ou interface grisée).",
         )

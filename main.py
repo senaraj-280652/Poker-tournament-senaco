@@ -1153,8 +1153,23 @@ def tournament_day_folder_proposal(is_sng=False):
 # lui-même.
 POKER_TOURNAMENT_INTERNAL_LAUNCH = "POKER_TOURNAMENT_INTERNAL_LAUNCH"
 
+# Marqueur d'environnement (demande du 2026-10-31, "une seule instance
+# du Lobby pour toute la session, qui survit à la fermeture de
+# n'importe quel tournoi précis") posé UNIQUEMENT par spawn_app_process
+# (lobby_standalone=True) — voir App._open_lobby_window, seul appelant
+# à le passer. Détecté tout en haut d'App.__init__ (avant toute
+# logique Menu principal/Bienvenue, qui n'a aucun rapport avec ce
+# mode) : ce processus n'ouvre jamais aucun tournoi ni écran d'accueil,
+# sa SEULE raison d'être est d'afficher LobbyDialog — jamais rattaché à
+# un tournoi précis, donc jamais affecté par la fermeture de l'un
+# d'eux. Même principe que POKER_TOURNAMENT_INTERNAL_LAUNCH ci-dessus,
+# jamais confondu avec lui (un processus peut porter l'un, l'autre, ou
+# aucun des deux — jamais les deux ensemble en pratique, mais rien ne
+# les rend mutuellement exclusifs au niveau du code).
+POKER_TOURNAMENT_LOBBY_STANDALONE = "POKER_TOURNAMENT_LOBBY_STANDALONE"
 
-def spawn_app_process(extra_args=None, internal_menu_child=False):
+
+def spawn_app_process(extra_args=None, internal_menu_child=False, lobby_standalone=False):
     """Lance une nouvelle instance indépendante de l'application (autre
     processus). `extra_args` : arguments supplémentaires passés au
     programme — notamment le chemin d'un fichier .tournoi à ouvrir
@@ -1202,9 +1217,12 @@ def spawn_app_process(extra_args=None, internal_menu_child=False):
     des descripteurs du parent, quelle que soit son ancienneté."""
     extra_args = list(extra_args or [])
     env = None
-    if internal_menu_child:
+    if internal_menu_child or lobby_standalone:
         env = os.environ.copy()
-        env[POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+        if internal_menu_child:
+            env[POKER_TOURNAMENT_INTERNAL_LAUNCH] = "1"
+        if lobby_standalone:
+            env[POKER_TOURNAMENT_LOBBY_STANDALONE] = "1"
     # Windows uniquement (demande du 2026-10-31, anomalie du Sony Vaio :
     # "Menu principal" cliqué depuis un tournoi ouvert faisait disparaître
     # la fenêtre du tournoi SANS jamais afficher la nouvelle fenêtre
@@ -3717,8 +3735,45 @@ class LobbyDialog(tk.Toplevel):
 
     REFRESH_MS = 4000
 
+    # Garde locale, DÉFENSE EN PROFONDEUR UNIQUEMENT (demande du
+    # 2026-10-28 initialement — un double-appel direct à ouvrir() dans
+    # CE MÊME processus ne crée jamais deux fenêtres). L'unicité réelle,
+    # pour TOUTE la session, est désormais inter-processus — voir
+    # open_windows.lobby_registry_lock/lobby_pid/register_lobby
+    # (demande du 2026-10-31, constat réel sur le Sony Vaio : chaque
+    # fenêtre de tournoi étant un processus séparé, cet attribut de
+    # CLASSE seul ne pouvait structurellement pas empêcher N fenêtres de
+    # tournoi d'ouvrir chacune leur propre Lobby). Voir App._open_lobby_
+    # window, point d'entrée réel pour un tournoi/l'écran Bienvenue —
+    # cette classe n'est plus jamais instanciée que dans un processus
+    # Lobby autonome dédié (voir App.__init__, POKER_TOURNAMENT_LOBBY_
+    # STANDALONE), où ce garde-fou local reste vrai mais redondant.
+    _instance = None
+
+    @classmethod
+    def ouvrir(cls, master):
+        """Construit l'unique LobbyDialog de CE processus (toujours un
+        processus Lobby autonome dédié désormais, jamais le processus
+        d'un tournoi — voir App._open_lobby_window) ; si une instance
+        existe déjà dans CE processus, la restaure plutôt que d'en
+        recréer une seconde (garde locale, voir _instance ci-dessus)."""
+        if cls._instance is not None and cls._instance.winfo_exists():
+            cls._instance._bring_to_front()
+            return cls._instance
+        return cls(master)
+
+    def _bring_to_front(self):
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+        except tk.TclError:
+            pass
+        self.lift()
+        self.focus_force()
+
     def __init__(self, master):
         super().__init__(master)
+        LobbyDialog._instance = self
         self.title("Lobby — Sit & Go / Tournois")
         self.geometry("860x420")
         # Empêche de réduire la fenêtre au point de cacher la barre de
@@ -3726,6 +3781,24 @@ class LobbyDialog(tk.Toplevel):
         # capture où la fenêtre, réduite trop petit, ne montrait plus que
         # le tableau, sans aucun moyen visible d'agir dessus.
         self.minsize(560, 320)
+        # NON MODAL, délibérément (demande explicite du 2026-10-31,
+        # remplace le comportement modal posé le 2026-10-28) : avec
+        # plusieurs tournois ouverts simultanément, un Lobby modal
+        # bloquerait l'usage des AUTRES fenêtres de tournoi pendant
+        # qu'il reste ouvert — inacceptable pour une vue d'ensemble
+        # censée rester consultable en permanence. Ni grab_set() ni
+        # transient() ici : ce processus est désormais toujours un
+        # processus Lobby autonome dédié (voir App.__init__,
+        # POKER_TOURNAMENT_LOBBY_STANDALONE), `master` y est une racine
+        # Tk délibérément retirée (withdraw()) et sans présence visible
+        # propre — s'y rendre transient n'aurait d'ailleurs aucun sens.
+        # lift()/focus_force() suffisent à amener cette fenêtre au
+        # premier plan avec le focus à sa création, sans jamais bloquer
+        # quoi que ce soit derrière elle (jamais de -topmost global non
+        # plus, qui maintiendrait Senaco devant TOUTES les autres
+        # applications — explicitement à éviter).
+        self.lift()
+        self.focus_force()
         self.bind(
             "<F1>",
             lambda e: HelpBrowser.open_at(
@@ -3822,6 +3895,26 @@ class LobbyDialog(tk.Toplevel):
             if path not in seen and os.path.exists(path):
                 seen.add(path)
                 paths.append(path)
+
+        # Aucun processus orphelin (demande explicite du 2026-10-31) :
+        # ce processus Lobby autonome n'a plus aucune raison d'être dès
+        # l'instant où PLUS AUCUN tournoi n'est ouvert — rien à afficher,
+        # rien à basculer vers. Basé sur `paths` (tournois réellement
+        # ouverts), jamais sur le tableau affiché après filtrage par
+        # "Masquer les tournois terminés" : des tournois ouverts mais
+        # tous terminés et masqués ne sont pas "aucun tournoi", juste un
+        # affichage filtré — le Lobby reste alors légitimement ouvert.
+        # Passe par _on_close() (pas destroy() directement) : symétrique
+        # à une fermeture manuelle, libère aussi l'enregistrement auprès
+        # d'open_windows (voir destroy() plus bas) avant de quitter ce
+        # processus. Sans risque de fermeture prématurée : au moment où
+        # CE Lobby a été lancé, au moins un tournoi (celui qui a cliqué
+        # "Lobby") était déjà forcément enregistré — voir open_windows.
+        # try_register, appelé bien avant qu'aucun bouton ne soit
+        # cliquable dans App.__init__.
+        if not paths:
+            self._on_close()
+            return
 
         for idx, path in enumerate(paths):
             try:
@@ -4009,12 +4102,72 @@ class LobbyDialog(tk.Toplevel):
         self._refresh()
         self._schedule_refresh()
 
-    def _on_close(self):
+    def destroy(self):
+        # Rappel diagnostiqué le 2026-10-28 (plantage SIGSEGV Tk signalé
+        # "pendant le traitement d'événements inactifs") : ce rappel
+        # after() récurrent (_schedule_refresh, REFRESH_MS) reste
+        # enregistré dans l'interpréteur Tcl tant qu'il n'est pas annulé
+        # explicitement — Tk ne l'annule jamais tout seul au destroy()
+        # d'un widget. S'il subsiste après la destruction de CETTE
+        # fenêtre (ex. fenêtre parente détruite en cascade — fermeture de
+        # l'application entière avec le Lobby encore ouvert — qui appelle
+        # destroy() sur chaque enfant SANS jamais déclencher le
+        # WM_DELETE_WINDOW d'un enfant, donc sans passer par _on_close),
+        # il continue de référencer la méthode liée self._auto_refresh
+        # d'une fenêtre désormais détruite ; son déclenchement différé
+        # (ou sa simple présence lors d'un traitement d'événements
+        # inactifs ultérieur, sur CETTE fenêtre ou toute autre) peut
+        # alors faire planter Tk. En surchargeant destroy() plutôt qu'en
+        # laissant cette annulation seulement dans _on_close(), ELLE
+        # s'applique à TOUT chemin de destruction — explicite, via
+        # _on_close(), ou en cascade depuis un parent — jamais un seul
+        # chemin privilégié qu'un appelant pourrait contourner.
         if self._after_id is not None:
             try:
                 self.after_cancel(self._after_id)
-            except Exception:
+            except tk.TclError:
                 pass
+            self._after_id = None
+        if LobbyDialog._instance is self:
+            LobbyDialog._instance = None
+        # Libère l'enregistrement inter-processus (demande du
+        # 2026-10-31, voir open_windows.register_lobby/lobby_pid) — SOUS
+        # TOUT chemin de destruction, pas seulement _on_close() (même
+        # raisonnement déjà appliqué ci-dessus pour l'annulation du
+        # rappel after()) : un Lobby détruit en cascade, ou qui s'auto-
+        # ferme depuis _refresh() faute de tournoi restant, doit lui
+        # aussi libérer la place pour une réouverture future. os.getpid()
+        # — jamais un pid mémorisé — puisque ce processus est TOUJOURS
+        # celui qui s'est lui-même enregistré (voir App._open_lobby_
+        # window, qui enregistre le pid de l'enfant tout juste lancé,
+        # c'est-à-dire CE processus).
+        try:
+            open_windows.unregister_lobby(os.getpid())
+        except Exception:
+            pass
+        super().destroy()
+        # Ce processus est désormais TOUJOURS un processus Lobby
+        # autonome dédié (voir App.__init__, POKER_TOURNAMENT_LOBBY_
+        # STANDALONE) : `self.master` est sa racine Tk retirée (withdraw)
+        # sans aucune autre fenêtre — rien d'autre à y faire une fois ce
+        # Lobby fermé. La détruire à son tour met fin à mainloop() et
+        # termine proprement le processus (jamais de processus orphelin
+        # qui continuerait de tourner sans aucune fenêtre visible).
+        try:
+            if self.master is not None and self.master.winfo_exists():
+                self.master.destroy()
+        except tk.TclError:
+            pass
+
+    def _on_close(self):
+        # Toute fermeture (bouton "Fermer", croix, fermeture programmatique
+        # depuis _refresh() faute de tournoi restant) passe par ici — voir
+        # WM_DELETE_WINDOW ci-dessus. Plus aucun grab à libérer depuis le
+        # 2026-10-31 (Lobby non modal, voir __init__) : l'annulation du
+        # rappel after(), le ménage de _instance, le désenregistrement
+        # inter-processus et la fin du processus vivent tous désormais
+        # dans destroy() (voir ci-dessus), pour s'appliquer aussi à une
+        # destruction qui ne passerait jamais par _on_close().
         self.destroy()
 
 
@@ -8786,6 +8939,22 @@ class App(tk.Tk):
                 self.destroy()
                 return
 
+        # Lobby autonome (demande du 2026-10-31, "une seule instance du
+        # Lobby pour toute la session, qui survit à la fermeture de
+        # n'importe quel tournoi précis") — voir POKER_TOURNAMENT_LOBBY_
+        # STANDALONE et App._open_lobby_window, seul appelant qui pose ce
+        # marqueur (via spawn_app_process(lobby_standalone=True)). Ce
+        # processus n'ouvre ni tournoi ni écran Bienvenue : sa SEULE
+        # raison d'être est d'afficher LobbyDialog, jamais rattaché à un
+        # tournoi précis. Retour anticipé AVANT open_path/le verrou Menu
+        # principal/l'écran Bienvenue ci-dessous — aucun rapport avec ce
+        # mode, jamais atteints ici. self.db reste None (déjà initialisé
+        # plus haut) : LobbyDialog._open_selected le tolère déjà (voir
+        # son own_path = getattr(self.master, "db", None) and ...).
+        if os.environ.get(POKER_TOURNAMENT_LOBBY_STANDALONE):
+            LobbyDialog.ouvrir(self)
+            return
+
         # `open_path` : ouvre directement ce fichier .tournoi, sans passer
         # par l'écran d'accueil — utilisé quand une nouvelle fenêtre est
         # lancée depuis le Lobby SNG pour un tournoi précis (voir
@@ -9445,7 +9614,46 @@ class App(tk.Tk):
         return True
 
     def _open_lobby(self):
-        LobbyDialog(self)
+        self._open_lobby_window(self)
+
+    def _open_lobby_window(self, parent_for_errors):
+        """Point d'entrée UNIQUE pour ouvrir le Lobby, que ce soit depuis
+        une vraie fenêtre de tournoi (_open_lobby ci-dessus) ou depuis
+        l'écran "Bienvenue" (_choose_tournament_file) — demande du
+        2026-10-31 : une seule instance du Lobby pour TOUTE la session,
+        même avec plusieurs fenêtres de tournoi dans des processus
+        séparés (voir open_windows.py, section "Instance unique du
+        Lobby" pour le diagnostic complet).
+
+        Ne construit JAMAIS LobbyDialog ici, dans CE processus : lance
+        toujours (ou ramène au premier plan) un processus Lobby
+        autonome dédié — voir spawn_app_process(lobby_standalone=True)
+        et App.__init__ (POKER_TOURNAMENT_LOBBY_STANDALONE), seul
+        endroit qui construit réellement LobbyDialog désormais.
+
+        Section critique ATOMIQUE (open_windows.lobby_registry_lock) :
+        lire le PID existant, décider, lancer le processus si besoin ET
+        l'enregistrer, le tout SANS jamais relâcher ce verrou entre ces
+        étapes — sans quoi deux fenêtres de tournoi cliquant "Lobby" à
+        quelques millisecondes d'écart pourraient toutes deux lire
+        "aucun Lobby" avant que l'une des deux n'ait eu le temps
+        d'enregistrer le sien, et lanceraient alors chacune leur propre
+        processus (même classe de course déjà diagnostiquée et corrigée
+        pour Menu principal le 2026-10-12 — voir acquire_menu_principal)."""
+        with open_windows.lobby_registry_lock():
+            existing_pid = open_windows.lobby_pid()
+            if existing_pid is not None:
+                open_windows.bring_pid_to_front(existing_pid)
+                return
+            try:
+                proc = spawn_app_process(lobby_standalone=True)
+            except OSError as e:
+                messagebox.showerror(
+                    "Erreur", f"Impossible d'ouvrir le Lobby :\n{e}",
+                    parent=parent_for_errors,
+                )
+                return
+            open_windows.register_lobby(proc.pid)
 
     # ---------------------------------------------------------------
     # Ouverture / création du fichier de tournoi
@@ -10113,7 +10321,7 @@ class App(tk.Tk):
         open_tournament_btn.pack(pady=6)
         lobby_btn = ttk.Button(
             btn_frame, text="📋  Lobby (plusieurs tournois)",
-            command=lambda: LobbyDialog(win), width=28,
+            command=lambda: self._open_lobby_window(win), width=28,
         )
         lobby_btn.pack(pady=6)
         Tooltip(

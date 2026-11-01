@@ -1126,6 +1126,129 @@ def list_standalone_screen_pids(key):
     return [entry.get("pid") for entry in data.values()]
 
 
+# -- Instance unique du Lobby, pour TOUTE la session (demande du
+# 2026-10-31) --------------------------------------------------------
+# Constat réel sur le Sony Vaio (capture à l'appui) : chaque fenêtre de
+# tournoi est un PROCESSUS SÉPARÉ (voir main.py:spawn_app_process) —
+# l'ancien correctif "une seule instance de LobbyDialog" (2026-10-28,
+# LobbyDialog._instance) n'était qu'un attribut de CLASSE PYTHON, donc
+# scopé à UN SEUL processus : rien n'empêchait N fenêtres de tournoi,
+# chacune dans son propre processus, d'ouvrir chacune son propre Lobby.
+#
+# Solution (option B validée explicitement) : le Lobby ne vit plus
+# JAMAIS dans le processus d'un tournoi — il est désormais lancé dans
+# son PROPRE processus autonome (voir main.py:spawn_app_process(
+# lobby_standalone=True)), enregistré ici comme détenteur UNIQUE,
+# exactement le même idiome que acquire_menu_principal/menu_principal_
+# pid ci-dessus (fichier dédié + verrou de fichier dédié, PID mort
+# auto-purgé) — réutilisation délibérée d'un mécanisme déjà
+# éprouvé (y compris sur Windows, voir le correctif du 2026-10-31 sur
+# menu_principal_registry_lock_path) plutôt qu'une nouvelle
+# architecture. Fichier et verrou SÉPARÉS de ceux de Menu principal
+# (même principe déjà appliqué partout ailleurs dans ce module : des
+# sections critiques indépendantes ne doivent jamais s'attendre l'une
+# l'autre).
+#
+# Acquisition atomique : la lecture (PID existant ?) et l'écriture
+# (nouveau PID enregistré) doivent se faire dans UNE SEULE section
+# critique protégée par verrou de fichier inter-processus — sans ça,
+# deux fenêtres de tournoi cliquant "Lobby" à quelques millisecondes
+# d'écart pourraient toutes deux lire "aucun Lobby" avant que l'une des
+# deux n'ait eu le temps d'écrire son enregistrement, et lanceraient
+# alors chacune leur propre processus Lobby (exactement la même classe
+# de course déjà diagnostiquée et corrigée pour Menu principal le
+# 2026-10-12). lobby_registry_lock() est exposée publiquement (pas de
+# préfixe _) car, contrairement à Menu principal, la décision complète
+# ("existe déjà ?" -> sinon "lancer le processus" -> "enregistrer son
+# PID") ne peut pas tenir entièrement dans open_windows.py : lancer le
+# processus est la responsabilité de main.py (spawn_app_process), qui
+# doit donc pouvoir tenir CE verrou pendant toute la durée de sa propre
+# décision — voir main.py:App._open_lobby_window, seul appelant réel.
+
+def _lobby_registry_path():
+    return os.path.join(os.path.expanduser("~"), ".poker_tournament", "lobby_pid.json")
+
+
+def _lobby_registry_lock_path():
+    d = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "lobby_pid.lock")
+
+
+@contextlib.contextmanager
+def lobby_registry_lock(timeout=5.0):
+    """Verrou inter-processus COURT à tenir pendant toute la séquence
+    lire-décider-(lancer)-écrire de l'ouverture du Lobby — voir
+    main.py:App._open_lobby_window, seul appelant réel. Sur son PROPRE
+    fichier (lobby_pid.lock), jamais celui de Menu principal ni d'open_
+    windows.json/remote_control.lock — même raisonnement déjà appliqué
+    pour chacun d'eux (sections critiques indépendantes)."""
+    with _file_lock(_lobby_registry_lock_path(), timeout=timeout):
+        yield
+
+
+def register_lobby(pid):
+    """Enregistre `pid` comme détenant l'UNIQUE Lobby de cette session —
+    à appeler SOUS lobby_registry_lock(), juste après avoir lancé le
+    processus (voir App._open_lobby_window) : jamais appelée seule en
+    production, pour ne jamais rouvrir la course qu'elle doit
+    justement éviter."""
+    try:
+        _atomic_write_json(_lobby_registry_path(), {"pid": pid})
+    except OSError:
+        pass
+
+
+def unregister_lobby(pid):
+    """Retire l'enregistrement SEULEMENT s'il appartient encore à
+    `pid` (même précaution que unregister_menu_principal : jamais
+    effacer par erreur celui d'un AUTRE Lobby plus récent, en cas de
+    course improbable). Appelée par le Lobby lui-même à sa fermeture
+    (voir main.py:LobbyDialog.destroy) — jamais besoin du verrou ici,
+    une libération ne court jamais contre elle-même."""
+    path = _lobby_registry_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict) and data.get("pid") == pid:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def lobby_pid():
+    """PID détenant actuellement l'unique Lobby de la session, ou None
+    si aucun (jamais lancé, déjà fermé proprement, ou verrou périmé).
+    Auto-nettoyant : si le PID enregistré n'est PLUS vivant (processus
+    arrêté brutalement — crash, Ctrl+C, gestionnaire de tâches), le
+    fichier est supprimé ici même, exactement comme menu_principal_pid
+    — un Lobby tué brutalement ne peut donc jamais bloquer durablement
+    une réouverture future. Lecture SANS verrou (comme menu_principal_
+    pid) : jamais la décision elle-même, voir lobby_registry_lock pour
+    la seule section atomique réelle."""
+    path = _lobby_registry_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    if not isinstance(pid, int):
+        return None
+    if not _pid_is_running(pid):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+    return pid
+
+
 def bring_pid_to_front(pid):
     """Ramène au premier plan la fenêtre du processus `pid` (best-effort,
     silencieux en cas d'échec — ex : permission Accessibilité macOS non
