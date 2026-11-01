@@ -4262,6 +4262,26 @@ class _ExclusiveThreadingHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
             self.socket.bind(self.server_address)
             self.server_address = self.socket.getsockname()
+            # Correctif du 2026-10-31 (AttributeError 'server_port' repéré
+            # sur le Sony Vaio, Windows 10 réel — jamais reproduit avant
+            # faute d'un vrai test Windows jusque-là) : cette branche
+            # appelle self.socket.bind() directement et ne passe JAMAIS
+            # par super().server_bind() (voir le commentaire de classe
+            # ci-dessus — c'est précisément le but, pour poser
+            # SO_EXCLUSIVEADDRUSE au lieu de SO_REUSEADDR). Mais c'est
+            # http.server.HTTPServer.server_bind() — jamais appelée ici —
+            # qui pose normalement self.server_name/self.server_port
+            # après le bind() de socketserver.TCPServer. Sans ces deux
+            # lignes, ces attributs n'existaient tout simplement jamais
+            # sous Windows, alors que plusieurs endroits de ce module
+            # (ex. do_GET, log_remote_event) lisent self.server.
+            # server_port. Reproduit ici le même calcul que HTTPServer.
+            # server_bind(), uniquement pour cette branche Windows —
+            # POSIX continue de l'obtenir gratuitement via
+            # super().server_bind() dans le else ci-dessous, inchangé.
+            host, port = self.server_address[:2]
+            self.server_name = socket.getfqdn(host)
+            self.server_port = port
         else:
             super().server_bind()
 

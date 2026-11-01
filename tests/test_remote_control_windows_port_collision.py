@@ -248,6 +248,38 @@ class ExclusiveThreadingHTTPServerServerBindTest(unittest.TestCase):
         inst.socket.bind.assert_called_once_with(("0.0.0.0", 8765))
         mock_super_bind.assert_not_called()
 
+    def test_sous_windows_pose_aussi_server_name_et_server_port(self):
+        """Correctif du 2026-10-31 (AttributeError 'server_port' repéré
+        sur un vrai poste Windows, voir le commentaire de server_bind) :
+        cette branche n'appelle jamais super().server_bind() — la seule
+        à poser self.server_name/self.server_port normalement — donc
+        doit les poser elle-même, avec les mêmes valeurs que http.server.
+        HTTPServer.server_bind() aurait posées."""
+        inst = self._bare_instance()
+        with patch.object(remote_control.sys, "platform", "win32"), \
+             patch.object(remote_control.socket, "SO_EXCLUSIVEADDRUSE", 0xBEEF, create=True):
+            inst.socket.getsockname.return_value = ("0.0.0.0", 8765)
+            inst.server_bind()
+
+        self.assertEqual(inst.server_port, 8765)
+        self.assertEqual(inst.server_name, socket.getfqdn("0.0.0.0"))
+
+    def test_do_get_peut_lire_server_port_apres_bind_simule_windows(self):
+        """Reproduit exactement le scénario du Sony Vaio : une requête
+        non authentifiée déclenche log_remote_event(..., port=self.server.
+        server_port) depuis do_GET — doit fonctionner sans AttributeError
+        une fois server_bind() passé par la branche Windows ci-dessus,
+        pas seulement en théorie sur l'attribut isolé."""
+        inst = self._bare_instance()
+        with patch.object(remote_control.sys, "platform", "win32"), \
+             patch.object(remote_control.socket, "SO_EXCLUSIVEADDRUSE", 0xBEEF, create=True):
+            inst.socket.getsockname.return_value = ("0.0.0.0", 8765)
+            inst.server_bind()
+        # Accès direct, tel que do_GET/do_POST le font (self.server.
+        # server_port) — AttributeError ici reproduirait exactement le
+        # plantage observé, sans dépendre du reste du handler HTTP.
+        self.assertEqual(inst.server_port, 8765)
+
     def test_hors_windows_delegue_integralement_a_la_classe_parente(self):
         """POSIX : AUCUNE différence avec avant ce correctif — server_bind
         appelle uniquement super().server_bind() (qui pose SO_REUSEADDR
