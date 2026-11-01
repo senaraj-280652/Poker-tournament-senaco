@@ -1057,6 +1057,50 @@ DEFAULT_TOURNAMENT_DAYS = "4,6"
 _PLAYER_STATUS_LABELS = {"active": "Actif", "withdrawn": "Forfait", "eliminated": "Éliminé"}
 
 
+def diagnostiquer_prerequis_nouveau_tournoi(club_name, dossier_par_defaut,
+                                             isdir_fn=os.path.isdir, access_fn=os.access):
+    """Logique PURE (aucun Tkinter, aucune dépendance à export_prefs/
+    tournament_prefs) vérifiant les deux prérequis obligatoires avant
+    toute création de tournoi (demande du 2026-10-26) : un nom de club
+    renseigné, et un "Dossier par défaut" explicitement configuré,
+    existant, et accessible en écriture. `isdir_fn`/`access_fn`
+    injectables pour les tests, sans toucher au vrai système de
+    fichiers (voir tests/test_diagnostiquer_prerequis_nouveau_tournoi.py).
+
+    Une valeur composée uniquement d'espaces compte comme vide — jamais
+    assimilée à une vraie valeur, demande explicite.
+
+    Retourne la liste des éléments manquants/invalides, dans l'ordre
+    club puis dossier (liste vide = tout est en ordre, la création peut
+    continuer). AUCUN repli automatique proposé ici (ni HOME, ni
+    Bureau, ni C:\\poker\\senaco) : cette fonction ne fait que
+    constater, jamais compenser — contrairement à
+    tournament_day_folder_proposal() ci-dessous, dont le repli Windows
+    reste un simple pré-remplissage visible d'un dialogue, pas un
+    contournement de CE contrôle, puisque ce contrôle s'exécute AVANT
+    que tournament_day_folder_proposal() ne soit jamais appelée."""
+    manques = []
+
+    if not (club_name or "").strip():
+        manques.append("le nom du club")
+
+    dossier = (dossier_par_defaut or "").strip()
+    if not dossier:
+        manques.append("le « Dossier par défaut »")
+    elif not isdir_fn(dossier):
+        manques.append(
+            f"un « Dossier par défaut » valide (« {dossier} » n'existe pas "
+            "ou n'est pas un dossier)"
+        )
+    elif not access_fn(dossier, os.W_OK):
+        manques.append(
+            f"un « Dossier par défaut » accessible en écriture (« {dossier} » "
+            "n'autorise pas l'écriture)"
+        )
+
+    return manques
+
+
 def tournament_day_folder_proposal(is_sng=False):
     """Renvoie (dossier_proposé, nom_de_fichier_proposé) pour "Nouveau
     tournoi" / "Sit & Go rapide", à partir de "Dossier par défaut" (voir
@@ -9737,6 +9781,44 @@ class App(tk.Tk):
         settings_win.grab_set()
         settings_win.wait_window(settings_win)
 
+    def _verifier_prerequis_nouveau_tournoi(self, win):
+        """Vérification centralisée (demande du 2026-10-26), appelée en
+        tout premier par new_tournament() ET new_sng() — AVANT
+        tournament_day_folder_proposal() et AVANT le moindre
+        filedialog.asksaveasfilename() — pour que ces deux points
+        d'entrée (et tout futur point d'entrée équivalent) partagent
+        EXACTEMENT la même règle, sans jamais pouvoir diverger.
+
+        Strictement identique sur Windows, macOS Intel et Apple Silicon
+        — aucune branche sys.platform ici, volontairement (contrairement
+        à tournament_day_folder_proposal(), dont le repli Windows reste
+        un pré-remplissage de dialogue, jamais un contournement de CE
+        contrôle puisqu'il s'exécute après).
+
+        Retourne True si la création peut continuer sans rien avoir
+        créé ni ouvert d'autre que ce message. Si False : un message
+        explicatif a déjà été affiché, avec la proposition d'ouvrir
+        "Paramètres de base" immédiatement (_open_basic_settings_dialog,
+        ci-dessus) — rien n'a été créé, aucun dialogue d'enregistrement
+        n'a été ouvert."""
+        club = export_prefs.load_value("club_name", "") or ""
+        dossier = tournament_prefs.load_last_settings().get("tournament_day_folder", "") or ""
+        manques = diagnostiquer_prerequis_nouveau_tournoi(club, dossier)
+        if not manques:
+            return True
+
+        lignes = "\n".join(f"• {m}" for m in manques)
+        if messagebox.askyesno(
+            "Configuration requise avant de créer un tournoi",
+            "Avant de créer un tournoi, Senaco a besoin de :\n\n"
+            f"{lignes}\n\n"
+            "Rien n'a été créé. Ouvrir les Paramètres de base maintenant "
+            "pour les configurer ?",
+            parent=win,
+        ):
+            self._open_basic_settings_dialog(win)
+        return False
+
     def _choose_tournament_file(self):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
@@ -9812,6 +9894,12 @@ class App(tk.Tk):
             # jamais se déclencher en usage normal.
             if _block_second_tournament_if_needed(win):
                 return
+            # Demande du 2026-10-26 : club + "Dossier par défaut" valides
+            # obligatoires AVANT toute proposition de dossier/fichier —
+            # voir App._verifier_prerequis_nouveau_tournoi. Rien n'est
+            # créé ni ouvert si ce contrôle échoue.
+            if not self._verifier_prerequis_nouveau_tournoi(win):
+                return
             day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau tournoi",
@@ -9865,6 +9953,8 @@ class App(tk.Tk):
         def new_sng():
             # Voir le commentaire équivalent dans new_tournament() ci-dessus.
             if _block_second_tournament_if_needed(win):
+                return
+            if not self._verifier_prerequis_nouveau_tournoi(win):
                 return
             day_folder, day_filename = tournament_day_folder_proposal(is_sng=True)
             path = filedialog.asksaveasfilename(
