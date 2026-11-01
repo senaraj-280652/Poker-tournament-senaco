@@ -37,7 +37,35 @@ cascade du destroy() d'un parent listé plus tôt dans le même appel)
 est ignoré, jamais un vrai problème Tk — voir _still_exists ci-dessous,
 dont le rôle est uniquement de détecter "déjà parti", jamais de
 masquer un échec de destroy() lui-même (destroy() est toujours appelé
-sans aucun try/except autour)."""
+sans aucun try/except autour).
+
+RÈGLE D'EXÉCUTION (ajoutée le 2026-10-31, suite à 4 plantages macOS
+réels — SIGILL, `Tcl_Panic` → ... → `gc_collect_main`, sur un thread
+nommé "Thread-N (call)") : ce mécanisme ne se déclenche que lorsqu'un
+fichier de test à RACINE TK RÉELLE (créant un vrai `tk.Tk()`) tourne
+dans le MÊME processus Python qu'un fichier de test à `threading.
+Thread` brut (le motif `def call(...): ...; t1 = threading.Thread
+(target=call)` utilisé par les tests d'atomicité/course — voir
+test_acquire_menu_principal_race.py, test_menu_principal_volontaire_
+duplication.py, test_remote_control_reliability.py et test_lobby_
+cross_process_registry.py). Ces 4 fichiers eux-mêmes ne créent AUCUN
+objet Tk (vérifié : aucun `tk.Tk()`, aucun widget) — rien à nettoyer
+en leur sein. Le risque vient uniquement du GC cyclique qui peut
+réclamer, DEPUIS leur thread `call`, un cycle Tk laissé par un AUTRE
+fichier de test réel-Tk exécuté plus tôt dans le même processus.
+
+Ne JAMAIS lancer manuellement une combinaison ad hoc de fichiers de
+tests mélangeant un fichier à racine Tk réelle et un de ces 4 fichiers
+(ou tout futur fichier au même motif `threading.Thread(target=call)`)
+dans un seul process `python3 -m unittest <fichiers...>` — utiliser
+systématiquement `python3 -m unittest discover` pour toute exécution
+couvrant plusieurs fichiers : son ordonnancement/isolation évite déjà
+ce chevauchement (confirmé par une exécution complète de 3400 tests,
+0 échec, 0 erreur). Si un nouveau fichier de test introduit ce même
+motif `threading.Thread(target=call)` sans racine Tk propre, l'ajouter
+à la liste ci-dessus plutôt que de le "corriger" individuellement — il
+n'y a rien à corriger dans ces fichiers, seulement une combinaison à
+éviter."""
 import gc
 
 
