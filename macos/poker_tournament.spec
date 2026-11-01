@@ -7,10 +7,24 @@
 #   pyinstaller macos/poker_tournament.spec --distpath macos/dist --workpath macos/build
 #
 # (macos/build_dmg.sh fait tout cela automatiquement, puis génère le .dmg.)
+import re
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH).resolve().parent  # racine du dépôt (parent de macos/)
+
+# Numéro de version lu depuis version.py (source unique de vérité, voir
+# sa docstring) — jamais recopié en dur ici (demande du 2026-10-22, suite
+# au même oubli déjà corrigé côté Windows via windows/read_version.py :
+# ce fichier était resté bloqué à "1.2.16" malgré de nombreuses versions
+# distribuées depuis). Un spec PyInstaller est lui-même du code Python
+# exécuté par `pyinstaller`, donc cette lecture se fait directement ici,
+# sans script séparé ni risque d'échappement de shell.
+_version_text = (ROOT / "version.py").read_text(encoding="utf-8")
+_version_match = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', _version_text)
+if not _version_match:
+    raise SystemExit("APP_VERSION introuvable dans version.py")
+APP_VERSION = _version_match.group(1)
 
 a = Analysis(
     [str(ROOT / "main.py")],
@@ -67,13 +81,17 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="PokerTournament.app",
-    icon=None,
+    # Icône Senaco dédiée (demande du 2026-10-22) — générée depuis
+    # windows/assets/logo_sena_source.png via sips+iconutil (outils macOS
+    # gratuits) ; remplace l'icône générique PyInstaller utilisée jusque-
+    # là (icon-windowed.icns). Voir macos/assets/app_icon.icns.
+    icon=str(ROOT / "macos" / "assets" / "app_icon.icns"),
     bundle_identifier="com.pokertournament.gestionnaire",
-    version="1.2.16",
+    version=APP_VERSION,
     info_plist={
         "CFBundleName": "Gestionnaire de Tournoi de Poker",
         "CFBundleDisplayName": "Gestionnaire de Tournoi de Poker",
-        "CFBundleShortVersionString": "1.2.16",
+        "CFBundleShortVersionString": APP_VERSION,
         "NSHumanReadableCopyright": "Raj Juganaikloo",
         "NSHighResolutionCapable": True,
         "NSCameraUsageDescription": "Utilisée pour prendre une photo de joueur depuis l'application.",

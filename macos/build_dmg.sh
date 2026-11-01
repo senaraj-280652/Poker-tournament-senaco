@@ -18,6 +18,16 @@ cd "$ROOT"
 APP_NAME="PokerTournament"
 VOL_NAME="Gestionnaire de Tournoi de Poker"
 
+# Nom du .dmg construit automatiquement à partir d'APP_VERSION
+# (version.py, source unique de vérité) et de l'architecture réelle de
+# CE Mac (demande du 2026-10-22, même principe que windows/read_version.py
+# pour le .msi) — jamais recodé en dur, pour qu'un futur changement de
+# version ou une reconstruction sur un Mac d'architecture différente
+# produisent toujours un nom correct sans y penser.
+APP_VERSION="$(python3 "$ROOT/macos/read_version.py")"
+ARCH="$(uname -m)"
+DMG_NAME="Senaco-${APP_VERSION}-macOS-${ARCH}.dmg"
+
 echo "== 1/5 : environnement virtuel Python =="
 rm -rf macos/venv
 python3 -m venv macos/venv
@@ -63,13 +73,13 @@ mkdir -p "$STAGING"
 cp -R "macos/dist/${APP_NAME}.app" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 
-rm -f "macos/dist/${APP_NAME}.dmg"
+rm -f "macos/dist/${DMG_NAME}"
 hdiutil create -volname "$VOL_NAME" \
     -srcfolder "$STAGING" \
     -ov -format UDZO \
-    "macos/dist/${APP_NAME}.dmg"
+    "macos/dist/${DMG_NAME}"
 
 rm -rf "$STAGING"
 
 echo ""
-echo "Terminé : macos/dist/${APP_NAME}.dmg"
+echo "Terminé : macos/dist/${DMG_NAME}"
