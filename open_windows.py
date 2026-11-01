@@ -924,9 +924,17 @@ def menu_principal_pid(key):
 
 
 def _menu_principal_registry_lock_path(key):
-    return os.path.join(
-        os.path.expanduser("~"), ".poker_tournament", f"menu_principal_{key}.lock",
-    )
+    # os.makedirs manquant ici jusqu'au 2026-10-22 (contrairement à
+    # _registry_lock_path/_remote_lock_path, qui s'en chargent déjà
+    # depuis longtemps) : sur un poste n'ayant JAMAIS lancé Senaco
+    # auparavant (~/.poker_tournament totalement absent — un tout
+    # premier lancement réel, macOS ou Windows), _file_lock plantait
+    # avec FileNotFoundError dès l'ouverture de ce fichier de verrou,
+    # avant même l'affichage du menu principal. Reproduit à l'identique
+    # depuis les sources et depuis un .app PyInstaller packagé.
+    d = os.path.join(os.path.expanduser("~"), ".poker_tournament")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"menu_principal_{key}.lock")
 
 
 @contextlib.contextmanager
