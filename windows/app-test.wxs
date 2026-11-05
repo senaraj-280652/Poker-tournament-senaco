@@ -63,7 +63,24 @@
 
     <SummaryInformation Description="Installateur - Gestionnaire de Tournoi de Poker (TEST)" />
 
+    <!-- AllowSameVersionUpgrades="yes" (correctif du 2026-11-05) :
+         Version ci-dessus reste volontairement fixe à "1.2.38" pour
+         CHAQUE build TEST (voir plus haut — l'identification d'un
+         build précis passe par TEST_BUILD_NUMBER/github.run_number
+         embarqué dans l'exécutable, jamais par ce champ). Sans cet
+         attribut, Windows Installer ne reconnaît pas qu'un nouveau
+         .msi TEST (même Version, même UpgradeCode qu'un précédent déjà
+         installé) doit le remplacer, et lance une RÉPARATION de
+         l'installation existante au lieu d'installer le nouveau
+         contenu — c'est le problème déjà rencontré. Avec cet
+         attribut, une Version identique déclenche quand même la
+         séquence de remplacement (RemoveExistingProducts) normale.
+         Concerne UNIQUEMENT cette ligne TEST (UpgradeCode distinct,
+         voir ci-dessus) : aucun effet sur windows/app.wxs
+         (production), qui bascule bien la Version à chaque release et
+         n'a donc jamais ce problème. -->
     <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
         DowngradeErrorMessage="Une version plus récente de Poker Senaco TEST est déjà installée." />
     <MediaTemplate EmbedCab="yes" />
 
