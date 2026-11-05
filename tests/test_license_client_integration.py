@@ -182,6 +182,44 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
             self.assertEqual(decision2.etat, lc.ETAT_NORMAL)
             self.assertIsNotNone(decision2.cycle_id)
 
+    def test_trois_mois_gratuits_date_expiration_exacte(self):
+        """Point B (demande du 2026-11-05) : la date d'expiration d'un
+        essai gratuit réel doit correspondre EXACTEMENT à la règle
+        métier (date_debut + 3 mois calendaires via
+        senaco_ajouter_mois_calendaires(), voir prive/lib/licences.php
+        — déjà exercée pour les cas particuliers de calendrier, fins de
+        mois et passages d'année, dans tests/CalculDatesTest.php côté
+        PHP), jamais une approximation (ex. +90 jours). Le calcul
+        attendu est obtenu en appelant la VRAIE fonction métier, pas
+        une réimplémentation Python qui pourrait diverger silencieusement."""
+        with patch("license.machine_id_display", return_value="AAAA-TEST-0008"):
+            lc.activer_en_ligne("Club Essai", "integration8@example.com")
+
+        resultat = subprocess.run(
+            [_MYSQL_BIN, "-h", _DB_HOST, "-P", _DB_PORT, "-u", _DB_USER,
+             f"-p{_DB_PASSWORD}", "senaco_test", "-N", "-e",
+             "SELECT l.date_debut, l.date_expiration FROM licences l "
+             "JOIN machines m ON m.id = l.machine_id "
+             "WHERE m.identifiant_machine = 'AAAA-TEST-0008';"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        date_debut, date_expiration_reelle = resultat.stdout.strip().split("\t")
+
+        calcul_attendu = subprocess.run(
+            [_PHP_BIN, "-r",
+             f'require "prive/lib/licences.php"; '
+             f'echo senaco_ajouter_mois_calendaires("{date_debut}", 3);'],
+            cwd=_MODULE_SERVEUR, capture_output=True, text=True, timeout=10, check=True,
+        )
+        date_expiration_attendue = calcul_attendu.stdout.strip()
+
+        self.assertEqual(
+            date_expiration_reelle, date_expiration_attendue,
+            "La date d'expiration de l'essai gratuit doit correspondre exactement "
+            "à date_debut + 3 mois calendaires (senaco_ajouter_mois_calendaires), "
+            "jamais une approximation.",
+        )
+
     def test_reinstallation_reelle_ne_redonne_pas_un_nouvel_essai(self):
         with patch("license.machine_id_display", return_value="AAAA-TEST-0002"):
             d1 = lc.activer_en_ligne("Club", "integration2@example.com")
