@@ -9492,6 +9492,20 @@ class App(tk.Tk):
             bg=FELT_DARK, fg=GOLD, font=("Helvetica", 18, "bold"),
         )
         self.header_title_lbl.pack(side="left", padx=(24, 0), pady=(14, 12))
+
+        # Demande du 2026-11-05 : bouton d'aide sur cette même barre,
+        # aligné complètement à droite (side="right", indépendant des
+        # boutons empaquetés à "left" ci-dessus — ne modifie en rien
+        # leur position). Réutilise exclusivement _show_context_help
+        # (même méthode que le menu Aide et F1, déjà lié globalement
+        # via bind_all — voir _build_menu) : aucune nouvelle logique
+        # d'aide, aucun changement du fonctionnement de F1.
+        aide_header_btn = ttk.Button(
+            inner, text="? Aide", command=self._show_context_help,
+        )
+        aide_header_btn.pack(side="right", pady=14)
+        Tooltip(aide_header_btn, "Ouvre l'aide intégrée (raccourci F1).")
+
         self._update_window_title()
 
     def _update_window_title(self):
