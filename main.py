@@ -1168,6 +1168,16 @@ POKER_TOURNAMENT_INTERNAL_LAUNCH = "POKER_TOURNAMENT_INTERNAL_LAUNCH"
 # les rend mutuellement exclusifs au niveau du code).
 POKER_TOURNAMENT_LOBBY_STANDALONE = "POKER_TOURNAMENT_LOBBY_STANDALONE"
 
+# Lot 5 du système de licences Senaco v3 (demande du 2026-11-03) :
+# bascule DORMANTE vers le nouveau mécanisme (jeton signé, activation
+# en ligne, voir license_client.py) — tant que cette variable n'est
+# PAS définie, le verrou HMAC actuel (license.py, ActivationDialog)
+# reste l'unique mécanisme actif, strictement inchangé. Voir
+# App.__init__ pour le point de bascule, et le compte rendu du Lot 5
+# pour ce qui reste volontairement hors périmètre (câblage de la
+# tolérance de session dans le flux d'ouverture de tournoi).
+POKER_TOURNAMENT_LICENSE_V3 = "POKER_TOURNAMENT_LICENSE_V3"
+
 
 def spawn_app_process(extra_args=None, internal_menu_child=False, lobby_standalone=False):
     """Lance une nouvelle instance indépendante de l'application (autre
@@ -6677,6 +6687,99 @@ class ActivationDialog(tk.Toplevel):
         self.destroy()
 
 
+class ActivationEnLigneDialog(tk.Toplevel):
+    """Lot 5 du système de licences Senaco v3 — activation en ligne,
+    utilisée UNIQUEMENT quand POKER_TOURNAMENT_LICENSE_V3 est défini
+    (voir App.__init__). DORMANT par défaut : ActivationDialog
+    ci-dessus reste la fenêtre réellement utilisée tant que cette
+    variable n'est pas positionnée.
+
+    Contrairement à ActivationDialog (clé saisie manuellement, délivrée
+    hors-ligne par l'éditeur), ce formulaire demande le nom du club et
+    un e-mail, puis appelle license_client.activer_en_ligne() — plus
+    de clé à copier-coller, l'activation se fait entièrement en ligne
+    (cahier des charges : "première activation obligatoirement en
+    ligne")."""
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.activated = False
+        self.decision = None  # DecisionLicence renvoyée par activer_en_ligne() si succès
+        self.title("Activation en ligne requise")
+        self.geometry("480x360")
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._quit)
+
+        ttk.Label(
+            self, text="Activation du logiciel", font=("Helvetica", 13, "bold"),
+        ).pack(anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(
+            self,
+            text="Ce poste n'est pas encore activé. Une connexion Internet est "
+                 "nécessaire pour cette première activation (une seule fois).",
+            wraplength=440, justify="left",
+        ).pack(anchor="w", padx=16, pady=(0, 12))
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=16, pady=(0, 6))
+        ttk.Label(form, text="Nom du club :").pack(anchor="w")
+        self.club_entry = ttk.Entry(form)
+        self.club_entry.pack(fill="x", pady=(2, 10))
+        ttk.Label(form, text="E-mail :").pack(anchor="w")
+        self.email_entry = ttk.Entry(form)
+        self.email_entry.pack(fill="x", pady=(2, 10))
+        ttk.Label(form, text="Code d'activation (fourni par l'éditeur, si applicable) :").pack(anchor="w")
+        self.code_entry = ttk.Entry(form)
+        self.code_entry.pack(fill="x", pady=(2, 0))
+
+        self.statut_lbl = ttk.Label(self, text="", foreground="#b00020", wraplength=440, justify="left")
+        self.statut_lbl.pack(anchor="w", padx=16, pady=(8, 0))
+
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", padx=16, pady=16, side="bottom")
+        ttk.Button(btns, text="Quitter", command=self._quit).pack(side="right")
+        self.activer_btn = ttk.Button(btns, text="Activer", command=self._activer)
+        self.activer_btn.pack(side="right", padx=(0, 6))
+
+        self.transient(master)
+        self.grab_set()
+        self.club_entry.focus_set()
+        self.wait_window(self)
+
+    def _activer(self):
+        club = self.club_entry.get().strip()
+        email = self.email_entry.get().strip()
+        code = self.code_entry.get().strip() or None
+        if not club or not email:
+            self.statut_lbl.configure(text="Renseignez le nom du club et l'e-mail.")
+            return
+        self.activer_btn.configure(state="disabled")
+        self.statut_lbl.configure(text="Activation en cours...", foreground="#444444")
+        self.update_idletasks()
+        import license_client  # import local — voir App.__init__ pour l'explication complète
+        try:
+            self.decision = license_client.activer_en_ligne(club, email, code_activation=code)
+        except license_client.ErreurIdentificationInsuffisante as e:
+            # Distinct des autres échecs (demande du 2026-11-04) : ne
+            # jamais suggérer un nouvel essai gratuit — orienter vers
+            # une procédure de migration/récupération, et laisser le
+            # champ "Code d'activation" ci-dessus prêt à l'emploi pour
+            # une nouvelle tentative immédiate une fois le code obtenu.
+            self.statut_lbl.configure(text=str(e), foreground="#b00020")
+            self.activer_btn.configure(state="normal")
+            return
+        except license_client.ErreurActivation as e:
+            self.statut_lbl.configure(text=str(e), foreground="#b00020")
+            self.activer_btn.configure(state="normal")
+            return
+        self.activated = True
+        self.destroy()
+
+    def _quit(self):
+        self.activated = False
+        self.destroy()
+
+
 class RemoteDeviceRequestWindow(tk.Toplevel):
     """Petite fenêtre flottante Tkinter (demande du 2026-09-09) :
     présente UNE demande d'accès au contrôle à distance à la fois
@@ -8931,10 +9034,61 @@ class App(tk.Tk):
         if pyi_splash is not None:
             pyi_splash.close()
 
-        # Verrou anti-copie (voir license.py) : sans effet tant que le
-        # logiciel tourne depuis les sources (aucun secret injecté) ;
-        # actif uniquement sur un exécutable compilé pour distribution.
-        if not licensing.is_licensed():
+        # Verrou anti-copie — DEUX mécanismes distincts, jamais mélangés
+        # (Lot 5, voir license_client.py et POKER_TOURNAMENT_LICENSE_V3
+        # ci-dessus) :
+        # - POKER_TOURNAMENT_LICENSE_V3 défini -> nouveau système
+        #   (jeton signé, activation en ligne). Volontairement limité
+        #   ici à l'activation/la vérification : l'application de la
+        #   tolérance de 2 dates de session après expiration/révocation
+        #   (ETAT_EXPIRE/ETAT_REVOQUE) n'est PAS encore câblée dans ce
+        #   lot — le démarrage continue normalement dans ces deux cas,
+        #   voir le compte rendu du Lot 5. Seul ETAT_VERIFICATION_
+        #   OBLIGATOIRE bloque ici (aucune info locale exploitable).
+        # - Sinon (cas par défaut, inchangé) -> ancien verrou HMAC
+        #   (license.py) : sans effet tant que le logiciel tourne
+        #   depuis les sources (aucun secret injecté) ; actif uniquement
+        #   sur un exécutable compilé pour distribution.
+        if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+            # Import local, DÉLIBÉRÉMENT jamais en tête de fichier :
+            # license_client (donc pynacl, voir requirements.txt)
+            # ne doit être une dépendance RÉELLE que si cette variable
+            # est explicitement définie — sans cette précaution, le
+            # simple fait d'importer main.py exigerait pynacl même
+            # avec le Lot 5 dormant, ce qui casserait tout lancement
+            # (process enfant compris, voir spawn_app_process) sur un
+            # poste où pynacl n'est pas installé. Détecté via la
+            # suite de tests complète (processus enfants réels) avant
+            # tout déploiement.
+            import license_client
+            decision = license_client.evaluer_licence()
+            if decision.etat == license_client.ETAT_ACTIVATION_REQUISE:
+                dialogue_activation = ActivationEnLigneDialog(self)
+                if not dialogue_activation.activated:
+                    self.destroy()
+                    return
+                # Remplace la décision "activation requise" (périmée dès
+                # l'instant où l'activation vient de réussir) par celle
+                # RÉELLEMENT renvoyée par l'activation elle-même — sans
+                # ça, self._decision_licence_v3 resterait figée sur
+                # ETAT_ACTIVATION_REQUISE pour tout le reste de ce
+                # processus (voir _verifier_tolerance_licence_avant_
+                # ouverture, qui s'appuie dessus).
+                decision = dialogue_activation.decision
+            elif decision.etat == license_client.ETAT_VERIFICATION_OBLIGATOIRE:
+                messagebox.showerror(
+                    "Vérification requise",
+                    "Une connexion Internet est nécessaire pour vérifier votre "
+                    "licence. Connectez-vous puis relancez Senaco.",
+                )
+                self.destroy()
+                return
+            # Conservée pour tout le reste de la vie de CE processus (voir
+            # _verifier_tolerance_licence_avant_ouverture) : UNE SEULE
+            # vérification/activation par lancement, jamais une par
+            # tournoi ouvert.
+            self._decision_licence_v3 = decision
+        elif not licensing.is_licensed():
             if not ActivationDialog(self).activated:
                 self.destroy()
                 return
@@ -8988,6 +9142,15 @@ class App(tk.Tk):
                 messagebox.showerror(
                     "Erreur", f"Impossible d'ouvrir ce fichier :\n{e}"
                 )
+                self.destroy()
+                return
+            # Lot 5 (suite) — tolérance de licence : voir la docstring de
+            # _verifier_tolerance_licence_avant_ouverture. Dormante par
+            # défaut, donc sans effet ici tant que POKER_TOURNAMENT_
+            # LICENSE_V3 n'est pas définie.
+            if not self._verifier_tolerance_licence_avant_ouverture(open_path, self):
+                self.db.close()
+                open_windows.unregister(open_path)
                 self.destroy()
                 return
         else:
@@ -10055,11 +10218,222 @@ class App(tk.Tk):
             self._open_basic_settings_dialog(win)
         return False
 
+    def _verifier_tolerance_licence_avant_ouverture(self, chemin_tournoi, parent_pour_messages):
+        """Lot 5 (suite, demande du 2026-11-03) — applique la
+        tolérance de 2 dates de session après expiration
+        (session_tolerance.py, Lot 3) à l'ouverture RÉELLE d'un
+        tournoi/Sit & Go, qu'il soit nouveau ou déjà existant. Appelée
+        aux DEUX seuls points où self.db devient un vrai tournoi
+        (App.__init__ pour open_path, et juste après Database(result[
+        "path"]) dans _choose_tournament_file) — jamais pour la Lobby
+        ni les Statistiques, qui ouvrent toujours leurs fichiers en
+        lecture seule (Database(..., read_only=True)), un chemin de
+        code totalement différent, jamais concerné ici.
+
+        DORMANT par défaut (voir POKER_TOURNAMENT_LICENSE_V3) : renvoie
+        toujours True sans rien évaluer si la variable n'est pas
+        définie — comportement strictement inchangé dans ce cas.
+
+        RÉVOCATION vs EXPIRATION (décision du 2026-11-03, section
+        sécurité) — traitées DIFFÉREMMENT, jamais la même logique :
+        une révocation est une décision administrative délibérée
+        (fraude, remplacement d'ordinateur, impayé contesté...) ->
+        blocage IMMÉDIAT, sans tolérance, jamais session_tolerance
+        appelée. Une expiration est un délai naturel -> la tolérance
+        de 2 dates s'applique normalement.
+
+        ÉTAT LOCAL INDÉTERMINÉ (décision du 2026-11-03, section
+        sécurité) — pour une licence expirée, un fichier de tolérance
+        absent/corrompu/incohérent N'EST PLUS permissif par défaut :
+        une vérification en ligne est tentée (license_client.
+        verifier_en_ligne, qui réconcilie l'état local depuis le
+        serveur — voir session_tolerance.reconcilier_depuis_serveur) ;
+        si la connexion échoue, l'ouverture est refusée (jamais un
+        tournoi déjà ouvert n'est pour autant interrompu — ce contrôle
+        n'intervient qu'AVANT l'ouverture d'un nouveau). Une licence
+        encore VALIDE ne passe jamais par ce chemin (court-circuitée
+        plus haut), donc continue de fonctionner hors ligne sans
+        aucune gêne.
+
+        Renvoie True si l'ouverture doit continuer (éventuellement
+        après avoir affiché un avertissement rouge), False si elle
+        doit être annulée (message déjà affiché, rien n'a été modifié
+        sur le fichier lui-même)."""
+        if not os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+            return True
+        decision = getattr(self, "_decision_licence_v3", None)
+        if decision is None:
+            return True
+
+        import license_client  # import local — voir App.__init__
+
+        if decision.etat == license_client.ETAT_REVOQUE:
+            self._afficher_blocage_revocation_licence(parent_pour_messages)
+            return False
+        if decision.etat != license_client.ETAT_EXPIRE:
+            return True
+
+        import session_tolerance  # import local — même principe que license_client
+        resultat = session_tolerance.evaluer_ouverture(chemin_tournoi, True, decision.cycle_id)
+
+        if resultat.etat == session_tolerance.ETAT_INDETERMINE:
+            # Jamais permissif pour une licence déjà expirée (voir la
+            # docstring ci-dessus) : tente une réconciliation en ligne
+            # avant de décider quoi que ce soit.
+            reponse = license_client.verifier_en_ligne()
+            if reponse is None:
+                self._afficher_blocage_verification_requise_licence(parent_pour_messages)
+                return False
+            if reponse.get("revoque"):
+                self._afficher_blocage_revocation_licence(parent_pour_messages)
+                return False
+            if reponse.get("licence", {}).get("statut") != "expiree":
+                # Renouvelée/régularisée entre-temps (ex. action admin) :
+                # plus aucune restriction pour le reste de ce processus.
+                self._decision_licence_v3 = license_client.DecisionLicence(
+                    license_client.ETAT_NORMAL, decision.cycle_id,
+                    "Licence régularisée (confirmée en ligne).",
+                )
+                return True
+            # Toujours expirée : réévalue avec l'état local désormais
+            # réconcilié depuis le serveur (effet de bord de
+            # verifier_en_ligne() ci-dessus).
+            resultat = session_tolerance.evaluer_ouverture(chemin_tournoi, True, decision.cycle_id)
+            if resultat.etat == session_tolerance.ETAT_INDETERMINE:
+                # Ne devrait plus arriver après une réconciliation
+                # réussie — filet de sécurité : jamais permissif par
+                # défaut ici, même dans ce cas résiduel.
+                self._afficher_blocage_verification_requise_licence(parent_pour_messages)
+                return False
+
+        if resultat.etat == session_tolerance.ETAT_BLOQUE:
+            self._afficher_blocage_licence(parent_pour_messages)
+            return False
+        if resultat.etat == session_tolerance.ETAT_AUTORISE_AVEC_AVERTISSEMENT:
+            self._afficher_avertissement_licence(parent_pour_messages)
+        # ETAT_ANOMALIE_LECTURE : permissif par construction — date de
+        # session illisible dans CE fichier précis (ex. .tournoi
+        # corrompu), sans aucun rapport avec une tentative de
+        # contournement de la tolérance elle-même (voir
+        # session_tolerance.py) — jamais confondu avec ETAT_INDETERMINE
+        # ci-dessus, traité différemment à dessein.
+        return True
+
+    def _url_renouvellement_licence(self):
+        """Jamais une URL inventée (demande explicite du cahier des
+        charges) : vide tant que POKER_TOURNAMENT_LICENSE_RENEWAL_URL
+        n'est pas configurée — les messages ci-dessous s'affichent
+        alors sans lien plutôt qu'avec un lien incorrect."""
+        return os.environ.get("POKER_TOURNAMENT_LICENSE_RENEWAL_URL", "")
+
+    def _afficher_lien_renouvellement(self, parent_win, url):
+        if not url:
+            return
+        import webbrowser
+        lien = ttk.Label(parent_win, text=url, foreground="#1a0dab", cursor="hand2")
+        lien.pack(padx=16, pady=(0, 8))
+        lien.bind("<Button-1>", lambda e: webbrowser.open(url))
+
+    def _afficher_avertissement_licence(self, parent):
+        """Avertissement rouge (point 8 de la demande), tournoi ouvert
+        normalement malgré tout — jamais bloquant."""
+        win = tk.Toplevel(parent)
+        win.title("Licence expirée")
+        ttk.Label(
+            win, text="Votre licence Senaco a expiré.",
+            foreground="#b00020", font=("Helvetica", 12, "bold"),
+        ).pack(padx=16, pady=(16, 4))
+        ttk.Label(
+            win,
+            text="Ce tournoi reste accessible pour l'instant. Au-delà de 2 "
+                 "dates de session supplémentaires, l'ouverture de nouveaux "
+                 "tournois sera bloquée jusqu'au renouvellement (49 €/an).",
+            wraplength=380, justify="left",
+        ).pack(padx=16, pady=(0, 8))
+        self._afficher_lien_renouvellement(win, self._url_renouvellement_licence())
+        ttk.Button(win, text="Continuer", command=win.destroy).pack(pady=(0, 16))
+        win.transient(parent)
+        win.grab_set()
+        win.wait_window(win)
+
+    def _afficher_blocage_licence(self, parent):
+        """Blocage réel (3e date de session distincte après une
+        EXPIRATION — jamais pour une révocation, voir _afficher_
+        blocage_revocation_licence, une décision administrative
+        distincte, bloquante dès la première tentative) — AUCUN
+        tournoi en cours n'est jamais interrompu par ce message : il
+        n'apparaît qu'AVANT l'ouverture d'un nouveau, jamais pendant
+        l'utilisation d'un tournoi déjà ouvert."""
+        win = tk.Toplevel(parent)
+        win.title("Licence expirée — renouvellement requis")
+        ttk.Label(
+            win,
+            text="Licence expirée — la tolérance de 2 dates de session "
+                 "supplémentaires est épuisée. Un renouvellement (49 €/an) "
+                 "est nécessaire pour ouvrir de nouveaux tournois.",
+            foreground="#b00020", font=("Helvetica", 12, "bold"),
+            wraplength=380, justify="left",
+        ).pack(padx=16, pady=(16, 8))
+        self._afficher_lien_renouvellement(win, self._url_renouvellement_licence())
+        ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
+        win.transient(parent)
+        win.grab_set()
+        win.wait_window(win)
+
+    def _afficher_blocage_revocation_licence(self, parent):
+        """Révocation (décision du 2026-11-03, section sécurité) —
+        message DISTINCT de l'expiration, aucune tolérance, et
+        SURTOUT jamais de lien de renouvellement présenté comme une
+        solution : un paiement ne lève jamais, à lui seul, une
+        révocation administrative (voir license_client.py, en-tête de
+        fichier). Comme _afficher_blocage_licence, n'interrompt jamais
+        un tournoi déjà ouvert — seule l'ouverture d'un nouveau est
+        concernée."""
+        win = tk.Toplevel(parent)
+        win.title("Licence révoquée")
+        ttk.Label(
+            win,
+            text="Licence révoquée. Cette licence a été révoquée par "
+                 "l'éditeur de Senaco — contactez-le pour en connaître la "
+                 "raison. Un renouvellement ne suffit pas à lever une "
+                 "révocation administrative.",
+            foreground="#b00020", font=("Helvetica", 12, "bold"),
+            wraplength=380, justify="left",
+        ).pack(padx=16, pady=(16, 8))
+        ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
+        win.transient(parent)
+        win.grab_set()
+        win.wait_window(win)
+
+    def _afficher_blocage_verification_requise_licence(self, parent):
+        """État local de tolérance indéterminé (fichier absent/
+        corrompu/incohérent) pour une licence expirée, ET vérification
+        en ligne impossible/échouée (décision du 2026-11-03, section
+        sécurité) — jamais permissif par défaut dans ce cas. N'interrompt
+        jamais un tournoi déjà ouvert, comme les autres messages de ce
+        garde."""
+        win = tk.Toplevel(parent)
+        win.title("Vérification en ligne nécessaire")
+        ttk.Label(
+            win,
+            text="L'état de votre licence ne peut pas être confirmé "
+                 "localement. Connectez-vous à Internet puis réessayez "
+                 "d'ouvrir ce tournoi.",
+            foreground="#b00020", font=("Helvetica", 12, "bold"),
+            wraplength=380, justify="left",
+        ).pack(padx=16, pady=(16, 8))
+        ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
+        win.transient(parent)
+        win.grab_set()
+        win.wait_window(win)
+
     def _choose_tournament_file(self):
         win = tk.Toplevel(self)
         win.title("Bienvenue")
         win.configure(bg=FELT_DARK)
-        # 480x607 (480x567 avant l'ajout du bouton "🖥️ Ouvrir Senaco" le
+        # 480x647 (480x607 avant l'ajout du bouton "🪪 Licence" le
+        # 2026-11-05, même modèle +40px déjà documenté ci-dessous ;
+        # 480x567 avant l'ajout du bouton "🖥️ Ouvrir Senaco" le
         # 2026-10-13 ; 480x527 avant l'ajout du bouton "🗑️ Purger les
         # données" le 2026-10-12, qui dépassait sinon hors de la fenêtre,
         # toujours non redimensionnable — signalé après essai manuel ;
@@ -10079,7 +10453,7 @@ class App(tk.Tk):
         # exactement le même modèle de géométrie fixe que toutes les
         # autres, Tk gérant déjà seul la mise à l'échelle du système —
         # rien de spécifique à régler pour ce bouton.
-        win.geometry("480x607")
+        win.geometry("480x647")
         win.resizable(False, False)
         # PAS de win.transient(self) ici, volontairement : à ce stade du
         # démarrage, self (la fenêtre racine) est encore self.withdraw()
@@ -10388,6 +10762,10 @@ class App(tk.Tk):
         )
 
         ttk.Button(
+            btn_frame, text="🪪  Licence", command=lambda: self._show_licence_window(win), width=28,
+        ).pack(pady=6)
+
+        ttk.Button(
             btn_frame, text="ℹ️  À propos", command=lambda: self._show_about(win), width=28,
         ).pack(pady=6)
 
@@ -10524,6 +10902,17 @@ class App(tk.Tk):
                 self.db.add_player(name, roster.get_club(name), roster.get_pseudo(name))
         if result.get("is_sng"):
             self._apply_sng_defaults(n_players=len(result.get("selected_players") or []))
+        # Lot 5 (suite) — tolérance de licence : voir la docstring de
+        # _verifier_tolerance_licence_avant_ouverture. Dormante par
+        # défaut. En cas de blocage, restaure l'invariant attendu par
+        # l'appelant ("self.db est encore None" — voir son commentaire
+        # au point d'appel de _choose_tournament_file) : jamais laisser
+        # un self.db à moitié ouvert derrière un retour False.
+        if not self._verifier_tolerance_licence_avant_ouverture(result["path"], win):
+            self.db.close()
+            open_windows.unregister(result["path"])
+            self.db = None
+            return False
         return True
 
     def _apply_sng_defaults(self, n_players):
@@ -10792,6 +11181,130 @@ class App(tk.Tk):
             current_tab = None
         chapter = TAB_TO_CHAPTER.get(current_tab)
         HelpBrowser.open_at(self, chapter_title=chapter)
+
+    def _show_licence_window(self, parent=None):
+        """Fenêtre « Licence Senaco » (Menu principal/Bienvenue, juste
+        avant « À propos ») — consultation UNIQUEMENT : son ouverture
+        ne déclenche JAMAIS de vérification réseau, fonctionne
+        entièrement hors connexion. Quand le système de licences v3
+        est désactivé (cas de toute installation réelle aujourd'hui),
+        affiche les seules informations fiables de l'ancien système,
+        sans aucune terminologie technique "v3" visible par le club."""
+        win = tk.Toplevel(parent or self)
+        win.title("Licence Senaco")
+        win.resizable(False, False)
+
+        corps = ttk.Frame(win)
+        corps.pack(padx=20, pady=16)
+
+        def ligne(libelle, valeur, gras=False):
+            rangee = ttk.Frame(corps)
+            rangee.pack(fill="x", pady=3)
+            ttk.Label(rangee, text=libelle, foreground="#666666").pack(side="left")
+            ttk.Label(
+                rangee, text=valeur, font=("Helvetica", 10, "bold" if gras else "normal"),
+            ).pack(side="left", padx=(6, 0))
+
+        ttk.Label(corps, text="Licence Senaco", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(0, 10))
+
+        # Nom du club : TOUJOURS le réglage "Paramètres de base" déjà
+        # existant (export_prefs "club_name") — jamais un second
+        # stockage, et jamais utilisé ailleurs pour une décision de
+        # licence (affichage pur).
+        nom_club = export_prefs.load_value("club_name", "") or "(non renseigné)"
+        ligne("Club :", nom_club)
+
+        if not os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+            # Système v3 désactivé : seules les informations fiables de
+            # l'ancien système (license.py), jamais de champ v3 inventé.
+            info = licensing.license_info()
+            ligne("Statut :", "Licence active sur cet ordinateur" if info is not None else "Non activée")
+            ttk.Label(
+                corps,
+                text="Les informations détaillées (type, dates, tolérance) ne "
+                     "sont pas encore disponibles sur cette installation.",
+                foreground="#888888", wraplength=320, justify="left",
+            ).pack(anchor="w", pady=(10, 0))
+        else:
+            import license_client  # import local — voir App.__init__ pour l'explication complète
+            decision = getattr(self, "_decision_licence_v3", None)
+            infos = license_client.obtenir_informations_affichage(decision)
+
+            if not infos.disponible:
+                ligne("Statut :", "Non activée")
+            else:
+                libelles_type = {
+                    "essai": "Essai gratuit",
+                    "payant": "Licence annuelle",
+                    "offerte": "Licence offerte par Senaco",
+                }
+                ligne("Type :", libelles_type.get(infos.type, infos.type or "Inconnu"))
+
+                libelles_etat = {
+                    license_client.ETAT_NORMAL: "Licence active",
+                    license_client.ETAT_EXPIRE: "Licence expirée",
+                    license_client.ETAT_REVOQUE: "Révoquée",
+                    license_client.ETAT_VERIFICATION_OBLIGATOIRE: "Vérification en ligne nécessaire",
+                    license_client.ETAT_ACTIVATION_REQUISE: "Non activée",
+                }
+                ligne("Statut :", libelles_etat.get(infos.etat, "Inconnu"))
+
+                def _fmt_date(valeur):
+                    if not valeur:
+                        return "—"
+                    try:
+                        return datetime.strptime(valeur, "%Y-%m-%d").strftime("%d/%m/%Y")
+                    except ValueError:
+                        return valeur
+
+                ligne("Première activation :", _fmt_date(infos.date_debut))
+                ligne(
+                    "Expiration :",
+                    "À vie" if infos.a_vie else _fmt_date(infos.date_expiration),
+                    gras=infos.a_vie,
+                )
+
+                if infos.tolerance_applicable:
+                    def _accord_journee(n, participe):
+                        # Pluriel standard, sauf à 0 où le singulier est
+                        # conservé (demande du 2026-11-04 : "0 journée
+                        # utilisée", jamais "0 journées utilisées").
+                        mot = "journée" if n <= 1 else "journées"
+                        suffixe = "" if n <= 1 else "s"
+                        return f"{mot} {participe}{suffixe}"
+
+                    utilisees = infos.tolerance_utilisees
+                    restantes = max(0, infos.tolerance_max - utilisees)
+                    texte_utilisees = f"{utilisees} {_accord_journee(utilisees, 'utilisée')}"
+                    if restantes == 0:
+                        texte_restantes = "Aucune journée restante"
+                    else:
+                        texte_restantes = f"{restantes} {_accord_journee(restantes, 'restante')}"
+                    ligne(
+                        "Tolérance après expiration :",
+                        f"{texte_utilisees} sur {infos.tolerance_max} — {texte_restantes}",
+                    )
+                else:
+                    ligne("Tolérance après expiration :", "Sans objet (licence active)")
+
+                if infos.derniere_confirmation_en_ligne is not None:
+                    texte_verif = (
+                        "Confirmée en ligne le "
+                        + infos.derniere_confirmation_en_ligne.astimezone().strftime("%d/%m/%Y à %H:%M")
+                    )
+                else:
+                    texte_verif = (
+                        "Jamais confirmée en ligne depuis cet ordinateur "
+                        "(information locale uniquement)."
+                    )
+                ttk.Label(
+                    corps, text=texte_verif, foreground="#888888", wraplength=320, justify="left",
+                ).pack(anchor="w", pady=(10, 0))
+
+        ttk.Button(corps, text="Fermer", command=win.destroy).pack(pady=(16, 0))
+        win.transient(parent or self)
+        win.grab_set()
+        win.wait_window(win)
 
     def _show_about(self, parent=None):
         # "[TEST]"/"[TEST N]" (demandes du 2026-09-12 et du 2026-09-14,

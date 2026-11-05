@@ -19,3 +19,16 @@ pyobjc-framework-Cocoa>=10.0
 # main.py: WhatsAppQRShareDialog) — pur Python, pillow ci-dessus comme
 # moteur de rendu.
 qrcode>=7.4
+# Vérification des jetons de licence signés (Lot 1, système de
+# licences Senaco v3 — voir license_token.py). Seule la clé PUBLIQUE
+# sera embarquée dans l'exécutable ; la clé privée de signature ne vit
+# que côté serveur OVH. Choisie plutôt que `cryptography` : fournit un
+# binaire précompilé (universal2 sur macOS, pas de compilation Rust
+# nécessaire), compatible Python 3.14 dès son installation.
+pynacl>=1.6
+# Stockage local sécurisé du secret d'appariement par appareil
+# (sécurité du 2026-11-04, voir device_secret.py — système de licences
+# v3) : Trousseau macOS via une API unique partagée avec Windows.
+# Vérifié avec un vrai build PyInstaller onefile sur cette machine
+# (round-trip réel confirmé) — voir le compte rendu.
+keyring>=25.0

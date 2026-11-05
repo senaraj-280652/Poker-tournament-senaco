@@ -70,7 +70,9 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=_datas,
-    hiddenimports=[],
+    # keyring.backends.Windows : voir poker_tournament.spec (même
+    # principe, même mise en garde — non vérifié sur Windows réel).
+    hiddenimports=["keyring.backends.Windows"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

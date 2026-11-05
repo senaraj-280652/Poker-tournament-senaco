@@ -145,9 +145,13 @@ class BienvenueButtonStructuralTest(_SourceHelper, unittest.TestCase):
         self.assertLess(idx_standalone, idx_database_call)
 
     def test_geometrie_agrandie(self):
+        # 480x647 depuis l'ajout du bouton "🪪 Licence" le 2026-11-05
+        # (480x607 avant cela, valeur verrouillée par cette même
+        # assertion jusqu'à cette mise à jour — voir le commentaire de
+        # tête de _choose_tournament_file pour l'historique complet).
         func = self._find_method("App", "_choose_tournament_file")
         seg = self._source_of(func)
-        self.assertIn('win.geometry("480x607")', seg)
+        self.assertIn('win.geometry("480x647")', seg)
 
 
 # =====================================================================

@@ -35,7 +35,13 @@ a = Analysis(
     # F1, voir help_browser.py), lu au runtime via sys._MEIPASS — sans
     # cette entrée, l'aide s'ouvrirait vide dans l'exécutable packagé.
     datas=[(str(ROOT / "help_content.json"), ".")],
-    hiddenimports=[],
+    # keyring.backends.Windows : chargement dynamique du backend Coffre
+    # d'identifiants Windows (device_secret.py, sécurité du 2026-11-04).
+    # Listé par précaution (même principe que keyring.backends.macOS
+    # côté macos/poker_tournament.spec) — NON vérifié par un vrai build
+    # sur cette machine de développement (pas de Windows disponible ici,
+    # voir le compte rendu) : à confirmer lors du prochain build réel.
+    hiddenimports=["keyring.backends.Windows"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

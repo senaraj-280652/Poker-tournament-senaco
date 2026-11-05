@@ -30,6 +30,7 @@
   groupe (impossible avec des moyens officiels, voir le diagnostic du
   2026-10-10)."""
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -962,7 +963,9 @@ class PyObjCDependencyDeclaredForMacDistributionTest(unittest.TestCase):
     def test_macos_spec_liste_appkit_en_hiddenimports(self):
         with open(os.path.join(self._root(), "macos", "poker_tournament.spec"), encoding="utf-8") as f:
             content = f.read()
-        self.assertIn('hiddenimports=["AppKit"]', content)
+        match = re.search(r"hiddenimports\s*=\s*\[([^\]]*)\]", content)
+        self.assertIsNotNone(match, "hiddenimports introuvable dans macos/poker_tournament.spec")
+        self.assertIn("AppKit", match.group(1))
 
 
 if __name__ == "__main__":

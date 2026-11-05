@@ -38,7 +38,12 @@ a = Analysis(
     # NSPASTEBOARD_AVAILABLE, copy_file_to_clipboard — bouton "Envoi
     # WhatsApp") que PyInstaller peut ne pas détecter automatiquement
     # par analyse statique seule, listé explicitement par précaution.
-    hiddenimports=["AppKit"],
+    # keyring.backends.macOS : chargement dynamique du backend Trousseau
+    # (device_secret.py, sécurité du 2026-11-04) — détecté correctement
+    # par PyInstaller même sans cette entrée (vérifié par un vrai build
+    # onefile de test), mais listé explicitement par précaution, même
+    # principe qu'AppKit ci-dessous.
+    hiddenimports=["AppKit", "keyring.backends.macOS"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
