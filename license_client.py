@@ -48,6 +48,7 @@ fiable connue, mise à jour par le SERVEUR lors d'un succès en ligne)
 sert de référence hors-ligne."""
 import json
 import os
+import secrets
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -61,6 +62,20 @@ import session_tolerance
 import trusted_clock
 
 LICENSE_STATE_FILE = os.path.join(os.path.expanduser("~"), ".poker_tournament", "licence_v3.json")
+
+# Protocole de rotation des secrets (validé le 2026-11-06) : jeton de
+# tentative conservé DURABLEMENT sur disque, écrit AVANT tout appel
+# réseau — survit à une coupure électrique/un redémarrage, pas
+# seulement à une simple coupure réseau (voir verifier_en_ligne). Se
+# supprime UNIQUEMENT une fois le nouveau secret confirmé enregistré
+# dans le stockage sécurisé local (device_secret.py) — jamais avant.
+ROTATION_EN_ATTENTE_FILE = os.path.join(os.path.expanduser("~"), ".poker_tournament", "rotation_en_attente.json")
+# Purge défensive d'une tentative devenue trop ancienne pour être
+# honorée côté serveur (fenêtre de 24h, voir securite_appareil.php:
+# SENACO_ROTATION_FENETRE_HEURES) — marge large, jamais une source de
+# blocage, juste un nettoyage pour ne pas conserver indéfiniment un
+# fichier devenu inutile.
+ROTATION_EN_ATTENTE_AGE_MAX_HEURES = 48
 
 ENV_URL_SERVEUR = "POKER_TOURNAMENT_LICENSE_SERVER_URL"
 ENV_CLE_PUBLIQUE = "POKER_TOURNAMENT_LICENSE_PUBLIC_KEY_HEX"
@@ -135,6 +150,60 @@ def _enregistrer_etat_local(jeton, chemin=None):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"jeton": jeton}, f, ensure_ascii=False, indent=2)
     os.replace(tmp, chemin)
+
+
+def _jeton_tentative_en_attente(chemin=None):
+    """Relit un jeton de tentative déjà écrit AVANT une précédente
+    coupure (réseau, électrique, redémarrage) — pour le réutiliser tel
+    quel, jamais un nouveau, afin que le serveur reconnaisse qu'il
+    s'agit du rejeu de la MÊME tentative (voir securite_appareil.php:
+    senaco_verifier_et_roter_secret). Renvoie None si absent, invalide,
+    ou trop ancien pour être encore honoré côté serveur (purge au
+    passage dans ce dernier cas — jamais une erreur, juste un nettoyage)."""
+    chemin = chemin or ROTATION_EN_ATTENTE_FILE
+    try:
+        with open(chemin, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("jeton_tentative"), str) \
+            or not isinstance(data.get("cree_le"), str):
+        return None
+    try:
+        cree_le = datetime.fromisoformat(data["cree_le"])
+    except ValueError:
+        return None
+    age_heures = (datetime.now(timezone.utc) - cree_le).total_seconds() / 3600.0
+    if age_heures > ROTATION_EN_ATTENTE_AGE_MAX_HEURES:
+        _effacer_tentative_en_attente(chemin)
+        return None
+    return data["jeton_tentative"]
+
+
+def _enregistrer_tentative_en_attente(jeton_tentative, chemin=None):
+    """Écrit le jeton de tentative AVANT l'appel réseau — voir le
+    commentaire de ROTATION_EN_ATTENTE_FILE. Écriture atomique, même
+    principe que _enregistrer_etat_local."""
+    chemin = chemin or ROTATION_EN_ATTENTE_FILE
+    os.makedirs(os.path.dirname(chemin), exist_ok=True)
+    tmp = chemin + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(
+            {"jeton_tentative": jeton_tentative, "cree_le": datetime.now(timezone.utc).isoformat()},
+            f, ensure_ascii=False, indent=2,
+        )
+    os.replace(tmp, chemin)
+
+
+def _effacer_tentative_en_attente(chemin=None):
+    """À appeler UNIQUEMENT après confirmation que le nouveau secret a
+    bien été enregistré dans le stockage sécurisé local — jamais avant
+    (voir verifier_en_ligne)."""
+    chemin = chemin or ROTATION_EN_ATTENTE_FILE
+    try:
+        os.remove(chemin)
+    except FileNotFoundError:
+        pass
 
 
 def _post_json(url, payload):
@@ -253,7 +322,16 @@ def verifier_en_ligne():
     exactement comme pour une vraie coupure réseau. Une distinction plus
     fine entre "hors ligne" et "identification refusée" n'apporterait
     rien ici : dans les deux cas, impossible de confirmer l'état réel en
-    ligne, donc même repli hors-ligne prudent."""
+    ligne, donc même repli hors-ligne prudent.
+
+    Protocole de rotation des secrets (validé le 2026-11-06) : chaque
+    vérification réussie fait émettre un nouveau secret par le serveur
+    (voir securite_appareil.php). Le jeton de tentative correspondant
+    est écrit DURABLEMENT sur disque AVANT l'appel réseau (survit à une
+    coupure électrique, pas seulement réseau) et n'est effacé qu'une
+    fois le nouveau secret confirmé enregistré dans le stockage
+    sécurisé local — jamais avant, pour ne jamais perdre la possibilité
+    de rejouer la même tentative après un redémarrage."""
     etat_local = _charger_etat_local()
     if etat_local is None:
         return None
@@ -268,14 +346,34 @@ def verifier_en_ligne():
     if not secret_local:
         return None
 
+    jeton_tentative = _jeton_tentative_en_attente()
+    if jeton_tentative is None:
+        jeton_tentative = secrets.token_hex(16)
+        _enregistrer_tentative_en_attente(jeton_tentative)
+
     dates = session_tolerance.dates_a_synchroniser()
     code, reponse = _post_json(_url_serveur() + "/verifier.php", {
         "identifiant_machine": identifiant_machine,
+        "identifiant_machine_frais": licensing.machine_id_display(),
         "secret_appareil": secret_local,
+        "jeton_tentative": jeton_tentative,
         "dates_session_a_synchroniser": dates,
     })
     if code != 200 or reponse is None:
-        return None
+        return None  # Tentative en attente CONSERVÉE : la fenêtre de rattrapage serveur (24h) couvre le prochain essai.
+
+    secret_recu = reponse.get("secret_appareil")
+    if isinstance(secret_recu, str) and secret_recu:
+        try:
+            device_secret.enregistrer_secret_local(identifiant_machine, secret_recu)
+        except device_secret.ErreurStockageSecret:
+            # Jamais un succès partiel silencieux (même principe
+            # qu'activer_en_ligne) : la tentative reste en attente,
+            # rejouable au prochain lancement avec ce même jeton — rien
+            # d'autre n'est modifié localement tant que ce n'est pas
+            # confirmé.
+            return None
+    _effacer_tentative_en_attente()
 
     jeton = reponse.get("jeton")
     if isinstance(jeton, str):

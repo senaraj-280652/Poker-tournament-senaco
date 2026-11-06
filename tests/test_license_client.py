@@ -50,6 +50,7 @@ class EnvironnementTestCase(unittest.TestCase):
         self.chemin_licence = os.path.join(self._tmp.name, "licence_v3.json")
         self.chemin_horloge = os.path.join(self._tmp.name, "horloge_fiable.json")
         self.chemin_tolerance = os.path.join(self._tmp.name, "tolerance_sessions.json")
+        self.chemin_rotation_en_attente = os.path.join(self._tmp.name, "rotation_en_attente.json")
 
         self.cle_privee, self.cle_publique = license_token.generer_cle_de_test()
 
@@ -73,6 +74,7 @@ class EnvironnementTestCase(unittest.TestCase):
 
         patchers = [
             patch.object(lc, "LICENSE_STATE_FILE", self.chemin_licence),
+            patch.object(lc, "ROTATION_EN_ATTENTE_FILE", self.chemin_rotation_en_attente),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self.chemin_horloge),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self.chemin_tolerance),
             patch.dict(os.environ, {
@@ -361,6 +363,95 @@ class VerifierEnLigneTest(EnvironnementTestCase):
         })
         lc.verifier_en_ligne()
         self.assertIsNone(session_tolerance.charger_etat(chemin_etat=self.chemin_tolerance))
+
+
+class RotationSecretClientTest(EnvironnementTestCase):
+    """Protocole de rotation des secrets (validé le 2026-11-06), côté
+    client : jeton de tentative persistant, reprise après coupure/
+    redémarrage, et séquencement strict (jamais effacé avant
+    confirmation de l'enregistrement local)."""
+
+    def _reponse_avec_secret(self, jeton, nouveau_secret="1" * 64):
+        return (200, {
+            "jeton": jeton, "revoque": False, "secret_appareil": nouveau_secret,
+            "licence": {"type": "essai", "statut": "active",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+            "date_serveur": "2026-11-02T10:00:00Z",
+        })
+
+    @patch.object(lc, "_post_json")
+    def test_jeton_tentative_et_identifiant_frais_sont_transmis(self, mock_post):
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        mock_post.return_value = self._reponse_avec_secret(jeton)
+        with patch.object(lc.licensing, "machine_id_display", return_value="ID-FRAIS-RECALCULE"):
+            lc.verifier_en_ligne()
+        payload_envoye = mock_post.call_args[0][1]
+        self.assertRegex(payload_envoye["jeton_tentative"], r"^[0-9a-f]{32,}$")
+        self.assertEqual(payload_envoye["identifiant_machine_frais"], "ID-FRAIS-RECALCULE")
+        # La clé de recherche, elle, reste celle du jeton en cache — jamais la fraîche.
+        self.assertEqual(payload_envoye["identifiant_machine"], IDENTIFIANT_MACHINE_TEST)
+
+    @patch.object(lc, "_post_json")
+    def test_succes_efface_la_tentative_en_attente_apres_stockage_reussi(self, mock_post):
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        mock_post.return_value = self._reponse_avec_secret(jeton)
+        lc.verifier_en_ligne()
+        self.assertFalse(os.path.exists(self.chemin_rotation_en_attente))
+        self.assertEqual(self._secrets_locaux[IDENTIFIANT_MACHINE_TEST], "1" * 64)
+
+    @patch.object(lc, "_post_json")
+    def test_coupure_reseau_simulee_conserve_la_tentative_pour_un_rejeu_identique(self, mock_post):
+        """La réponse réussie du serveur n'arrive jamais (coupure) —
+        simulé ici en renvoyant (0, None), comme le ferait _post_json
+        sur toute anomalie réseau."""
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        mock_post.return_value = (0, None)
+        resultat = lc.verifier_en_ligne()
+        self.assertIsNone(resultat)
+
+        self.assertTrue(os.path.exists(self.chemin_rotation_en_attente))
+        jeton_ecrit = lc._jeton_tentative_en_attente(chemin=self.chemin_rotation_en_attente)
+
+        # Nouvel essai (redémarrage de l'application) : le MÊME jeton
+        # doit être réutilisé, jamais un nouveau.
+        mock_post.return_value = self._reponse_avec_secret(jeton)
+        lc.verifier_en_ligne()
+        payload_envoye = mock_post.call_args[0][1]
+        self.assertEqual(payload_envoye["jeton_tentative"], jeton_ecrit)
+
+    @patch.object(lc, "_post_json")
+    def test_echec_de_stockage_local_conserve_la_tentative_et_najamais_de_succes_partiel(self, mock_post):
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        mock_post.return_value = self._reponse_avec_secret(jeton, nouveau_secret="2" * 64)
+        with patch.object(
+            lc.device_secret, "enregistrer_secret_local",
+            side_effect=lc.device_secret.ErreurStockageSecret("échec simulé"),
+        ):
+            resultat = lc.verifier_en_ligne()
+
+        self.assertIsNone(resultat, "Un échec de stockage local ne doit jamais être un succès partiel.")
+        self.assertTrue(os.path.exists(self.chemin_rotation_en_attente), "La tentative doit rester disponible pour un rejeu.")
+        # Ni le jeton signé ni rien d'autre ne doit avoir été mis à jour localement.
+        etat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertEqual(etat["jeton"], jeton)
+
+    @patch.object(lc, "_post_json")
+    def test_tentative_trop_ancienne_est_purgee_et_jamais_reutilisee(self, mock_post):
+        ancien = (datetime.now(timezone.utc) - timedelta(hours=49)).isoformat()
+        with open(self.chemin_rotation_en_attente, "w", encoding="utf-8") as f:
+            json.dump({"jeton_tentative": "a" * 32, "cree_le": ancien}, f)
+
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        mock_post.return_value = self._reponse_avec_secret(jeton)
+        lc.verifier_en_ligne()
+
+        payload_envoye = mock_post.call_args[0][1]
+        self.assertNotEqual(payload_envoye["jeton_tentative"], "a" * 32, "Une tentative trop ancienne ne doit jamais être réutilisée.")
 
 
 class MatriceDecisionTest(EnvironnementTestCase):

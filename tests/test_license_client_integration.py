@@ -148,6 +148,7 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
 
         patchers = [
             patch.object(lc, "LICENSE_STATE_FILE", os.path.join(self._tmp.name, "licence_v3.json")),
+            patch.object(lc, "ROTATION_EN_ATTENTE_FILE", os.path.join(self._tmp.name, "rotation_en_attente.json")),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", os.path.join(self._tmp.name, "horloge.json")),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", os.path.join(self._tmp.name, "tolerance.json")),
             patch.dict(os.environ, {
@@ -181,6 +182,74 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
             decision2 = lc.evaluer_licence()
             self.assertEqual(decision2.etat, lc.ETAT_NORMAL)
             self.assertIsNotNone(decision2.cycle_id)
+
+    def test_verification_reelle_fait_tourner_le_secret_a_chaque_fois(self):
+        """Protocole de rotation (validé le 2026-11-06) — bout en bout
+        réel : le secret stocké localement change à chaque vérification
+        réussie contre le vrai serveur, jamais le même deux fois."""
+        with patch("license.machine_id_display", return_value="AAAA-TEST-0020"):
+            lc.activer_en_ligne("Club Rotation", "rotation20@example.com")
+            secret_apres_activation = self._secrets_locaux["AAAA-TEST-0020"]
+
+            lc.evaluer_licence()
+            secret_apres_verif1 = self._secrets_locaux["AAAA-TEST-0020"]
+            self.assertNotEqual(secret_apres_activation, secret_apres_verif1)
+
+            lc.evaluer_licence()
+            secret_apres_verif2 = self._secrets_locaux["AAAA-TEST-0020"]
+            self.assertNotEqual(secret_apres_verif1, secret_apres_verif2)
+
+    def test_reprise_reelle_apres_coupure_reseau_simulee_avec_le_vrai_serveur(self):
+        """Simule une vraie coupure réseau survenue APRÈS que le serveur
+        a traité la rotation mais AVANT que le client ne reçoive/
+        enregistre la réponse : un appel bas niveau identique à celui
+        que ferait _post_json est effectué directement ici, sa réponse
+        délibérément ignorée (jamais passée à enregistrer_secret_local),
+        puis verifier_en_ligne() est appelé normalement avec ce même
+        jeton de tentative pré-enregistré — doit récupérer EXACTEMENT
+        le même secret auprès du vrai serveur, sans jamais contacter
+        OVH ni modifier le secret courant une seconde fois."""
+        with patch("license.machine_id_display", return_value="AAAA-TEST-0021"):
+            lc.activer_en_ligne("Club Coupure", "coupure21@example.com")
+
+            etat_local = lc._charger_etat_local()
+            identifiant_machine = etat_local and lc.license_token.extraire_licence(
+                etat_local["jeton"], self.cle_publique_hex
+            )["identifiant_machine"]
+            secret_local = self._secrets_locaux["AAAA-TEST-0021"]
+            jeton_tentative = "ab" * 16
+
+            # Appel réel direct (même requête que verifier_en_ligne
+            # enverrait) — rotation réellement effectuée côté serveur,
+            # réponse ensuite délibérément ignorée.
+            code, reponse = lc._post_json(lc._url_serveur() + "/verifier.php", {
+                "identifiant_machine": identifiant_machine,
+                "identifiant_machine_frais": identifiant_machine,
+                "secret_appareil": secret_local,
+                "jeton_tentative": jeton_tentative,
+                "dates_session_a_synchroniser": [],
+            })
+            self.assertEqual(code, 200)
+            secret_jamais_enregistre = reponse["secret_appareil"]
+            # Le secret local n'a PAS changé : exactement ce qui se
+            # passerait après une vraie coupure réseau.
+            self.assertEqual(self._secrets_locaux["AAAA-TEST-0021"], secret_local)
+
+            # Reprise : la tentative en attente est pré-enregistrée avec
+            # le MÊME jeton, comme si l'appel précédent avait été fait
+            # par verifier_en_ligne() lui-même avant la coupure.
+            lc._enregistrer_tentative_en_attente(jeton_tentative)
+            resultat = lc.verifier_en_ligne()
+
+            self.assertIsNotNone(resultat, "La reprise après coupure réseau ne doit jamais échouer dans la fenêtre de rattrapage.")
+            self.assertEqual(
+                self._secrets_locaux["AAAA-TEST-0021"], secret_jamais_enregistre,
+                "Doit récupérer EXACTEMENT le même secret que celui émis lors de l'appel interrompu.",
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(self._tmp.name, "rotation_en_attente.json")),
+                "La tentative doit être effacée une fois le secret confirmé enregistré.",
+            )
 
     def test_trois_mois_gratuits_date_expiration_exacte(self):
         """Point B (demande du 2026-11-05) : la date d'expiration d'un
