@@ -129,15 +129,26 @@ class OnCloseStructuralTest(_SourceHelper, unittest.TestCase):
         """self.db is not None : après le early-return ci-dessus, _on_
         close doit nettoyer/détruire PUIS reconstruire une App(start_
         standalone=True) dans ce même processus (jamais Bienvenue, jamais
-        un second processus)."""
+        un second processus).
+
+        Correctif du 2026-11-06 (garde anti-crash Windows "application has
+        been destroyed", voir tests/test_activation_root_destroy_guard.py)
+        : App(start_standalone=True) et .mainloop() ne sont plus un seul
+        appel chaîné — mainloop() est désormais conditionné à
+        _fermee_pendant_init (posé par App._detruire_racine_en_securite
+        lors d'un abandon d'activation V2/V3 pendant __init__) — vérifié
+        séparément ci-dessous plutôt que par une seule sous-chaîne."""
         func = self._find_method("App", "_on_close")
         seg = self._source_of(func)
         idx_after_guard = seg.index("return\n") + len("return\n")
         tail = seg[idx_after_guard:]
         self.assertIn("self._cleanup_for_close()", tail)
         self.assertIn("self.destroy()", tail)
-        self.assertIn("App(start_standalone=True).mainloop()", tail)
+        self.assertIn("App(start_standalone=True)", tail)
+        self.assertIn("_fermee_pendant_init", tail)
+        self.assertIn(".mainloop()", tail)
         self.assertLess(tail.index("self.destroy()"), tail.index("App(start_standalone=True)"))
+        self.assertLess(tail.index("App(start_standalone=True)"), tail.index(".mainloop()"))
 
     def test_app_standalone_gardee_par_was_last_open_tournament(self):
         """Correction du 2026-10-14 (plusieurs tournois ouverts, fermer
@@ -151,7 +162,10 @@ class OnCloseStructuralTest(_SourceHelper, unittest.TestCase):
             if isinstance(n, ast.If) and self._source_of(n.test) == "was_last"
         )
         branch_seg = "\n".join(self._source_of(s) for s in if_was_last.body)
-        self.assertIn("App(start_standalone=True).mainloop()", branch_seg)
+        # Voir test_avec_tournoi_revient_a_senaco_sans_tournoi ci-dessus
+        # pour le détail du correctif du 2026-11-06 (garde mainloop()).
+        self.assertIn("App(start_standalone=True)", branch_seg)
+        self.assertIn(".mainloop()", branch_seg)
         seg = self._source_of(func)
         self.assertIn("was_last = self._was_last_open_tournament", seg)
         # Ordre : _cleanup_for_close() (pose l'attribut) -> capture dans

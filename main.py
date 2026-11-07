@@ -6652,7 +6652,14 @@ class ActivationDialog(tk.Toplevel):
         ttk.Button(btns, text="Quitter", command=self._quit).pack(side="right")
         ttk.Button(btns, text="Activer", command=self._activate).pack(side="right", padx=(0, 6))
 
-        self.transient(master)
+        # PAS de self.transient(master) ici, volontairement : à ce stade du
+        # démarrage, master (la fenêtre racine App) est encore self.withdraw()
+        # (voir App.__init__, avant self.deiconify()) — même précaution que
+        # _choose_tournament_file()/"Bienvenue" (voir son commentaire) : lier
+        # cette fenêtre à un parent jamais affiché l'a rendue invisible sous
+        # macOS, et a provoqué un TclError "application has been destroyed"
+        # sous Windows (diagnostiqué le 2026-11-06, TEST-25). grab_set() seul
+        # suffit à la modalité ici.
         self.grab_set()
         self.club_entry.focus_set()
         self.wait_window(self)
@@ -6741,7 +6748,14 @@ class ActivationEnLigneDialog(tk.Toplevel):
         self.activer_btn = ttk.Button(btns, text="Activer", command=self._activer)
         self.activer_btn.pack(side="right", padx=(0, 6))
 
-        self.transient(master)
+        # PAS de self.transient(master) ici, volontairement : à ce stade du
+        # démarrage, master (la fenêtre racine App) est encore self.withdraw()
+        # (voir App.__init__, avant self.deiconify()) — même précaution que
+        # _choose_tournament_file()/"Bienvenue" (voir son commentaire) : lier
+        # cette fenêtre à un parent jamais affiché l'a rendue invisible sous
+        # macOS, et a provoqué un TclError "application has been destroyed"
+        # sous Windows (diagnostiqué le 2026-11-06, TEST-25). grab_set() seul
+        # suffit à la modalité ici.
         self.grab_set()
         self.club_entry.focus_set()
         self.wait_window(self)
@@ -8710,9 +8724,33 @@ class App(tk.Tk):
         terminal visible (contrôle à distance, tests)."""
         _log_exception(exc, val, tb)
 
+    def _detruire_racine_en_securite(self):
+        """destroy() défensif pour un abandon d'activation V2/V3 pendant
+        __init__, AVANT self.deiconify() (correctif du 2026-11-06 — voir
+        le diagnostic du TclError "application has been destroyed" observé
+        sur Windows avec TEST-25, lié à transient() sur une fenêtre pas
+        encore affichée ; retiré depuis d'ActivationDialog/
+        ActivationEnLigneDialog, voir leurs __init__ respectifs).
+        self._fermee_pendant_init permet au bloc __main__ en bas de ce
+        fichier de ne JAMAIS appeler mainloop() sur une racine déjà
+        détruite — positionné AVANT la tentative de destruction, jamais
+        après (self.destroy() peut lui-même lever TclError si la racine
+        est déjà détruite par un autre mécanisme, voir point 6 du
+        diagnostic : la cause exacte d'une destruction prématurée n'est
+        pas définitivement exclue ailleurs, cette garde reste donc utile
+        même si transient() n'était pas l'unique cause)."""
+        self._fermee_pendant_init = True
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
     def __init__(self, open_path=None, start_standalone=False, force_menu_principal_check=False):
         super().__init__()
         self.withdraw()
+        # Voir _detruire_racine_en_securite ci-dessus — False tant que
+        # __init__ n'a pas lui-même décidé de fermer l'application.
+        self._fermee_pendant_init = False
         # Titre initial (Menu principal, avant tout choix de tournoi —
         # voir _app_title_prefix, demande du 2026-09-09) : identique au
         # préfixe utilisé ensuite par _update_window_title pour une
@@ -9065,7 +9103,7 @@ class App(tk.Tk):
             if decision.etat == license_client.ETAT_ACTIVATION_REQUISE:
                 dialogue_activation = ActivationEnLigneDialog(self)
                 if not dialogue_activation.activated:
-                    self.destroy()
+                    self._detruire_racine_en_securite()
                     return
                 # Remplace la décision "activation requise" (périmée dès
                 # l'instant où l'activation vient de réussir) par celle
@@ -9081,7 +9119,7 @@ class App(tk.Tk):
                     "Une connexion Internet est nécessaire pour vérifier votre "
                     "licence. Connectez-vous puis relancez Senaco.",
                 )
-                self.destroy()
+                self._detruire_racine_en_securite()
                 return
             # Conservée pour tout le reste de la vie de CE processus (voir
             # _verifier_tolerance_licence_avant_ouverture) : UNE SEULE
@@ -9090,7 +9128,7 @@ class App(tk.Tk):
             self._decision_licence_v3 = decision
         elif not licensing.is_licensed():
             if not ActivationDialog(self).activated:
-                self.destroy()
+                self._detruire_racine_en_securite()
                 return
 
         # Lobby autonome (demande du 2026-10-31, "une seule instance du
@@ -11065,7 +11103,20 @@ class App(tk.Tk):
         was_last = self._was_last_open_tournament
         self.destroy()
         if was_last:
-            App(start_standalone=True).mainloop()
+            # Même garde qu'en bas de ce fichier (bloc __main__) : la
+            # nouvelle App() repasse par le verrou d'activation V2/V3 —
+            # un abandon pendant __init__ détruit déjà la racine (voir
+            # App._detruire_racine_en_securite), jamais mainloop() dessus.
+            # "is not True" (pas une simple négation de vérité) :
+            # getattr(..., False) sur un App() simulé par
+            # patch.object(main, "App") (voir tests/test_fermeture_un_
+            # tournoi_parmi_plusieurs.py) renvoie un MagicMock enfant
+            # auto-créé, toujours vrai — une négation de vérité
+            # bloquerait alors à tort mainloop() dans ces tests, qui ne
+            # posent jamais ce drapeau.
+            _app_relancee = App(start_standalone=True)
+            if getattr(_app_relancee, "_fermee_pendant_init", False) is not True:
+                _app_relancee.mainloop()
 
     def _quit_app(self):
         """"Fichier > Quitter" (demande explicite du 2026-10-14, pour la
@@ -11387,7 +11438,13 @@ class App(tk.Tk):
         self._cleanup_for_close()
         self.destroy()
         app = App(force_menu_principal_check=force_menu_principal_check)
-        app.mainloop()
+        # Même garde qu'en bas de ce fichier (bloc __main__) — voir
+        # App._detruire_racine_en_securite. "is not True", pas une simple
+        # négation de vérité : voir le commentaire équivalent dans
+        # _on_close ci-dessus (App() simulé par patch.object renvoie un
+        # MagicMock toujours vrai pour cet attribut).
+        if getattr(app, "_fermee_pendant_init", False) is not True:
+            app.mainloop()
 
     def _open_tournament(self):
         self._new_tournament()
@@ -24157,7 +24214,15 @@ if __name__ == "__main__":
     _open_path = sys.argv[1] if len(sys.argv) > 1 else None
     try:
         app = App(open_path=_open_path)
-        app.mainloop()
+        # Correctif du 2026-11-06 : ne jamais appeler mainloop() si
+        # __init__ a lui-même déjà détruit la racine (abandon d'activation
+        # V2/V3 — voir App._detruire_racine_en_securite) : sans cette
+        # garde, un abandon suivi d'un self.destroy() déjà en échec (ou
+        # d'une destruction prématurée d'une autre origine, voir le
+        # diagnostic du 2026-11-06) ferait lever une seconde TclError
+        # "application has been destroyed" ici.
+        if getattr(app, "_fermee_pendant_init", False) is not True:
+            app.mainloop()
     except Exception:
         _log_exception(*sys.exc_info())
         raise
