@@ -375,12 +375,21 @@ class ConsultationJamaisConcerneeTest(unittest.TestCase):
     def setUp(self):
         self.source = _lire_main()
 
-    def test_le_garde_est_appele_exactement_deux_fois(self):
+    def test_le_garde_est_appele_exactement_quatre_fois(self):
+        """Correctif du 2026-11-08 (TEST-26) : le garde unique en toute
+        fin de _choose_tournament_file a été retiré — chacun des 3
+        boutons (new_tournament/new_sng/open_tournament) effectue
+        désormais son propre contrôle, AVANT toute création/ouverture
+        physique du fichier (voir tests/test_licence_tolerance_avant_
+        creation.py pour le détail). Avec open_path (App.__init__),
+        cela fait 4 points d'appel réels au total — jamais un 5e."""
         occurrences = self.source.count("self._verifier_tolerance_licence_avant_ouverture(")
         self.assertEqual(
-            occurrences, 2,
-            "Doit être appelé exactement aux deux points d'ouverture réelle "
-            "(open_path et _choose_tournament_file) — jamais ailleurs.",
+            occurrences, 4,
+            "Doit être appelé exactement aux quatre points d'ouverture "
+            "réelle (open_path, new_tournament, new_sng, open_tournament) "
+            "— jamais ailleurs, jamais un contrôle centralisé en fin de "
+            "fonction (voir le correctif du 2026-11-08).",
         )
 
     def test_jamais_reference_dans_lobbydialog(self):
@@ -396,16 +405,36 @@ class ConsultationJamaisConcerneeTest(unittest.TestCase):
         bloc = self.source[debut:fin]
         self.assertIn("_verifier_tolerance_licence_avant_ouverture", bloc)
 
-    def test_appele_juste_avant_le_return_true_de_choose_tournament_file(self):
+    def test_controle_precede_toute_creation_ouverture_physique(self):
+        """Correctif du 2026-11-08 (TEST-26) : contrairement à l'ancien
+        comportement (contrôle APRÈS tournament_date/_update_window_
+        title, donc après création physique du fichier), le contrôle
+        doit désormais précéder tout sélecteur de fichier (nouveau
+        tournoi/SnG) ou toute ouverture réelle (tournoi existant) —
+        jamais après. Voir tests/test_licence_tolerance_avant_creation.py
+        pour la vérification détaillée par bouton."""
         debut = self.source.index("def _choose_tournament_file(self):")
         fin = self.source.index("def _apply_sng_defaults(self, n_players):")
         bloc = self.source[debut:fin]
-        self.assertIn("_verifier_tolerance_licence_avant_ouverture", bloc)
-        # Doit intervenir APRÈS la mise en place complète (tournament_date
-        # etc.), jamais avant — voir le commentaire de tête de fichier.
-        pos_tolerance = bloc.index("_verifier_tolerance_licence_avant_ouverture")
+        # Appels RÉELS uniquement ("self....(" ) — un commentaire de
+        # new_tournament() référence aussi ce nom par son nom seul, sans
+        # "self." ni parenthèse, volontairement exclu ici.
+        motif = "self._verifier_tolerance_licence_avant_ouverture("
+        self.assertEqual(bloc.count(motif), 3)
+        # Les 3 appels (un par bouton) doivent tous précéder
+        # self._update_window_title() — qui n'intervient qu'une fois le
+        # fichier déjà physiquement créé/ouvert.
+        positions = []
+        depart = 0
+        while True:
+            pos = bloc.find(motif, depart)
+            if pos == -1:
+                break
+            positions.append(pos)
+            depart = pos + 1
         pos_update_title = bloc.index("self._update_window_title()")
-        self.assertLess(pos_update_title, pos_tolerance)
+        self.assertEqual(len(positions), 3)
+        self.assertTrue(all(pos < pos_update_title for pos in positions))
 
 
 @unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible dans cet environnement")
@@ -503,8 +532,9 @@ class DialoguesReelsTest(unittest.TestCase):
 class _FakeAppAvecMethodesReelles:
     """Fournit juste de quoi satisfaire les méthodes RÉELLES
     _afficher_avertissement_licence/_afficher_blocage_licence (elles
-    n'utilisent que _url_renouvellement_licence et _afficher_lien_
-    renouvellement, elles aussi réelles ici — seule wait_window est
+    n'utilisent que _url_renouvellement_licence, _afficher_lien_
+    renouvellement et _parent_vivant_ou_racine — correctif du
+    2026-11-08 —, elles aussi réelles ici — seule wait_window est
     patchée côté test pour ne jamais bloquer)."""
 
     def __init__(self, root):
@@ -515,6 +545,9 @@ class _FakeAppAvecMethodesReelles:
 
     def _afficher_lien_renouvellement(self, parent_win, url):
         return main.App._afficher_lien_renouvellement(self, parent_win, url)
+
+    def _parent_vivant_ou_racine(self, parent):
+        return main.App._parent_vivant_ou_racine(self, parent)
 
 
 if __name__ == "__main__":

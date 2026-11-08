@@ -26,7 +26,7 @@ import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
 
 from database import (
-    Database, build_period_summary, export_period_summary_csv,
+    Database, _read_tournament_date_ro, build_period_summary, export_period_summary_csv,
     export_period_summary_xlsx, export_period_summary_pdf,
     read_player_names_from_file, bounty_unit_value, find_players_active_elsewhere,
     find_stale_active_players, withdraw_stale_active_players,
@@ -10270,17 +10270,35 @@ class App(tk.Tk):
             self._open_basic_settings_dialog(win)
         return False
 
-    def _verifier_tolerance_licence_avant_ouverture(self, chemin_tournoi, parent_pour_messages):
+    def _verifier_tolerance_licence_avant_ouverture(
+        self, chemin_tournoi, parent_pour_messages, date_session_connue=None,
+    ):
         """Lot 5 (suite, demande du 2026-11-03) — applique la
         tolérance de 2 dates de session après expiration
         (session_tolerance.py, Lot 3) à l'ouverture RÉELLE d'un
         tournoi/Sit & Go, qu'il soit nouveau ou déjà existant. Appelée
-        aux DEUX seuls points où self.db devient un vrai tournoi
-        (App.__init__ pour open_path, et juste après Database(result[
-        "path"]) dans _choose_tournament_file) — jamais pour la Lobby
-        ni les Statistiques, qui ouvrent toujours leurs fichiers en
-        lecture seule (Database(..., read_only=True)), un chemin de
-        code totalement différent, jamais concerné ici.
+        aux TROIS seuls points où self.db devient (ou va devenir) un
+        vrai tournoi (App.__init__ pour open_path, et dans les 3
+        boutons de _choose_tournament_file — AVANT toute création
+        physique du fichier, correctif du 2026-11-08, voir plus bas) —
+        jamais pour la Lobby ni les Statistiques, qui ouvrent toujours
+        leurs fichiers en lecture seule (Database(..., read_only=True)),
+        un chemin de code totalement différent, jamais concerné ici.
+
+        `date_session_connue` (correctif du 2026-11-08) : pour un
+        NOUVEAU tournoi, sa date de session sera de toute façon
+        "aujourd'hui" (voir main.py: tournament_date, fixée à la
+        création) — connue AVANT même que le fichier n'existe, donc
+        transmise ici directement plutôt que de la faire relire par
+        session_tolerance.evaluer_ouverture() depuis un fichier qui
+        n'existe pas encore (ce qui aurait été pris, à tort, pour une
+        anomalie de lecture permissive). Pour un tournoi EXISTANT
+        (bouton "Ouvrir"), la date réelle est relue AVANT toute
+        ouverture via database._read_tournament_date_ro(), sans jamais
+        construire de Database() complète juste pour ce contrôle.
+        None (comportement par défaut, ex. appel depuis App.__init__
+        pour open_path) : laisse session_tolerance relire lui-même
+        depuis `chemin_tournoi`, comportement strictement inchangé.
 
         DORMANT par défaut (voir POKER_TOURNAMENT_LICENSE_V3) : renvoie
         toujours True sans rien évaluer si la variable n'est pas
@@ -10326,7 +10344,16 @@ class App(tk.Tk):
             return True
 
         import session_tolerance  # import local — même principe que license_client
-        resultat = session_tolerance.evaluer_ouverture(chemin_tournoi, True, decision.cycle_id)
+        # lire_date_fn : voir le commentaire de date_session_connue ci-dessus
+        # — None laisse evaluer_ouverture relire lui-même depuis le fichier
+        # (comportement par défaut, inchangé).
+        lire_date_fn = (
+            (lambda _chemin, _d=date_session_connue: _d)
+            if date_session_connue is not None else None
+        )
+        resultat = session_tolerance.evaluer_ouverture(
+            chemin_tournoi, True, decision.cycle_id, lire_date_fn=lire_date_fn,
+        )
 
         if resultat.etat == session_tolerance.ETAT_INDETERMINE:
             # Jamais permissif pour une licence déjà expirée (voir la
@@ -10350,7 +10377,9 @@ class App(tk.Tk):
             # Toujours expirée : réévalue avec l'état local désormais
             # réconcilié depuis le serveur (effet de bord de
             # verifier_en_ligne() ci-dessus).
-            resultat = session_tolerance.evaluer_ouverture(chemin_tournoi, True, decision.cycle_id)
+            resultat = session_tolerance.evaluer_ouverture(
+                chemin_tournoi, True, decision.cycle_id, lire_date_fn=lire_date_fn,
+            )
             if resultat.etat == session_tolerance.ETAT_INDETERMINE:
                 # Ne devrait plus arriver après une réconciliation
                 # réussie — filet de sécurité : jamais permissif par
@@ -10371,6 +10400,26 @@ class App(tk.Tk):
         # ci-dessus, traité différemment à dessein.
         return True
 
+    def _parent_vivant_ou_racine(self, parent):
+        """Repli défensif (correctif du 2026-11-08, diagnostic du TclError
+        "bad window path name" observé sur TEST-26) : utilisé par les 4
+        messages _afficher_*_licence ci-dessous pour ne jamais tenter
+        tk.Toplevel(parent) sur une fenêtre déjà détruite. La cause
+        réelle (win de _choose_tournament_file détruite avant la fin du
+        contrôle de licence) est corrigée à la racine — voir ses 3
+        boutons, le contrôle de licence s'y exécute désormais AVANT
+        toute destruction de win — mais ce filet protège aussi tout
+        futur appelant qui referait la même erreur, et reste cohérent
+        avec les deux plateformes (Windows/macOS). self (la racine App)
+        reste toujours vivante pour toute la durée du processus : repli
+        sûr systématique."""
+        try:
+            if parent.winfo_exists():
+                return parent
+        except tk.TclError:
+            pass
+        return self
+
     def _url_renouvellement_licence(self):
         """Jamais une URL inventée (demande explicite du cahier des
         charges) : vide tant que POKER_TOURNAMENT_LICENSE_RENEWAL_URL
@@ -10389,6 +10438,7 @@ class App(tk.Tk):
     def _afficher_avertissement_licence(self, parent):
         """Avertissement rouge (point 8 de la demande), tournoi ouvert
         normalement malgré tout — jamais bloquant."""
+        parent = self._parent_vivant_ou_racine(parent)
         win = tk.Toplevel(parent)
         win.title("Licence expirée")
         ttk.Label(
@@ -10404,7 +10454,10 @@ class App(tk.Tk):
         ).pack(padx=16, pady=(0, 8))
         self._afficher_lien_renouvellement(win, self._url_renouvellement_licence())
         ttk.Button(win, text="Continuer", command=win.destroy).pack(pady=(0, 16))
-        win.transient(parent)
+        # PAS de win.transient(parent) : parent peut être self, encore
+        # withdraw() à ce stade (voir App.__init__/_choose_tournament_file,
+        # même précaution établie pour ActivationDialog) — grab_set() seul
+        # suffit à la modalité.
         win.grab_set()
         win.wait_window(win)
 
@@ -10416,6 +10469,7 @@ class App(tk.Tk):
         tournoi en cours n'est jamais interrompu par ce message : il
         n'apparaît qu'AVANT l'ouverture d'un nouveau, jamais pendant
         l'utilisation d'un tournoi déjà ouvert."""
+        parent = self._parent_vivant_ou_racine(parent)
         win = tk.Toplevel(parent)
         win.title("Licence expirée — renouvellement requis")
         ttk.Label(
@@ -10428,7 +10482,7 @@ class App(tk.Tk):
         ).pack(padx=16, pady=(16, 8))
         self._afficher_lien_renouvellement(win, self._url_renouvellement_licence())
         ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
-        win.transient(parent)
+        # PAS de win.transient(parent) : voir _afficher_avertissement_licence.
         win.grab_set()
         win.wait_window(win)
 
@@ -10441,6 +10495,7 @@ class App(tk.Tk):
         fichier). Comme _afficher_blocage_licence, n'interrompt jamais
         un tournoi déjà ouvert — seule l'ouverture d'un nouveau est
         concernée."""
+        parent = self._parent_vivant_ou_racine(parent)
         win = tk.Toplevel(parent)
         win.title("Licence révoquée")
         ttk.Label(
@@ -10453,7 +10508,7 @@ class App(tk.Tk):
             wraplength=380, justify="left",
         ).pack(padx=16, pady=(16, 8))
         ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
-        win.transient(parent)
+        # PAS de win.transient(parent) : voir _afficher_avertissement_licence.
         win.grab_set()
         win.wait_window(win)
 
@@ -10464,6 +10519,7 @@ class App(tk.Tk):
         sécurité) — jamais permissif par défaut dans ce cas. N'interrompt
         jamais un tournoi déjà ouvert, comme les autres messages de ce
         garde."""
+        parent = self._parent_vivant_ou_racine(parent)
         win = tk.Toplevel(parent)
         win.title("Vérification en ligne nécessaire")
         ttk.Label(
@@ -10475,7 +10531,7 @@ class App(tk.Tk):
             wraplength=380, justify="left",
         ).pack(padx=16, pady=(16, 8))
         ttk.Button(win, text="Fermer", command=win.destroy).pack(pady=(0, 16))
-        win.transient(parent)
+        # PAS de win.transient(parent) : voir _afficher_avertissement_licence.
         win.grab_set()
         win.wait_window(win)
 
@@ -10562,6 +10618,21 @@ class App(tk.Tk):
             # créé ni ouvert si ce contrôle échoue.
             if not self._verifier_prerequis_nouveau_tournoi(win):
                 return
+            # Correctif du 2026-11-08 (TEST-26, diagnostic du blocage
+            # trop tardif + crash Tkinter associé) : le contrôle de
+            # licence/tolérance s'exécute ICI, AVANT tout sélecteur de
+            # fichier et toute création physique du .tournoi — jamais
+            # après. La date de session d'un nouveau tournoi sera de
+            # toute façon "aujourd'hui" (voir tournament_date plus bas),
+            # connue sans lire aucun fichier — voir date_session_connue
+            # dans _verifier_tolerance_licence_avant_ouverture. `win`
+            # est encore vivante ici (jamais détruite avant ce point),
+            # donc jamais le TclError "bad window path name" diagnostiqué
+            # le 2026-11-08.
+            if not self._verifier_tolerance_licence_avant_ouverture(
+                None, win, date_session_connue=time.strftime("%Y-%m-%d"),
+            ):
+                return
             day_folder, day_filename = tournament_day_folder_proposal()
             path = filedialog.asksaveasfilename(
                 title="Créer un nouveau tournoi",
@@ -10617,6 +10688,12 @@ class App(tk.Tk):
             if _block_second_tournament_if_needed(win):
                 return
             if not self._verifier_prerequis_nouveau_tournoi(win):
+                return
+            # Voir le commentaire équivalent dans new_tournament() ci-dessus
+            # (correctif du 2026-11-08).
+            if not self._verifier_tolerance_licence_avant_ouverture(
+                None, win, date_session_connue=time.strftime("%Y-%m-%d"),
+            ):
                 return
             day_folder, day_filename = tournament_day_folder_proposal(is_sng=True)
             path = filedialog.asksaveasfilename(
@@ -10677,6 +10754,20 @@ class App(tk.Tk):
                 initialdir=day_folder if day_folder and os.path.isdir(day_folder) else None,
             )
             if path:
+                # Correctif du 2026-11-08 : contrôle de licence/tolérance
+                # AVANT toute ouverture réelle (Database()), `win` encore
+                # vivante — voir le commentaire équivalent dans
+                # new_tournament() ci-dessus. Pour un tournoi EXISTANT, la
+                # date de session est relue directement depuis le fichier
+                # (déjà sur disque de toute façon, aucune "création
+                # physique" en jeu ici), sans construire de Database()
+                # complète juste pour ce contrôle — voir
+                # database._read_tournament_date_ro.
+                date_session = _read_tournament_date_ro(path) or None
+                if not self._verifier_tolerance_licence_avant_ouverture(
+                    path, win, date_session_connue=date_session,
+                ):
+                    return
                 result["path"] = path
                 result["is_new"] = False
                 win.destroy()
@@ -10954,17 +11045,15 @@ class App(tk.Tk):
                 self.db.add_player(name, roster.get_club(name), roster.get_pseudo(name))
         if result.get("is_sng"):
             self._apply_sng_defaults(n_players=len(result.get("selected_players") or []))
-        # Lot 5 (suite) — tolérance de licence : voir la docstring de
-        # _verifier_tolerance_licence_avant_ouverture. Dormante par
-        # défaut. En cas de blocage, restaure l'invariant attendu par
-        # l'appelant ("self.db est encore None" — voir son commentaire
-        # au point d'appel de _choose_tournament_file) : jamais laisser
-        # un self.db à moitié ouvert derrière un retour False.
-        if not self._verifier_tolerance_licence_avant_ouverture(result["path"], win):
-            self.db.close()
-            open_windows.unregister(result["path"])
-            self.db = None
-            return False
+        # Lot 5 (suite) — tolérance de licence : le contrôle n'a plus
+        # lieu ici depuis le correctif du 2026-11-08 (voir new_tournament/
+        # new_sng/open_tournament ci-dessus, chacun l'effectue désormais
+        # AVANT toute création/ouverture physique du fichier, et avant
+        # que `win` ne soit détruite — voir _verifier_tolerance_licence_
+        # avant_ouverture). Le répéter ici aurait, pour une licence
+        # tolérée, affiché l'avertissement une seconde fois pour le même
+        # tournoi, et utilisé une `win` déjà détruite (cause du TclError
+        # "bad window path name" diagnostiqué le 2026-11-08).
         return True
 
     def _apply_sng_defaults(self, n_players):
