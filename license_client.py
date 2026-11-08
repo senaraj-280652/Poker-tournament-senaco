@@ -77,6 +77,19 @@ ROTATION_EN_ATTENTE_FILE = os.path.join(os.path.expanduser("~"), ".poker_tournam
 # fichier devenu inutile.
 ROTATION_EN_ATTENTE_AGE_MAX_HEURES = 48
 
+# Diagnostic du 2026-11-08 (TEST-27, HP Windows 10) : _charger_etat_local()
+# avalait silencieusement l'exception exacte en cas d'échec de lecture,
+# rendant impossible tout diagnostic à distance d'une "Activation en
+# ligne requise" inattendue malgré un fichier local apparemment valide.
+# Ce journal consigne UNIQUEMENT le chemin recherché et la NATURE du
+# rejet (type d'exception, ou raison de rejet du contenu JSON) — jamais
+# le jeton, la clé publique, ni aucune autre valeur lue dans le fichier.
+# N'écrit RIEN en cas de succès (jamais un journal qui grossirait à
+# chaque lancement normal une fois ce protocole en production).
+LICENSE_DIAGNOSTIC_LOG_FILE = os.path.join(
+    os.path.expanduser("~"), ".poker_tournament", "licence_diagnostic.log",
+)
+
 ENV_URL_SERVEUR = "POKER_TOURNAMENT_LICENSE_SERVER_URL"
 ENV_CLE_PUBLIQUE = "POKER_TOURNAMENT_LICENSE_PUBLIC_KEY_HEX"
 
@@ -131,14 +144,45 @@ def _cle_publique_hex():
     return cle
 
 
+def _journaliser_diagnostic_chargement(chemin, raison, detail, chemin_journal=None):
+    """Consigne pourquoi _charger_etat_local() a rejeté `chemin` — jamais
+    une valeur lue dans le fichier, uniquement le chemin lui-même et une
+    classification/texte d'exception (voir LICENSE_DIAGNOSTIC_LOG_FILE).
+    N'échoue jamais : une panne d'écriture du journal ne doit jamais
+    perturber le flux normal d'évaluation de la licence."""
+    chemin_journal = chemin_journal or LICENSE_DIAGNOSTIC_LOG_FILE
+    try:
+        os.makedirs(os.path.dirname(chemin_journal), exist_ok=True)
+        with open(chemin_journal, "a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+                f"chemin_recherche={chemin!r} raison={raison} detail={detail}\n"
+            )
+    except OSError:
+        pass
+
+
 def _charger_etat_local(chemin=None):
     chemin = chemin or LICENSE_STATE_FILE
     try:
         with open(chemin, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    except OSError as e:
+        _journaliser_diagnostic_chargement(chemin, "echec_lecture", f"{type(e).__name__}: {e}")
         return None
-    if not isinstance(data, dict) or not isinstance(data.get("jeton"), str):
+    except json.JSONDecodeError as e:
+        _journaliser_diagnostic_chargement(chemin, "json_invalide", f"{type(e).__name__}: {e}")
+        return None
+    if not isinstance(data, dict):
+        _journaliser_diagnostic_chargement(
+            chemin, "contenu_rejete", f"racine_json de type {type(data).__name__}, dict attendu",
+        )
+        return None
+    if not isinstance(data.get("jeton"), str):
+        _journaliser_diagnostic_chargement(
+            chemin, "contenu_rejete",
+            f"cle 'jeton' de type {type(data.get('jeton')).__name__}, chaine attendue",
+        )
         return None
     return data
 

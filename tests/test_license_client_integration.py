@@ -39,6 +39,16 @@ _DB_HOST = os.environ.get("SENACO_TEST_DB_HOST", "127.0.0.1")
 _DB_PORT = os.environ.get("SENACO_TEST_DB_PORT", "3306")
 _DB_USER = os.environ.get("SENACO_TEST_DB_USER", "senaco_test")
 _DB_PASSWORD = os.environ.get("SENACO_TEST_DB_PASSWORD", "senaco_test_local_only")
+# Incident du 2026-11-08 : ce fichier ciblait jusqu'ici directement le
+# nom littéral "senaco_test" (base PERSISTANTE des essais réels V3 sur
+# le HP) dans _executer_sql() et le calcul de date d'expiration
+# ci-dessous — indépendamment du nom RÉELLEMENT utilisé par la config
+# PHP générée (BaseDeTestLocale::creerBaseEtConfiguration(), voir
+# setUpClass). Transmis explicitement ici pour ne plus jamais dépendre
+# implicitement de la valeur par défaut PHP — voir aussi
+# BaseDeTestLocale::NOM_BASE_EPHEMERE_AUTORISE, côté PHP, seule source
+# de vérité sur le nom autorisé.
+_NOM_BASE_EPHEMERE = os.environ.get("SENACO_TEST_DB_NAME", "senaco_test_auto")
 
 
 def _mariadb_accessible():
@@ -65,7 +75,8 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         env = {**os.environ, "SENACO_TEST_DB_HOST": _DB_HOST, "SENACO_TEST_DB_PORT": _DB_PORT,
-               "SENACO_TEST_DB_USER": _DB_USER, "SENACO_TEST_DB_PASSWORD": _DB_PASSWORD}
+               "SENACO_TEST_DB_USER": _DB_USER, "SENACO_TEST_DB_PASSWORD": _DB_PASSWORD,
+               "SENACO_TEST_DB_NAME": _NOM_BASE_EPHEMERE}
         resultat = subprocess.run(
             [_PHP_BIN, "-r",
              'require "tests/BaseDeTestLocale.php"; '
@@ -149,6 +160,7 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
         patchers = [
             patch.object(lc, "LICENSE_STATE_FILE", os.path.join(self._tmp.name, "licence_v3.json")),
             patch.object(lc, "ROTATION_EN_ATTENTE_FILE", os.path.join(self._tmp.name, "rotation_en_attente.json")),
+            patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FILE", os.path.join(self._tmp.name, "licence_diagnostic.log")),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", os.path.join(self._tmp.name, "horloge.json")),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", os.path.join(self._tmp.name, "tolerance.json")),
             patch.dict(os.environ, {
@@ -170,7 +182,7 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
     def _executer_sql(self, sql):
         subprocess.run(
             [_MYSQL_BIN, "-h", _DB_HOST, "-P", _DB_PORT, "-u", _DB_USER,
-             f"-p{_DB_PASSWORD}", "senaco_test", "-e", sql],
+             f"-p{_DB_PASSWORD}", _NOM_BASE_EPHEMERE, "-e", sql],
             capture_output=True, timeout=10, check=True,
         )
 
@@ -266,7 +278,7 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
 
         resultat = subprocess.run(
             [_MYSQL_BIN, "-h", _DB_HOST, "-P", _DB_PORT, "-u", _DB_USER,
-             f"-p{_DB_PASSWORD}", "senaco_test", "-N", "-e",
+             f"-p{_DB_PASSWORD}", _NOM_BASE_EPHEMERE, "-N", "-e",
              "SELECT l.date_debut, l.date_expiration FROM licences l "
              "JOIN machines m ON m.id = l.machine_id "
              "WHERE m.identifiant_machine = 'AAAA-TEST-0008';"],

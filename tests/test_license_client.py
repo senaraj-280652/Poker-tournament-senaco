@@ -51,6 +51,7 @@ class EnvironnementTestCase(unittest.TestCase):
         self.chemin_horloge = os.path.join(self._tmp.name, "horloge_fiable.json")
         self.chemin_tolerance = os.path.join(self._tmp.name, "tolerance_sessions.json")
         self.chemin_rotation_en_attente = os.path.join(self._tmp.name, "rotation_en_attente.json")
+        self.chemin_diagnostic = os.path.join(self._tmp.name, "licence_diagnostic.log")
 
         self.cle_privee, self.cle_publique = license_token.generer_cle_de_test()
 
@@ -75,6 +76,7 @@ class EnvironnementTestCase(unittest.TestCase):
         patchers = [
             patch.object(lc, "LICENSE_STATE_FILE", self.chemin_licence),
             patch.object(lc, "ROTATION_EN_ATTENTE_FILE", self.chemin_rotation_en_attente),
+            patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FILE", self.chemin_diagnostic),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self.chemin_horloge),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self.chemin_tolerance),
             patch.dict(os.environ, {
@@ -136,6 +138,87 @@ class PostJsonTest(unittest.TestCase):
 def io_fp(contenu_bytes):
     import io
     return io.BytesIO(contenu_bytes)
+
+
+class ChargerEtatLocalDiagnosticTest(EnvironnementTestCase):
+    """Correctif du 2026-11-08 (TEST-27, HP Windows 10) : _charger_etat_
+    local() journalise désormais pourquoi il rejette un fichier (chemin
+    recherché + nature du rejet), jamais une valeur lue dedans. Couvre
+    les 4 causes de rejet possibles, confirme l'absence totale
+    d'écriture en cas de succès, et l'absence de toute fuite de valeur
+    sensible dans le journal."""
+
+    def _lire_journal(self):
+        if not os.path.exists(self.chemin_diagnostic):
+            return ""
+        with open(self.chemin_diagnostic, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_succes_necrit_rien_dans_le_journal(self):
+        self._ecrire_etat_local(_jeton_test(self.cle_privee))
+        resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNotNone(resultat)
+        self.assertFalse(os.path.exists(self.chemin_diagnostic), "Aucune écriture attendue en cas de succès.")
+
+    def test_fichier_absent_journalise_le_chemin_et_le_type_dexception(self):
+        chemin_absent = os.path.join(self._tmp.name, "nexiste_pas.json")
+        resultat = lc._charger_etat_local(chemin=chemin_absent)
+        self.assertIsNone(resultat)
+        journal = self._lire_journal()
+        self.assertIn(repr(chemin_absent), journal)
+        self.assertIn("echec_lecture", journal)
+        self.assertIn("FileNotFoundError", journal)
+
+    def test_json_invalide_journalise_json_invalide(self):
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            f.write("{ceci n'est pas du json valide")
+        resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNone(resultat)
+        journal = self._lire_journal()
+        self.assertIn("json_invalide", journal)
+        self.assertIn("JSONDecodeError", journal)
+
+    def test_racine_json_pas_un_dict_journalise_le_type_recu(self):
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            json.dump(["pas", "un", "dict"], f)
+        resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNone(resultat)
+        journal = self._lire_journal()
+        self.assertIn("contenu_rejete", journal)
+        self.assertIn("list", journal)
+
+    def test_jeton_absent_ou_mauvais_type_journalise_sans_jamais_exposer_sa_valeur(self):
+        secret_qui_ne_doit_jamais_fuiter = "SECRET-NE-DOIT-JAMAIS-APPARAITRE-DANS-LE-JOURNAL"
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            json.dump({"jeton": 12345, "autre_champ": secret_qui_ne_doit_jamais_fuiter}, f)
+        resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNone(resultat)
+        journal = self._lire_journal()
+        self.assertIn("contenu_rejete", journal)
+        self.assertIn("int", journal, "Le type reçu (int) doit être journalisé.")
+        self.assertNotIn("12345", journal, "La valeur elle-même ne doit jamais apparaître.")
+        self.assertNotIn(secret_qui_ne_doit_jamais_fuiter, journal)
+
+    def test_jeton_valide_present_najamais_sa_valeur_dans_un_journal_dechec_dun_autre_champ(self):
+        """Un jeton par ailleurs valide ne doit jamais apparaître dans le
+        journal, même lorsque l'échec vient d'un AUTRE motif (ici une
+        racine JSON qui n'est pas un dict, contenant malgré tout un
+        jeton valide ailleurs dans le fichier)."""
+        jeton_reel = _jeton_test(self.cle_privee)
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            json.dump([{"jeton": jeton_reel}], f)
+        lc._charger_etat_local(chemin=self.chemin_licence)
+        journal = self._lire_journal()
+        self.assertNotIn(jeton_reel, journal)
+
+    def test_chemin_par_defaut_journalise_correctement(self):
+        """Sans `chemin` explicite, c'est bien LICENSE_STATE_FILE (ici
+        redirigé par l'isolation du test) qui doit apparaître dans le
+        journal — jamais un autre chemin recalculé différemment."""
+        resultat = lc._charger_etat_local()
+        self.assertIsNone(resultat)
+        journal = self._lire_journal()
+        self.assertIn(repr(self.chemin_licence), journal)
 
 
 class ActiverEnLigneTest(EnvironnementTestCase):
