@@ -150,6 +150,7 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
         # tests automatisés (voir tests/test_device_secret.py pour la
         # vérification du VRAI stockage sécurisé, isolément).
         self._secrets_locaux = {}
+        self.chemin_verrou_verification = os.path.join(self._tmp.name, "verification_en_ligne.lock")
 
         def _fausse_lire_secret(identifiant_machine):
             return self._secrets_locaux.get(identifiant_machine)
@@ -161,6 +162,8 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
             patch.object(lc, "LICENSE_STATE_FILE", os.path.join(self._tmp.name, "licence_v3.json")),
             patch.object(lc, "ROTATION_EN_ATTENTE_FILE", os.path.join(self._tmp.name, "rotation_en_attente.json")),
             patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FILE", os.path.join(self._tmp.name, "licence_diagnostic.log")),
+            patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FALLBACK_FILE", os.path.join(self._tmp.name, "licence_diagnostic_secours.log")),
+            patch.object(lc, "VERIFICATION_LOCK_FILE", self.chemin_verrou_verification),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", os.path.join(self._tmp.name, "horloge.json")),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", os.path.join(self._tmp.name, "tolerance.json")),
             patch.dict(os.environ, {
@@ -262,6 +265,63 @@ class LicenceClientBoutEnBoutTest(unittest.TestCase):
                 os.path.exists(os.path.join(self._tmp.name, "rotation_en_attente.json")),
                 "La tentative doit être effacée une fois le secret confirmé enregistré.",
             )
+
+    def test_verrou_reel_entre_deux_vrais_processus_mesure_du_delai(self):
+        """Correctif du 2026-11-11, précaution impérative : « deux
+        processus Senaco » au sens LITTÉRAL ici — un VRAI second
+        processus OS (pas un thread) tient le vrai verrou natif pendant
+        une durée connue, le processus de ce test appelle
+        verifier_en_ligne() (vrai round-trip HTTP contre le vrai
+        serveur) et on mesure le délai réellement observé : doit avoir
+        réellement attendu (pas un succès instantané qui prouverait que
+        le verrou n'a rien bloqué), puis réussir normalement une fois
+        le verrou libéré — jamais un blocage au-delà du raisonnable."""
+        with patch("license.machine_id_display", return_value="AAAA-TEST-0022"):
+            lc.activer_en_ligne("Club Verrou Reel", "verrou22@example.com")
+
+        duree_maintien = 1.2
+        script = (
+            "import os, sys, time\n"
+            "sys.path.insert(0, " + repr(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) + ")\n"
+            "import license_client as lc\n"
+            "fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR)\n"
+            "lc._acquire_lock(fd, timeout=5.0)\n"
+            "print('LOCK_ACQUIRED', flush=True)\n"
+            "time.sleep(float(sys.argv[2]))\n"
+            "lc._release_lock(fd)\n"
+            "os.close(fd)\n"
+        )
+        processus = subprocess.Popen(
+            [sys.executable, "-c", script, self.chemin_verrou_verification, str(duree_maintien)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            premiere_ligne = processus.stdout.readline().strip()
+            if premiere_ligne != "LOCK_ACQUIRED":
+                # .stderr.read() lit jusqu'à l'EOF — ne JAMAIS l'appeler
+                # avant d'être certain que le sous-processus est déjà
+                # terminé (ce serait sinon un faux "succès instantané"
+                # artificiel, le temps d'attendre toute sa durée de vie
+                # avant même d'arriver à la mesure ci-dessous).
+                self.fail(f"Le second processus n'a pas confirmé avoir obtenu le verrou (stderr: {processus.stderr.read()}).")
+
+            debut = time.monotonic()
+            resultat = lc.verifier_en_ligne()
+            duree_observee = time.monotonic() - debut
+
+            self.assertIsNotNone(resultat, "Doit réussir normalement une fois le verrou réellement libéré par l'autre processus.")
+            self.assertGreaterEqual(
+                duree_observee, duree_maintien * 0.7,
+                "Le délai observé doit refléter une vraie attente du verrou tenu par l'autre processus — un succès quasi instantané prouverait que le verrou n'a rien bloqué.",
+            )
+            self.assertLess(
+                duree_observee, duree_maintien + lc.VERIFICATION_LOCK_TIMEOUT_SECONDES,
+                "Ne doit jamais attendre significativement plus longtemps que la durée réelle de maintien du verrou.",
+            )
+        finally:
+            processus.wait(timeout=5)
+            processus.stdout.close()
+            processus.stderr.close()
 
     def test_trois_mois_gratuits_date_expiration_exacte(self):
         """Point B (demande du 2026-11-05) : la date d'expiration d'un

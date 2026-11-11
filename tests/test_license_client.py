@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -52,6 +53,8 @@ class EnvironnementTestCase(unittest.TestCase):
         self.chemin_tolerance = os.path.join(self._tmp.name, "tolerance_sessions.json")
         self.chemin_rotation_en_attente = os.path.join(self._tmp.name, "rotation_en_attente.json")
         self.chemin_diagnostic = os.path.join(self._tmp.name, "licence_diagnostic.log")
+        self.chemin_diagnostic_secours = os.path.join(self._tmp.name, "licence_diagnostic_secours.log")
+        self.chemin_verrou_verification = os.path.join(self._tmp.name, "verification_en_ligne.lock")
 
         self.cle_privee, self.cle_publique = license_token.generer_cle_de_test()
 
@@ -77,6 +80,8 @@ class EnvironnementTestCase(unittest.TestCase):
             patch.object(lc, "LICENSE_STATE_FILE", self.chemin_licence),
             patch.object(lc, "ROTATION_EN_ATTENTE_FILE", self.chemin_rotation_en_attente),
             patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FILE", self.chemin_diagnostic),
+            patch.object(lc, "LICENSE_DIAGNOSTIC_LOG_FALLBACK_FILE", self.chemin_diagnostic_secours),
+            patch.object(lc, "VERIFICATION_LOCK_FILE", self.chemin_verrou_verification),
             patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self.chemin_horloge),
             patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self.chemin_tolerance),
             patch.dict(os.environ, {
@@ -93,6 +98,12 @@ class EnvironnementTestCase(unittest.TestCase):
 
     def _ecrire_etat_local(self, jeton):
         lc._enregistrer_etat_local(jeton, chemin=self.chemin_licence)
+
+    def _lire_journal(self):
+        if not os.path.exists(self.chemin_diagnostic):
+            return ""
+        with open(self.chemin_diagnostic, "r", encoding="utf-8") as f:
+            return f.read()
 
 
 class PostJsonTest(unittest.TestCase):
@@ -147,12 +158,6 @@ class ChargerEtatLocalDiagnosticTest(EnvironnementTestCase):
     les 4 causes de rejet possibles, confirme l'absence totale
     d'écriture en cas de succès, et l'absence de toute fuite de valeur
     sensible dans le journal."""
-
-    def _lire_journal(self):
-        if not os.path.exists(self.chemin_diagnostic):
-            return ""
-        with open(self.chemin_diagnostic, "r", encoding="utf-8") as f:
-            return f.read()
 
     def test_succes_necrit_rien_dans_le_journal(self):
         self._ecrire_etat_local(_jeton_test(self.cle_privee))
@@ -219,6 +224,379 @@ class ChargerEtatLocalDiagnosticTest(EnvironnementTestCase):
         self.assertIsNone(resultat)
         journal = self._lire_journal()
         self.assertIn(repr(self.chemin_licence), journal)
+
+
+class LectureAvecTentativesTest(EnvironnementTestCase):
+    """Correctif du 2026-11-11 : PermissionError (WinError 32 "violation
+    de partage" ET WinError 33 "violation de verrouillage" remontent
+    toutes les deux ainsi en Python — vérifié empiriquement le
+    2026-11-11 sur le HP Windows 10 réel, voir le compte-rendu) déclenche
+    jusqu'à 3 tentatives supplémentaires, espacées de ~150ms. AUCUNE
+    autre exception n'est retentée — un fichier réellement absent ne
+    doit jamais être ralenti par une attente inutile."""
+
+    def setUp(self):
+        super().setUp()
+        self._ecrire_etat_local(_jeton_test(self.cle_privee))
+        self._vrai_open = open
+
+    def _open_qui_echoue_n_fois(self, nb_echecs, exception=PermissionError):
+        compteur = {"appels": 0}
+
+        def _faux_open(chemin, *args, **kwargs):
+            if chemin == self.chemin_licence:
+                compteur["appels"] += 1
+                if compteur["appels"] <= nb_echecs:
+                    raise exception(13, "Simulation de verrou transitoire")
+            return self._vrai_open(chemin, *args, **kwargs)
+
+        return _faux_open, compteur
+
+    def test_permission_error_puis_succes_renvoie_les_vraies_donnees(self):
+        """2 échecs puis succès (dans la limite des 3 tentatives
+        supplémentaires) : le résultat final doit être EXACTEMENT celui
+        d'une lecture réussie, jamais dégradé."""
+        faux_open, compteur = self._open_qui_echoue_n_fois(2)
+        with patch("builtins.open", side_effect=faux_open), \
+                patch.object(lc.time, "sleep") as faux_sleep:
+            resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNotNone(resultat)
+        self.assertIsInstance(resultat, dict)
+        self.assertEqual(compteur["appels"], 3)  # 2 échecs + 1 succès
+        self.assertEqual(faux_sleep.call_count, 2)
+        for appel in faux_sleep.call_args_list:
+            self.assertEqual(appel.args[0], lc.LECTURE_LICENCE_DELAI_SECONDES)
+
+    def test_permission_error_sur_toutes_les_tentatives_renvoie_la_sentinelle(self):
+        """4 échecs (1 + 3 tentatives supplémentaires), tous par
+        PermissionError : la sentinelle _ACCES_TEMPORAIREMENT_INDISPONIBLE
+        doit être renvoyée — JAMAIS None (qui signifierait "jamais
+        activé" à evaluer_licence, voir EtatLectureIndisponibleTest)."""
+        faux_open, compteur = self._open_qui_echoue_n_fois(99)
+        with patch("builtins.open", side_effect=faux_open), \
+                patch.object(lc.time, "sleep"):
+            resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIs(resultat, lc._ACCES_TEMPORAIREMENT_INDISPONIBLE)
+        self.assertIsNot(resultat, None)
+        self.assertEqual(compteur["appels"], 4)
+        journal = self._lire_journal()
+        self.assertIn("acces_temporairement_indisponible", journal)
+        self.assertIn("apres 4 tentatives", journal)
+
+    def test_filenotfounderror_nest_jamais_retentee(self):
+        """Une licence réellement absente ne doit jamais subir le délai
+        d'attente — comportement identique à avant ce correctif."""
+        chemin_absent = os.path.join(self._tmp.name, "nexiste_vraiment_pas.json")
+        with patch.object(lc.time, "sleep") as faux_sleep:
+            resultat = lc._charger_etat_local(chemin=chemin_absent)
+        self.assertIsNone(resultat)
+        faux_sleep.assert_not_called()
+
+    def test_jsondecodeerror_nest_jamais_retentee(self):
+        """Un contenu JSON corrompu ne devient pas valide en relisant le
+        même fichier (écriture atomique déjà en place) — aucune
+        tentative supplémentaire, comportement identique à avant."""
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            f.write("{pas du json valide")
+        with patch.object(lc.time, "sleep") as faux_sleep:
+            resultat = lc._charger_etat_local(chemin=self.chemin_licence)
+        self.assertIsNone(resultat)
+        faux_sleep.assert_not_called()
+
+
+class EtatLectureIndisponibleTest(EnvironnementTestCase):
+    """Correctif du 2026-11-11 : ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE
+    ne doit JAMAIS être confondu avec ETAT_ACTIVATION_REQUISE — c'est le
+    cœur du correctif (voir l'audit du 2026-11-10 : un client déjà
+    licencié ne doit jamais être invité à réactiver à cause d'un verrou
+    transitoire)."""
+
+    def test_evaluer_licence_renvoie_le_nouvel_etat_sur_sentinelle(self):
+        with patch.object(lc, "_charger_etat_local", return_value=lc._ACCES_TEMPORAIREMENT_INDISPONIBLE):
+            decision = lc.evaluer_licence()
+        self.assertEqual(decision.etat, lc.ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE)
+        self.assertNotEqual(decision.etat, lc.ETAT_ACTIVATION_REQUISE)
+
+    def test_evaluer_licence_renvoie_toujours_activation_requise_sur_none_reel(self):
+        """Non-régression : une absence RÉELLE (None, pas la sentinelle)
+        continue de produire ETAT_ACTIVATION_REQUISE, inchangé."""
+        with patch.object(lc, "_charger_etat_local", return_value=None):
+            decision = lc.evaluer_licence()
+        self.assertEqual(decision.etat, lc.ETAT_ACTIVATION_REQUISE)
+
+    def test_verifier_en_ligne_se_replie_silencieusement_sur_sentinelle(self):
+        """verifier_en_ligne() ne doit jamais planter ni tenter un appel
+        réseau quand l'état local est temporairement inaccessible."""
+        with patch.object(lc, "_charger_etat_local", return_value=lc._ACCES_TEMPORAIREMENT_INDISPONIBLE), \
+                patch.object(lc, "_post_json") as faux_post:
+            resultat = lc.verifier_en_ligne()
+        self.assertIsNone(resultat)
+        faux_post.assert_not_called()
+
+    def test_obtenir_informations_affichage_ne_plante_pas_sur_sentinelle(self):
+        """Régression : avant correction, indexer la sentinelle
+        (object() non souscriptible) levait TypeError au lieu de
+        renvoyer disponible=False — ce test aurait échoué sans le
+        correctif correspondant dans obtenir_informations_affichage()."""
+        with patch.object(lc, "_charger_etat_local", return_value=lc._ACCES_TEMPORAIREMENT_INDISPONIBLE):
+            infos = lc.obtenir_informations_affichage(None)
+        self.assertFalse(infos.disponible)
+
+
+class JournalSecoursEtRotationTest(EnvironnementTestCase):
+    """Correctif du 2026-11-11 : journal de secours (dossier distinct de
+    .poker_tournament, voir l'audit du 2026-11-10) et plafonnement à
+    200 Ko des deux journaux, une seule génération précédente
+    conservée."""
+
+    def test_bascule_vers_le_journal_de_secours_si_le_principal_echoue(self):
+        _vrai_open = open
+
+        def _faux_open(chemin, *args, **kwargs):
+            if chemin == self.chemin_diagnostic:
+                raise PermissionError(13, "Dossier .poker_tournament inaccessible")
+            return _vrai_open(chemin, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=_faux_open):
+            lc._journaliser_diagnostic_chargement(self.chemin_licence, "echec_lecture", "detail de test")
+
+        self.assertFalse(os.path.exists(self.chemin_diagnostic))
+        self.assertTrue(os.path.exists(self.chemin_diagnostic_secours))
+        with open(self.chemin_diagnostic_secours, "r", encoding="utf-8") as f:
+            contenu = f.read()
+        self.assertIn("echec_lecture", contenu)
+        self.assertIn(repr(self.chemin_licence), contenu)
+
+    def test_echec_des_deux_journaux_ne_leve_jamais(self):
+        """Même si le journal principal ET le journal de secours
+        échouent tous les deux, _journaliser_diagnostic_chargement() ne
+        doit jamais lever — appelé depuis _charger_etat_local(), qui ne
+        doit jamais planter l'évaluation de la licence pour cette raison."""
+        with patch("builtins.open", side_effect=PermissionError(13, "aucun dossier accessible")):
+            try:
+                lc._journaliser_diagnostic_chargement(self.chemin_licence, "echec_lecture", "detail")
+            except Exception as e:  # pragma: no cover - le test échoue si ceci est atteint
+                self.fail(f"_journaliser_diagnostic_chargement a levé {e!r} au lieu de rester silencieuse.")
+
+    def test_rotation_quand_le_journal_depasse_la_taille_max(self):
+        with patch.object(lc, "DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS", 50):
+            lc._journaliser_diagnostic_chargement(self.chemin_licence, "echec_lecture", "a" * 60)
+            taille_apres_premier = os.path.getsize(self.chemin_diagnostic)
+            self.assertGreater(taille_apres_premier, 50)
+            lc._journaliser_diagnostic_chargement(self.chemin_licence, "echec_lecture", "b" * 10)
+
+        self.assertTrue(os.path.exists(self.chemin_diagnostic + ".1"))
+        with open(self.chemin_diagnostic + ".1", "r", encoding="utf-8") as f:
+            self.assertIn("a" * 60, f.read())
+        with open(self.chemin_diagnostic, "r", encoding="utf-8") as f:
+            contenu_courant = f.read()
+        self.assertIn("b" * 10, contenu_courant)
+        self.assertNotIn("a" * 60, contenu_courant)
+
+    def test_aucun_jeton_ni_secret_dans_le_journal_de_secours(self):
+        jeton_reel = _jeton_test(self.cle_privee)
+        secret_qui_ne_doit_jamais_fuiter = "SECRET-NE-DOIT-JAMAIS-FUITER-DANS-LE-SECOURS"
+        with open(self.chemin_licence, "w", encoding="utf-8") as f:
+            json.dump([{"jeton": jeton_reel, "secret": secret_qui_ne_doit_jamais_fuiter}], f)
+
+        _vrai_open = open
+
+        def _faux_open(chemin, *args, **kwargs):
+            if chemin == self.chemin_diagnostic:
+                raise PermissionError(13, "simulation")
+            return _vrai_open(chemin, *args, **kwargs)
+
+        with patch("builtins.open", side_effect=_faux_open):
+            lc._charger_etat_local(chemin=self.chemin_licence)
+
+        with open(self.chemin_diagnostic_secours, "r", encoding="utf-8") as f:
+            contenu = f.read()
+        self.assertNotIn(jeton_reel, contenu)
+        self.assertNotIn(secret_qui_ne_doit_jamais_fuiter, contenu)
+
+
+class VerrouVerificationTest(EnvironnementTestCase):
+    """Correctif du 2026-11-11 : verrou interprocessus natif de l'OS
+    (fcntl.flock/msvcrt.locking — même mécanisme déjà utilisé par
+    session_tolerance.py/open_windows.py, voir tests/
+    test_open_windows_try_register.py pour le même principe de test
+    avec un VRAI verrou tenu via threading.Barrier, jamais une
+    simulation icacls)."""
+
+    def test_verrou_obtenu_normalement_sans_contention(self):
+        with lc._verrou_verification(chemin=self.chemin_verrou_verification, timeout=1.0):
+            pass  # ne doit jamais lever en l'absence de tout concurrent
+
+    def test_dossier_du_verrou_impossible_a_creer_ne_plante_pas(self):
+        """Trouvé le 2026-11-11 en vérification (précaution impérative
+        du 2026-11-11) : avant correction, une PermissionError sur
+        os.makedirs() (dossier inaccessible) se propageait hors de
+        verifier_en_ligne(), violant son contrat "ne lève jamais" et
+        plantant App.__init__ au lieu de se replier. TimeoutError étant
+        une sous-classe d'OSError, la même clause `except OSError`
+        couvre ce cas sans traitement séparé."""
+        dossier_verrou_impossible = os.path.join(self._tmp.name, "dossier_verrou_impossible")
+        chemin_verrou = os.path.join(dossier_verrou_impossible, "verification_en_ligne.lock")
+        _vrai_makedirs = os.makedirs
+
+        def _makedirs_qui_refuse_le_verrou(chemin, *args, **kwargs):
+            if chemin == dossier_verrou_impossible:
+                raise PermissionError(13, "Simulation : dossier du verrou inaccessible")
+            return _vrai_makedirs(chemin, *args, **kwargs)
+
+        with patch.object(lc, "VERIFICATION_LOCK_FILE", chemin_verrou), \
+                patch.object(lc.os, "makedirs", side_effect=_makedirs_qui_refuse_le_verrou):
+            try:
+                resultat = lc.verifier_en_ligne()
+            except Exception as e:  # pragma: no cover - le test échoue si ceci est atteint
+                self.fail(f"verifier_en_ligne() a levé {e!r} au lieu de se replier silencieusement.")
+        self.assertIsNone(resultat)
+
+    def test_fichier_du_verrou_impossible_a_ouvrir_ne_plante_pas(self):
+        """Même principe que ci-dessus, mais l'échec porte sur
+        os.open() du fichier de verrou lui-même (dossier accessible,
+        fichier refusé — ex. verrou système/antivirus)."""
+        with patch.object(lc.os, "open", side_effect=PermissionError(13, "Simulation : fichier de verrou refusé")):
+            try:
+                resultat = lc.verifier_en_ligne()
+            except Exception as e:  # pragma: no cover - le test échoue si ceci est atteint
+                self.fail(f"verifier_en_ligne() a levé {e!r} au lieu de se replier silencieusement.")
+        self.assertIsNone(resultat)
+
+    def test_licence_locale_expiree_najamais_contournee_quand_le_verrou_est_inutilisable(self):
+        """Précaution impérative du 2026-11-11, point 2 : un verrou
+        totalement inutilisable (dossier inaccessible) doit produire
+        EXACTEMENT le même repli qu'une vraie coupure réseau — jamais
+        un raccourci qui traiterait une licence localement expirée
+        comme valide. Vérifié ici avec un VRAI jeton signé expiré,
+        jamais un mock de la décision elle-même."""
+        jeton_expire = _jeton_test(
+            self.cle_privee, date_debut="2026-01-01", date_expiration="2026-01-15",
+        )
+        self._ecrire_etat_local(jeton_expire)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 2, 1, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        dossier_verrou_impossible = os.path.join(self._tmp.name, "dossier_verrou_impossible_2")
+        chemin_verrou = os.path.join(dossier_verrou_impossible, "verification_en_ligne.lock")
+        _vrai_makedirs = os.makedirs
+
+        def _makedirs_qui_refuse_le_verrou(chemin, *args, **kwargs):
+            if chemin == dossier_verrou_impossible:
+                raise PermissionError(13, "Simulation : dossier du verrou inaccessible")
+            return _vrai_makedirs(chemin, *args, **kwargs)
+
+        with patch.object(lc, "VERIFICATION_LOCK_FILE", chemin_verrou), \
+                patch.object(lc.os, "makedirs", side_effect=_makedirs_qui_refuse_le_verrou):
+            decision = lc.evaluer_licence()
+        self.assertEqual(
+            decision.etat, lc.ETAT_EXPIRE,
+            "Un verrou inutilisable ne doit jamais, même indirectement, faire passer une licence expirée pour valide.",
+        )
+
+    def test_timeout_leve_quand_le_verrou_est_deja_tenu(self):
+        """Tient le VRAI verrou OS via un descripteur distinct (comme le
+        ferait un second processus), puis vérifie que la tentative
+        concurrente échoue par TimeoutError — jamais un blocage
+        indéfini."""
+        fd_tenu = os.open(self.chemin_verrou_verification, os.O_CREAT | os.O_RDWR)
+        lc._acquire_lock(fd_tenu, timeout=1.0)
+        try:
+            with self.assertRaises(TimeoutError):
+                with lc._verrou_verification(chemin=self.chemin_verrou_verification, timeout=0.3):
+                    pass  # jamais atteint
+        finally:
+            lc._release_lock(fd_tenu)
+            os.close(fd_tenu)
+
+    def test_verifier_en_ligne_se_replie_sur_none_si_verrou_occupe_sans_lever(self):
+        """Précaution impérative : jamais un blocage durable ni une
+        exception visible si le verrou est occupé — repli identique à
+        une panne réseau."""
+        with patch.object(lc, "VERIFICATION_LOCK_TIMEOUT_SECONDES", 0.3):
+            fd_tenu = os.open(self.chemin_verrou_verification, os.O_CREAT | os.O_RDWR)
+            lc._acquire_lock(fd_tenu, timeout=1.0)
+            try:
+                resultat = lc.verifier_en_ligne()
+            finally:
+                lc._release_lock(fd_tenu)
+                os.close(fd_tenu)
+        self.assertIsNone(resultat)
+
+    def test_mesure_le_delai_de_demarrage_quand_le_verrou_est_occupe(self):
+        """Précaution impérative : mesurer le délai réel — doit être
+        borné par le timeout configuré, jamais instantané (le verrou a
+        réellement été attendu) ni significativement plus long (pas de
+        blocage au-delà du délai prévu)."""
+        delai_configure = 0.4
+        with patch.object(lc, "VERIFICATION_LOCK_TIMEOUT_SECONDES", delai_configure):
+            fd_tenu = os.open(self.chemin_verrou_verification, os.O_CREAT | os.O_RDWR)
+            lc._acquire_lock(fd_tenu, timeout=1.0)
+            try:
+                debut = lc.time.monotonic()
+                lc.verifier_en_ligne()
+                duree = lc.time.monotonic() - debut
+            finally:
+                lc._release_lock(fd_tenu)
+                os.close(fd_tenu)
+        self.assertGreaterEqual(duree, delai_configure * 0.8)
+        self.assertLess(duree, delai_configure + 1.0, "Le délai d'attente du verrou ne doit jamais dériver largement au-delà du timeout configuré.")
+
+    def test_second_processus_relit_letat_actualise_apres_le_verrou(self):
+        """Cœur du point 2 du correctif : deux appels quasi simultanés à
+        verifier_en_ligne() (deux threads, deux descripteurs distincts
+        sur le MÊME verrou réel — même principe que test_open_windows_
+        try_register.py) — le second ne doit jamais utiliser ni écraser
+        le secret que le premier vient d'écrire ; il doit relire l'état
+        réellement à jour une fois son tour venu."""
+        self._ecrire_etat_local(_jeton_test(self.cle_privee))
+        barrier = threading.Barrier(2)
+        secrets_vus_a_la_lecture = []
+        verrou_appels = threading.Lock()
+
+        appels_restants = {"n": 2}
+
+        def fausse_post_json(url, payload):
+            # Chaque appel "réussit" et fait tourner un secret différent,
+            # pour détecter si un processus utilise/écrase une valeur
+            # périmée par rapport à celle que l'autre vient d'écrire.
+            with verrou_appels:
+                appels_restants["n"] -= 1
+                nouveau_secret = f"secret-rotation-{appels_restants['n']}"
+            secrets_vus_a_la_lecture.append(payload["secret_appareil"])
+            return 200, {
+                "secret_appareil": nouveau_secret,
+                "jeton": _jeton_test(self.cle_privee),
+                "date_serveur": "2026-11-11T12:00:00Z",
+            }
+
+        resultats = []
+
+        def worker():
+            barrier.wait(timeout=2)
+            resultats.append(lc.verifier_en_ligne())
+
+        # Le correctif patché UNE SEULE FOIS avant de démarrer les deux
+        # threads — unittest.mock.patch n'est pas conçu pour être
+        # entré/sorti depuis plusieurs threads simultanément sur LA
+        # MÊME cible (ce serait une fragilité du test, pas du code
+        # réel) ; les deux threads partagent donc la même fonction
+        # patchée, ce qui est exactement ce qu'on veut tester.
+        with patch.object(lc, "_post_json", side_effect=fausse_post_json):
+            t1 = threading.Thread(target=worker)
+            t2 = threading.Thread(target=worker)
+            t1.start()
+            t2.start()
+            t1.join(timeout=5)
+            t2.join(timeout=5)
+
+        self.assertEqual(len(resultats), 2)
+        self.assertTrue(all(r is not None for r in resultats), "Les deux vérifications doivent réussir, jamais une course silencieuse.")
+        # Le second appel (dans l'ordre réel d'exécution sous le verrou)
+        # doit avoir vu le secret ISSU du premier, jamais le secret
+        # d'origine pré-rotation pour les deux à la fois.
+        self.assertEqual(len(set(secrets_vus_a_la_lecture)), 2, "Les deux tentatives ne doivent jamais lire le même secret pré-rotation — la seconde doit voir celui écrit par la première.")
+        self.assertIn("0" * 64, secrets_vus_a_la_lecture, "Le tout premier appel doit bien voir le secret d'origine.")
 
 
 class ActiverEnLigneTest(EnvironnementTestCase):

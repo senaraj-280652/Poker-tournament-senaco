@@ -9121,6 +9121,22 @@ class App(tk.Tk):
                 )
                 self._detruire_racine_en_securite()
                 return
+            elif decision.etat == license_client.ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE:
+                # Correctif du 2026-11-11 : licence locale présente mais
+                # illisible (verrou transitoire probable) — JAMAIS la
+                # fenêtre d'activation en ligne ci-dessus (branche
+                # précédente), qui créerait un second client/machine
+                # pour un poste déjà licencié (voir l'audit du
+                # 2026-11-10). Aucun champ club/e-mail/clé ici,
+                # volontairement : rien à activer.
+                messagebox.showerror(
+                    "Licence temporairement inaccessible",
+                    "Impossible de lire votre licence pour le moment "
+                    "(probablement temporaire — antivirus, disque). Fermez "
+                    "puis relancez Senaco. Si cela persiste, contactez le support.",
+                )
+                self._detruire_racine_en_securite()
+                return
             # Conservée pour tout le reste de la vie de CE processus (voir
             # _verifier_tolerance_licence_avant_ouverture) : UNE SEULE
             # vérification/activation par lancement, jamais une par

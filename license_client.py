@@ -46,14 +46,23 @@ La date système locale n'est JAMAIS utilisée pour décider de
 l'expiration : seule trusted_clock.evaluer_horloge() (dernière date
 fiable connue, mise à jour par le SERVEUR lors d'un succès en ligne)
 sert de référence hors-ligne."""
+import contextlib
 import json
 import os
 import secrets
+import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Optional
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 import device_secret
 import license as licensing
@@ -90,16 +99,76 @@ LICENSE_DIAGNOSTIC_LOG_FILE = os.path.join(
     os.path.expanduser("~"), ".poker_tournament", "licence_diagnostic.log",
 )
 
+# Correctif du 2026-11-11 (robustesse) : si le dossier .poker_tournament
+# LUI-MÊME est momentanément inaccessible (pas seulement licence_v3.json),
+# l'écriture dans LICENSE_DIAGNOSTIC_LOG_FILE ci-dessus échoue aussi,
+# silencieusement — perte totale de visibilité au moment où elle compte
+# le plus (voir l'audit du 2026-11-10). Ce second journal vit dans le
+# dossier temporaire propre à l'utilisateur (tempfile.gettempdir(),
+# jamais partagé entre comptes sur Windows ni macOS), donc dans un
+# dossier distinct, non soumis au même éventuel blocage. Même contenu,
+# même garantie absolue : jamais le jeton, la clé ou un secret.
+LICENSE_DIAGNOSTIC_LOG_FALLBACK_FILE = os.path.join(
+    tempfile.gettempdir(), "senaco_licence_diagnostic_secours.log",
+)
+
+# Plafond appliqué aux DEUX journaux ci-dessus (principal et de secours) :
+# au-delà, le fichier courant devient ".1" (écrasant l'ancienne
+# génération s'il y en avait déjà une) et un nouveau fichier courant est
+# créé — une seule génération précédente conservée, jamais une
+# croissance illimitée sur la durée de vie d'une installation.
+DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS = 200 * 1024
+
 ENV_URL_SERVEUR = "POKER_TOURNAMENT_LICENSE_SERVER_URL"
 ENV_CLE_PUBLIQUE = "POKER_TOURNAMENT_LICENSE_PUBLIC_KEY_HEX"
 
 TIMEOUT_RESEAU_SECONDES = 5.0
+
+# Correctif du 2026-11-11 : nombre de tentatives SUPPLÉMENTAIRES (donc 4
+# essais au total) en cas de PermissionError (et uniquement elle, voir
+# _charger_etat_local) à la lecture de licence_v3.json — couvre les
+# verrous transitoires Windows réels (violation de partage WinError 32,
+# violation de verrouillage WinError 33 : les deux remontent en Python
+# comme PermissionError, vérifié empiriquement le 2026-11-11, voir le
+# compte-rendu). Délai court entre essais : n'ajoute que ~450ms au
+# démarrage dans le pire cas, et UNIQUEMENT quand ce cas se produit —
+# jamais pour un lancement normal (FileNotFoundError n'est jamais
+# retentée, voir plus bas).
+LECTURE_LICENCE_TENTATIVES_SUPPLEMENTAIRES = 3
+LECTURE_LICENCE_DELAI_SECONDES = 0.15
+
+# Verrou interprocessus (même principe que session_tolerance._verrou et
+# open_windows.py — dupliqué ici volontairement, convention déjà en
+# place dans ce dépôt pour garder chaque module isolé, voir leurs
+# commentaires respectifs) protégeant verifier_en_ligne() dans son
+# intégralité : un seul processus Senaco à la fois peut lire l'état
+# local, appeler le serveur, et écrire un secret/jeton rotatés — élimine
+# par construction (jamais par probabilité réduite) la course entre
+# plusieurs fenêtres ouvertes simultanément (voir le compte-rendu du
+# 2026-11-11, point 2).
+VERIFICATION_LOCK_FILE = os.path.join(
+    os.path.expanduser("~"), ".poker_tournament", "verification_en_ligne.lock",
+)
+VERIFICATION_LOCK_TIMEOUT_SECONDES = 5.0
 
 ETAT_NORMAL = "normal"
 ETAT_EXPIRE = "expire"
 ETAT_REVOQUE = "revoque"
 ETAT_VERIFICATION_OBLIGATOIRE = "verification_obligatoire"
 ETAT_ACTIVATION_REQUISE = "activation_requise"  # jamais activé, aucun état local
+# Correctif du 2026-11-11 : licence locale PRÉSENTE mais illisible après
+# toutes les tentatives (verrou transitoire probable, voir ci-dessus) —
+# JAMAIS confondue avec ETAT_ACTIVATION_REQUISE. main.py ne doit jamais
+# proposer de (ré)activation pour cet état : ce serait créer un second
+# client/machine pour un poste déjà licencié (voir l'audit du
+# 2026-11-10, section risques).
+ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE = "lecture_temporairement_indisponible"
+
+# Sentinelle interne distincte de None — jamais exposée hors de ce
+# module, jamais sérialisée. Permet à _charger_etat_local() de signaler
+# "illisible malgré les tentatives" sans que l'appelant puisse la
+# confondre avec "jamais activé" (None).
+_ACCES_TEMPORAIREMENT_INDISPONIBLE = object()
 
 
 @dataclass
@@ -126,6 +195,69 @@ class ErreurIdentificationInsuffisante(ErreurActivation):
     vers un nouvel essai gratuit (sécurité, demande du 2026-11-04)."""
 
 
+# ---------------------------------------------------------------------
+# Verrou de fichier natif de l'OS — même mécanisme que session_tolerance.
+# _acquire_lock/_release_lock (fcntl.flock / msvcrt.locking, bibliothèque
+# standard uniquement), dupliqué ici pour garder ce module isolé (même
+# choix déjà fait pour trusted_clock.py et open_windows.py).
+# ---------------------------------------------------------------------
+def _acquire_lock(fd, timeout):
+    deadline = time.monotonic() + timeout
+    if sys.platform == "win32":
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        while True:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("verrou verification_en_ligne indisponible (timeout)")
+                time.sleep(0.02)
+    else:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("verrou verification_en_ligne indisponible (timeout)")
+                time.sleep(0.02)
+
+
+def _release_lock(fd):
+    try:
+        if sys.platform == "win32":
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _verrou_verification(chemin=None, timeout=None):
+    """Verrou interprocessus protégeant verifier_en_ligne() — voir
+    VERIFICATION_LOCK_FILE. Lève TimeoutError si non obtenu avant
+    `timeout` (défaut VERIFICATION_LOCK_TIMEOUT_SECONDES) : à l'appelant
+    de traiter ce cas EXACTEMENT comme une indisponibilité réseau,
+    jamais comme un blocage ou une erreur visible (voir verifier_en_ligne)."""
+    chemin = chemin or VERIFICATION_LOCK_FILE
+    timeout = VERIFICATION_LOCK_TIMEOUT_SECONDES if timeout is None else timeout
+    os.makedirs(os.path.dirname(chemin), exist_ok=True)
+    fd = os.open(chemin, os.O_CREAT | os.O_RDWR)
+    try:
+        _acquire_lock(fd, timeout)
+        try:
+            yield
+        finally:
+            _release_lock(fd)
+    finally:
+        os.close(fd)
+
+
 def _url_serveur():
     url = os.environ.get(ENV_URL_SERVEUR)
     if not url:
@@ -144,35 +276,106 @@ def _cle_publique_hex():
     return cle
 
 
-def _journaliser_diagnostic_chargement(chemin, raison, detail, chemin_journal=None):
-    """Consigne pourquoi _charger_etat_local() a rejeté `chemin` — jamais
-    une valeur lue dans le fichier, uniquement le chemin lui-même et une
-    classification/texte d'exception (voir LICENSE_DIAGNOSTIC_LOG_FILE).
-    N'échoue jamais : une panne d'écriture du journal ne doit jamais
-    perturber le flux normal d'évaluation de la licence."""
-    chemin_journal = chemin_journal or LICENSE_DIAGNOSTIC_LOG_FILE
+def _faire_pivoter_journal_si_trop_grand(chemin_journal, taille_max):
+    """Avant d'ajouter une ligne : si le journal courant dépasse
+    `taille_max`, le fait devenir "<chemin>.1" (écrasant une éventuelle
+    génération précédente) et repart d'un journal vide — une seule
+    génération précédente conservée, jamais une croissance illimitée.
+    N'échoue jamais : une panne de rotation ne doit jamais empêcher la
+    tentative d'écriture elle-même (voir l'appelant)."""
     try:
-        os.makedirs(os.path.dirname(chemin_journal), exist_ok=True)
-        with open(chemin_journal, "a", encoding="utf-8") as f:
-            f.write(
-                f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
-                f"chemin_recherche={chemin!r} raison={raison} detail={detail}\n"
-            )
+        if os.path.getsize(chemin_journal) >= taille_max:
+            os.replace(chemin_journal, chemin_journal + ".1")
     except OSError:
         pass
 
 
-def _charger_etat_local(chemin=None):
-    chemin = chemin or LICENSE_STATE_FILE
+def _ecrire_ligne_journal(chemin_journal, ligne, taille_max):
+    """Écrit `ligne` dans `chemin_journal`, avec rotation préalable si
+    besoin — lève OSError (jamais avalée ICI) si l'écriture elle-même
+    échoue, pour laisser l'appelant décider du repli (voir
+    _journaliser_diagnostic_chargement)."""
+    os.makedirs(os.path.dirname(chemin_journal), exist_ok=True)
+    _faire_pivoter_journal_si_trop_grand(chemin_journal, taille_max)
+    with open(chemin_journal, "a", encoding="utf-8") as f:
+        f.write(ligne)
+
+
+def _journaliser_diagnostic_chargement(chemin, raison, detail, chemin_journal=None, chemin_journal_secours=None):
+    """Consigne pourquoi _charger_etat_local() a rejeté `chemin` — jamais
+    une valeur lue dans le fichier, uniquement le chemin lui-même et une
+    classification/texte d'exception (voir LICENSE_DIAGNOSTIC_LOG_FILE).
+    N'échoue jamais : une panne d'écriture du journal ne doit jamais
+    perturber le flux normal d'évaluation de la licence.
+
+    Correctif du 2026-11-11 : si l'écriture dans le journal PRINCIPAL
+    échoue (le dossier .poker_tournament lui-même peut être la cause de
+    l'indisponibilité — voir l'audit du 2026-11-10), tente le journal de
+    SECOURS (dossier temporaire, distinct) avant d'abandonner — jamais
+    l'inverse, le journal principal reste la source privilégiée."""
+    chemin_journal = chemin_journal or LICENSE_DIAGNOSTIC_LOG_FILE
+    chemin_journal_secours = chemin_journal_secours or LICENSE_DIAGNOSTIC_LOG_FALLBACK_FILE
+    ligne = (
+        f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+        f"chemin_recherche={chemin!r} raison={raison} detail={detail}\n"
+    )
     try:
-        with open(chemin, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except OSError as e:
-        _journaliser_diagnostic_chargement(chemin, "echec_lecture", f"{type(e).__name__}: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        _journaliser_diagnostic_chargement(chemin, "json_invalide", f"{type(e).__name__}: {e}")
-        return None
+        _ecrire_ligne_journal(chemin_journal, ligne, DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS)
+        return
+    except OSError:
+        pass
+    try:
+        _ecrire_ligne_journal(chemin_journal_secours, ligne, DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS)
+    except OSError:
+        pass
+
+
+def _charger_etat_local(chemin=None, tentatives_supplementaires=None, delai_secondes=None):
+    """Lit et valide LICENSE_STATE_FILE. Renvoie le dict validé en cas de
+    succès, None si la licence est GENUINEMENT absente ou son contenu
+    invalide (jamais retenté — voir plus bas), ou la sentinelle
+    _ACCES_TEMPORAIREMENT_INDISPONIBLE si l'accès a échoué par
+    PermissionError sur TOUTES les tentatives (voir evaluer_licence,
+    qui ne doit jamais confondre ce dernier cas avec une absence de
+    licence).
+
+    Correctif du 2026-11-11 : PermissionError (WinError 32 "violation de
+    partage" ET WinError 33 "violation de verrouillage" remontent toutes
+    les deux ainsi en Python — vérifié empiriquement le 2026-11-11, voir
+    le compte-rendu) déclenche jusqu'à `tentatives_supplementaires`
+    nouveaux essais, espacés de `delai_secondes`. Aucune autre exception
+    n'est retentée : FileNotFoundError (licence réellement jamais
+    activée) ne doit jamais être ralentie par une attente inutile, et un
+    contenu JSON invalide ne devient pas valide en relisant le même
+    fichier (écriture atomique déjà en place, voir _enregistrer_etat_local)."""
+    chemin = chemin or LICENSE_STATE_FILE
+    tentatives_supplementaires = (
+        LECTURE_LICENCE_TENTATIVES_SUPPLEMENTAIRES if tentatives_supplementaires is None
+        else tentatives_supplementaires
+    )
+    delai_secondes = LECTURE_LICENCE_DELAI_SECONDES if delai_secondes is None else delai_secondes
+
+    for tentative in range(tentatives_supplementaires + 1):
+        try:
+            with open(chemin, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            break
+        except PermissionError as e:
+            if tentative < tentatives_supplementaires:
+                time.sleep(delai_secondes)
+                continue
+            _journaliser_diagnostic_chargement(
+                chemin, "acces_temporairement_indisponible",
+                f"{type(e).__name__}: {e} (apres {tentative + 1} tentatives)",
+            )
+            return _ACCES_TEMPORAIREMENT_INDISPONIBLE
+        except OSError as e:
+            _journaliser_diagnostic_chargement(chemin, "echec_lecture", f"{type(e).__name__}: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            _journaliser_diagnostic_chargement(chemin, "json_invalide", f"{type(e).__name__}: {e}")
+            return None
+
     if not isinstance(data, dict):
         _journaliser_diagnostic_chargement(
             chemin, "contenu_rejete", f"racine_json de type {type(data).__name__}, dict attendu",
@@ -357,16 +560,54 @@ def activer_en_ligne(nom_club, email, plateforme=None, code_activation=None):
 
 
 def verifier_en_ligne():
+    """Point d'entrée public — acquiert le verrou interprocessus (voir
+    _verrou_verification/VERIFICATION_LOCK_FILE) puis délègue à
+    _verifier_en_ligne_sous_verrou(). Correctif du 2026-11-11 : TOUTE
+    impossibilité d'utiliser ce verrou est traitée EXACTEMENT comme une
+    indisponibilité réseau — repli hors-ligne silencieux, jamais un
+    blocage ni une exception visible — qu'il s'agisse :
+    - d'un timeout (TimeoutError, un autre processus Senaco tient déjà
+      le verrou) ;
+    - OU de l'impossibilité même de créer/ouvrir le fichier de verrou
+      (PermissionError, dossier inaccessible, erreur disque — OSError).
+      Trouvé le 2026-11-11 en vérification : sans ce second cas,
+      verifier_en_ligne() violait son propre contrat ("ne lève jamais")
+      et plantait App.__init__ au lieu de se replier — TimeoutError
+      étant lui-même une sous-classe d'OSError, une seule clause suffit
+      à couvrir les deux.
+
+    Ce repli ne contourne JAMAIS une expiration ni une vérification
+    obligatoire : evaluer_licence() retombe alors sur le MÊME jeton
+    local déjà signé/vérifié et la MÊME horloge de confiance locale
+    qu'une vraie coupure réseau — jamais un raccourci qui accepterait
+    une licence par défaut."""
+    try:
+        with _verrou_verification():
+            return _verifier_en_ligne_sous_verrou()
+    except OSError:
+        return None
+
+
+def _verifier_en_ligne_sous_verrou():
     """Appelle /verifier.php. Renvoie le dict de réponse si succès,
-    None pour toute anomalie — réseau, jeton local illisible, secret
-    d'appareil local absent, OU refus explicite du serveur (401,
-    identification insuffisante) — ces trois derniers cas sont traités
-    IDENTIQUEMENT à une panne réseau : jamais d'exception, la matrice de
-    décision (evaluer_licence) se replie alors sur l'état local fiable,
-    exactement comme pour une vraie coupure réseau. Une distinction plus
-    fine entre "hors ligne" et "identification refusée" n'apporterait
-    rien ici : dans les deux cas, impossible de confirmer l'état réel en
-    ligne, donc même repli hors-ligne prudent.
+    None pour toute anomalie — réseau, jeton local illisible/
+    temporairement inaccessible, secret d'appareil local absent, OU
+    refus explicite du serveur (401, identification insuffisante) — ces
+    cas sont traités IDENTIQUEMENT à une panne réseau : jamais
+    d'exception, la matrice de décision (evaluer_licence) se replie
+    alors sur l'état local fiable, exactement comme pour une vraie
+    coupure réseau. Une distinction plus fine entre "hors ligne" et
+    "identification refusée" n'apporterait rien ici : dans les deux cas,
+    impossible de confirmer l'état réel en ligne, donc même repli
+    hors-ligne prudent.
+
+    TOUJOURS appelée sous VERIFICATION_LOCK_FILE (voir verifier_en_ligne
+    ci-dessus) : la lecture de l'état local ci-dessous, comme l'écriture
+    du secret/jeton rotatés plus bas, n'arrivent donc jamais en même
+    temps qu'un autre processus Senaco — un second processus en attente
+    du verrou relit systématiquement l'état ACTUALISÉ (celui que le
+    premier vient d'écrire), jamais une version pré-rotation (voir le
+    compte-rendu du 2026-11-11, point 2).
 
     Protocole de rotation des secrets (validé le 2026-11-06) : chaque
     vérification réussie fait émettre un nouveau secret par le serveur
@@ -377,7 +618,7 @@ def verifier_en_ligne():
     sécurisé local — jamais avant, pour ne jamais perdre la possibilité
     de rejouer la même tentative après un redémarrage."""
     etat_local = _charger_etat_local()
-    if etat_local is None:
+    if etat_local is None or etat_local is _ACCES_TEMPORAIREMENT_INDISPONIBLE:
         return None
     try:
         cle_publique = _cle_publique_hex()
@@ -467,6 +708,17 @@ def evaluer_licence():
     complète. Ne lève jamais d'exception — toute anomalie se traduit
     par un DecisionLicence explicite, jamais une interruption."""
     etat_local = _charger_etat_local()
+    if etat_local is _ACCES_TEMPORAIREMENT_INDISPONIBLE:
+        # Correctif du 2026-11-11 : licence locale PRÉSENTE mais
+        # illisible après plusieurs tentatives (verrou transitoire
+        # probable) — JAMAIS confondue avec "jamais activé" (voir
+        # ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE). main.py ne doit
+        # jamais, pour cet état, proposer une nouvelle activation.
+        return DecisionLicence(
+            ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE, None,
+            "Licence locale présente mais temporairement illisible après "
+            "plusieurs tentatives — probablement transitoire (antivirus, disque).",
+        )
     if etat_local is None:
         return DecisionLicence(
             ETAT_ACTIVATION_REQUISE, None,
@@ -562,10 +814,12 @@ def obtenir_informations_affichage(decision):
     traité sans erreur.
 
     N'invente jamais une information absente : si le jeton local est
-    illisible ou absent, `disponible=False` est renvoyé et AUCUN autre
-    champ n'est à considérer comme fiable."""
+    illisible, absent, ou temporairement inaccessible (voir
+    _ACCES_TEMPORAIREMENT_INDISPONIBLE — correctif du 2026-11-11, évite
+    ici un TypeError sur un sentinelle non indexable), `disponible=False`
+    est renvoyé et AUCUN autre champ n'est à considérer comme fiable."""
     etat_local = _charger_etat_local()
-    if etat_local is None:
+    if etat_local is None or etat_local is _ACCES_TEMPORAIREMENT_INDISPONIBLE:
         return InformationsLicenceAffichage(disponible=False)
     try:
         cle_publique = _cle_publique_hex()

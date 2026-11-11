@@ -64,6 +64,23 @@ class GatingLicenceV3Test(unittest.TestCase):
         self.assertNotIn("ETAT_REVOQUE", bloc)
         self.assertIn("ETAT_ACTIVATION_REQUISE", bloc)
         self.assertIn("ETAT_VERIFICATION_OBLIGATOIRE", bloc)
+        self.assertIn(
+            "ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE", bloc,
+            "Correctif du 2026-11-11 : cet état doit aussi pouvoir bloquer "
+            "le démarrage (licence présente mais illisible), sans jamais "
+            "être confondu avec ETAT_ACTIVATION_REQUISE.",
+        )
+
+    def test_lecture_indisponible_najamais_la_fenetre_dactivation(self):
+        """Correctif du 2026-11-11 (cœur du risque identifié le
+        2026-11-10) : la branche ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE
+        ne doit JAMAIS instancier ActivationEnLigneDialog — ce serait
+        créer un second client/machine pour un poste déjà licencié."""
+        debut = self.source.index("elif decision.etat == license_client.ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE:")
+        fin = self.source.index("self._decision_licence_v3 = decision")
+        bloc = self.source[debut:fin]
+        self.assertNotIn("ActivationEnLigneDialog", bloc)
+        self.assertIn("self._detruire_racine_en_securite()", bloc)
 
     def test_import_license_client_present(self):
         self.assertIn("import license_client", self.source)
@@ -91,7 +108,11 @@ class GardeDestructionRacineTest(unittest.TestCase):
         protégé dans ce bloc précis."""
         bloc = self._bloc_init()
         self.assertNotIn("self.destroy()", bloc)
-        self.assertEqual(bloc.count("self._detruire_racine_en_securite()"), 3)
+        self.assertEqual(
+            bloc.count("self._detruire_racine_en_securite()"), 4,
+            "4 depuis le correctif du 2026-11-11 (nouvelle branche "
+            "ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE) — 3 auparavant.",
+        )
 
     def test_methode_detruire_racine_en_securite_definie_et_protegee(self):
         self.assertIn("def _detruire_racine_en_securite(self):", self.source)
