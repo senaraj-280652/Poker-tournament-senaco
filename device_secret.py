@@ -70,8 +70,10 @@ def _vrai_home_temporairement():
     Library/Keychains. Restaure le VRAI HOME (jamais en se fiant à la
     valeur courante de HOME, justement redirigée) uniquement le temps de
     l'appel au Trousseau, puis revient à la valeur précédente (même en
-    cas d'exception, via finally) pour que les processus enfants lancés
-    ensuite héritent toujours de l'isolation TEST normale."""
+    cas d'exception, via finally) — y compris l'ABSENCE de HOME (jamais
+    laissé sur le vrai dossier personnel si HOME n'était pas défini avant
+    l'appel) — pour que les processus enfants lancés ensuite héritent
+    toujours de l'isolation TEST normale."""
     if sys.platform != "darwin" or not _est_un_build_test():
         yield
         return
@@ -82,7 +84,9 @@ def _vrai_home_temporairement():
         try:
             yield
         finally:
-            if ancien is not None:
+            if ancien is None:
+                os.environ.pop("HOME", None)
+            else:
                 os.environ["HOME"] = ancien
 
 

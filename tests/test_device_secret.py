@@ -261,6 +261,21 @@ class VraiHomeTemporairementTest(unittest.TestCase):
             self.assertEqual(os.environ["HOME"], "/Users/quelquun/SenacoTEST")
 
     @unittest.skipIf(sys.platform == "win32", "pwd indisponible sur Windows — mécanisme volontairement macOS uniquement")
+    def test_ne_laisse_pas_home_defini_si_absent_avant_l_appel(self):
+        """Asymétrie relevée le 2026-11-14 (vérification post-push) :
+        si HOME n'était pas défini du tout avant l'appel, le laisser au
+        vrai dossier personnel après coup serait une fuite d'état —
+        HOME doit redevenir ABSENT, pas seulement « une autre valeur »."""
+        os.environ.pop("HOME", None)
+        with patch.object(device_secret.sys, "platform", "darwin"), \
+                patch.object(device_secret, "_est_un_build_test", return_value=True), \
+                patch("pwd.getpwuid") as mock_getpwuid:
+            mock_getpwuid.return_value.pw_dir = "/Users/quelquun"
+            with device_secret._vrai_home_temporairement():
+                self.assertEqual(os.environ["HOME"], "/Users/quelquun")
+            self.assertNotIn("HOME", os.environ)
+
+    @unittest.skipIf(sys.platform == "win32", "pwd indisponible sur Windows — mécanisme volontairement macOS uniquement")
     def test_restaure_meme_en_cas_d_exception(self):
         """Précaution explicite demandée le 2026-11-13 : un échec pendant
         l'appel Trousseau ne doit jamais laisser HOME bloqué sur le vrai
