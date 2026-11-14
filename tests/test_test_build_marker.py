@@ -61,6 +61,65 @@ class IsTestBuildTest(unittest.TestCase):
                 self.assertFalse(main._is_test_build())
 
 
+class RedirigerHomeTestMacosTest(unittest.TestCase):
+    """Correctif du 2026-11-13 (préparation de la version TEST macOS
+    Intel, isolation automatique des données/licences) —
+    main._rediriger_home_test_macos_si_necessaire()."""
+
+    def setUp(self):
+        self._home_original = os.environ.get("HOME")
+        self.addCleanup(self._restaurer_home)
+
+    def _restaurer_home(self):
+        if self._home_original is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._home_original
+
+    @unittest.skipIf(sys.platform == "win32", "pwd indisponible sur Windows — mécanisme volontairement macOS uniquement")
+    def test_redirige_vers_sous_dossier_senacotest_sur_macos_en_build_test(self):
+        os.environ["HOME"] = "/Users/quelquun"
+        with patch.object(main.sys, "platform", "darwin"), \
+                patch.object(main, "_is_test_build", return_value=True), \
+                patch("pwd.getpwuid") as mock_getpwuid:
+            mock_getpwuid.return_value.pw_dir = "/Users/quelquun"
+            main._rediriger_home_test_macos_si_necessaire()
+        self.assertEqual(os.environ["HOME"], "/Users/quelquun/SenacoTEST")
+
+    def test_jamais_sur_windows_meme_en_build_test(self):
+        """Précaution impérative du 2026-11-13 : ne jamais toucher à
+        l'isolation Windows existante (USERPROFILE positionné à la main
+        par l'expérimentateur, HP/Vaio)."""
+        os.environ["HOME"] = "/Users/quelquun"
+        with patch.object(main.sys, "platform", "win32"), \
+                patch.object(main, "_is_test_build", return_value=True):
+            main._rediriger_home_test_macos_si_necessaire()
+        self.assertEqual(os.environ["HOME"], "/Users/quelquun")
+
+    def test_jamais_hors_build_test_meme_sur_macos(self):
+        os.environ["HOME"] = "/Users/quelquun"
+        with patch.object(main.sys, "platform", "darwin"), \
+                patch.object(main, "_is_test_build", return_value=False):
+            main._rediriger_home_test_macos_si_necessaire()
+        self.assertEqual(os.environ["HOME"], "/Users/quelquun")
+
+    @unittest.skipIf(sys.platform == "win32", "pwd indisponible sur Windows — mécanisme volontairement macOS uniquement")
+    def test_insensible_a_une_redirection_deja_en_place_jamais_imbriquee(self):
+        """Cœur de la précaution n°1 : si HOME est DÉJÀ redirigé (ce
+        processus est un enfant relancé par spawn_app_process, voir
+        App._open_new_window/_open_lobby_window), une nouvelle 'auto-
+        redirection' ne doit JAMAIS produire .../SenacoTEST/SenacoTEST —
+        pwd.getpwuid() renvoie le VRAI dossier système, insensible à
+        HOME."""
+        os.environ["HOME"] = "/Users/quelquun/SenacoTEST"  # déjà redirigé par le parent
+        with patch.object(main.sys, "platform", "darwin"), \
+                patch.object(main, "_is_test_build", return_value=True), \
+                patch("pwd.getpwuid") as mock_getpwuid:
+            mock_getpwuid.return_value.pw_dir = "/Users/quelquun"  # toujours le VRAI home
+            main._rediriger_home_test_macos_si_necessaire()
+        self.assertEqual(os.environ["HOME"], "/Users/quelquun/SenacoTEST")
+
+
 class AppTitlePrefixTestMarkerTest(unittest.TestCase):
     def test_prefixe_test_ajoute_quand_build_de_test(self):
         with patch.object(main, "_is_test_build", return_value=True), \
@@ -298,6 +357,91 @@ class BuildFilesIsolationTest(unittest.TestCase):
         self.assertTrue(
             os.path.exists(os.path.join(REPO_ROOT, "windows", "assets", "TEST_BUILD_MARKER"))
         )
+
+
+class MacosBuildFilesIsolationTest(unittest.TestCase):
+    """Même principe que BuildFilesIsolationTest ci-dessus, pour les
+    fichiers de build macOS (demande du 2026-11-13, préparation d'une
+    version TEST macOS Intel distincte de Senaco 1.2.45) : ces tests
+    lisent les VRAIS fichiers du dépôt — ils échoueraient si une
+    modification future réintroduisait un risque de cohabitation entre
+    la ligne TEST et la ligne de production macOS."""
+
+    def setUp(self):
+        self.prod_spec = _read("macos", "poker_tournament.spec")
+        self.test_spec = _read("macos", "poker_tournament-test.spec")
+        self.prod_build_sh = _read("macos", "build_dmg.sh")
+        self.test_build_sh = _read("macos", "build_dmg_test.sh")
+
+    def test_marqueur_test_absent_du_spec_de_production(self):
+        self.assertNotIn("TEST_BUILD_MARKER", self.prod_spec)
+
+    def test_marqueur_test_present_dans_le_spec_de_test(self):
+        self.assertIn("TEST_BUILD_MARKER", self.test_spec)
+
+    def test_marqueur_fichier_existe_sur_disque(self):
+        self.assertTrue(
+            os.path.exists(os.path.join(REPO_ROOT, "macos", "assets", "TEST_BUILD_MARKER"))
+        )
+
+    def test_noms_pyinstaller_differents(self):
+        """name= apparaît pour EXE/COLLECT (le binaire) ET pour BUNDLE
+        (le .app, couvert séparément par test_noms_app_bundle_
+        differents) — ce test ne vérifie que le nom du binaire lui-même,
+        jamais partagé entre les deux lignes."""
+        import re
+        prod_names = set(re.findall(r'name="([^"]+)"', self.prod_spec))
+        test_names = set(re.findall(r'name="([^"]+)"', self.test_spec))
+        self.assertIn("PokerTournament", prod_names)
+        self.assertNotIn("PokerTournament-TEST", prod_names)
+        self.assertIn("PokerTournament-TEST", test_names)
+        self.assertNotIn("PokerTournament", test_names)
+
+    def test_noms_app_bundle_differents(self):
+        import re
+        prod_app = re.search(r'name="([^"]+\.app)"', self.prod_spec).group(1)
+        test_app = re.search(r'name="([^"]+\.app)"', self.test_spec).group(1)
+        self.assertNotEqual(prod_app, test_app)
+        self.assertEqual(prod_app, "PokerTournament.app")
+        self.assertEqual(test_app, "PokerTournament-TEST.app")
+
+    def test_bundle_identifiers_differents(self):
+        """Cœur de la garantie « aucun remplacement possible de
+        /Applications/PokerTournament.app » : deux identifiants de
+        bundle différents suffisent, à eux seuls, à ce que macOS/Launch
+        Services traitent les deux comme des applications totalement
+        distinctes."""
+        import re
+        prod_id = re.search(r'bundle_identifier="([^"]+)"', self.prod_spec).group(1)
+        test_id = re.search(r'bundle_identifier="([^"]+)"', self.test_spec).group(1)
+        self.assertNotEqual(prod_id, test_id)
+        self.assertEqual(prod_id, "com.pokertournament.gestionnaire")
+        self.assertEqual(test_id, "com.pokertournament.gestionnaire.test")
+
+    def test_script_test_distinct_du_script_de_production(self):
+        """Script de build TEST délibérément SÉPARÉ (pas un drapeau sur
+        build_dmg.sh) — garantit qu'aucune automatisation future ne peut
+        déclencher un build TEST en croyant lancer la production."""
+        self.assertIn("poker_tournament-test.spec", self.test_build_sh)
+        self.assertNotIn("poker_tournament-test.spec", self.prod_build_sh)
+        self.assertIn("PokerTournament-TEST", self.test_build_sh)
+        self.assertNotIn("PokerTournament-TEST", self.prod_build_sh)
+
+    def test_nom_dmg_explicitement_test(self):
+        self.assertIn("TEST", self.test_build_sh[self.test_build_sh.index('DMG_NAME='):self.test_build_sh.index('DMG_NAME=') + 80])
+
+    def test_cffi_backend_declare_en_hiddenimport_dans_le_spec_test(self):
+        """Non-regression du diagnostic du 2026-11-13 : nacl._sodium.abi3.so
+        importe _cffi_backend depuis son propre code C (aucune dependance
+        Mach-O visible via otool, aucun import Python statique visible dans
+        main.py) -- hook-nacl.py de _pyinstaller_hooks_contrib ne le
+        declare pas (ecrit pour une disposition de PyNaCl anterieure a
+        nacl/_sodium.abi3.so). Sans ce hiddenimport explicite, le lancement
+        avec POKER_TOURNAMENT_LICENSE_V3 defini crashe avant tout affichage
+        (ModuleNotFoundError: No module named '_cffi_backend')."""
+        import re
+        test_hidden = re.search(r'hiddenimports=\[([^\]]*)\]', self.test_spec).group(1)
+        self.assertIn('"_cffi_backend"', test_hidden)
 
 
 if __name__ == "__main__":

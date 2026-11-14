@@ -25,6 +25,88 @@ from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox, filedialog, colorchooser
 
+# Nom du fichier-marqueur qui identifie un exécutable compilé pour la
+# ligne « TEST » (cohabitation avec une installation de production sur le
+# même poste, demande du 2026-09-12 — voir windows/README.md, section
+# "Version de TEST"). Embarqué UNIQUEMENT par poker_tournament-test.spec
+# (datas, Windows et macOS), JAMAIS par le spec de production : un build
+# de production normal ne peut donc jamais l'embarquer, même par erreur
+# de fusion de branche, sans une modification explicite du spec TEST.
+# Ne touche ni version.py (APP_VERSION reste inchangé) ni license.py
+# (aucun rapport avec la licence V2/HMAC).
+#
+# Déplacé ICI (demande du 2026-11-13, avant TOUT import local) depuis sa
+# position d'origine, juste après _is_test_build() ci-dessous — voir le
+# bloc d'isolation macOS qui suit : il a besoin de savoir "est-ce un
+# build TEST ?" AVANT que database.py/license_client.py/etc. ne
+# calculent leurs chemins ~/.poker_tournament en constantes de MODULE
+# (donc une seule fois, à l'import — trop tard pour agir ensuite).
+_TEST_BUILD_MARKER_FILENAME = "TEST_BUILD_MARKER"
+
+
+def _is_test_build():
+    """Vrai uniquement pour un exécutable compilé à partir du spec TEST
+    dédié (voir _TEST_BUILD_MARKER_FILENAME ci-dessus) : ce spec embarque
+    un petit fichier marqueur à la racine du bundle, absent du spec de
+    production. Même repli sys._MEIPASS / dossier du fichier source que
+    help_browser._data_dir() pour fonctionner identiquement en build
+    compilée (onedir, _MEIPASS pointe vers _internal/ sous Windows ou
+    Contents/MacOS sous macOS) et en lancement depuis les sources.
+
+    En lancement depuis les sources (python main.py), le dossier vérifié
+    est celui de main.py lui-même (racine du dépôt) — PAS windows/assets/
+    ni macos/assets/ — donc ce marqueur n'y est jamais trouvé : aucun
+    effet sur le développement courant, uniquement sur un exécutable
+    réellement compilé avec ce spec dédié. Fonction MODULE-LEVEL (pas une
+    méthode), volontairement peu coûteuse (un seul appel os.path.exists) :
+    appelée à chaque rafraîchissement de titre, jamais mise en cache (le
+    marqueur ne peut de toute façon pas changer en cours d'exécution)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
+
+
+# Isolation automatique des données/licences d'un build TEST macOS
+# (demande du 2026-11-13, préparation d'une version TEST macOS Intel
+# distincte de 1.2.45, cf. le compte-rendu correspondant) :
+# os.path.expanduser("~") — utilisé par une vingtaine de fichiers
+# (license_client.py, database.py, open_windows.py, backup_restore.py,
+# device_secret.py pour le nom de service excepté, etc.) pour localiser
+# ~/.poker_tournament — lit la variable d'environnement HOME. La
+# repositionner ICI, avant le moindre import local (ces modules calculent
+# leurs chemins en constantes de MODULE, une seule fois à l'import),
+# redirige automatiquement TOUS ces fichiers sans qu'aucun d'eux n'ait
+# besoin d'être modifié individuellement.
+#
+# Volontairement limité à macOS (sys.platform == "darwin") pour
+# l'instant : ne touche JAMAIS Windows, où l'isolation reste gérée
+# manuellement par l'expérimentateur (USERPROFILE positionné à la main
+# avant chaque lancement, HP/Vaio) — précaution explicite du 2026-11-13 :
+# ne jamais écraser silencieusement une isolation déjà configurée à la
+# main.
+#
+# pwd.getpwuid(...).pw_dir (PAS os.path.expanduser("~"), qui lirait HOME
+# — potentiellement DÉJÀ redirigé si ce process est lui-même un enfant
+# relancé par spawn_app_process, voir App._open_new_window/_open_lobby_
+# window) donne le VRAI dossier personnel système, lu dans la base
+# utilisateur du système, totalement insensible à une redirection déjà
+# en place : un processus enfant retombe ainsi TOUJOURS sur le même
+# ~/SenacoTEST, jamais une redirection imbriquée (~/SenacoTEST/
+# SenacoTEST/...) à chaque relance (précaution explicite du 2026-11-13).
+def _rediriger_home_test_macos_si_necessaire():
+    """Isole ~/.poker_tournament pour un build TEST macOS (voir le bloc
+    de commentaires ci-dessus) — fonction séparée (plutôt qu'un simple
+    `if` exécuté au chargement du module) pour rester testable
+    isolément, avec sys.platform/_is_test_build/pwd.getpwuid substitués,
+    sans avoir à réimporter ce module entier à chaque test. Appelée une
+    seule fois, juste après sa définition, avant tout import local."""
+    if sys.platform == "darwin" and _is_test_build():
+        import pwd
+        vrai_home = pwd.getpwuid(os.getuid()).pw_dir
+        os.environ["HOME"] = os.path.join(vrai_home, "SenacoTEST")
+
+
+_rediriger_home_test_macos_si_necessaire()
+
 from database import (
     Database, _read_tournament_date_ro, build_period_summary, export_period_summary_csv,
     export_period_summary_xlsx, export_period_summary_pdf,
@@ -66,41 +148,11 @@ import license as licensing
 from version import APP_NAME, APP_VERSION, dev_suffix
 
 
-# Nom du fichier-marqueur qui identifie un exécutable compilé pour la
-# ligne « TEST » (cohabitation avec une installation de production sur le
-# même poste, demande du 2026-09-12 — voir windows/README.md, section
-# "Version de TEST"). Embarqué UNIQUEMENT par windows/poker_tournament-
-# test.spec (datas), JAMAIS par windows/poker_tournament.spec (le spec de
-# production ne le référence nulle part) : un build de production normal
-# ne peut donc jamais l'embarquer, même par erreur de fusion de branche,
-# sans une modification explicite de CE spec-ci. Ne touche ni version.py
-# (APP_VERSION reste inchangé) ni license.py (aucun rapport avec la
-# licence) — seul l'AFFICHAGE (titre de fenêtre, "À propos") en tient
-# compte, voir _is_test_build ci-dessous.
-_TEST_BUILD_MARKER_FILENAME = "TEST_BUILD_MARKER"
-
-
-def _is_test_build():
-    """Vrai uniquement pour un exécutable compilé à partir de windows/
-    poker_tournament-test.spec (voir _TEST_BUILD_MARKER_FILENAME
-    ci-dessus) : ce spec embarque un petit fichier marqueur
-    (windows/assets/TEST_BUILD_MARKER) à la racine du bundle, absent du
-    spec de production. Même repli sys._MEIPASS / dossier du fichier
-    source que help_browser._data_dir() pour fonctionner identiquement en
-    build compilée (onedir, _MEIPASS pointe vers _internal/) et en
-    lancement depuis les sources.
-
-    En lancement depuis les sources (python main.py), le dossier vérifié
-    est celui de main.py lui-même (racine du dépôt) — PAS windows/assets/
-    — donc ce marqueur n'y est jamais trouvé : aucun effet sur le
-    développement courant, uniquement sur un exécutable réellement
-    compilé avec ce spec dédié. Fonction MODULE-LEVEL (pas une méthode),
-    volontairement peu coûteuse (un seul appel os.path.exists) : appelée
-    à chaque rafraîchissement de titre, jamais mise en cache (le marqueur
-    ne peut de toute façon pas changer en cours d'exécution)."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
-
+# _TEST_BUILD_MARKER_FILENAME et _is_test_build() sont désormais définis
+# tout en haut de ce fichier, AVANT les imports locaux (voir le bloc
+# d'isolation macOS juste après leur définition) — déplacement du
+# 2026-11-13, jamais une suppression : le comportement et les docstrings
+# sont inchangés, seule la position dans le fichier a changé.
 
 # Nom du fichier optionnel portant le numéro identifiant CE build TEST
 # précis (demande du 2026-09-14, "pouvoir distinguer immédiatement les
