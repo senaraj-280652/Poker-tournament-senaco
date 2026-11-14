@@ -1019,16 +1019,36 @@ class MatriceDecisionTest(EnvironnementTestCase):
 
     @patch.object(lc, "verifier_en_ligne")
     def test_hors_ligne_recul_horloge_exige_verification(self, mock_verifier):
+        """Corrigé le 2026-11-14 : ce test dépendait silencieusement de
+        la VRAIE date du jour à l'exécution. L'appel évaluer_horloge(
+        maintenant=...) ci-dessous ne faisait que vérifier le recul une
+        fois, SANS jamais avancer la date fiable stockée (comportement
+        voulu d'evaluer_horloge, non modifié ici) — mais l'appel suivant
+        à lc.evaluer_licence() ne réutilise jamais ce `maintenant` : il
+        relit l'horloge RÉELLE du système en interne
+        (trusted_clock._maintenant_utc(), jamais exposée en paramètre).
+        Tant que la vraie date du jour restait avant le 2026-11-10 semé
+        ci-dessous, ça ressemblait malgré tout à un recul et le test
+        passait par coïncidence ; au-delà (cas réel depuis plusieurs
+        sessions), la vraie date avance normalement le repère stocké et
+        plus aucun recul n'est détecté.
+
+        Correction : on contrôle désormais explicitement ce que
+        trusted_clock considère comme « maintenant » pour toute la
+        durée du test (jamais l'horloge système réelle, jamais modifié
+        trusted_clock.py lui-même) — le recul est alors simulé de
+        façon fiable, indépendamment de la date réelle d'exécution."""
         mock_verifier.return_value = None
         jeton = _jeton_test(self.cle_privee)
         self._ecrire_etat_local(jeton)
         trusted_clock.initialiser_apres_verification_en_ligne(
             datetime(2026, 11, 10, tzinfo=timezone.utc), chemin=self.chemin_horloge,
         )
-        trusted_clock.evaluer_horloge(
-            chemin=self.chemin_horloge, maintenant=datetime(2026, 11, 1, tzinfo=timezone.utc),
-        )
-        decision = lc.evaluer_licence()
+        with patch.object(
+            trusted_clock, "_maintenant_utc",
+            return_value=datetime(2026, 11, 1, tzinfo=timezone.utc),
+        ):
+            decision = lc.evaluer_licence()
         self.assertEqual(decision.etat, lc.ETAT_VERIFICATION_OBLIGATOIRE)
 
     @patch.object(lc, "verifier_en_ligne")

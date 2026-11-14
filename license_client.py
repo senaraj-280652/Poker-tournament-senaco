@@ -777,6 +777,76 @@ def evaluer_licence():
     return DecisionLicence(ETAT_NORMAL, payload["id_jeton"], "Licence valide (hors ligne, dernière info fiable).")
 
 
+def reevaluer_expiration_locale(decision):
+    """Correctif du 2026-11-14 (défaut : Senaco reste ouvert plusieurs
+    jours, self._decision_licence_v3 calculée une seule fois au
+    démarrage par evaluer_licence() n'est ensuite jamais rafraîchie —
+    voir main.App._verifier_tolerance_licence_avant_ouverture, seul
+    appelant) : réévalue localement, SANS LA MOINDRE requête réseau, si
+    une décision ETAT_NORMAL déjà en cache est toujours valide À
+    L'INSTANT PRÉSENT. Appelée juste avant chaque ouverture/création de
+    tournoi — jamais au démarrage, où evaluer_licence() vient déjà de
+    tourner.
+
+    Ne touche à rien d'autre que ETAT_NORMAL : les autres états
+    (EXPIRE/REVOQUE/VERIFICATION_OBLIGATOIRE/ACTIVATION_REQUISE/...)
+    sont déjà déterminés par construction — jamais recalculés une
+    seconde fois pour rien, jamais rétrogradés.
+
+    Mêmes primitives EXACTEMENT que le repli hors ligne de
+    evaluer_licence() ci-dessus (_charger_etat_local, trusted_clock.
+    evaluer_horloge, license_token.extraire_licence) — aucune nouvelle
+    dépendance, aucun appel à verifier_en_ligne() ici (lui seul
+    déclenche un VRAI appel réseau, systématiquement, voir plus haut —
+    précisément ce qu'on veut éviter pour une licence encore valide).
+
+    Incertitude non résolue (jeton local illisible, horloge jugée non
+    fiable) : ne tranche JAMAIS silencieusement en faveur de l'accès —
+    bascule sur ETAT_VERIFICATION_OBLIGATOIRE, mécanisme déjà existant
+    (voir App.__init__), jamais un nouveau mécanisme parallèle."""
+    if decision.etat != ETAT_NORMAL:
+        return decision
+
+    etat_local = _charger_etat_local()
+    if etat_local is None or etat_local is _ACCES_TEMPORAIREMENT_INDISPONIBLE:
+        return DecisionLicence(
+            ETAT_VERIFICATION_OBLIGATOIRE, decision.cycle_id,
+            "Jeton local introuvable/illisible lors de la réévaluation avant "
+            "ouverture d'un tournoi — vérification en ligne nécessaire.",
+        )
+
+    resultat_horloge = trusted_clock.evaluer_horloge()
+    if resultat_horloge.etat != trusted_clock.ETAT_OK:
+        return DecisionLicence(
+            ETAT_VERIFICATION_OBLIGATOIRE, decision.cycle_id,
+            f"Horloge non fiable ({resultat_horloge.etat}) lors de la "
+            "réévaluation avant ouverture d'un tournoi — vérification en "
+            "ligne nécessaire.",
+        )
+
+    try:
+        cle_publique = _cle_publique_hex()
+        payload = license_token.extraire_licence(etat_local["jeton"], cle_publique)
+    except (RuntimeError, license_token.JetonInvalide):
+        return DecisionLicence(
+            ETAT_VERIFICATION_OBLIGATOIRE, decision.cycle_id,
+            "Jeton local illisible/invalide lors de la réévaluation avant "
+            "ouverture d'un tournoi — vérification en ligne nécessaire.",
+        )
+
+    date_expiration = date.fromisoformat(payload["date_expiration"])
+    aujourdhui_fiable = resultat_horloge.derniere_date_fiable.astimezone(timezone.utc).date()
+    if aujourdhui_fiable > date_expiration:
+        _amorcer_tolerance_si_nouveau_cycle(payload["id_jeton"])
+        return DecisionLicence(
+            ETAT_EXPIRE, payload["id_jeton"],
+            "Licence expirée (détectée lors de la réévaluation avant "
+            "ouverture d'un tournoi).",
+        )
+
+    return decision
+
+
 @dataclass
 class InformationsLicenceAffichage:
     """Instantané PUREMENT LOCAL des informations de licence v3, à

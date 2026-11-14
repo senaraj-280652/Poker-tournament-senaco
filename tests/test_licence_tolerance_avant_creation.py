@@ -37,6 +37,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,7 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main  # noqa: E402
 import license_client  # noqa: E402
+import license_token  # noqa: E402
 import session_tolerance  # noqa: E402
+import trusted_clock  # noqa: E402
 
 try:
     import tkinter as tk
@@ -203,12 +206,49 @@ class VerifierToleranceLogiqueTest(unittest.TestCase):
         self._tmp_dir = tempfile.TemporaryDirectory(prefix="senaco_tolerance_test_")
         self.addCleanup(self._tmp_dir.cleanup)
         self._tmp_tolerance = os.path.join(self._tmp_dir.name, "tolerance_sessions.json")
-        patcher = patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self._tmp_tolerance)
-        self.addCleanup(patcher.stop)
-        patcher.start()
-        env_patcher = patch.dict(os.environ, {main.POKER_TOURNAMENT_LICENSE_V3: "1"})
+        # Correctif du 2026-11-14 (reevaluer_expiration_locale) : une
+        # décision ETAT_NORMAL n'est plus un pur court-circuit — elle
+        # relit désormais le jeton local et l'horloge fiable (jamais le
+        # réseau). Isolés ici comme le reste, jamais les vrais fichiers
+        # de l'utilisateur.
+        self._tmp_licence = os.path.join(self._tmp_dir.name, "licence_v3.json")
+        self._tmp_horloge = os.path.join(self._tmp_dir.name, "horloge_fiable.json")
+        self.cle_privee_test, self.cle_publique_test = license_token.generer_cle_de_test()
+        patchers = [
+            patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self._tmp_tolerance),
+            patch.object(license_client, "LICENSE_STATE_FILE", self._tmp_licence),
+            patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self._tmp_horloge),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+        env_patcher = patch.dict(os.environ, {
+            main.POKER_TOURNAMENT_LICENSE_V3: "1",
+            license_client.ENV_CLE_PUBLIQUE: self.cle_publique_test,
+            license_client.ENV_URL_SERVEUR: "https://test.invalide/",
+        })
         self.addCleanup(env_patcher.stop)
         env_patcher.start()
+
+    def _ecrire_jeton_local_valide(self, cycle_id="cycle-1", jours_avant_expiration=30):
+        """Écrit un jeton local réellement valide pour `cycle_id`, avec
+        l'horloge fiable ancrée dans le passé (même principe que
+        LicenceDevientObsoletePendantUneLongueSessionTest, tests/
+        test_license_tolerance_tournament_opening.py) — jamais l'horloge
+        système réelle."""
+        expiration = (datetime.now(timezone.utc) + timedelta(days=jours_avant_expiration)).date().isoformat()
+        jeton = license_token.construire_jeton_licence({
+            "id_jeton": cycle_id,
+            "identifiant_machine": "TEST-TOLERANCE-AVANT-CREATION",
+            "type": "essai",
+            "date_debut": "2026-01-01",
+            "date_expiration": expiration,
+            "emis_le": "2026-01-01T00:00:00Z",
+        }, self.cle_privee_test)
+        license_client._enregistrer_etat_local(jeton, chemin=self._tmp_licence)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), chemin=self._tmp_horloge,
+        )
 
     def test_v3_desactivee_retourne_true_sans_rien_evaluer(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -226,6 +266,11 @@ class VerifierToleranceLogiqueTest(unittest.TestCase):
         self.assertTrue(resultat)
 
     def test_licence_normale_retourne_true_sans_dialogue(self):
+        # Correctif du 2026-11-14 : ETAT_NORMAL relit désormais le jeton
+        # local pour confirmer qu'il est TOUJOURS valide (voir
+        # reevaluer_expiration_locale) — fournir un vrai jeton valide,
+        # jamais une décision creuse sans état local correspondant.
+        self._ecrire_jeton_local_valide("cycle-1")
         self.app._decision_licence_v3 = license_client.DecisionLicence(
             license_client.ETAT_NORMAL, "cycle-1", "",
         )

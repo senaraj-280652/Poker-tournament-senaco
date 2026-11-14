@@ -10405,8 +10405,30 @@ class App(tk.Tk):
 
         import license_client  # import local — voir App.__init__
 
+        # Correctif du 2026-11-14 : `decision` ci-dessus peut dater du
+        # démarrage de CE processus, parfois plusieurs jours plus tôt
+        # (Senaco resté ouvert sans redémarrage) — jamais rafraîchie
+        # jusqu'ici. reevaluer_expiration_locale() ne fait RIEN (aucun
+        # coût, aucun réseau) pour tout autre état que ETAT_NORMAL ;
+        # pour ETAT_NORMAL, relit uniquement le jeton local et
+        # l'horloge fiable (toutes deux déjà purement locales) afin de
+        # détecter une expiration survenue depuis le démarrage, sans
+        # jamais appeler verifier_en_ligne(). Décision mise à jour en
+        # cache pour le reste de ce processus — même principe que
+        # App.__init__, "UNE SEULE réévaluation par tentative d'ouverture,
+        # jamais une par frame/clic".
+        decision = license_client.reevaluer_expiration_locale(decision)
+        self._decision_licence_v3 = decision
+
         if decision.etat == license_client.ETAT_REVOQUE:
             self._afficher_blocage_revocation_licence(parent_pour_messages)
+            return False
+        if decision.etat == license_client.ETAT_VERIFICATION_OBLIGATOIRE:
+            # Incertitude non résolue (jeton/horloge) détectée par la
+            # réévaluation ci-dessus — jamais un accès silencieux dans ce
+            # cas (demande explicite du 2026-11-14), même mécanisme déjà
+            # utilisé ailleurs pour ce même état.
+            self._afficher_blocage_verification_requise_licence(parent_pour_messages)
             return False
         if decision.etat != license_client.ETAT_EXPIRE:
             return True

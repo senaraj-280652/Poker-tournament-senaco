@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,7 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import main  # noqa: E402
 import license_client  # noqa: E402
+import license_token  # noqa: E402
 import session_tolerance  # noqa: E402
+import trusted_clock  # noqa: E402
 
 try:
     import tkinter as tk
@@ -82,10 +85,23 @@ class GardeDormantTest(unittest.TestCase):
 
 
 class MatriceGardeTest(unittest.TestCase):
+    """Teste la logique de DISPATCH à partir d'une décision déjà connue
+    (doublure directe — jamais de vrai App()). La réévaluation locale
+    elle-même (reevaluer_expiration_locale, correctif du 2026-11-14) a
+    sa propre classe dédiée ci-dessous
+    (LicenceDevientObsoletePendantUneLongueSessionTest) — neutralisée
+    ici en identité pour ne jamais faire dépendre ces tests, antérieurs
+    à ce correctif, d'un jeton local réel hors de propos pour eux."""
+
     def setUp(self):
         patcher = patch.dict(os.environ, {main.POKER_TOURNAMENT_LICENSE_V3: "1"})
         patcher.start()
         self.addCleanup(patcher.stop)
+        reeval_patcher = patch.object(
+            license_client, "reevaluer_expiration_locale", side_effect=lambda d: d,
+        )
+        reeval_patcher.start()
+        self.addCleanup(reeval_patcher.stop)
 
     def test_aucune_decision_encore_calculee_est_permissif(self):
         """Ne devrait normalement jamais arriver (le garde de démarrage
@@ -548,6 +564,233 @@ class _FakeAppAvecMethodesReelles:
 
     def _parent_vivant_ou_racine(self, parent):
         return main.App._parent_vivant_ou_racine(self, parent)
+
+
+class LicenceDevientObsoletePendantUneLongueSessionTest(unittest.TestCase):
+    """Défaut signalé le 2026-11-14 : self._decision_licence_v3 est
+    calculée UNE SEULE fois au démarrage (App.__init__) puis jamais
+    réévaluée. Si Senaco reste ouvert assez longtemps pour que la
+    licence réelle expire entre-temps, le garde d'ouverture de
+    tournoi continue de se fier à l'ancienne décision ETAT_NORMAL,
+    sans jamais déclencher la tolérance ni le moindre avertissement.
+
+    Horloge simulée via trusted_clock.initialiser_apres_verification_
+    en_ligne() — jamais l'horloge réelle du Mac/HP (demande explicite).
+    Comme _FakeApp ci-dessus : doublure directe de la méthode de
+    main.App, jamais de vrai App() ni de vraie fenêtre Tk."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="licence_longue_session_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.chemin_licence = os.path.join(self._tmp.name, "licence_v3.json")
+        self.chemin_horloge = os.path.join(self._tmp.name, "horloge_fiable.json")
+        self.chemin_tolerance = os.path.join(self._tmp.name, "tolerance_sessions.json")
+        self.cle_privee, self.cle_publique = license_token.generer_cle_de_test()
+
+        patchers = [
+            patch.object(license_client, "LICENSE_STATE_FILE", self.chemin_licence),
+            patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self.chemin_horloge),
+            patch.object(session_tolerance, "TOLERANCE_STATE_FILE", self.chemin_tolerance),
+            patch.dict(os.environ, {
+                main.POKER_TOURNAMENT_LICENSE_V3: "1",
+                license_client.ENV_CLE_PUBLIQUE: self.cle_publique,
+                license_client.ENV_URL_SERVEUR: "https://test.invalide/",
+            }),
+        ]
+        for p in patchers:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _creer_jeton_expire_hier(self):
+        """Jeton dont la date d'expiration est HIER par rapport à la
+        vraie date du jour (jamais l'horloge système modifiée — juste
+        une date choisie dans un jeton de test). L'horloge fiable est
+        ancrée loin dans le passé (2026-01-01) : evaluer_horloge()
+        avance toujours cette date vers max(ancienne, VRAI maintenant
+        système), donc le "maintenant" réellement utilisé reste celui
+        de la vraie exécution du test, jamais une valeur figée."""
+        hier = (date.today() - timedelta(days=1)).isoformat()
+        jeton = license_token.construire_jeton_licence({
+            "id_jeton": "cycle-longue-session",
+            "identifiant_machine": "TEST-LONGUE-SESSION",
+            "type": "essai",
+            "date_debut": "2026-01-01",
+            "date_expiration": hier,
+            "emis_le": "2026-01-01T00:00:00Z",
+        }, self.cle_privee)
+        license_client._enregistrer_etat_local(jeton, chemin=self.chemin_licence)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+
+    @patch.object(license_client, "verifier_en_ligne", return_value=None)
+    def test_une_reevaluation_fraiche_detecterait_correctement_lexpiration(self, _mock):
+        """Preuve que le mécanisme sous-jacent (license_client/trusted_
+        clock) fonctionne bel et bien — la « fraîcheur » manquante vient
+        exclusivement du cache dans main.App, jamais d'ici."""
+        self._creer_jeton_expire_hier()
+        decision = license_client.evaluer_licence()
+        self.assertEqual(decision.etat, license_client.ETAT_EXPIRE)
+
+    @patch.object(license_client, "verifier_en_ligne", return_value=None)
+    def test_decision_figee_au_demarrage_detecte_desormais_lexpiration_survenue_ensuite(self, _mock):
+        """Reproduit le scénario demandé le 2026-11-14 : Senaco démarre
+        avec une licence ENCORE valide (décision ETAT_NORMAL mise en
+        cache dans self._decision_licence_v3, comme le fait réellement
+        App.__init__), reste ouvert, la licence expire réellement
+        entre-temps, puis un nouveau tournoi est créé — sans jamais
+        redémarrer Senaco, donc sans jamais recalculer cette décision
+        via App.__init__.
+
+        CORRIGÉ le 2026-11-14 (license_client.reevaluer_expiration_
+        locale, appelée depuis le garde) : la première ouverture
+        suivant une expiration réelle déclenche désormais la tolérance
+        (avertissement rouge), jamais silencieuse."""
+        self._creer_jeton_expire_hier()
+        decision_figee_au_demarrage = license_client.DecisionLicence(
+            etat=license_client.ETAT_NORMAL, cycle_id="cycle-longue-session", message="",
+        )
+        fake = _FakeApp(decision=decision_figee_au_demarrage)
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin_tournoi = os.path.join(tmp, "tournoi.tournoi")
+            open(chemin_tournoi, "w").close()
+            resultat = main.App._verifier_tolerance_licence_avant_ouverture(
+                fake, chemin_tournoi, fake, date_session_connue=date.today().isoformat(),
+            )
+        self.assertTrue(resultat)  # 1re date tolérée : ouverture autorisée, avec avertissement
+        self.assertTrue(
+            fake.avertissements,
+            "aucun avertissement de tolérance déclenché alors que la licence "
+            "a réellement expiré hier",
+        )
+        # self._decision_licence_v3 doit rester rafraîchie (ETAT_EXPIRE)
+        # pour le reste du processus, jamais revenir à l'ancienne valeur.
+        self.assertEqual(fake._decision_licence_v3.etat, license_client.ETAT_EXPIRE)
+
+    @patch.object(license_client, "verifier_en_ligne", return_value=None)
+    def test_licence_encore_valide_reevaluee_najamais_de_message(self, _mock):
+        """Cas de référence : une licence réellement toujours valide ne
+        doit déclencher ni avertissement ni blocage après réévaluation —
+        seul le cas « expirée entre-temps » doit changer de comportement."""
+        demain = (date.today() + timedelta(days=30)).isoformat()
+        jeton = license_token.construire_jeton_licence({
+            "id_jeton": "cycle-toujours-valide",
+            "identifiant_machine": "TEST-LONGUE-SESSION",
+            "type": "essai",
+            "date_debut": "2026-01-01",
+            "date_expiration": demain,
+            "emis_le": "2026-01-01T00:00:00Z",
+        }, self.cle_privee)
+        license_client._enregistrer_etat_local(jeton, chemin=self.chemin_licence)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        decision_au_demarrage = license_client.DecisionLicence(
+            etat=license_client.ETAT_NORMAL, cycle_id="cycle-toujours-valide", message="",
+        )
+        fake = _FakeApp(decision=decision_au_demarrage)
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin_tournoi = os.path.join(tmp, "tournoi.tournoi")
+            open(chemin_tournoi, "w").close()
+            resultat = main.App._verifier_tolerance_licence_avant_ouverture(
+                fake, chemin_tournoi, fake, date_session_connue=date.today().isoformat(),
+            )
+        self.assertTrue(resultat)
+        self.assertEqual(fake.avertissements, [])
+        self.assertEqual(fake.blocages, [])
+        self.assertEqual(fake._decision_licence_v3.etat, license_client.ETAT_NORMAL)
+
+    def test_reevaluation_najamais_dappel_reseau_pour_licence_valide(self):
+        """Condition explicite du 2026-11-14 : aucune requête réseau
+        systématique pour une licence encore valide. verifier_en_ligne
+        n'est jamais défini ici (contrairement aux autres tests) — si la
+        réévaluation l'appelait, le test échouerait par AttributeError/
+        appel réel, pas seulement par une assertion de comptage."""
+        demain = (date.today() + timedelta(days=30)).isoformat()
+        jeton = license_token.construire_jeton_licence({
+            "id_jeton": "cycle-sans-reseau",
+            "identifiant_machine": "TEST-LONGUE-SESSION",
+            "type": "essai",
+            "date_debut": "2026-01-01",
+            "date_expiration": demain,
+            "emis_le": "2026-01-01T00:00:00Z",
+        }, self.cle_privee)
+        license_client._enregistrer_etat_local(jeton, chemin=self.chemin_licence)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        decision_au_demarrage = license_client.DecisionLicence(
+            etat=license_client.ETAT_NORMAL, cycle_id="cycle-sans-reseau", message="",
+        )
+        with patch.object(
+            license_client, "verifier_en_ligne",
+            side_effect=AssertionError("verifier_en_ligne ne doit jamais être appelée ici"),
+        ):
+            decision = license_client.reevaluer_expiration_locale(decision_au_demarrage)
+        self.assertEqual(decision.etat, license_client.ETAT_NORMAL)
+
+    def test_mesure_temps_reevaluation_locale(self):
+        """Mesure (indicative, pas une assertion stricte de performance)
+        du coût de la réévaluation locale ajoutée avant chaque ouverture —
+        doit rester de l'ordre de la milliseconde (lecture fichier +
+        vérification Ed25519 locale), jamais un appel réseau."""
+        import time as _time
+        demain = (date.today() + timedelta(days=30)).isoformat()
+        jeton = license_token.construire_jeton_licence({
+            "id_jeton": "cycle-timing",
+            "identifiant_machine": "TEST-LONGUE-SESSION",
+            "type": "essai",
+            "date_debut": "2026-01-01",
+            "date_expiration": demain,
+            "emis_le": "2026-01-01T00:00:00Z",
+        }, self.cle_privee)
+        license_client._enregistrer_etat_local(jeton, chemin=self.chemin_licence)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 1, 1, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        decision_au_demarrage = license_client.DecisionLicence(
+            etat=license_client.ETAT_NORMAL, cycle_id="cycle-timing", message="",
+        )
+        debut = _time.perf_counter()
+        for _ in range(50):
+            license_client.reevaluer_expiration_locale(decision_au_demarrage)
+        duree_moyenne_ms = (_time.perf_counter() - debut) / 50 * 1000
+        print(f"\n[timing] reevaluer_expiration_locale: {duree_moyenne_ms:.3f} ms/appel en moyenne")
+        self.assertLess(duree_moyenne_ms, 50, "coût local anormalement élevé (>50 ms/appel)")
+
+    @patch.object(license_client, "verifier_en_ligne", return_value=None)
+    def test_tolerance_deja_epuisee_bloque_meme_detectee_apres_coup(self, _mock):
+        """Vérifie, pour la tolérance ÉPUISÉE, que la détection tardive
+        (via reevaluer_expiration_locale) bloque bien — jamais une
+        permissivité accidentelle sous prétexte que l'expiration vient
+        d'être détectée seulement maintenant."""
+        self._creer_jeton_expire_hier()
+        # Deux dates de tolérance déjà consommées pour ce cycle, AVANT
+        # même que la réévaluation ne tourne — même mécanisme que
+        # test_deux_dates_distinctes_puis_blocage_a_la_troisieme.
+        session_tolerance.amorcer_ou_reinitialiser_tolerance(
+            "cycle-longue-session", chemin_etat=self.chemin_tolerance,
+        )
+        for jour_deja_tolere in ("2026-11-10", "2026-11-11"):
+            session_tolerance.evaluer_ouverture(
+                "/tmp/x.tournoi", True, "cycle-longue-session",
+                lire_date_fn=lambda _c, _d=jour_deja_tolere: _d,
+                chemin_etat=self.chemin_tolerance,
+            )
+
+        decision_figee_au_demarrage = license_client.DecisionLicence(
+            etat=license_client.ETAT_NORMAL, cycle_id="cycle-longue-session", message="",
+        )
+        fake = _FakeApp(decision=decision_figee_au_demarrage)
+        with tempfile.TemporaryDirectory() as tmp:
+            chemin_tournoi = os.path.join(tmp, "tournoi.tournoi")
+            open(chemin_tournoi, "w").close()
+            resultat = main.App._verifier_tolerance_licence_avant_ouverture(
+                fake, chemin_tournoi, fake, date_session_connue=date.today().isoformat(),
+            )
+        self.assertFalse(resultat)
+        self.assertTrue(fake.blocages)
+        self.assertEqual(fake.avertissements, [])
 
 
 if __name__ == "__main__":
