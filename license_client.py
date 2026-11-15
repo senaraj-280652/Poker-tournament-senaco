@@ -122,6 +122,38 @@ DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS = 200 * 1024
 ENV_URL_SERVEUR = "POKER_TOURNAMENT_LICENSE_SERVER_URL"
 ENV_CLE_PUBLIQUE = "POKER_TOURNAMENT_LICENSE_PUBLIC_KEY_HEX"
 
+# Détection de build TEST dupliquée ICI (même marqueur, même logique que
+# main.py._is_test_build() et device_secret.py._est_un_build_test()) —
+# jamais une dépendance vers main.py : importer main depuis ce module
+# créerait une dépendance circulaire (main.py importe déjà license_
+# client.py). Demande du 2026-11-15 (lancement direct depuis le
+# raccourci, sans PowerShell) : un build TEST connaît par défaut
+# l'adresse et la clé du serveur de test local, SANS JAMAIS permettre
+# l'inverse (un build de production ne peut structurellement jamais
+# porter ce marqueur, voir windows/poker_tournament.spec/macos/
+# poker_tournament.spec — testé explicitement).
+_TEST_BUILD_MARKER_FILENAME = "TEST_BUILD_MARKER"
+
+
+def _est_un_build_test():
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.exists(os.path.join(base, _TEST_BUILD_MARKER_FILENAME))
+
+
+# Valeurs par défaut RÉSERVÉES AUX BUILDS TEST (jamais production, voir
+# _url_serveur/_cle_publique_hex ci-dessous) — utilisées UNIQUEMENT si
+# _est_un_build_test() est vrai ET qu'aucune variable d'environnement
+# ne les définit déjà (priorité ABSOLUE aux variables, pour continuer à
+# pouvoir pointer un build TEST vers un autre serveur ponctuellement,
+# sans rien reconstruire). Clé PUBLIQUE uniquement, jamais la clé
+# privée (qui n'existe que dans prive/config/config.php, sur le Mac,
+# jamais dans ce dépôt) ; adresse du serveur de test local, jamais une
+# adresse de production (qui n'existe pas encore, voir l'analyse
+# publiée dans l'issue GitHub #9). À mettre à jour manuellement si le
+# serveur de test ou sa clé sont régénérés.
+URL_SERVEUR_TEST_PAR_DEFAUT = "http://192.168.0.164:8932"
+CLE_PUBLIQUE_TEST_PAR_DEFAUT = "8376a8496085be596836c15ffc6f5617fb5c536d2376fc30024c7027c96031be"
+
 TIMEOUT_RESEAU_SECONDES = 5.0
 
 # Correctif du 2026-11-11 : nombre de tentatives SUPPLÉMENTAIRES (donc 4
@@ -260,20 +292,24 @@ def _verrou_verification(chemin=None, timeout=None):
 
 def _url_serveur():
     url = os.environ.get(ENV_URL_SERVEUR)
-    if not url:
-        raise RuntimeError(
-            f"{ENV_URL_SERVEUR} non défini — aucun serveur de licences configuré."
-        )
-    return url.rstrip("/")
+    if url:
+        return url.rstrip("/")
+    if _est_un_build_test():
+        return URL_SERVEUR_TEST_PAR_DEFAUT
+    raise RuntimeError(
+        f"{ENV_URL_SERVEUR} non défini — aucun serveur de licences configuré."
+    )
 
 
 def _cle_publique_hex():
     cle = os.environ.get(ENV_CLE_PUBLIQUE)
-    if not cle:
-        raise RuntimeError(
-            f"{ENV_CLE_PUBLIQUE} non défini — impossible de vérifier un jeton de licence."
-        )
-    return cle
+    if cle:
+        return cle
+    if _est_un_build_test():
+        return CLE_PUBLIQUE_TEST_PAR_DEFAUT
+    raise RuntimeError(
+        f"{ENV_CLE_PUBLIQUE} non défini — impossible de vérifier un jeton de licence."
+    )
 
 
 def _faire_pivoter_journal_si_trop_grand(chemin_journal, taille_max):

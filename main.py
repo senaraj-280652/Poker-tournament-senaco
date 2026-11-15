@@ -9139,7 +9139,14 @@ class App(tk.Tk):
         #   (license.py) : sans effet tant que le logiciel tourne
         #   depuis les sources (aucun secret injecté) ; actif uniquement
         #   sur un exécutable compilé pour distribution.
-        if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+        # Correctif du 2026-11-15 (lancement direct depuis le raccourci,
+        # sans PowerShell) : un build TEST active V3 automatiquement,
+        # même sans POKER_TOURNAMENT_LICENSE_V3 — voir license_client.
+        # _est_un_build_test()/_url_serveur()/_cle_publique_hex(), qui
+        # appliquent alors leurs propres valeurs par défaut réservées au
+        # TEST. Un build de production, lui, continue d'exiger cette
+        # variable explicitement (comportement strictement inchangé).
+        if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build():
             # Import local, DÉLIBÉRÉMENT jamais en tête de fichier :
             # license_client (donc pynacl, voir requirements.txt)
             # ne doit être une dépendance RÉELLE que si cette variable
@@ -10397,7 +10404,11 @@ class App(tk.Tk):
         après avoir affiché un avertissement rouge), False si elle
         doit être annulée (message déjà affiché, rien n'a été modifié
         sur le fichier lui-même)."""
-        if not os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+        # Correctif du 2026-11-15 : même condition qu'App.__init__ (voir
+        # plus haut) — un build TEST reste soumis à ce garde même sans
+        # la variable d'environnement, sinon V3 serait actif au
+        # démarrage mais jamais appliqué à l'ouverture d'un tournoi.
+        if not (os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build()):
             return True
         decision = getattr(self, "_decision_licence_v3", None)
         if decision is None:
@@ -11458,7 +11469,8 @@ class App(tk.Tk):
         nom_club = export_prefs.load_value("club_name", "") or "(non renseigné)"
         ligne("Club :", nom_club)
 
-        if not os.environ.get(POKER_TOURNAMENT_LICENSE_V3):
+        # Correctif du 2026-11-15 : même condition qu'App.__init__.
+        if not (os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build()):
             # Système v3 désactivé : seules les informations fiables de
             # l'ancien système (license.py), jamais de champ v3 inventé.
             info = licensing.license_info()

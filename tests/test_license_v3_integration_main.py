@@ -24,12 +24,16 @@ class GatingLicenceV3Test(unittest.TestCase):
         self.source = _lire_main()
 
     def test_les_deux_mecanismes_sont_un_seul_ifelif(self):
-        """`if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):` doit être
-        immédiatement suivi, dans le MÊME bloc conditionnel, d'un
+        """`if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) [...]:` doit
+        être immédiatement suivi, dans le MÊME bloc conditionnel, d'un
         `elif not licensing.is_licensed():` — jamais deux `if` séparés
-        qui pourraient, par erreur future, s'exécuter tous les deux."""
+        qui pourraient, par erreur future, s'exécuter tous les deux.
+        Le `[...]` tolère l'ajout du 2026-11-15 (` or _is_test_build()`)
+        sans affaiblir la vérification : la condition complète doit
+        toujours commencer EXACTEMENT par `os.environ.get(POKER_
+        TOURNAMENT_LICENSE_V3)`, jamais autre chose en premier."""
         motif = re.search(
-            r"if os\.environ\.get\(POKER_TOURNAMENT_LICENSE_V3\):.*?"
+            r"if os\.environ\.get\(POKER_TOURNAMENT_LICENSE_V3\)[^:\n]*:.*?"
             r"elif not licensing\.is_licensed\(\):",
             self.source, re.DOTALL,
         )
@@ -37,6 +41,17 @@ class GatingLicenceV3Test(unittest.TestCase):
             motif,
             "Le nouveau et l'ancien mécanisme de licence doivent être "
             "les branches d'un seul if/elif, pas deux `if` indépendants.",
+        )
+
+    def test_condition_v3_inclut_desormais_is_test_build(self):
+        """Correctif du 2026-11-15 (lancement direct depuis le raccourci,
+        sans PowerShell) : un build TEST active V3 même sans la
+        variable d'environnement — vérifié ici au niveau du source,
+        complément du test ci-dessus (qui tolère mais n'exige pas cet
+        ajout)."""
+        self.assertIn(
+            "if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build():",
+            self.source,
         )
 
     def test_ancien_mecanisme_toujours_present_et_inchange(self):
@@ -56,7 +71,7 @@ class GatingLicenceV3Test(unittest.TestCase):
         OBLIGATOIRE doivent pouvoir empêcher le démarrage dans ce lot
         (la tolérance de session reste hors périmètre, voir le compte
         rendu)."""
-        debut = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):")
+        debut = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build():")
         fin = self.source.index("elif not licensing.is_licensed():")
         bloc = self.source[debut:fin]
         self.assertNotIn("ETAT_NORMAL", bloc)
@@ -97,7 +112,7 @@ class GardeDestructionRacineTest(unittest.TestCase):
         self.source = _lire_main()
 
     def _bloc_init(self):
-        debut = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):")
+        debut = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build():")
         fin = self.source.index("# Lobby autonome (demande du 2026-10-31")
         return self.source[debut:fin]
 
@@ -125,7 +140,7 @@ class GardeDestructionRacineTest(unittest.TestCase):
 
     def test_drapeau_initialise_a_false_au_debut_de_init(self):
         debut = self.source.index("def __init__(self, open_path=None,")
-        fin = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3):")
+        fin = self.source.index("if os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build():")
         corps = self.source[debut:fin]
         self.assertIn("self._fermee_pendant_init = False", corps)
 

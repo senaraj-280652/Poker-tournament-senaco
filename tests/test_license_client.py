@@ -1199,5 +1199,62 @@ class IntegrationStructurelleTest(unittest.TestCase):
         self.assertIn("POKER_TOURNAMENT_LICENSE_V3", contenu)
 
 
+class ValeursParDefautBuildTestTest(unittest.TestCase):
+    """Correctif du 2026-11-15 (lancement direct depuis le raccourci,
+    sans PowerShell) : _url_serveur()/_cle_publique_hex() se replient
+    sur des valeurs réservées au build TEST — jamais la production, qui
+    n'a jamais ce marqueur (voir l'analyse publiée dans l'issue GitHub
+    #9 pour le raisonnement de sûreté)."""
+
+    def setUp(self):
+        env_patcher = patch.dict(os.environ, {}, clear=True)
+        env_patcher.start()
+        self.addCleanup(env_patcher.stop)
+
+    def test_url_par_defaut_utilisee_si_build_test_sans_variable(self):
+        with patch.object(lc, "_est_un_build_test", return_value=True):
+            self.assertEqual(lc._url_serveur(), lc.URL_SERVEUR_TEST_PAR_DEFAUT)
+
+    def test_cle_par_defaut_utilisee_si_build_test_sans_variable(self):
+        with patch.object(lc, "_est_un_build_test", return_value=True):
+            self.assertEqual(lc._cle_publique_hex(), lc.CLE_PUBLIQUE_TEST_PAR_DEFAUT)
+
+    def test_variable_environnement_toujours_prioritaire_sur_le_defaut(self):
+        """Condition explicite du 2026-11-15 : pouvoir pointer un build
+        TEST vers un autre serveur ponctuellement, sans reconstruire."""
+        os.environ[lc.ENV_URL_SERVEUR] = "https://autre-serveur-de-test.invalide/"
+        os.environ[lc.ENV_CLE_PUBLIQUE] = "0" * 64
+        with patch.object(lc, "_est_un_build_test", return_value=True):
+            self.assertEqual(lc._url_serveur(), "https://autre-serveur-de-test.invalide")
+            self.assertEqual(lc._cle_publique_hex(), "0" * 64)
+
+    def test_build_non_test_sans_variable_leve_toujours_une_erreur(self):
+        """Comportement de production strictement inchangé : aucun
+        repli, jamais."""
+        with patch.object(lc, "_est_un_build_test", return_value=False):
+            with self.assertRaises(RuntimeError):
+                lc._url_serveur()
+            with self.assertRaises(RuntimeError):
+                lc._cle_publique_hex()
+
+    def test_detection_sappuie_sur_meipass_jamais_sur_une_variable(self):
+        """_est_un_build_test() (comme device_secret._est_un_build_test
+        et main._is_test_build) ne dépend d'AUCUNE variable
+        d'environnement — propriété de l'exécutable lui-même, donc
+        héritée automatiquement par tout processus enfant, même lancé
+        différemment du parent."""
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_test_") as d:
+            open(os.path.join(d, "TEST_BUILD_MARKER"), "w").close()
+            with patch.object(lc.sys, "_MEIPASS", d, create=True):
+                self.assertTrue(lc._est_un_build_test())
+
+    def test_faux_si_meipass_sans_marqueur(self):
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="fake_meipass_prod_") as d:
+            with patch.object(lc.sys, "_MEIPASS", d, create=True):
+                self.assertFalse(lc._est_un_build_test())
+
+
 if __name__ == "__main__":
     unittest.main()
