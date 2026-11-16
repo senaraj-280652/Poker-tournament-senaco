@@ -722,6 +722,33 @@ class VerifierEnLigneTest(EnvironnementTestCase):
             self.assertIsNone(resultat)
             mock_post.assert_not_called()
 
+    def test_sans_secret_local_journalise_un_diagnostic_sans_appel_reseau(self):
+        """Correctif du 2026-11-16 (issue GitHub n°9) : ce cas précis —
+        secret d'appareil introuvable sous device_secret.NOM_SERVICE —
+        ne laissait AUCUNE trace locale avant ce correctif, ce qui avait
+        rendu le diagnostic de la licence V3 du HP particulièrement long
+        (plusieurs jours de recoupement de journaux). Vérifie les trois
+        exigences ensemble : le diagnostic est écrit, le comportement
+        (repli hors-ligne silencieux, aucun appel réseau) est strictement
+        inchangé."""
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        del self._secrets_locaux[IDENTIFIANT_MACHINE_TEST]
+        with patch.object(lc, "_post_json") as mock_post:
+            resultat = lc.verifier_en_ligne()
+            self.assertIsNone(resultat)
+            mock_post.assert_not_called()
+
+        with open(self.chemin_diagnostic, "r", encoding="utf-8") as f:
+            contenu_journal = f.read()
+        self.assertIn("secret_appareil_absent", contenu_journal)
+        self.assertIn(IDENTIFIANT_MACHINE_TEST, contenu_journal)
+        self.assertIn(f"nom_service_attendu={lc.device_secret.NOM_SERVICE!r}", contenu_journal)
+        # Garde-fou supplémentaire (demande explicite : jamais de secret
+        # dans ce journal) : aucune valeur de secret de test utilisée
+        # ailleurs dans cette suite ne doit jamais s'y retrouver.
+        self.assertNotIn("0" * 64, contenu_journal)
+
     @patch.object(lc, "_post_json")
     def test_secret_local_est_transmis_au_serveur(self, mock_post):
         jeton = _jeton_test(self.cle_privee)

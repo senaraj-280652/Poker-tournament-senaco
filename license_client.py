@@ -366,6 +366,39 @@ def _journaliser_diagnostic_chargement(chemin, raison, detail, chemin_journal=No
         pass
 
 
+def _journaliser_diagnostic_secret_absent(identifiant_machine, chemin_journal=None, chemin_journal_secours=None):
+    """Consigne pourquoi _verifier_en_ligne_sous_verrou() s'est replié
+    hors ligne SANS la moindre requête réseau : aucun secret d'appareil
+    trouvé sous device_secret.NOM_SERVICE pour cet identifiant_machine
+    (voir le compte-rendu du 2026-11-16, issue GitHub n°9 — c'est
+    exactement ce silence, non journalisé jusqu'ici, qui a rendu le
+    diagnostic de la licence V3 du HP aussi long).
+
+    JAMAIS le secret lui-même (il est par définition absent/illisible
+    ici, il n'y a rien à enregistrer de sensible) — uniquement
+    l'identifiant de machine (déjà affiché tel quel dans l'interface et
+    dans le Coffre/Trousseau du système, jamais un secret) et le nom de
+    service attendu (une constante publique du code, pas une valeur
+    secrète). Même garantie de ne jamais échouer et même repli vers le
+    journal de secours que _journaliser_diagnostic_chargement ci-dessus."""
+    chemin_journal = chemin_journal or LICENSE_DIAGNOSTIC_LOG_FILE
+    chemin_journal_secours = chemin_journal_secours or LICENSE_DIAGNOSTIC_LOG_FALLBACK_FILE
+    ligne = (
+        f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} "
+        f"secret_appareil_absent identifiant_machine={identifiant_machine!r} "
+        f"nom_service_attendu={device_secret.NOM_SERVICE!r}\n"
+    )
+    try:
+        _ecrire_ligne_journal(chemin_journal, ligne, DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS)
+        return
+    except OSError:
+        pass
+    try:
+        _ecrire_ligne_journal(chemin_journal_secours, ligne, DIAGNOSTIC_LOG_TAILLE_MAX_OCTETS)
+    except OSError:
+        pass
+
+
 def _charger_etat_local(chemin=None, tentatives_supplementaires=None, delai_secondes=None):
     """Lit et valide LICENSE_STATE_FILE. Renvoie le dict validé en cas de
     succès, None si la licence est GENUINEMENT absente ou son contenu
@@ -665,6 +698,7 @@ def _verifier_en_ligne_sous_verrou():
     identifiant_machine = payload_courant["identifiant_machine"]
     secret_local = device_secret.lire_secret_local(identifiant_machine)
     if not secret_local:
+        _journaliser_diagnostic_secret_absent(identifiant_machine)
         return None
 
     jeton_tentative = _jeton_tentative_en_attente()
