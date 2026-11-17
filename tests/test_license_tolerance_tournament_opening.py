@@ -51,6 +51,15 @@ class _FakeApp:
         self.blocages_revocation = []
         self.blocages_verification_requise = []
 
+    def _appliquer_resultats_verification_v3_en_attente(self):
+        # Correctif du 2026-11-17 : _verifier_tolerance_licence_avant_
+        # ouverture() appelle désormais ceci avant de lire self.
+        # _decision_licence_v3 (course réseau/ouverture) — doublure
+        # directe sans file d'attente réelle, donc rien à appliquer
+        # (comportement identique à la vraie méthode quand self.
+        # _verification_v3_file_attente est absente/vide).
+        pass
+
     def _afficher_avertissement_licence(self, parent):
         self.avertissements.append(parent)
 

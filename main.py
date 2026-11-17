@@ -1230,6 +1230,18 @@ POKER_TOURNAMENT_LOBBY_STANDALONE = "POKER_TOURNAMENT_LOBBY_STANDALONE"
 # tolérance de session dans le flux d'ouverture de tournoi).
 POKER_TOURNAMENT_LICENSE_V3 = "POKER_TOURNAMENT_LICENSE_V3"
 
+# Correctif du 2026-11-17 (règles de vérification de licence V3,
+# issue GitHub n°9) : fréquence à laquelle App._planifier_sondage_
+# verification_v3() se réveille pour vérifier si 24h se sont écoulées
+# depuis la dernière confirmation en ligne connue (license_client.
+# verification_periodique_necessaire()) — jamais un unique self.after()
+# programmé 24h à l'avance, qui empêcherait ce processus de profiter
+# d'une confirmation obtenue entretemps par un AUTRE processus Senaco
+# (Bienvenue/Lobby/tournoi, voir ce même correctif). Un sondage local
+# (lecture d'un petit fichier JSON, aucun réseau) toutes les 20 minutes
+# est négligeable, bien loin de justifier un intervalle plus long.
+_SONDAGE_VERIFICATION_V3_INTERVALLE_MS = 20 * 60 * 1000
+
 
 def spawn_app_process(extra_args=None, internal_menu_child=False, lobby_standalone=False):
     """Lance une nouvelle instance indépendante de l'application (autre
@@ -9158,7 +9170,33 @@ class App(tk.Tk):
             # suite de tests complète (processus enfants réels) avant
             # tout déploiement.
             import license_client
-            decision = license_client.evaluer_licence()
+            # Correctif du 2026-11-17 (règles de vérification de licence
+            # V3, issue GitHub n°9, règles 1 et 5) : évaluer_licence_
+            # sans_reseau() ne tente JAMAIS verifier_en_ligne() — le menu
+            # principal peut donc s'afficher immédiatement avec cette
+            # décision locale déjà fiable (le même repli qu'une coupure
+            # réseau réelle), sans attendre la moindre réponse serveur.
+            # La vérification en ligne elle-même est lancée en tâche de
+            # fond juste plus bas (_lancer_verification_v3_en_arriere_
+            # plan), jamais sur ce thread.
+            decision = license_client.evaluer_licence_sans_reseau()
+            verification_en_ligne_deja_tentee = False
+            if decision.etat in (
+                license_client.ETAT_VERIFICATION_OBLIGATOIRE,
+                license_client.ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE,
+            ):
+                # Ces deux états signifient que le repli LOCAL lui-même
+                # est inexploitable (jeton/horloge locaux illisibles) —
+                # rien de fiable à afficher pendant ce temps de toute
+                # façon, donc aucune perte à retenter ici, de façon
+                # synchrone, la matrice complète (qui tente, elle,
+                # verifier_en_ligne() en premier) : comportement
+                # RIGOUREUSEMENT inchangé par rapport à avant ce
+                # correctif pour ces deux cas précis — une connexion
+                # disponible peut encore les résoudre (jeton secouru par
+                # le serveur, verrou transitoire qui se libère).
+                decision = license_client.evaluer_licence()
+                verification_en_ligne_deja_tentee = True
             if decision.etat == license_client.ETAT_ACTIVATION_REQUISE:
                 dialogue_activation = ActivationEnLigneDialog(self)
                 if not dialogue_activation.activated:
@@ -9172,6 +9210,7 @@ class App(tk.Tk):
                 # processus (voir _verifier_tolerance_licence_avant_
                 # ouverture, qui s'appuie dessus).
                 decision = dialogue_activation.decision
+                verification_en_ligne_deja_tentee = True
             elif decision.etat == license_client.ETAT_VERIFICATION_OBLIGATOIRE:
                 messagebox.showerror(
                     "Vérification requise",
@@ -9201,6 +9240,24 @@ class App(tk.Tk):
             # vérification/activation par lancement, jamais une par
             # tournoi ouvert.
             self._decision_licence_v3 = decision
+            # Correctif du 2026-11-17 : file d'attente thread-safe pour
+            # le résultat de la vérification en ligne en tâche de fond
+            # (démarrage ET sondage périodique ci-dessous) — jamais
+            # traitée ailleurs que par _appliquer_resultats_verification_
+            # v3_en_attente(), toujours depuis ce thread principal.
+            self._verification_v3_file_attente = queue.Queue()
+            if not verification_en_ligne_deja_tentee:
+                self._lancer_verification_v3_en_arriere_plan()
+            # Minuteur périodique (règle 2, "toutes les 24h tant que
+            # Senaco reste ouvert") — premier sondage dans _SONDAGE_
+            # VERIFICATION_V3_INTERVALLE_MS, jamais immédiatement (la
+            # vérification de démarrage ci-dessus vient potentiellement
+            # d'avoir lieu à l'instant, inutile de la dupliquer tout de
+            # suite). Se replanifie lui-même indéfiniment — voir
+            # _planifier_sondage_verification_v3, qui s'arrête de
+            # lui-même (winfo_exists()) sans annulation explicite
+            # nécessaire à la fermeture de cette fenêtre.
+            self.after(_SONDAGE_VERIFICATION_V3_INTERVALLE_MS, self._planifier_sondage_verification_v3)
         elif not licensing.is_licensed():
             if not ActivationDialog(self).activated:
                 self._detruire_racine_en_securite()
@@ -10345,6 +10402,62 @@ class App(tk.Tk):
             self._open_basic_settings_dialog(win)
         return False
 
+    def _lancer_verification_v3_en_arriere_plan(self):
+        """Correctif du 2026-11-17 (règles 1 et 5) : lance license_
+        client.verifier_en_ligne() dans un thread démon séparé, jamais
+        sur ce thread (Tkinter) — le menu principal ne doit jamais
+        attendre une éventuelle lenteur réseau. Le résultat est déposé
+        sur self._verification_v3_file_attente, consommé uniquement
+        par _appliquer_resultats_verification_v3_en_attente() ci-dessous
+        (toujours depuis ce thread principal, jamais depuis le thread
+        d'arrière-plan lui-même)."""
+        import license_client  # import local — voir App.__init__
+        license_client.demarrer_verification_en_arriere_plan(self._verification_v3_file_attente)
+
+    def _appliquer_resultats_verification_v3_en_attente(self):
+        """Consomme la file d'attente de vérification en ligne et met à
+        jour self._decision_licence_v3 en conséquence (ne fait rien si
+        rien n'attend, ou si le seul résultat en attente est un échec
+        réseau — voir license_client.appliquer_resultats_verification_
+        en_attente, où vit toute la logique réellement testée). Appelée
+        à la fois par le sondage périodique ci-dessous ET juste avant
+        toute décision d'ouverture de tournoi (voir _verifier_tolerance_
+        licence_avant_ouverture) — c'est cette seconde invocation qui
+        garantit qu'aucune décision de blocage déjà reçue du serveur ne
+        peut jamais être ignorée à cause d'une course avec le réseau
+        (règle 1, demande explicite du 2026-11-17)."""
+        import license_client  # import local — voir App.__init__
+        file_attente = getattr(self, "_verification_v3_file_attente", None)
+        if file_attente is None:
+            return
+        self._decision_licence_v3 = license_client.appliquer_resultats_verification_en_attente(
+            self._decision_licence_v3, file_attente,
+        )
+
+    def _planifier_sondage_verification_v3(self):
+        """Minuteur périodique (règle 2, "toutes les 24h tant que
+        Senaco reste ouvert") — se réveille toutes les _SONDAGE_
+        VERIFICATION_V3_INTERVALLE_MS (jamais un seul self.after(24h) :
+        voir license_client.verification_periodique_necessaire(), qui
+        s'appuie sur un horodatage PARTAGÉ entre tous les processus
+        Senaco de cette machine, pas un compteur propre à ce seul
+        processus — "éviter les vérifications multiples provenant des
+        différents processus", demande explicite du 2026-11-17).
+
+        S'arrête de lui-même dès que cette fenêtre n'existe plus
+        (winfo_exists(), même principe déjà utilisé ailleurs dans ce
+        fichier pour des boucles self.after() récurrentes, voir par
+        exemple App._tick_countdown) — aucune annulation explicite
+        nécessaire à la fermeture ("fermeture propre des tâches de
+        vérification", demande explicite du 2026-11-17)."""
+        if not self.winfo_exists():
+            return
+        self._appliquer_resultats_verification_v3_en_attente()
+        import license_client  # import local — voir App.__init__
+        if license_client.verification_periodique_necessaire():
+            self._lancer_verification_v3_en_arriere_plan()
+        self.after(_SONDAGE_VERIFICATION_V3_INTERVALLE_MS, self._planifier_sondage_verification_v3)
+
     def _verifier_tolerance_licence_avant_ouverture(
         self, chemin_tournoi, parent_pour_messages, date_session_connue=None,
     ):
@@ -10410,6 +10523,14 @@ class App(tk.Tk):
         # démarrage mais jamais appliqué à l'ouverture d'un tournoi.
         if not (os.environ.get(POKER_TOURNAMENT_LICENSE_V3) or _is_test_build()):
             return True
+        # Correctif du 2026-11-17 (règle 1, "aucune décision de blocage
+        # reçue ne doit pouvoir être ignorée") : applique D'ABORD tout
+        # résultat de vérification en ligne déjà arrivé en tâche de
+        # fond mais pas encore consommé par le sondage périodique
+        # (course explicite entre le réseau et l'ouverture d'un
+        # tournoi) — AVANT de lire self._decision_licence_v3 juste en
+        # dessous, jamais après.
+        self._appliquer_resultats_verification_v3_en_attente()
         decision = getattr(self, "_decision_licence_v3", None)
         if decision is None:
             return True
@@ -11483,6 +11604,14 @@ class App(tk.Tk):
             ).pack(anchor="w", pady=(10, 0))
         else:
             import license_client  # import local — voir App.__init__ pour l'explication complète
+            # Correctif du 2026-11-17 : affiche la décision la plus
+            # fraîche possible — applique d'abord un éventuel résultat
+            # de vérification en ligne déjà arrivé en tâche de fond
+            # (même geste que _verifier_tolerance_licence_avant_
+            # ouverture, jamais indispensable ici puisque cette fenêtre
+            # est purement informative, mais évite d'afficher un statut
+            # périmé sans raison).
+            self._appliquer_resultats_verification_v3_en_attente()
             decision = getattr(self, "_decision_licence_v3", None)
             infos = license_client.obtenir_informations_affichage(decision)
 

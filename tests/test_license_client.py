@@ -11,9 +11,11 @@ module lui-même, jamais l'intégration dans l'application (voir le test
 structurel en fin de fichier)."""
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -1105,6 +1107,259 @@ class MatriceDecisionTest(EnvironnementTestCase):
         except Exception as e:  # pragma: no cover
             self.fail(f"evaluer_licence() a levé une exception : {e}")
         self.assertEqual(decision.etat, lc.ETAT_VERIFICATION_OBLIGATOIRE)
+
+
+class EvaluerLicenceSansReseauTest(EnvironnementTestCase):
+    """Correctif du 2026-11-17 (règle « vérification systématique au
+    démarrage, sans jamais bloquer l'affichage du menu principal ») :
+    evaluer_licence_sans_reseau() doit produire EXACTEMENT la même
+    matrice de décision que le repli hors ligne de evaluer_licence(),
+    mais sans jamais tenter verifier_en_ligne() — même en cas de
+    démarrage avec Internet disponible (règle 1, test ci-dessous) ou
+    serveur lent/inaccessible (règle 5) : aucun de ces cas ne doit
+    jamais retarder cette fonction."""
+
+    def test_aucun_etat_local_demande_activation_sans_appel_reseau(self):
+        with patch.object(lc, "verifier_en_ligne") as mock_verifier:
+            decision = lc.evaluer_licence_sans_reseau()
+            mock_verifier.assert_not_called()
+        self.assertEqual(decision.etat, lc.ETAT_ACTIVATION_REQUISE)
+
+    def test_valide_est_normal_meme_si_internet_disponible(self):
+        """Démarrage avec Internet disponible (règle 1) : la vérification
+        en ligne existe, mais evaluer_licence_sans_reseau() ne doit
+        jamais la déclencher — c'est tout l'objet de cette fonction."""
+        jeton = _jeton_test(self.cle_privee, date_expiration="2099-01-01")
+        self._ecrire_etat_local(jeton)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 11, 2, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        with patch.object(lc, "verifier_en_ligne") as mock_verifier:
+            decision = lc.evaluer_licence_sans_reseau()
+            mock_verifier.assert_not_called()
+        self.assertEqual(decision.etat, lc.ETAT_NORMAL)
+
+    def test_expiree_localement_est_expire_sans_appel_reseau(self):
+        jeton = _jeton_test(self.cle_privee, date_expiration="2020-01-01")
+        self._ecrire_etat_local(jeton)
+        trusted_clock.initialiser_apres_verification_en_ligne(
+            datetime(2026, 11, 2, tzinfo=timezone.utc), chemin=self.chemin_horloge,
+        )
+        with patch.object(lc, "verifier_en_ligne") as mock_verifier:
+            decision = lc.evaluer_licence_sans_reseau()
+            mock_verifier.assert_not_called()
+        self.assertEqual(decision.etat, lc.ETAT_EXPIRE)
+
+    def test_horloge_indeterminee_exige_verification_sans_appel_reseau(self):
+        jeton = _jeton_test(self.cle_privee)
+        self._ecrire_etat_local(jeton)
+        with patch.object(lc, "verifier_en_ligne") as mock_verifier:
+            decision = lc.evaluer_licence_sans_reseau()
+            mock_verifier.assert_not_called()
+        self.assertEqual(decision.etat, lc.ETAT_VERIFICATION_OBLIGATOIRE)
+
+    def test_lecture_temporairement_indisponible_sans_appel_reseau(self):
+        with patch.object(lc, "_charger_etat_local", return_value=lc._ACCES_TEMPORAIREMENT_INDISPONIBLE):
+            with patch.object(lc, "verifier_en_ligne") as mock_verifier:
+                decision = lc.evaluer_licence_sans_reseau()
+                mock_verifier.assert_not_called()
+        self.assertEqual(decision.etat, lc.ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE)
+
+
+class DecisionDepuisReponseServeurTest(EnvironnementTestCase):
+    """decision_depuis_reponse_serveur() — factorisée le 2026-11-17 pour
+    être partagée entre le chemin synchrone (evaluer_licence) et le
+    chemin asynchrone (appliquer_resultats_verification_en_attente,
+    testé plus bas). Couvre directement règle 4 du cahier des charges
+    du 2026-11-17 : licence active, expirée ou révoquée."""
+
+    def test_licence_active_est_normal(self):
+        jeton = _jeton_test(self.cle_privee)
+        reponse = {
+            "jeton": jeton, "revoque": False,
+            "licence": {"statut": "active", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        decision = lc.decision_depuis_reponse_serveur(reponse)
+        self.assertEqual(decision.etat, lc.ETAT_NORMAL)
+        self.assertEqual(decision.cycle_id, "cycle-test-1")
+
+    def test_licence_expiree_est_expire_et_amorce_la_tolerance(self):
+        jeton = _jeton_test(self.cle_privee)
+        reponse = {
+            "jeton": jeton, "revoque": False,
+            "licence": {"statut": "expiree", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        decision = lc.decision_depuis_reponse_serveur(reponse)
+        self.assertEqual(decision.etat, lc.ETAT_EXPIRE)
+        etat_tolerance = session_tolerance.charger_etat(chemin_etat=self.chemin_tolerance)
+        self.assertEqual(etat_tolerance[0], "cycle-test-1")
+
+    def test_licence_revoquee_est_revoque_sans_tolerance(self):
+        jeton = _jeton_test(self.cle_privee)
+        reponse = {
+            "jeton": jeton, "revoque": True,
+            "licence": {"statut": "revoquee", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        decision = lc.decision_depuis_reponse_serveur(reponse)
+        self.assertEqual(decision.etat, lc.ETAT_REVOQUE)
+        self.assertIsNone(session_tolerance.charger_etat(chemin_etat=self.chemin_tolerance))
+
+
+class VerificationPeriodiqueNecessaireTest(unittest.TestCase):
+    """verification_periodique_necessaire() — règle 2 du 2026-11-17
+    (« toutes les 24h tant que Senaco reste ouvert »). Horloges
+    TOUJOURS simulées (paramètre `maintenant` injecté) — jamais une
+    attente réelle de 24h dans ces tests."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="verif_periodique_test_")
+        self.addCleanup(self._tmp.cleanup)
+        self.chemin_horloge = os.path.join(self._tmp.name, "horloge_fiable.json")
+        patcher = patch.object(trusted_clock, "TRUSTED_CLOCK_FILE", self.chemin_horloge)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_vrai_si_jamais_confirme_en_ligne(self):
+        self.assertTrue(lc.verification_periodique_necessaire())
+
+    def test_faux_juste_apres_une_confirmation(self):
+        maintenant = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+        trusted_clock.initialiser_apres_verification_en_ligne(maintenant, chemin=self.chemin_horloge)
+        self.assertFalse(lc.verification_periodique_necessaire(maintenant=maintenant))
+
+    def test_faux_23h59_apres_la_confirmation(self):
+        confirmation = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+        trusted_clock.initialiser_apres_verification_en_ligne(confirmation, chemin=self.chemin_horloge)
+        presque_24h = confirmation + timedelta(hours=23, minutes=59)
+        self.assertFalse(lc.verification_periodique_necessaire(maintenant=presque_24h))
+
+    def test_vrai_pile_24h_apres_la_confirmation(self):
+        confirmation = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+        trusted_clock.initialiser_apres_verification_en_ligne(confirmation, chemin=self.chemin_horloge)
+        exactement_24h = confirmation + timedelta(hours=24)
+        self.assertTrue(lc.verification_periodique_necessaire(maintenant=exactement_24h))
+
+    def test_vrai_largement_apres_24h(self):
+        confirmation = datetime(2026, 11, 10, 10, 0, tzinfo=timezone.utc)
+        trusted_clock.initialiser_apres_verification_en_ligne(confirmation, chemin=self.chemin_horloge)
+        une_semaine_plus_tard = confirmation + timedelta(days=7)
+        self.assertTrue(lc.verification_periodique_necessaire(maintenant=une_semaine_plus_tard))
+
+    def test_plusieurs_processus_partagent_le_meme_horodatage(self):
+        """Règle 2, point « éviter les vérifications multiples
+        provenant des différents processus » : si un AUTRE processus
+        (simulé ici par un second appel direct à initialiser_apres_
+        verification_en_ligne, sur le MÊME fichier partagé) vient de
+        confirmer en ligne, ce processus-ci doit le constater et ne pas
+        juger une nouvelle vérification nécessaire, même si SA PROPRE
+        dernière confirmation connue datait de plus de 24h."""
+        ancienne_confirmation = datetime(2026, 11, 1, 10, 0, tzinfo=timezone.utc)
+        trusted_clock.initialiser_apres_verification_en_ligne(ancienne_confirmation, chemin=self.chemin_horloge)
+        maintenant = datetime(2026, 11, 17, 10, 0, tzinfo=timezone.utc)
+        self.assertTrue(lc.verification_periodique_necessaire(maintenant=maintenant))
+
+        # Un autre processus Senaco vient de vérifier en ligne avec succès.
+        trusted_clock.initialiser_apres_verification_en_ligne(maintenant, chemin=self.chemin_horloge)
+        self.assertFalse(lc.verification_periodique_necessaire(maintenant=maintenant))
+
+
+class VerificationAsynchroneTest(EnvironnementTestCase):
+    """demarrer_verification_en_arriere_plan() et appliquer_resultats_
+    verification_en_attente() — le cœur du correctif du 2026-11-17.
+    Couvre : serveur lent/inaccessible (jamais de blocage), et la course
+    explicitement signalée par Raj entre le réseau et l'ouverture d'un
+    tournoi (aucune décision de blocage déjà reçue ne doit être
+    ignorée)."""
+
+    def test_le_thread_ne_bloque_jamais_lappelant(self):
+        """Simule un serveur lent : verifier_en_ligne() dort un court
+        instant avant de répondre. L'appelant doit pouvoir continuer
+        IMMÉDIATEMENT — c'est tout l'objet de cette fonction (règle 5)."""
+        evenement_reponse_prete = threading.Event()
+
+        def verifier_lent():
+            time.sleep(0.2)
+            evenement_reponse_prete.set()
+            return {"jeton": _jeton_test(self.cle_privee), "revoque": False,
+                    "licence": {"statut": "active", "type": "essai",
+                                "date_debut": "2026-11-01", "date_expiration": "2027-02-01"}}
+
+        file_attente = queue.Queue()
+        with patch.object(lc, "verifier_en_ligne", side_effect=verifier_lent):
+            debut = time.monotonic()
+            thread = lc.demarrer_verification_en_arriere_plan(file_attente)
+            duree_appel = time.monotonic() - debut
+        self.assertLess(duree_appel, 0.1, "demarrer_verification_en_arriere_plan() a bloqué l'appelant.")
+        self.assertFalse(evenement_reponse_prete.is_set(), "le thread semble déjà terminé avant même d'avoir démarré pour de vrai.")
+        thread.join(timeout=2)
+        self.assertTrue(evenement_reponse_prete.is_set())
+        resultat = file_attente.get_nowait()
+        self.assertIsNotNone(resultat)
+
+    def test_serveur_inaccessible_ne_change_rien(self):
+        """Règle 3 : si Internet est indisponible, les règles hors
+        ligne existantes s'appliquent — ici, la décision en cache reste
+        simplement inchangée (rien à appliquer depuis un échec réseau)."""
+        file_attente = queue.Queue()
+        file_attente.put(None)
+        decision_locale = lc.DecisionLicence(lc.ETAT_NORMAL, "cycle-test-1", "Licence valide (hors ligne).")
+        decision_mise_a_jour = lc.appliquer_resultats_verification_en_attente(decision_locale, file_attente)
+        self.assertIs(decision_mise_a_jour, decision_locale)
+
+    def test_aucune_decision_de_blocage_recue_nest_jamais_ignoree(self):
+        """Reproduit exactement la course signalée par Raj : une
+        réponse serveur (ici révoquée) est déjà arrivée sur la file
+        d'attente — simulant le cas où elle est reçue PENDANT l'ouverture
+        d'un tournoi — au moment où la décision est consultée. Elle doit
+        être appliquée, jamais ignorée au profit de l'ancienne décision
+        locale encore valide en cache."""
+        jeton = _jeton_test(self.cle_privee)
+        reponse_revoquee = {
+            "jeton": jeton, "revoque": True,
+            "licence": {"statut": "revoquee", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        file_attente = queue.Queue()
+        file_attente.put(reponse_revoquee)
+        decision_locale_encore_normale = lc.DecisionLicence(lc.ETAT_NORMAL, "cycle-test-1", "Licence valide (hors ligne).")
+        decision_mise_a_jour = lc.appliquer_resultats_verification_en_attente(
+            decision_locale_encore_normale, file_attente,
+        )
+        self.assertEqual(decision_mise_a_jour.etat, lc.ETAT_REVOQUE)
+
+    def test_file_vide_renvoie_la_decision_inchangee(self):
+        decision_locale = lc.DecisionLicence(lc.ETAT_NORMAL, "cycle-test-1", "Licence valide (hors ligne).")
+        decision_mise_a_jour = lc.appliquer_resultats_verification_en_attente(
+            decision_locale, queue.Queue(),
+        )
+        self.assertIs(decision_mise_a_jour, decision_locale)
+
+    def test_ne_consomme_que_le_dernier_resultat_si_plusieurs_en_attente(self):
+        """Cas limite : deux résultats empilés (ne devrait normalement
+        jamais arriver, un seul thread à la fois) — le plus récent doit
+        l'emporter, jamais le premier."""
+        jeton = _jeton_test(self.cle_privee)
+        reponse_active = {
+            "jeton": jeton, "revoque": False,
+            "licence": {"statut": "active", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        reponse_revoquee = {
+            "jeton": jeton, "revoque": True,
+            "licence": {"statut": "revoquee", "type": "essai",
+                        "date_debut": "2026-11-01", "date_expiration": "2027-02-01"},
+        }
+        file_attente = queue.Queue()
+        file_attente.put(reponse_active)
+        file_attente.put(reponse_revoquee)
+        decision_mise_a_jour = lc.appliquer_resultats_verification_en_attente(
+            lc.DecisionLicence(lc.ETAT_NORMAL, "cycle-test-1", "Licence valide (hors ligne)."),
+            file_attente,
+        )
+        self.assertEqual(decision_mise_a_jour.etat, lc.ETAT_REVOQUE)
 
 
 class ObtenirInformationsAffichageTest(EnvironnementTestCase):

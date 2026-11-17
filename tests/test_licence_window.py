@@ -109,6 +109,14 @@ class _FakeApp:
     def __init__(self, decision=None):
         self._decision_licence_v3 = decision
 
+    def _appliquer_resultats_verification_v3_en_attente(self):
+        # Correctif du 2026-11-17 : _show_licence_window() appelle
+        # désormais ceci pour afficher la décision la plus fraîche —
+        # doublure directe sans file d'attente réelle, donc rien à
+        # appliquer (comportement identique à la vraie méthode quand
+        # self._verification_v3_file_attente est absente/vide).
+        pass
+
 
 @unittest.skipUnless(_TK_AVAILABLE, "Tkinter indisponible sur ce poste")
 class FenetreLicenceReelleTest(unittest.TestCase):

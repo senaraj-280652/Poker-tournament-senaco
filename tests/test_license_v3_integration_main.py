@@ -172,5 +172,88 @@ class GardeDestructionRacineTest(unittest.TestCase):
                 self.assertIn("_fermee_pendant_init", contexte_avant)
 
 
+class VerificationAsynchroneEtPeriodiqueTest(unittest.TestCase):
+    """Correctif du 2026-11-17 (règles de vérification de licence V3,
+    issue GitHub n°9) : vérification structurelle du SOURCE, même
+    principe que GatingLicenceV3Test ci-dessus — instancier un vrai
+    App() reste hors de portée pour un test (voir l'en-tête de ce
+    fichier), donc ce lot se vérifie à la lecture du code, pas à
+    l'exécution. Le comportement réel (thread, file d'attente, matrice
+    de décision) est, lui, testé pour de vrai dans tests/test_license_
+    client.py (EvaluerLicenceSansReseauTest, VerificationAsynchroneTest,
+    VerificationPeriodiqueNecessaireTest)."""
+
+    def setUp(self):
+        self.source = _lire_main()
+
+    def test_demarrage_utilise_la_matrice_sans_reseau(self):
+        """Règle 1/5 : le démarrage doit utiliser evaluer_licence_sans_
+        reseau() — jamais evaluer_licence() en premier (qui bloquerait
+        sur un réseau lent avant l'affichage du menu principal)."""
+        self.assertIn("license_client.evaluer_licence_sans_reseau()", self.source)
+
+    def test_retente_la_matrice_complete_seulement_pour_les_deux_etats_indetermines(self):
+        """Les deux seuls états où le repli local est inexploitable
+        doivent encore retenter evaluer_licence() (comportement
+        rigoureusement inchangé pour eux, voir license_client.py) —
+        jamais pour ETAT_NORMAL/ETAT_EXPIRE, désormais rafraîchis en
+        tâche de fond."""
+        debut = self.source.index("decision = license_client.evaluer_licence_sans_reseau()")
+        fin = self.source.index("if decision.etat == license_client.ETAT_ACTIVATION_REQUISE:")
+        bloc = self.source[debut:fin]
+        self.assertIn("ETAT_VERIFICATION_OBLIGATOIRE", bloc)
+        self.assertIn("ETAT_LECTURE_TEMPORAIREMENT_INDISPONIBLE", bloc)
+        self.assertIn("license_client.evaluer_licence()", bloc)
+        self.assertNotIn("ETAT_NORMAL", bloc)
+        self.assertNotIn("ETAT_EXPIRE", bloc)
+
+    def test_verification_en_arriere_plan_lancee_au_demarrage(self):
+        self.assertIn("self._lancer_verification_v3_en_arriere_plan()", self.source)
+
+    def test_sondage_periodique_planifie_au_demarrage(self):
+        self.assertIn(
+            "self.after(_SONDAGE_VERIFICATION_V3_INTERVALLE_MS, self._planifier_sondage_verification_v3)",
+            self.source,
+        )
+
+    def test_methode_arriere_plan_utilise_un_thread_demon_jamais_le_thread_principal(self):
+        self.assertIn("def _lancer_verification_v3_en_arriere_plan(self):", self.source)
+        debut = self.source.index("def _lancer_verification_v3_en_arriere_plan(self):")
+        fin = self.source.index("def _appliquer_resultats_verification_v3_en_attente(self):")
+        bloc = self.source[debut:fin]
+        self.assertIn("license_client.demarrer_verification_en_arriere_plan(", bloc)
+
+    def test_sondage_periodique_sarrete_de_lui_meme_a_la_fermeture(self):
+        """Règle "fermeture propre des tâches de vérification" : jamais
+        une boucle self.after() qui continue après la destruction de la
+        fenêtre — même garde winfo_exists() déjà établie ailleurs dans
+        ce fichier pour ce type de boucle récurrente."""
+        self.assertIn("def _planifier_sondage_verification_v3(self):", self.source)
+        debut = self.source.index("def _planifier_sondage_verification_v3(self):")
+        fin = self.source.index(
+            "def _verifier_tolerance_licence_avant_ouverture(", debut,
+        )
+        bloc = self.source[debut:fin]
+        self.assertIn("if not self.winfo_exists():", bloc)
+        self.assertIn("return", bloc)
+        self.assertIn("license_client.verification_periodique_necessaire()", bloc)
+        self.assertIn(
+            "self.after(_SONDAGE_VERIFICATION_V3_INTERVALLE_MS, self._planifier_sondage_verification_v3)",
+            bloc,
+        )
+
+    def test_ouverture_tournoi_applique_les_resultats_en_attente_avant_de_lire_la_decision(self):
+        """Cœur de la demande du 2026-11-17 : "aucune décision de
+        blocage reçue ne doit pouvoir être ignorée" — la purge de la
+        file d'attente doit avoir lieu AVANT la lecture de self.
+        _decision_licence_v3, jamais après."""
+        debut = self.source.index("def _verifier_tolerance_licence_avant_ouverture(")
+        fin = self.source.index(
+            'decision = getattr(self, "_decision_licence_v3", None)', debut,
+        )
+        bloc = self.source[debut:fin]
+        self.assertIn("self._appliquer_resultats_verification_v3_en_attente()", bloc)
+
+
 if __name__ == "__main__":
     unittest.main()

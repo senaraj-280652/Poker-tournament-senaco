@@ -49,14 +49,16 @@ sert de référence hors-ligne."""
 import contextlib
 import json
 import os
+import queue
 import secrets
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 if sys.platform == "win32":
@@ -773,11 +775,13 @@ def _amorcer_tolerance_si_nouveau_cycle(cycle_id):
         session_tolerance.amorcer_ou_reinitialiser_tolerance(cycle_id)
 
 
-def evaluer_licence():
-    """Point d'entrée principal : implémente la matrice de décision
-    complète. Ne lève jamais d'exception — toute anomalie se traduit
-    par un DecisionLicence explicite, jamais une interruption."""
-    etat_local = _charger_etat_local()
+def _decision_si_etat_local_bloquant(etat_local):
+    """Renvoie une DecisionLicence si `etat_local` (tel que renvoyé par
+    _charger_etat_local()) empêche structurellement toute poursuite —
+    absent, ou temporairement illisible — sinon None (etat_local est
+    exploitable, l'appelant doit poursuivre). Factorisé le 2026-11-17
+    pour être partagé entre evaluer_licence() et evaluer_licence_sans_
+    reseau() ci-dessous, sans dupliquer ces deux messages."""
     if etat_local is _ACCES_TEMPORAIREMENT_INDISPONIBLE:
         # Correctif du 2026-11-11 : licence locale PRÉSENTE mais
         # illisible après plusieurs tentatives (verrou transitoire
@@ -794,34 +798,49 @@ def evaluer_licence():
             ETAT_ACTIVATION_REQUISE, None,
             "Aucune licence locale — activation en ligne requise (voir activer_en_ligne).",
         )
+    return None
 
-    reponse_serveur = verifier_en_ligne()
 
-    if reponse_serveur is not None:
-        # id_jeton n'apparaît pas tel quel dans reponse_serveur["licence"]
-        # (voir public/verifier.php) — seul le jeton signé lui-même le
-        # porte ; on le relit donc depuis là, seule source fiable ici.
-        try:
-            payload = license_token.extraire_licence(reponse_serveur["jeton"], _cle_publique_hex())
-            cycle_id = payload["id_jeton"]
-        except (KeyError, RuntimeError, license_token.JetonInvalide):
-            cycle_id = None
+def decision_depuis_reponse_serveur(reponse_serveur):
+    """Convertit une réponse déjà reçue de /verifier.php en DecisionLicence
+    — factorisé le 2026-11-17 (règle « vérification systématique au
+    démarrage, sans jamais bloquer l'affichage du menu principal ») pour
+    être appelée aussi bien par evaluer_licence() (chemin synchrone
+    historique, inchangé) que par appliquer_resultats_verification_en_
+    attente() ci-dessous (chemin ASYNCHRONE : le résultat arrive d'un
+    thread d'arrière-plan, bien après que le menu principal est déjà
+    affiché avec la décision locale)."""
+    # id_jeton n'apparaît pas tel quel dans reponse_serveur["licence"]
+    # (voir public/verifier.php) — seul le jeton signé lui-même le
+    # porte ; on le relit donc depuis là, seule source fiable ici.
+    try:
+        payload = license_token.extraire_licence(reponse_serveur["jeton"], _cle_publique_hex())
+        cycle_id = payload["id_jeton"]
+    except (KeyError, RuntimeError, license_token.JetonInvalide):
+        cycle_id = None
 
-        if reponse_serveur.get("revoque"):
-            # Décision du 2026-11-03 : une révocation entraîne un
-            # blocage IMMÉDIAT, SANS tolérance (contrairement à une
-            # expiration naturelle) — jamais d'amorçage de
-            # session_tolerance ici, il n'y a rien à tolérer.
-            return DecisionLicence(ETAT_REVOQUE, cycle_id, "Licence révoquée.")
+    if reponse_serveur.get("revoque"):
+        # Décision du 2026-11-03 : une révocation entraîne un blocage
+        # IMMÉDIAT, SANS tolérance (contrairement à une expiration
+        # naturelle) — jamais d'amorçage de session_tolerance ici, il
+        # n'y a rien à tolérer.
+        return DecisionLicence(ETAT_REVOQUE, cycle_id, "Licence révoquée.")
 
-        if reponse_serveur.get("licence", {}).get("statut") == "expiree":
-            if cycle_id:
-                _amorcer_tolerance_si_nouveau_cycle(cycle_id)
-            return DecisionLicence(ETAT_EXPIRE, cycle_id, "Licence expirée (confirmé en ligne).")
+    if reponse_serveur.get("licence", {}).get("statut") == "expiree":
+        if cycle_id:
+            _amorcer_tolerance_si_nouveau_cycle(cycle_id)
+        return DecisionLicence(ETAT_EXPIRE, cycle_id, "Licence expirée (confirmé en ligne).")
 
-        return DecisionLicence(ETAT_NORMAL, cycle_id, "Licence valide (confirmé en ligne).")
+    return DecisionLicence(ETAT_NORMAL, cycle_id, "Licence valide (confirmé en ligne).")
 
-    # --- Hors ligne : se replier sur le dernier jeton connu localement.
+
+def _evaluer_licence_hors_ligne(etat_local):
+    """Repli purement local (jeton signé + horloge de confiance), SANS
+    LA MOINDRE requête réseau — factorisé le 2026-11-17 à partir du
+    corps historique de evaluer_licence() pour être réutilisé par
+    evaluer_licence_sans_reseau() ci-dessous. `etat_local` doit déjà
+    avoir été validé par _decision_si_etat_local_bloquant() (jamais
+    None ni _ACCES_TEMPORAIREMENT_INDISPONIBLE ici)."""
     try:
         cle_publique = _cle_publique_hex()
         payload = license_token.extraire_licence(etat_local["jeton"], cle_publique)
@@ -845,6 +864,138 @@ def evaluer_licence():
         return DecisionLicence(ETAT_EXPIRE, payload["id_jeton"], "Licence expirée (dernière info locale fiable).")
 
     return DecisionLicence(ETAT_NORMAL, payload["id_jeton"], "Licence valide (hors ligne, dernière info fiable).")
+
+
+def evaluer_licence():
+    """Point d'entrée principal (chemin SYNCHRONE, inchangé depuis les
+    lots précédents) : implémente la matrice de décision complète, en
+    tentant TOUJOURS verifier_en_ligne() en premier. Ne lève jamais
+    d'exception — toute anomalie se traduit par un DecisionLicence
+    explicite, jamais une interruption.
+
+    Voir evaluer_licence_sans_reseau() ci-dessous pour le chemin
+    ASYNCHRONE (règle du 2026-11-17, « ne jamais bloquer l'affichage du
+    menu principal en cas de lenteur réseau ») — cette fonction-ci reste
+    utilisée telle quelle pour la toute première activation (rien à
+    afficher sans jeton local) et pour retenter une résolution en ligne
+    des deux états où le repli local lui-même est inexploitable
+    (ETAT_VERIFICATION_OBLIGATOIRE, ETAT_LECTURE_TEMPORAIREMENT_
+    INDISPONIBLE) — jamais pour le cas courant (jeton local déjà
+    valide), désormais traité en tâche de fond."""
+    etat_local = _charger_etat_local()
+    decision_bloquante = _decision_si_etat_local_bloquant(etat_local)
+    if decision_bloquante is not None:
+        return decision_bloquante
+
+    reponse_serveur = verifier_en_ligne()
+    if reponse_serveur is not None:
+        return decision_depuis_reponse_serveur(reponse_serveur)
+
+    return _evaluer_licence_hors_ligne(etat_local)
+
+
+def evaluer_licence_sans_reseau():
+    """Même matrice de décision que evaluer_licence(), mais NE TENTE
+    JAMAIS verifier_en_ligne() — aucune requête réseau, donc aucune
+    attente possible. Ajoutée le 2026-11-17 (règle « vérification
+    systématique au démarrage, sans jamais bloquer l'affichage du menu
+    principal en cas de lenteur réseau ») : main.py l'utilise pour
+    afficher le menu principal immédiatement avec une décision locale
+    déjà fiable — le MÊME repli que celui d'une coupure réseau réelle,
+    jamais une valeur optimiste inventée — puis lance verifier_en_ligne()
+    en tâche de fond (voir demarrer_verification_en_arriere_plan) et met
+    à jour la décision via decision_depuis_reponse_serveur() dès que la
+    réponse arrive. Jamais de double amorçage de tolérance pour un même
+    cycle : _amorcer_tolerance_si_nouveau_cycle() est déjà idempotente
+    par construction (voir son propre contrat)."""
+    etat_local = _charger_etat_local()
+    decision_bloquante = _decision_si_etat_local_bloquant(etat_local)
+    if decision_bloquante is not None:
+        return decision_bloquante
+    return _evaluer_licence_hors_ligne(etat_local)
+
+
+def demarrer_verification_en_arriere_plan(file_attente):
+    """Lance verifier_en_ligne() dans un thread démon séparé — jamais
+    sur le thread appelant (règle du 2026-11-17, « ne jamais bloquer
+    l'affichage »). Le résultat (dict de réponse serveur, ou None en cas
+    d'échec réseau) est simplement déposé sur `file_attente` dès qu'il
+    est connu ; ce thread ne le traite JAMAIS lui-même (aucun accès à
+    l'état de l'interface depuis un thread d'arrière-plan) — voir
+    appliquer_resultats_verification_en_attente() ci-dessous, seule
+    fonction censée consommer cette file, toujours depuis le thread
+    principal. Renvoie l'objet Thread déjà démarré (utile pour les
+    tests — join() avec délai — jamais nécessaire en usage réel, le
+    thread est démon et se termine de lui-même)."""
+    def worker():
+        file_attente.put(verifier_en_ligne())
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
+
+
+def appliquer_resultats_verification_en_attente(decision_actuelle, file_attente):
+    """Consomme TOUT ce qui attend sur `file_attente` (normalement 0 ou
+    1 élément — un seul thread d'arrière-plan à la fois, voir
+    license_client._verrou_verification) et renvoie la décision mise à
+    jour en conséquence, ou `decision_actuelle` inchangée si rien
+    n'attendait ou si le seul résultat en attente était un échec réseau
+    (None) — les règles hors ligne déjà en vigueur restent alors
+    seules applicables (règle du 2026-11-17, point 3).
+
+    Fonction PURE (aucun accès réseau, aucun accès Tkinter) — appelée
+    par main.py à deux endroits : le sondage périodique du minuteur, et
+    juste AVANT toute décision d'ouverture de tournoi, pour qu'une
+    décision de blocage déjà reçue du serveur ne puisse jamais être
+    ignorée à cause d'une course entre le réseau et l'ouverture (règle
+    du 2026-11-17, point 1 — exigence explicite)."""
+    while True:
+        try:
+            resultat = file_attente.get_nowait()
+        except queue.Empty:
+            return decision_actuelle
+        if resultat is not None:
+            decision_actuelle = decision_depuis_reponse_serveur(resultat)
+
+
+VERIFICATION_PERIODIQUE_INTERVALLE_SECONDES = 24 * 3600
+
+
+def verification_periodique_necessaire(maintenant=None):
+    """Vrai si au moins VERIFICATION_PERIODIQUE_INTERVALLE_SECONDES se
+    sont écoulées depuis la dernière CONFIRMATION serveur connue —
+    trusted_clock.charger_etat()[1] (derniere_date_serveur_confirmee),
+    jamais la simple date locale avancée hors ligne (voir trusted_
+    clock.py : cette dernière avance à chaque evaluer_horloge() réussi,
+    y compris hors ligne, ce qui la rendrait inutilisable ici) — ou si
+    aucune confirmation n'est encore connue. `maintenant` est injectable
+    (tests uniquement, horloge simulée — jamais besoin d'attendre 24h
+    pour de vrai).
+
+    Cette fonction n'est JAMAIS consultée par evaluer_licence() ni
+    evaluer_licence_sans_reseau() : la règle du 2026-11-17 exige une
+    vérification systématique à CHAQUE lancement, quelle que soit la
+    fraîcheur de la dernière — seul le minuteur PÉRIODIQUE de main.py
+    (tant que Senaco reste ouvert) s'appuie dessus pour décider si ce
+    sondage-ci doit réellement relancer verifier_en_ligne().
+
+    Reposer sur cet horodatage PARTAGÉ (fichier commun à tous les
+    processus Senaco d'une même machine) plutôt que sur un simple
+    compteur propre à un seul processus permet à plusieurs processus
+    (Bienvenue, Lobby, fenêtres de tournoi) de ne jamais tous relancer
+    leur propre vérification au même moment : si l'un d'eux vient de
+    confirmer en ligne, les autres le constatent via ce même fichier et
+    se replanifient sans rien faire cette fois-ci (règle du 2026-11-17,
+    point 2 — « éviter les vérifications multiples »)."""
+    maintenant = maintenant or datetime.now(timezone.utc)
+    etat = trusted_clock.charger_etat()
+    if etat is None:
+        return True
+    _, derniere_confirmation = etat
+    if derniere_confirmation is None:
+        return True
+    return (maintenant - derniere_confirmation) >= timedelta(seconds=VERIFICATION_PERIODIQUE_INTERVALLE_SECONDES)
 
 
 def reevaluer_expiration_locale(decision):
